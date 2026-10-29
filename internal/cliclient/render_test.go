@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/MMinasyan/lightcode/internal/terminal"
@@ -212,7 +213,11 @@ func TestActualWriterToolMetadataRawArgsAndCanonicalClipboard(t *testing.T) {
 	c, transport := fixture(t)
 	r := settledReader(t, c, transport)
 	metadata := json.RawMessage(`{"edit_preview":{"hunks":[{"rows":[{"kind":"remove","oldLine":1,"text":"old metadata"},{"kind":"add","newLine":1,"text":"new metadata"}]}]}}`)
-	a := protocol.AssistantItem{Kind: "assistant", ItemId: "edit", Status: "completed", Source: "provider/model", Content: append(textParts("canonical first"), textParts("canonical second")...), ToolCalls: []protocol.ToolCallView{{Id: "call", Name: "edit_file", Arguments: `{"path":"raw.go"}`, NormalizedArguments: pointer(protocol.JSONObject{"path": json.RawMessage(`"normalized.go"`)}), Metadata: &metadata, Status: pointer(protocol.ToolCallStatusSuccess), Content: pointer("not a preview")}}}
+	a := protocol.AssistantItem{Kind: "assistant", ItemId: "edit", Status: "completed", Source: "provider/model", Content: append(textParts("canonical first"), textParts("canonical second")...), ToolCalls: []protocol.ToolCallView{
+		{Id: "call", Name: "edit_file", Arguments: `{"path":"raw.go"}`, NormalizedArguments: pointer(protocol.JSONObject{"path": json.RawMessage(`"normalized.go"`)}), Metadata: &metadata, Status: pointer(protocol.ToolCallStatusSuccess), Content: pointer("not a preview")},
+		{Id: "uncertain", Name: "echo", Arguments: "{}", Status: pointer(protocol.ToolCallStatusInterrupted), Content: pointer("Tool call interrupted."), Evidence: pointer(protocol.Unknown)},
+		{Id: "clean", Name: "echo", Arguments: "{}", Status: pointer(protocol.ToolCallStatusInterrupted), Content: pointer("Tool call interrupted."), Evidence: pointer(protocol.NotStarted)},
+	}}
 	var item protocol.ConversationItem
 	_ = item.FromAssistantItem(a)
 	done := c.refreshReader(r)
@@ -228,6 +233,11 @@ func TestActualWriterToolMetadataRawArgsAndCanonicalClipboard(t *testing.T) {
 	frameContaining(t, screen, "new metadata")
 	result := screen.text()
 	testassert.Require(t, strings.Contains(result, "raw.go") && !strings.Contains(result, "normalized.go") && strings.Contains(result, "old metadata"), "tool display used wrong arguments/metadata: %s", result)
+	// The unknown outcome renders uncertain — its own "outcome unknown"
+	// marker — while the proven-unstarted clean cancellation renders exactly
+	// as before: both stored contents appear, only the uncertain call gains
+	// the marker.
+	testassert.Require(t, strings.Count(result, "outcome unknown") == 1 && strings.Count(result, "Tool call interrupted.") == 2, "unknown-vs-clean cancellation rendering: %s", result)
 	c.command("/copy")
 	osc := frameContaining(t, screen, "\x1b]52;")
 	encoded := base64.StdEncoding.EncodeToString([]byte("canonical first\ncanonical second"))
@@ -291,6 +301,8 @@ func TestUsageWarningsOwnAndGlobalAndUnknownRuntime(t *testing.T) {
 	h := hydration(rootA, "2", inputs(1, 1), nil)
 	h.Usage.Context.UsedTokens = "9007199254740993"
 	h.Usage.Totals.ByModel = []protocol.ModelUsage{{Model: "provider/model", Usage: protocol.UsageCount{InputTokens: "18446744073709551615", OutputTokens: "1", CachedInputTokens: "0"}}}
+	estimate := 0.015
+	h.Usage.Totals.EstimatedCostUsd = &estimate
 	h.Warnings = []protocol.Warning{{Message: "global"}, {SessionId: pointer(rootA), Message: "own"}}
 	done := c.refreshReader(r)
 	receive(t, transport.requests).respond(h)
@@ -310,7 +322,7 @@ func TestUsageWarningsOwnAndGlobalAndUnknownRuntime(t *testing.T) {
 	c.command("/context")
 	c.command("/warnings")
 	text := outputs(c)
-	testassert.Require(t, strings.Contains(text, "9007199254740993") && strings.Contains(text, "18446744073709551615") && strings.Contains(text, "own") && !strings.Contains(text, "sibling"), "usage/warnings lost exact subset")
+	testassert.Require(t, strings.Contains(text, "9007199254740993") && strings.Contains(text, "18446744073709551615") && strings.Contains(text, `"estimated_cost_usd":0.015`) && strings.Contains(text, "own") && !strings.Contains(text, "sibling"), "usage/warnings lost exact subset")
 	c.mu.Lock()
 	c.root = nil
 	c.mu.Unlock()
@@ -413,7 +425,72 @@ func TestProgressTupleUnmatchedOperationRepairsWithoutReplay(t *testing.T) {
 	testassert.Require(t, r.chain == nil && c.provisional == "", "foreign Session tool hint dirtied selected Session")
 	c.mu.Unlock()
 	c.acceptEvent(eventDelivery{c.conn, tool(rootA, "second")})
+	// A finished unknown outcome's transient label is uncertain — never the
+	// plain status of a clean, safe cancellation.
+	var finished protocol.Event
+	{
+		var scope protocol.Scope
+		_ = scope.FromOperationScope(protocol.OperationScope{Kind: "operation", SessionId: rootA, OperationId: "second"})
+		unknownEvidence := protocol.Unknown
+		_ = finished.FromToolFinishedEvent(protocol.ToolFinishedEvent{Kind: protocol.ToolFinished, CallId: "same-call", Status: protocol.ToolCallStatusInterrupted, Scope: scope, Evidence: &unknownEvidence})
+	}
+	c.acceptEvent(eventDelivery{c.conn, finished})
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	testassert.Require(t, strings.Contains(c.provisional, "same-call"), "same call ID under current Operation was suppressed")
+	testassert.Require(t, strings.Contains(c.provisional, "same-call: outcome unknown") && !strings.Contains(c.provisional, "same-call: interrupted"), "unknown tool outcome transient label = %q, want the uncertain wording, not a clean cancellation", c.provisional)
+}
+
+// TestCheckpointRendererInspectsAdmittedFields proves the checkpoint
+// renderer keeps every admitted message field inspectable beside the content
+// and refusal rendering: call-only and extras-only messages stay visible
+// through the raw-field/JSON pattern instead of being silently omitted or
+// dumped as an opaque item.
+func TestCheckpointRendererInspectsAdmittedFields(t *testing.T) {
+	c, transport := fixture(t)
+	r := settledReader(t, c, transport)
+	call := protocol.MessageToolCall{
+		Id:              "c-call",
+		Name:            "echo",
+		ArgumentsBase64: "eyJ4IjoxfQ==",
+		Extra:           pointer(protocol.JSONObject{"call": json.RawMessage(`"x"`)}),
+	}
+	var checkpoint protocol.ConversationItem
+	producer := protocol.ModelRef("prov/compact")
+	retained := protocol.ModelRef("prov/model")
+	if err := checkpoint.FromCheckpointItem(protocol.CheckpointItem{
+		ItemId:      "cp",
+		Kind:        "context_checkpoint",
+		CommittedAt: time.Now(),
+		Strategy:    "test.strategy/v1",
+		Model:       &producer,
+		Messages: []protocol.Message{
+			{Role: protocol.MessageRoleAssistant, Source: &producer, Content: pointer(textParts("kept content")), Refusal: pointer("declined")},
+			{Role: protocol.MessageRoleAssistant, Source: &retained, ToolCalls: &[]protocol.MessageToolCall{call}},
+			{Role: protocol.MessageRoleTool, ToolCallId: pointer("c-call"), Content: pointer(textParts("call result text"))},
+			{Role: protocol.MessageRoleUser, Name: pointer("memo"), Extra: pointer(protocol.JSONObject{"vendor": json.RawMessage(`1`)})},
+			{Role: protocol.MessageRoleSystem, Content: pointer(textParts("identical note"))},
+			{Role: protocol.MessageRoleUser, Content: pointer(textParts("identical note"))},
+		},
+	}); err != nil {
+		t.Fatalf("checkpoint item: %v", err)
+	}
+	done := c.refreshReader(r)
+	receive(t, transport.requests).respond(hydration(rootA, "2", []protocol.ConversationItem{inputs(1, 1)[0], checkpoint}, nil))
+	barrier(t, done)
+	screen := newScreen(80)
+	go c.writer(screen)
+	frameContaining(t, screen, "Context checkpoint")
+	result := screen.text()
+	testassert.Require(t, strings.Contains(result, "kept content") && strings.Contains(result, "Refusal: declined"), "content/refusal rendering lost: %s", result)
+	testassert.Require(t, strings.Contains(result, "tool call:") && strings.Contains(result, "c-call") && strings.Contains(result, "echo") && strings.Contains(result, "eyJ4IjoxfQ==") && strings.Contains(result, `"call"`),
+		"call-only message not inspectable: %s", result)
+	testassert.Require(t, strings.Contains(result, "tool result: c-call") && strings.Contains(result, "call result text"), "tool result member not inspectable: %s", result)
+	testassert.Require(t, strings.Contains(result, "name: memo") && strings.Contains(result, "vendor"), "extras-only message not inspectable: %s", result)
+	testassert.Require(t, strings.Contains(result, "role: system") && strings.Contains(result, "role: user") && strings.Contains(result, "role: tool") && strings.Contains(result, "role: assistant"), "message roles not inspectable: %s", result)
+	testassert.Require(t, strings.Count(result, "identical note") == 2, "the two same-text system/user messages are not both inspectable: %s", result)
+	// The retained assistant's own source stays visible and distinct from the
+	// checkpoint producer's identity.
+	testassert.Require(t, strings.Contains(result, "source: prov/model") && strings.Contains(result, "source: prov/compact"), "per-message source not inspectable: %s", result)
+	c.requestExit(nil)
 }

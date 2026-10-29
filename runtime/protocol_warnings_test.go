@@ -467,6 +467,18 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 				testassert.Check(t, err == nil, "execution close: %v", err)
 			}
 		}()
+		inv, err := execution.OpenInvocation(context.Background(), harness.InvocationRequest{
+			ID:      "inv-maintenance",
+			Purpose: harness.InvocationPurposeMaintenance,
+			Model:   prepared.Capture.Compact.Model,
+		})
+		testassert.NoError(t, err)
+		defer func() {
+			{
+				err := inv.Close()
+				testassert.Check(t, err == nil, "invocation close: %v", err)
+			}
+		}()
 
 		// The compaction shape's system+user messages carry no diagnostics;
 		// an assistant-with-tool-calls message replay-kept for the compact
@@ -477,14 +489,14 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 				ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`)}}},
 		}}
 		{
-			_, err := execution.CompactModel(context.Background(), diagnostic)
+			_, err := inv.Model(context.Background(), diagnostic)
 			testassert.Require(t, err != nil, "compact transport request over the failing endpoint succeeded, want the transport failure")
 		}
 		revision, storeWarnings := r.warnings.hydrate(sessionID)
 		testassert.Require(t, warningOf(storeWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) != nil, "the compact closure dropped its post-encode diagnostics: %+v", storeWarnings)
 
 		// An identical attempt replaces with the same list: no advance.
-		_, _ = execution.CompactModel(context.Background(), diagnostic)
+		_, _ = inv.Model(context.Background(), diagnostic)
 		deduped, dedupedWarnings := r.warnings.hydrate(sessionID)
 		testassert.Require(t, deduped == revision && slices.Equal(warningBodies(dedupedWarnings), warningBodies(storeWarnings)), "an identical attempt advanced the store: revision %d → %d", revision, deduped)
 
@@ -494,7 +506,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 			{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "summarize"}}},
 		}}
 		{
-			_, err := execution.CompactModel(context.Background(), clean)
+			_, err := inv.Model(context.Background(), clean)
 			testassert.Require(t, err != nil, "diagnostic-free compact request over the failing endpoint succeeded, want the transport failure")
 		}
 		cleared, clearedWarnings := r.warnings.hydrate(sessionID)
@@ -509,14 +521,14 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		}
 		testassert.NoError(t, r.deleteSession(ctx, sessionID))
 		beforeLate, _ := r.warnings.snapshot()
-		_, _ = execution.CompactModel(context.Background(), diagnostic)
+		_, _ = inv.Model(context.Background(), diagnostic)
 		afterLate, lateWarnings := r.warnings.snapshot()
 		testassert.Equal(t, afterLate, beforeLate)
 		testassert.Require(t, warningOf(lateWarnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID) == nil, "a late attempt resurrected the deleted subject's diagnostics: %+v", lateWarnings)
 
 		// Reports after the owner's warning-store closure are ignored.
 		r.warnings.close()
-		_, _ = execution.CompactModel(context.Background(), diagnostic)
+		_, _ = inv.Model(context.Background(), diagnostic)
 		closed, closedWarnings := r.warnings.snapshot()
 		testassert.Require(t, closed == afterLate && slices.Equal(warningBodies(closedWarnings), warningBodies(lateWarnings)), "a report after closure changed the store")
 	})

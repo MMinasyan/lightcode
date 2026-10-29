@@ -121,6 +121,22 @@ describe('ToolCallBlock independent expansion', () => {
     expect(target.textContent).toContain('one line');
     expect(target.querySelector('.opaque')).toBeNull();
   });
+
+  it('shows an unknown outcome as uncertain, not as a clean cancellation', async () => {
+    const uncertain = await mountCall({
+      id: 'call-u', name: 'echo', arguments: '{}', status: 'interrupted', evidence: 'unknown',
+      content: 'Execution outcome unknown; the action may have occurred.\n\nTool call interrupted.',
+    });
+    const uncertainStatus = uncertain.target.querySelector('.status')?.textContent ?? '';
+    expect(uncertainStatus).toContain('outcome unknown');
+    expect(uncertainStatus).not.toContain('· interrupted');
+    const clean = await mountCall({
+      id: 'call-c', name: 'echo', arguments: '{}', status: 'interrupted', content: 'Tool call interrupted.',
+    });
+    const cleanStatus = clean.target.querySelector('.status')?.textContent ?? '';
+    expect(cleanStatus).toContain('· interrupted');
+    expect(cleanStatus).not.toContain('outcome unknown');
+  });
 });
 
 // A consumed-shape row as the ACTUAL producer emits it (kind context/add/remove,

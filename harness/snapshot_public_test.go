@@ -49,14 +49,12 @@ func snapshotTurnPrepared(script *scriptModel) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			exec := publicExecution(script.effect, script.effect)
-			exec.Tool = func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0],"s":"<>&"}`),
 				}}
-			}
-			return exec, nil
+			}), nil
 		},
 	}
 }
@@ -133,8 +131,8 @@ func TestPublicReadSessionHistoryOwnedCapture(t *testing.T) {
 			if fact.Signal != nil && fact.Signal.RelatedMember != nil {
 				fact.Signal.RelatedMember.ID = "mutated"
 			}
-			if fact.Compaction != nil && fact.Compaction.Usage != nil {
-				fact.Compaction.Usage.InputTokens = 999
+			if fact.Checkpoint != nil && len(fact.Checkpoint.Facts) > 0 && fact.Checkpoint.Facts[0].Usage != nil {
+				fact.Checkpoint.Facts[0].Usage.InputTokens = 999
 			}
 			if fact.Settlement != nil {
 				if fact.Settlement.Model != nil {
@@ -552,13 +550,13 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		awaitTerminal(t, f.h, session, "comp-1")
 		after, err := f.h.ReadSessionView(ctx, session)
 		testassert.NoError(t, err)
-		var compaction *harness.CompactionEntry
+		var compaction *harness.ContextCheckpointEntry
 		for _, fact := range after.History.HistoryFacts(historyIDsOf(after.History.HistoryHeaders())) {
-			if fact.Compaction != nil {
-				compaction = fact.Compaction
+			if fact.Checkpoint != nil {
+				compaction = fact.Checkpoint
 			}
 		}
-		testassert.Require(t, compaction != nil && compaction.Summary == "Summary." && compaction.Model == compactModelRef, "compaction fact = %+v", compaction)
+		testassert.Require(t, compaction != nil && len(compaction.Messages) == 1 && compaction.Messages[0].TextContent() == "[Previous conversation summary]\n\nSummary.\n\n[End of summary. Continue from here.]" && compaction.Facts[0].Model == compactModelRef, "compaction fact = %+v", compaction)
 		found := false
 		for _, op := range after.Operations {
 			if op.OperationID == "comp-1" {
@@ -567,6 +565,7 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 		}
 		testassert.Require(t, found, "the compact Operation is missing from the read")
 
+		awaitQuiet(t, f.h, session) // the retiring compact run drains and releases before the lifecycle transitions
 		{
 			_, err := f.h.ArchiveSession(ctx, session)
 			testassert.NoError(t, err)
@@ -1334,6 +1333,10 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		f.prepareHook = func(call int, _ harness.PreparationRequest) (harness.PreparedExecution, error) {
 			capture := publicCapture()
 			capture.Capabilities = []string{"cap.a", "cap.b"}
+			conversationInput, conversationOutput := 1.0, 2.0
+			compactInput := 0.5
+			capture.Pricing = &harness.ModelPricing{Input: &conversationInput, Output: &conversationOutput}
+			capture.Compact.Pricing = &harness.ModelPricing{Input: &compactInput}
 			immediateTool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
@@ -1358,12 +1361,7 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: capture,
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool:          tool,
-					}, nil
+					return publicExecutionOver(script.effect, script.effect, tool), nil
 				},
 			}, nil
 		}
@@ -1524,7 +1522,7 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 				relatedOperation = relatedOperation || fact.Signal.RelatedOperation != nil
 				relatedMember = relatedMember || fact.Signal.RelatedMember != nil
 			case harness.EntryCompaction:
-				testassert.Require(t, fact.Compaction != nil && fact.Compaction.Usage != nil, "compaction fact fixture lost its usage: %+v", fact.Compaction)
+				testassert.Require(t, fact.Checkpoint != nil && len(fact.Checkpoint.Facts) > 0 && fact.Checkpoint.Facts[0].Usage != nil, "compaction fact fixture lost its usage: %+v", fact.Checkpoint)
 			case harness.EntryOperationSettlement:
 				testassert.Require(t, fact.Settlement != nil, "settlement fact fixture lost its payload: %+v", fact)
 				settlementWithUsage = settlementWithUsage || (fact.Settlement.Model != nil && fact.Settlement.Usage != nil)
@@ -1581,6 +1579,9 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		mutatedRecord.Admission.Execution.Capabilities[0] = "mutated"
 		mutatedRecord.Admission.Execution.Capabilities = append(mutatedRecord.Admission.Execution.Capabilities, "forged")
 		mutatedRecord.Admission.Execution.Compact.SystemPrompt = "mutated"
+		*mutatedRecord.Admission.Execution.Pricing.Input = 999
+		*mutatedRecord.Admission.Execution.Pricing.Output = 999
+		*mutatedRecord.Admission.Execution.Compact.Pricing.Input = 999
 		*mutatedRecord.State.SettledAt = mutatedRecord.State.SettledAt.Add(2 * time.Hour)
 		mutatedRecord.State.Terminal.Detail = "mutated"
 		mutatedRecord.State.Terminal.SettlementEntry.EntryID = "mutated"
@@ -1642,12 +1643,12 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 					fact.Signal.RelatedMember.ID = "mutated"
 				}
 				fact.Signal.Content = "mutated"
-			case fact.Compaction != nil:
-				fact.Compaction.Summary = "mutated"
-				fact.Compaction.BoundaryEntryID = "mutated"
-				fact.Compaction.Model.Provider = "mutated"
-				fact.Compaction.ConfigurationRevision = "mutated"
-				*fact.Compaction.Usage = harness.UsageCount{InputTokens: 999}
+			case fact.Checkpoint != nil:
+				fact.Checkpoint.Messages = nil
+				fact.Checkpoint.BoundaryEntryID = "mutated"
+				fact.Checkpoint.Facts[0].Model.Provider = "mutated"
+				fact.Checkpoint.ConfigurationRevision = "mutated"
+				*fact.Checkpoint.Facts[0].Usage = harness.UsageCount{InputTokens: 999}
 			case fact.Settlement != nil:
 				if fact.Settlement.Model != nil {
 					fact.Settlement.Model.Provider = "mutated"

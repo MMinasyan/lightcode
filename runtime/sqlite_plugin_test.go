@@ -329,6 +329,7 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 						Model:        model.ModelRef{Provider: "prov", Model: "m"},
 						SystemPrompt: "summarize",
 					},
+					Strategy: harness.StrategyCapture{ID: harness.IncludedStrategyID, RequiresContextWindow: true},
 				},
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 					modelFn := func(context.Context, model.Request) (model.Stream, error) {
@@ -340,20 +341,21 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 						<-release
 						return nil, errors.New("seeded execution released after the test converged")
 					}
-					return harness.Execution{
-						NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
-							var obj map[string]json.RawMessage
-							if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
-								return nil, errors.New("arguments must be one non-null JSON object")
-							}
-							return json.Marshal(obj)
-						},
-						Model:        modelFn,
-						CompactModel: modelFn,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
-						},
-					}, nil
+					return harness.Execution{OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
+						return harness.InvocationExecution{
+							NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
+								var obj map[string]json.RawMessage
+								if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
+									return nil, errors.New("arguments must be one non-null JSON object")
+								}
+								return json.Marshal(obj)
+							},
+							Model: modelFn,
+							Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+								return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
+							},
+						}, nil
+					}}, nil
 				},
 			}, nil
 		},

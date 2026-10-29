@@ -29,7 +29,7 @@ const (
 	testCredential = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	// testVersion is the current wire identity every compatible fixture
 	// speaks; the incompatible rows keep the literal old "1".
-	testVersion = string(protocol.N2)
+	testVersion = string(protocol.N6)
 )
 
 // recordContent builds one private four-field discovery document.
@@ -435,8 +435,9 @@ func TestEventsFrames(t *testing.T) {
 			Kind: protocol.ToolStarted, Scope: operationEventScope(), CallId: "call-1", Ordinal: 0, Name: "read",
 		}))
 		var finished protocol.Event
+		evidence := protocol.Unknown
 		testassert.NoError(t, finished.FromToolFinishedEvent(protocol.ToolFinishedEvent{
-			Kind: protocol.ToolFinished, Scope: operationEventScope(), CallId: "call-1", Status: protocol.ToolCallStatusSuccess,
+			Kind: protocol.ToolFinished, Scope: operationEventScope(), CallId: "call-1", Status: protocol.ToolCallStatusSuccess, Evidence: &evidence,
 		}))
 		frames := notificationFrame(t, delta) + notificationFrame(t, refusal) + notificationFrame(t, started) + notificationFrame(t, finished)
 		server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(frames))
@@ -453,6 +454,8 @@ func TestEventsFrames(t *testing.T) {
 		}
 		refusalBody, err := delivered[1].AsRefusalDeltaEvent()
 		testassert.Require(t, err == nil && refusalBody.Content == "refused", "delivered refusal delta = (%+v, %v), want its distinct refusal content", refusalBody, err)
+		finishedBody, err := delivered[3].AsToolFinishedEvent()
+		testassert.Require(t, err == nil && finishedBody.Evidence != nil && *finishedBody.Evidence == protocol.Unknown, "delivered tool finished = (%+v, %v), want its unknown evidence carried through", finishedBody, err)
 	})
 
 	// Every non-global scope kind delivers through its real producer shape:
@@ -510,6 +513,7 @@ func TestEventsFrames(t *testing.T) {
 		{"missing refusal content", rawNotification(`{"kind":"refusal_delta","scope":{"kind":"runtime"}}`)},
 		{"position member on refusal_delta", rawNotification(`{"kind":"refusal_delta","scope":{"kind":"runtime"},"content":"x","position":0}`)},
 		{"unknown tool status", rawNotification(`{"kind":"tool_finished","scope":{"kind":"runtime"},"call_id":"c","status":"pending"}`)},
+		{"unknown tool evidence", rawNotification(`{"kind":"tool_finished","scope":{"kind":"runtime"},"call_id":"c","status":"success","evidence":"pending"}`)},
 		{"negative tool ordinal", rawNotification(`{"kind":"tool_started","scope":{"kind":"runtime"},"call_id":"c","ordinal":-1,"name":"n"}`)},
 		{"wrong event name", "event: other\ndata: {}\n\n"},
 		{"unexpected stream field", "id: 7\nevent: notification\ndata: {}\n\n"},

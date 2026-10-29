@@ -101,6 +101,7 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 		return h.forkTransaction(tx, destID, view, req, content, capture, &commit)
 	})
 	if txErr != nil {
+		h.releasePrepared(&prepared) // the fork never adopts: its transaction failed or resolved to an existing destination
 		h.markCorrupt(req.SourceSessionID, txErr)
 		if errors.Is(txErr, ErrConflict) {
 			// first-writer resolution: the same exact lookup runs once; the
@@ -296,7 +297,7 @@ func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRec
 			}
 		}
 	}
-	dest.State.CompactionEntryID = lastCompactionEntryID
+	dest.State.CheckpointEntryID = lastCompactionEntryID
 
 	record, committed, entry, perr := produceAdmission(tx, dest, capture, admissionRequest{
 		SessionID:   destID,
@@ -342,6 +343,8 @@ func copyForkEntry(tx Transaction, destID, sourceID string, decoded graphEntry, 
 		copied := *decoded.Assistant
 		copied.SessionID, copied.EntryID, copied.OperationID = destID, newID, ""
 		copied.Usage = nil // copied prefix entries carry no source usage
+		copied.Evidence = copyRequestEvidencePointer(decoded.Assistant.Evidence)
+		remapEvidenceRefs(copied.Evidence, entryIDs)
 		for i := range copied.ToolCalls {
 			fresh, err := newHexID()
 			if err != nil {
@@ -393,12 +396,17 @@ func copyForkEntry(tx Transaction, destID, sourceID string, decoded graphEntry, 
 		}
 		copied := *decoded.Compaction
 		copied.SessionID, copied.EntryID, copied.OperationID = destID, newID, ""
-		copied.Usage = nil // copied prefix entries carry no source usage
+		copied.Facts = cloneMaintenanceFacts(decoded.Compaction.Facts)
+		for i := range copied.Facts {
+			copied.Facts[i].Usage = nil // copied prefix entries carry no source usage
+		}
 		// the boundary reference is rewritten when its target is in the copied prefix
 		if published, ok := entryIDs[copied.BoundaryEntryID]; ok {
 			copied.BoundaryEntryID = published
 		}
-		payload, err := encodeCompactionEntry(copied)
+		copied.Evidence = copyRequestEvidencePointer(decoded.Compaction.Evidence)
+		remapEvidenceRefs(copied.Evidence, entryIDs)
+		payload, err := encodeContextCheckpointEntry(copied)
 		if err != nil {
 			return nil, err
 		}
@@ -416,4 +424,20 @@ func copyForkEntry(tx Transaction, destID, sourceID string, decoded graphEntry, 
 	}
 	entryIDs[decoded.Envelope.ID] = adopted.Envelope.ID
 	return &adopted, nil
+}
+
+// remapEvidenceRefs rewrites a copied evidence value's canonical references to
+// the copied identities when their targets lie in the copied prefix; identity
+// provenance and the closed delta values are retained unchanged. Source-only
+// references never survive into the destination's validated graph.
+func remapEvidenceRefs(evidence *RequestEvidence, entryIDs map[string]string) {
+	if evidence == nil {
+		return
+	}
+	if published, ok := entryIDs[evidence.BoundaryEntryID]; ok {
+		evidence.BoundaryEntryID = published
+	}
+	if published, ok := entryIDs[evidence.CheckpointEntryID]; ok {
+		evidence.CheckpointEntryID = published
+	}
 }

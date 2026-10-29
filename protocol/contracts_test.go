@@ -257,6 +257,8 @@ func TestConversationRawObjectFieldsShareOneComponent(t *testing.T) {
 	want := []string{
 		"AssistantItem.extra=JSONObject",
 		"ImageURLPart.extra=JSONObject",
+		"Message.extra=JSONObject",
+		"MessageToolCall.extra=JSONObject",
 		"OpaquePart.extra=JSONObject",
 		"TextPart.extra=JSONObject",
 		"ToolCallView.extra=JSONObject",

@@ -21,7 +21,7 @@ const (
 	EntryToolResult          EntryKind = "tool_result"
 	EntrySignal              EntryKind = "signal"
 	EntryHookResult          EntryKind = "hook_result"
-	EntryCompaction          EntryKind = "compaction"
+	EntryCompaction          EntryKind = "context_checkpoint"
 	EntryOperationSettlement EntryKind = "operation_settlement"
 )
 

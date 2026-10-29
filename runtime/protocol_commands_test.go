@@ -371,7 +371,7 @@ func TestSessionCommandCompact(t *testing.T) {
 
 		op, err := r.compactSession(ctx, sessionID, protocol.CompactRequest{OperationId: "op-compact"})
 		testassert.NoError(t, err)
-		testassert.Require(t, op.OperationId == "op-compact" && op.RequestKind == protocol.Compact, "compact operation = %+v, want op-compact compact", op)
+		testassert.Require(t, op.OperationId == "op-compact" && op.RequestKind == protocol.OperationRequestKindCompact, "compact operation = %+v, want op-compact compact", op)
 		retry, err := r.compactSession(ctx, sessionID, protocol.CompactRequest{OperationId: "op-compact"})
 		testassert.NoError(t, err)
 		testassert.Require(t, retry.OperationId == op.OperationId && retry.AdmittedAt.Equal(op.AdmittedAt), "compact retry = %+v, want the first-writer Operation", retry)

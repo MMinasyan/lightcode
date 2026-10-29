@@ -174,7 +174,7 @@ func TestInterruptSettlesUnstartedExecutionAtEntry(t *testing.T) {
 		}
 		{
 			err := executeDirect(h, c, h.ctx, testOpID, prepared)
-			testassert.Require(t, errors.Is(err, context.Canceled), "execute = %v, want the entry interruption", err)
+			testassert.Require(t, err == nil, "execute = %v, want the entry interruption settled with no run error", err)
 		}
 		testassert.Equal(t, opens, 0)
 		c.mu.Lock()
@@ -214,7 +214,7 @@ func TestInterruptSettlesUnstartedExecutionAtEntry(t *testing.T) {
 		}
 		{
 			err := executeDirect(h, c, h.ctx, testOpID, prepared)
-			testassert.Require(t, errors.Is(err, context.Canceled), "execute = %v, want the entry interruption", err)
+			testassert.Require(t, err == nil, "execute = %v, want the entry interruption settled with no run error", err)
 		}
 		testassert.Equal(t, opens, 0)
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)

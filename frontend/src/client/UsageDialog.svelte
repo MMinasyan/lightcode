@@ -9,6 +9,9 @@
   export let usage = { totals: { by_model: [] }, context: { used_tokens: '0', context_window: 0 } };
   const dispatch = createEventDispatcher();
   let dialog;
+  // The session estimate is the harness's read-time approximation: absent is
+  // unknown, never zero; a present zero is a known zero.
+  $: estimate = usage.totals.estimated_cost_usd;
 
 </script>
 
@@ -34,6 +37,7 @@
         {/each}
       {/if}
       <div class="context">Context used: {usage.context.used_tokens} / {presentNumber(usage.context.context_window)}</div>
+      <div class="estimate">Estimated cost (approx. USD): {estimate == null ? 'unknown' : '$' + presentNumber(estimate)}</div>
     </div>
   </div>
 </dialog>
@@ -47,4 +51,5 @@
   .row .model { text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .empty { padding:8px 0; color:var(--text-dim); font-family:var(--font-ui); font-size:12px; }
   .context { padding:8px 0 2px; border-top:1px solid var(--border); color:var(--text-dim); font-family:var(--font-mono); font-size:12px; }
+  .estimate { padding:2px 0 8px; color:var(--text-dim); font-family:var(--font-mono); font-size:12px; }
 </style>

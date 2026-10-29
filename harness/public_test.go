@@ -51,6 +51,7 @@ func publicCapture() harness.ExecutionCapture {
 			Model:        publicModelRef,
 			SystemPrompt: "summarize",
 		},
+		Strategy: harness.StrategyCapture{ID: harness.IncludedStrategyID, RequiresContextWindow: true},
 	}
 }
 
@@ -64,18 +65,36 @@ func publicNormalize(call model.ToolCall) (json.RawMessage, error) {
 	return json.Marshal(obj)
 }
 
-// publicExecution is the suite's ordinary opened execution: the two actual
-// model callbacks, the suite's required normalizer, and the immediate
-// "no tools" result plan.
+// publicExecution is the suite's ordinary opened execution: an opener whose
+// invocations carry the two actual model callbacks selected by purpose, the
+// suite's required normalizer, and the immediate "no tools" result plan.
 func publicExecution(conversation, compact func(context.Context, model.Request) (model.Stream, error)) harness.Execution {
-	return harness.Execution{
-		Model:         conversation,
-		CompactModel:  compact,
-		NormalizeTool: publicNormalize,
-		Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
-		},
-	}
+	return harness.Execution{OpenInvocation: func(_ context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+		modelFn := conversation
+		if request.Purpose == harness.InvocationPurposeMaintenance {
+			modelFn = compact
+		}
+		return harness.InvocationExecution{
+			Model:         modelFn,
+			NormalizeTool: publicNormalize,
+			Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+				return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+			},
+		}, nil
+	}}
+}
+
+// publicExecutionOver is the suite's opened execution shape over a caller's
+// tool-plan function: its invocations carry the purpose-selected model
+// callbacks, the suite's required normalizer, and the given plan.
+func publicExecutionOver(conversation, compact func(context.Context, model.Request) (model.Stream, error), tool func(context.Context, model.ToolCall) harness.PreparedTool) harness.Execution {
+	return harness.Execution{OpenInvocation: func(_ context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+		modelFn := conversation
+		if request.Purpose == harness.InvocationPurposeMaintenance {
+			modelFn = compact
+		}
+		return harness.InvocationExecution{Model: modelFn, NormalizeTool: publicNormalize, Tool: tool}, nil
+	}}
 }
 
 // publicPermission is one built-in-allowed declaration for the suite's
@@ -311,6 +330,37 @@ func (f *publicFixture) preparationCalls() []harness.PreparationRequest {
 	f.prepMu.Lock()
 	defer f.prepMu.Unlock()
 	return append([]harness.PreparationRequest(nil), f.preps...)
+}
+
+// newObservingPublicFixture is the scripted fixture with a passive observer
+// installed: the callback receives every fact the Harness emits, so a row can
+// park one emission on a gate it owns.
+func newObservingPublicFixture(t *testing.T, store harness.Storage, script *scriptModel, observe func(harness.HarnessFact)) *publicFixture {
+	t.Helper()
+	f := &publicFixture{store: store, cancel: func() {}, prepare: make(chan struct{}, 16), model: script}
+	f.defaultPrep = harness.PreparedExecution{
+		Capture: publicCapture(),
+		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+			return publicExecution(script.effect, script.effect), nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	f.cancel = cancel
+	h, err := harness.New(ctx, harness.Dependencies{Storage: store, Observe: observe, Prepare: func(_ context.Context, req harness.PreparationRequest) (harness.PreparedExecution, error) {
+		f.prepMu.Lock()
+		call := len(f.preps)
+		f.preps = append(f.preps, req)
+		hook := f.prepareHook
+		f.prepMu.Unlock()
+		f.prepare <- struct{}{}
+		if hook != nil {
+			return hook(call, req)
+		}
+		return f.defaultPrep, nil
+	}})
+	testassert.NoError(t, err)
+	f.h = h
+	return f
 }
 
 func (f *publicFixture) close() { f.cancel() }
@@ -952,10 +1002,13 @@ func (s *publicationCancelStore) Transact(ctx context.Context, fn func(harness.T
 		hook()
 		// the harness-combined publication context may lag the canceled parent
 		// by one AfterFunc hop: wait until the context the transaction actually
-		// runs on observes the cancellation
-		deadline := time.Now().Add(5 * time.Second)
-		for ctx.Err() == nil && time.Now().Before(deadline) {
-			time.Sleep(time.Millisecond)
+		// runs on observes the cancellation. A context without a Done channel
+		// can never observe one, so there is nothing to wait for.
+		if ctx.Done() != nil {
+			deadline := time.Now().Add(5 * time.Second)
+			for ctx.Err() == nil && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
 		}
 	}
 	err := s.Storage.Transact(ctx, fn)
@@ -1236,6 +1289,50 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 	})
 }
 
+// TestPublicExecutionCancellationAtModelIntentHandoff proves the managed
+// shutdown row at the model effect intent handoff on both real stores: a
+// Harness lifetime cancellation injected exactly when the intent transaction
+// is handed to the store — after beginModelEffect's pre-Transact check has
+// already admitted the transition — never aborts the admitted intent's
+// durable write, the execution gate then settles the ordinary terminal
+// interruption without ever dispatching the external model callback, and
+// Wait retains no publication failure, so Close leaves no running Operation
+// behind.
+func TestPublicExecutionCancellationAtModelIntentHandoff(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		script := newScriptModel(publicTurn())
+		probe := &publicationCancelStore{Storage: store}
+		f := newPublicFixture(t, probe, script, nil)
+		defer f.close()
+		session := createSession(t, f.h)
+		intentHandoff := make(chan struct{})
+		f.prepareHook = func(call int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
+			// Armed before the admission commits: the Harness lifetime dies
+			// at the entry of the transaction that follows it — the model
+			// effect's intent transaction handed to the actual store.
+			probe.afterCommit = func() {
+				probe.atEntry = func() {
+					close(intentHandoff)
+					f.cancel()
+				}
+			}
+			return f.defaultPrep, nil
+		}
+		res, err := submit(t, f.h, session, "op-intent", harness.MessageModeRegular, "hello")
+		testassert.Require(t, err == nil && res.Disposition == harness.DispositionAdmitted && res.Operation != nil, "submit = %+v err %v, want the admitted operation", res, err)
+		<-intentHandoff // the intent transaction is at the store handoff: the pre-Transact cancellation check has already passed
+		{
+			err := converge(t, f)
+			testassert.Require(t, err == nil, "Wait after the intent-handoff shutdown = %v, want no retained publication or storage failure", err)
+		}
+		testassert.Require(t, len(script.seen()) == 0, "the canceled execution dispatched %d model requests, want none after the committed intent", len(script.seen()))
+		rec, err := f.h.ReadOperation(context.Background(), session, "op-intent")
+		testassert.NoError(t, err)
+		testassert.Require(t, rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == "agent interrupted",
+			"operation after the intent-handoff shutdown = %+v, want the committed ordinary interruption and no running state", rec.State)
+	})
+}
+
 // tamper replaces an equal-length substring of one raw JSON buffer in place,
 // exactly the scratch mutation an uncooperative opener could apply to the
 // bytes it receives.
@@ -1286,11 +1383,14 @@ func TestPublicOpenerInputMutationKeepsAdmittedExecution(t *testing.T) {
 								adm.Execution.Capabilities[0] = "dropped"
 							}
 							return harness.Execution{
-								Model:         script.effect,
-								CompactModel:  script.effect,
-								NormalizeTool: publicNormalize,
-								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+								OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
+									return harness.InvocationExecution{
+										Model:         script.effect,
+										NormalizeTool: publicNormalize,
+										Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+											return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+										},
+									}, nil
 								},
 								Close: func() error { // runs after the terminal settlement commits
 									select {
@@ -1633,33 +1733,28 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 		prepared := harness.PreparedExecution{
 			Capture: publicCapture(),
 			Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-				return harness.Execution{
-					Model:         script.effect,
-					CompactModel:  script.effect,
-					NormalizeTool: publicNormalize,
-					Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-						toolMu.Lock()
-						toolOrder = append(toolOrder, call.ID)
-						toolMu.Unlock()
-						if call.ID == "call-1" { // executor-backed: intent before execution, one result after
-							return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
-								reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"})
-								if err != nil {
-									t.Errorf("read operation register during execution: %v", err)
-									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
-								}
-								var wire opRegisterWire
-								if err := json.Unmarshal(reg.Payload, &wire); err != nil {
-									t.Errorf("decode operation register during execution: %v", err)
-									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
-								}
-								testassert.Check(t, wire.State.ActiveEffect != nil && wire.State.ActiveEffect.Kind == "tool" && wire.State.ActiveEffect.ToolCallID == "call-1" && wire.State.ActiveEffect.ResultEntryID != "", "tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
+				return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					toolMu.Lock()
+					toolOrder = append(toolOrder, call.ID)
+					toolMu.Unlock()
+					if call.ID == "call-1" { // executor-backed: intent before execution, one result after
+						return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
+							reg, err := store.ReadRegister(context.Background(), harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"})
+							if err != nil {
+								t.Errorf("read operation register during execution: %v", err)
 								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
-							}}
-						}
-						return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}}} // no effect intent
-					},
-				}, nil
+							}
+							var wire opRegisterWire
+							if err := json.Unmarshal(reg.Payload, &wire); err != nil {
+								t.Errorf("decode operation register during execution: %v", err)
+								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+							}
+							testassert.Check(t, wire.State.ActiveEffect != nil && wire.State.ActiveEffect.Kind == "tool" && wire.State.ActiveEffect.ToolCallID == "call-1" && wire.State.ActiveEffect.ResultEntryID != "", "tool intent during execution = %+v, want the committed call-1 intent with a reserved result", wire.State.ActiveEffect)
+							return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+						}}
+					}
+					return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "immediate call-2"}}} // no effect intent
+				}), nil
 			},
 		}
 		f.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) { return prepared, nil }
@@ -1732,31 +1827,26 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							switch call.ID {
-							case "call-2": // malformed metadata: dropped, the result still commits
-								return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
-									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "no preview"},
-									Metadata: json.RawMessage(`{broken`),
-								}}
-							case "call-3": // durable-oversized after escaping: dropped, no transaction failure
-								return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
-									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "expanded metadata"},
-									Metadata: expanded,
-								}}
-							}
-							return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
-								return harness.ToolOutcome{
-									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
-									Metadata: rawOverBound,
-								}
+					return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+						switch call.ID {
+						case "call-2": // malformed metadata: dropped, the result still commits
+							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "no preview"},
+								Metadata: json.RawMessage(`{broken`),
 							}}
-						},
-					}, nil
+						case "call-3": // durable-oversized after escaping: dropped, no transaction failure
+							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "expanded metadata"},
+								Metadata: expanded,
+							}}
+						}
+						return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
+							return harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
+								Metadata: rawOverBound,
+							}
+						}}
+					}), nil
 				},
 			}, nil
 		}
@@ -1847,27 +1937,22 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: capture,
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							if call.ID == "call-2" { // the exit-condition omission through the public path
-								return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-									Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "undeclared success"},
-									Metadata: json.RawMessage(`{"would":"leak"}`),
-								}}
-							}
-							return harness.PreparedTool{
-								Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}},
-								Execute: func(context.Context) harness.ToolOutcome {
-									executions++
-									consumed = call.Arguments
-									return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
-								},
-							}
-						},
-					}, nil
+					return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+						if call.ID == "call-2" { // the exit-condition omission through the public path
+							return harness.PreparedTool{Immediate: &harness.ToolOutcome{
+								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "undeclared success"},
+								Metadata: json.RawMessage(`{"would":"leak"}`),
+							}}
+						}
+						return harness.PreparedTool{
+							Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "fixture"}},
+							Execute: func(context.Context) harness.ToolOutcome {
+								executions++
+								consumed = call.Arguments
+								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"}}
+							},
+						}
+					}), nil
 				},
 			}, nil
 		}
@@ -2029,6 +2114,115 @@ func TestPublicSessionLifecycle(t *testing.T) {
 			}
 			drained, err := f.h.ReadOperation(ctx, session, "op-2")
 			testassert.Require(t, err == nil && drained.State.Terminal != nil, "buffered item after rejected archive = %+v err %v, want it delivered and settled", drained, err)
+		})
+
+		t.Run("archive and sweep leave buffered input to the retiring execution", func(t *testing.T) {
+			script := newScriptModel(publicFail("terminal-to-retirement window boom"))
+			sessionID := ""
+			parked := make(chan struct{})
+			release := make(chan struct{})
+			var closeRelease sync.Once
+			var parkOnce atomic.Bool
+			var h *harness.Harness // the fixture's Harness, installed before any emission the latch reads
+			f := newObservingPublicFixture(t, store, script, func(fact harness.HarnessFact) {
+				if fact.Kind != harness.FactInvalidation || fact.SessionID != sessionID {
+					return
+				}
+				// Park the first invalidation that rides a committed terminal: the
+				// emission runs after the settlement transaction released the
+				// coordinator and before the completion owner takes its reservation.
+				rec, err := h.ReadOperation(context.Background(), sessionID, "window-1")
+				if err != nil || rec.State.Terminal == nil {
+					return
+				}
+				if !parkOnce.CompareAndSwap(false, true) {
+					return
+				}
+				close(parked)
+				select {
+				case <-release:
+				case <-time.After(60 * time.Second):
+				}
+			})
+			defer closeRelease.Do(func() { close(release) }) // the latch releases in every outcome
+			defer f.close()
+			h = f.h
+			session, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+			testassert.NoError(t, err)
+			sessionID = session.Identity.SessionID
+
+			{
+				_, err := submit(t, f.h, sessionID, "window-1", harness.MessageModeRegular, "hello")
+				testassert.NoError(t, err)
+			}
+			<-f.prepare // the admission prepared; the scripted attempt fails and settles the terminal
+			select {
+			case <-parked:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the post-terminal invalidation never parked the execution")
+			}
+			{
+				rec, err := f.h.ReadOperation(ctx, sessionID, "window-1")
+				testassert.Require(t, err == nil && rec.State.Status == harness.OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == "terminal-to-retirement window boom", "parked operation = %+v err %v, want the scripted failed terminal", rec, err)
+			}
+			{
+				res, err := submit(t, f.h, sessionID, "window-2", harness.MessageModeRegular, "steer-window")
+				testassert.Require(t, err == nil && res.Disposition == harness.DispositionSteering, "steering submit while the run retires = %+v err %v, want it buffered", res, err)
+			}
+			{
+				res, err := submit(t, f.h, sessionID, "window-3", harness.MessageModeQueued, "queue-window")
+				testassert.Require(t, err == nil && res.Disposition == harness.DispositionQueued, "queued submit while the run retires = %+v err %v, want it buffered", res, err)
+			}
+			before := sessionRegister(t, store, sessionID)
+
+			{
+				_, err := f.h.ArchiveSession(ctx, sessionID)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive during the terminal-to-retirement window = err %v, want ErrInvalid", err)
+			}
+			{
+				deleted, err := f.h.SweepSession(ctx, sessionID, harness.SweepPolicy{ArchiveAfter: time.Second}, time.Now().Add(time.Hour))
+				testassert.Require(t, err == nil && !deleted, "sweep during the terminal-to-retirement window = deleted %v err %v, want the busy Session skipped", deleted, err)
+			}
+			after := sessionRegister(t, store, sessionID)
+			testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "rejected archive or skipped sweep changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
+
+			closeRelease.Do(func() { close(release) }) // the parked emission returns; the execution completes and its drain delivers both items
+
+			// awaitDelivery polls until the ordinary drain admits the item and
+			// it settles: the delivery is the completion owner's deferred act.
+			awaitDelivery := func(operationID string) harness.OperationRecord {
+				t.Helper()
+				deadline := time.Now().Add(30 * time.Second)
+				for {
+					rec, err := f.h.ReadOperation(ctx, sessionID, operationID)
+					if err == nil && rec.State.Terminal != nil {
+						return rec
+					}
+					testassert.Require(t, !time.Now().After(deadline), "buffered item %s was never delivered and settled", operationID)
+					time.Sleep(time.Millisecond)
+				}
+			}
+			{
+				rec := awaitDelivery("window-2")
+				testassert.Require(t, rec.State.Status == harness.OperationSuccess, "buffered steering item = %+v, want the ordinary successor delivery", rec)
+			}
+			{
+				rec := awaitDelivery("window-3")
+				testassert.Require(t, rec.State.Status == harness.OperationSuccess, "buffered queued item = %+v, want the ordinary successor delivery", rec)
+			}
+			archived := harness.SessionRecord{}
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				var err error
+				archived, err = f.h.ArchiveSession(ctx, sessionID)
+				if err == nil {
+					break
+				}
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive after the deliveries = err %v, want the quiescence rejection until retirement", err)
+				testassert.Require(t, time.Now().Before(deadline), "the Session never became quiescent after the buffered deliveries")
+				time.Sleep(time.Millisecond)
+			}
+			testassert.Require(t, archived.State.Lifecycle == harness.LifecycleArchived && archived.State.ArchivedAt != nil, "archived Session = %+v, want the archived lifecycle after convergence", archived.State)
 		})
 
 		t.Run("delete requires archived and invalidates the coordinator", func(t *testing.T) {
@@ -3102,7 +3296,8 @@ func rawAdmission(sessionID, operationID, entryID string) string {
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
 			`"context_window":4096,"output_reserve":2048,`+
 			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"},`+
+			`"strategy":{"id":"melta.summary/v1","requires_context_window":true}},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, rawToolDefinition, now)
 }
 
@@ -3115,7 +3310,7 @@ func rawInputEntryPayload(sessionID, entryID, operationID string) string {
 
 // rawAssistantEntryPayload builds one completed assistant entry publishing the
 // given (call ID, reserved result ID) pairs in publication order.
-func rawAssistantEntryPayload(sessionID, entryID, operationID string, calls [][2]string) string {
+func rawAssistantEntryPayload(sessionID, entryID, operationID, boundaryID string, calls [][2]string) string {
 	parts := make([]string, 0, len(calls))
 	args := base64.StdEncoding.EncodeToString([]byte(`{"x":1}`))
 	for i, call := range calls {
@@ -3125,8 +3320,8 @@ func rawAssistantEntryPayload(sessionID, entryID, operationID string, calls [][2
 	}
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s]}`,
-		sessionID, entryID, operationID, strings.Join(parts, ","))
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, operationID, strings.Join(parts, ","), "request-a-"+entryID, boundaryID)
 }
 
 // seedRunningOperationShape inserts one quiescent open Session with one
@@ -3150,15 +3345,17 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 		reserved[i] = newRawSessionID(t)
 	}
 	activeEffectJSON := ""
+	requestJSON := ""
 	switch activeEffect {
 	case "model":
 		modelReserved = newRawSessionID(t)
-		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q}`, modelReserved)
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"request-live","model":{"provider":"prov","model":"gpt-x"},"purpose":"conversation","evidence":{"boundary_entry_id":%q}}`, modelReserved, entryID)
+		requestJSON = fmt.Sprintf(`,"running_request":{"request_id":"request-live","boundary_entry_id":%q,"hook_results":[]}`, entryID)
 	case "tool":
-		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"tool","result_entry_id":%q,"tool_call_id":%q}`, reserved[0], calls[0])
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"tool","result_entry_id":%q,"tool_call_id":%q,"final_arguments":{"x":1}}`, reserved[0], calls[0])
 	case "hook":
 		modelReserved = newRawSessionID(t) // the hook effect's own reserved result identity
-		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"hook","result_entry_id":%q,"tool_call_id":%q,"hook_id":"cap.hook.one"}`, modelReserved, calls[0])
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"hook","result_entry_id":%q,"tool_call_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","input_arguments_base64":""}`, modelReserved, calls[0])
 	}
 	pendingJSON := `,"pending_tool_calls":[]` // required member; empty arrays are non-null
 	if len(calls) > 0 {
@@ -3175,8 +3372,8 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 		pendingJSON = fmt.Sprintf(`,"pending_tool_calls":[%s]`, strings.Join(parts, ","))
 	}
 	operationPayload := fmt.Sprintf(
-		`{"admission":%s,"state":{"status":"running","started_at":%q%s%s,"usage":{"by_model":[]}}}`,
-		rawAdmission(sessionID, operationID, entryID), now, activeEffectJSON, pendingJSON)
+		`{"admission":%s,"state":{"status":"running","started_at":%q%s%s%s,"usage":{"by_model":[]}}}`,
+		rawAdmission(sessionID, operationID, entryID), now, activeEffectJSON, requestJSON, pendingJSON)
 
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}, rawSessionRegister(sessionID, operationID))
 	insertRawEntry(t, store, sessionID, entryID, operationID, harness.EntryInput, rawInputEntryPayload(sessionID, entryID, operationID))
@@ -3185,7 +3382,7 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 		for i := range calls {
 			pairs[i] = [2]string{calls[i], reserved[i]}
 		}
-		insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, rawAssistantEntryPayload(sessionID, assistantID, operationID, pairs))
+		insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, rawAssistantEntryPayload(sessionID, assistantID, operationID, entryID, pairs))
 	}
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID}, operationPayload)
 	return sessionID, modelReserved, reserved
@@ -3235,14 +3432,35 @@ func harnessOver(t *testing.T, store harness.Storage) *harness.Harness {
 	return h
 }
 
+// recoveredToolResult is one expected recovery-settled interrupted tool
+// result: its reserved identity, its stored final model-facing content, and
+// its stored execution evidence.
+type recoveredToolResult struct {
+	ID       string
+	Content  string
+	Evidence string
+}
+
+// plainInterruptedResults renders the expected settled results of calls that
+// recovery proves unstarted: the ordinary interrupted content and no
+// uncertainty.
+func plainInterruptedResults(ids ...string) []recoveredToolResult {
+	out := make([]recoveredToolResult, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, recoveredToolResult{ID: id, Content: "Tool call interrupted.", Evidence: "not_started"})
+	}
+	return out
+}
+
 // assertRecoveredOperation verifies the complete recovery outcome on one
 // Session's durable state: the terminal interruption with the exact detail,
 // no active or pending effects, the cleared Session current Operation, and
 // the exact committed tail — one interrupted tool result under each reserved
-// identity in order, exactly one signal, and the one settlement entry under
-// wantSettlementID (or a fresh identity when it is empty). Every pre-recovery
-// entry stays byte-identical: no replay, repair, or truncation.
-func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, operationID string, preEntries []harness.Entry, wantSettlementID string, wantInterruptedResultIDs []string) {
+// identity in order with its expected stored content and evidence, exactly
+// one signal, and the one settlement entry under wantSettlementID (or a fresh
+// identity when it is empty). Every pre-recovery entry stays byte-identical:
+// no replay, repair, or truncation.
+func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, operationID string, preEntries []harness.Entry, wantSettlementID string, wantResults []recoveredToolResult) {
 	t.Helper()
 	state := recoverOpStateAt(t, store, sessionID, operationID)
 	testassert.Require(t, state.Status == "interruption" && state.ActiveEffect == nil && len(state.PendingToolCalls) == 0 && state.Terminal != nil, "recovered operation = %+v, want terminal interruption with no active or pending effects", state)
@@ -3255,8 +3473,8 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 		for _, e := range preEntries {
 			seen[e.ID] = true
 		}
-		for _, id := range wantInterruptedResultIDs {
-			seen[id] = true
+		for _, want := range wantResults {
+			seen[want.ID] = true
 		}
 		testassert.Require(t, len(settlementID) == 32 && !seen[settlementID], "settlement entry = %q, want a fresh identity unused by the pre-recovery state", settlementID)
 	}
@@ -3264,8 +3482,8 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 		current := recoverSessionCurrent(t, store, sessionID)
 		testassert.Equal(t, current, "")
 	}
-	wantTail := make([]harness.EntryKind, 0, len(wantInterruptedResultIDs)+2)
-	for range wantInterruptedResultIDs {
+	wantTail := make([]harness.EntryKind, 0, len(wantResults)+2)
+	for range wantResults {
 		wantTail = append(wantTail, harness.EntryToolResult)
 	}
 	wantTail = append(wantTail, harness.EntrySignal, harness.EntryOperationSettlement)
@@ -3279,15 +3497,19 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 		testassert.Require(t, entry.Kind == kind, "recovery commit %d is a %s entry, want %s", i, entry.Kind, kind)
 		switch kind {
 		case harness.EntryToolResult:
-			testassert.Require(t, entry.ID == wantInterruptedResultIDs[i], "interrupted result %d = %s, want the reserved identity %s", i, entry.ID, wantInterruptedResultIDs[i])
+			want := wantResults[i]
+			testassert.Require(t, entry.ID == want.ID, "interrupted result %d = %s, want the reserved identity %s", i, entry.ID, want.ID)
 			var wire struct {
-				Status  model.ToolResultStatus `json:"status"`
-				Content string                 `json:"content"`
+				Status   model.ToolResultStatus `json:"status"`
+				Content  string                 `json:"content"`
+				Evidence string                 `json:"evidence"`
 			}
 			{
 				err := json.Unmarshal(entry.Payload, &wire)
-				testassert.Require(t, err == nil && wire.Status == model.ResultInterrupted && wire.Content == "Tool call interrupted.", "interrupted tool payload = %s, want the ordinary interrupted result", entry.Payload)
+				testassert.Require(t, err == nil && wire.Status == model.ResultInterrupted, "interrupted tool payload = %s, want the ordinary interrupted result", entry.Payload)
 			}
+			testassert.Require(t, wire.Content == want.Content, "interrupted result %s content = %q, want %q", want.ID, wire.Content, want.Content)
+			testassert.Require(t, wire.Evidence == want.Evidence, "interrupted result %s evidence = %q, want %q", want.ID, wire.Evidence, want.Evidence)
 		case harness.EntryOperationSettlement:
 			testassert.Equal(t, entry.ID, settlementID)
 			var wire struct {
@@ -3301,6 +3523,15 @@ func assertRecoveredOperation(t *testing.T, store harness.Storage, sessionID, op
 			testassert.Require(t, wire.Status == "interruption" && wire.Detail == recoveredInterruptionDetail, "settlement payload = %+v, want the terminal interruption with the recovery detail", wire)
 		}
 	}
+}
+
+// estimateText renders one read-time estimate for a failure message: absent
+// is unknown, a present value is its exact number.
+func estimateText(v *float64) string {
+	if v == nil {
+		return "absent"
+	}
+	return fmt.Sprintf("%v", *v)
 }
 
 // assertRecoverIdempotent runs Recover once more and requires it to find no
@@ -3327,13 +3558,17 @@ func assertRecoverIdempotent(t *testing.T, store harness.Storage, sessionID, ope
 
 // TestPublicRecoverRunningOperationShapes proves the recovery row: every
 // running effect/pending shape — a quiet Operation with no calls, an active
-// model effect, an active tool effect, and a quiet Operation with pending
-// calls — is seeded directly into storage, settled by Recover (which runs
-// before any Harness exists) in one transaction as terminal interruption
-// through the regular result/signal/terminal helpers, with the settlement
-// consuming an active model effect's reserved identity or a fresh identity
-// otherwise; a second run writes nothing, and one Harness constructed only
-// afterwards materializes the repaired state.
+// model effect, an active tool effect alone and with a later unstarted
+// sibling, and a quiet Operation with pending calls — is seeded directly into
+// storage, settled by Recover (which runs before any Harness exists) in one
+// transaction as terminal interruption through the regular
+// result/signal/terminal helpers, with the settlement consuming an active
+// model effect's reserved identity or a fresh identity otherwise. Only the
+// active tool action carries conservative unknown evidence and its
+// uncertainty prefix; every unstarted sibling stays plain. A second run
+// writes nothing, one Harness constructed only afterwards materializes the
+// repaired state, and the next explicitly submitted request carries exactly
+// the stored final contents with zero replayed executions.
 func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 	shapes := []struct {
 		name         string
@@ -3343,6 +3578,7 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 		{"quiet running operation without calls", "", 0},
 		{"active model effect settles under its reserved identity", "model", 0},
 		{"active tool effect interrupts its pending call", "tool", 1},
+		{"active tool effect leaves its later sibling unstarted", "tool", 2},
 		{"quiet running operation with pending calls", "", 2},
 	}
 	for _, shape := range shapes {
@@ -3355,6 +3591,20 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 					calls[i] = fmt.Sprintf("call-%d", i+1)
 				}
 				sessionID, modelReserved, pendingResultIDs := seedRunningOperationShape(t, store, shape.activeEffect, "op-1", calls)
+
+				// The closed settled expectation per call: only the active
+				// tool action is possibly-executed-but-unverified.
+				wantResults := make([]recoveredToolResult, 0, len(calls))
+				wantTexts := map[string]string{}
+				for i, callID := range calls {
+					content, evidence := "Tool call interrupted.", "not_started"
+					if i == 0 && shape.activeEffect == "tool" {
+						content = "Execution outcome unknown; the action may have occurred.\n\n" + content
+						evidence = "unknown"
+					}
+					wantResults = append(wantResults, recoveredToolResult{ID: pendingResultIDs[i], Content: content, Evidence: evidence})
+					wantTexts[callID] = content
+				}
 
 				state := recoverOpStateAt(t, store, sessionID, "op-1")
 				testassert.Require(t, state.Status == "running" && len(state.PendingToolCalls) == shape.calls, "seeded operation = %+v, want running with %d pending call(s)", state, shape.calls)
@@ -3373,7 +3623,7 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 					err := harness.Recover(ctx, store)
 					testassert.NoError(t, err)
 				}
-				assertRecoveredOperation(t, store, sessionID, "op-1", pre, modelReserved, pendingResultIDs)
+				assertRecoveredOperation(t, store, sessionID, "op-1", pre, modelReserved, wantResults)
 				assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 				h := harnessOver(t, store) // one Harness after recovery: materialization verification only
@@ -3381,8 +3631,51 @@ func TestPublicRecoverRunningOperationShapes(t *testing.T) {
 				testassert.Require(t, err == nil && sess.CurrentOperationID == "", "repaired session = %+v err %v, want open with the current Operation cleared", sess, err)
 				rec, err := h.ReadOperation(ctx, sessionID, "op-1")
 				testassert.Require(t, err == nil && rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == recoveredInterruptionDetail, "repaired operation = %+v err %v, want the terminal interruption with the recovery detail", rec, err)
+
+				assertNextRequestAfterColdRecovery(t, store, sessionID, wantTexts)
 			})
 		})
+	}
+}
+
+// assertNextRequestAfterColdRecovery submits the next message on a recovered
+// Session through a freshly constructed Harness and proves the recovered
+// uncertainty reaches the first model request exactly as stored: each call's
+// projected tool message carries its stored final content, and no recovered
+// call is ever replayed — zero preparation/execution callbacks ran.
+func assertNextRequestAfterColdRecovery(t *testing.T, store harness.Storage, sessionID string, wantTexts map[string]string) {
+	t.Helper()
+	script := newScriptModel(publicTurn())
+	executed := 0
+	f := newPublicFixtureWithJobs(t, store, nil, script, nil, nil)
+	defer f.close()
+	f.defaultPrep = harness.PreparedExecution{
+		Capture: publicCapture(),
+		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
+			return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+				executed++
+				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}}
+			}), nil
+		},
+	}
+	{
+		_, err := submit(t, f.h, sessionID, "op-2", harness.MessageModeRegular, "next question")
+		testassert.NoError(t, err)
+	}
+	awaitTerminal(t, f.h, sessionID, "op-2")
+	testassert.Equal(t, executed, 0)
+	seen := script.seen()
+	testassert.Require(t, len(seen) == 1, "captured %d model requests, want exactly the first request after cold recovery", len(seen))
+	byCall := map[string]string{}
+	for _, msg := range seen[0].Messages {
+		if msg.Role == model.RoleTool {
+			byCall[msg.ToolCallID] = msg.TextContent()
+		}
+	}
+	testassert.Equal(t, len(byCall), len(wantTexts))
+	for callID, wantText := range wantTexts {
+		got, ok := byCall[callID]
+		testassert.Require(t, ok && got == wantText, "tool message for %s = %q (present %v), want %q", callID, got, ok, wantText)
 	}
 }
 
@@ -3430,7 +3723,7 @@ const (
 // answering the given assistant entry's call under the reserved identity.
 func rawToolResultPayload(sessionID, entryID, operationID, assistantEntryID, callID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done"}`,
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done","original_content":"done","evidence":"observed"}`,
 		sessionID, entryID, operationID, sessionID, assistantEntryID, callID)
 }
 
@@ -3446,16 +3739,17 @@ func rawSignalPayload(sessionID, entryID, operationID string) string {
 // for one hook execution of the given call.
 func rawHookResultPayload(sessionID, entryID, operationID, hookID, callID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"tool_call_id":%q,"status":"success","arguments":{"x":1}}`,
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"extension_id":"ext.raw","tool_call_id":%q,"status":"success","evidence":"observed","input_arguments_base64":"eyJ4IjoxfQ==","arguments":{"x":1}}`,
 		sessionID, entryID, operationID, hookID, callID)
 }
 
 // rawFailedHookResultPayload builds one settled failed or interrupted
-// hook-result entry payload carrying a non-empty error and no arguments.
-func rawFailedHookResultPayload(sessionID, entryID, operationID, hookID, callID, status, errText string) string {
+// hook-result entry payload carrying the given execution evidence, a
+// non-empty error and no arguments.
+func rawFailedHookResultPayload(sessionID, entryID, operationID, hookID, callID, status, evidence, errText string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"tool_call_id":%q,"status":%q,"error":%q}`,
-		sessionID, entryID, operationID, hookID, callID, status, errText)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"extension_id":"ext.raw","tool_call_id":%q,"status":%q,"evidence":%q,"input_arguments_base64":"","error":%q}`,
+		sessionID, entryID, operationID, hookID, callID, status, evidence, errText)
 }
 
 // rawSettlementPayload builds one successful settlement entry payload.
@@ -3491,9 +3785,20 @@ func rawCopiedInputPayload(sessionID, entryID string) string {
 		sessionID, entryID)
 }
 
+// corruptSiblingBoundaryFor names an existing entry of the mutated snapshot
+// to serve as a copied assistant's evidence boundary, so a mutation corrupts
+// on its intended axis rather than through an incidental dangling reference.
+func corruptSiblingBoundaryFor(t *testing.T, snap *sessionSnapshot) string {
+	t.Helper()
+	if len(snap.entries) > 0 {
+		return snap.entries[len(snap.entries)-1].ID
+	}
+	return corruptSiblingOtherEntry
+}
+
 // rawCopiedAssistantPayload builds one operationless copied assistant entry
 // payload publishing the given (call ID, reserved result ID) pairs.
-func rawCopiedAssistantPayload(sessionID, entryID string, calls [][2]string) string {
+func rawCopiedAssistantPayload(sessionID, entryID, boundaryID string, calls [][2]string) string {
 	parts := make([]string, 0, len(calls))
 	args := base64.StdEncoding.EncodeToString([]byte(`{"x":1}`))
 	for i, call := range calls {
@@ -3503,15 +3808,15 @@ func rawCopiedAssistantPayload(sessionID, entryID string, calls [][2]string) str
 	}
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s]}`,
-		sessionID, entryID, strings.Join(parts, ","))
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, strings.Join(parts, ","), "request-a-"+entryID, boundaryID)
 }
 
 // rawCopiedResultPayload builds one operationless copied tool-result entry
 // payload answering the given copied assistant entry's call.
 func rawCopiedResultPayload(sessionID, entryID, assistantEntryID, callID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done"}`,
+		`{"session_id":%q,"entry_id":%q,"assistant_entry":{"session_id":%q,"entry_id":%q},"tool_call_id":%q,"status":"success","content":"done","original_content":"done","evidence":"observed"}`,
 		sessionID, entryID, sessionID, assistantEntryID, callID)
 }
 
@@ -3539,7 +3844,7 @@ func seedCorruptSiblingWithResult(t *testing.T, store harness.Storage) string {
 	sessionID, entryID, assistantID, resultID := newRawSessionID(t), newRawSessionID(t), newRawSessionID(t), newRawSessionID(t)
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}, rawSessionRegister(sessionID, "op-1"))
 	insertRawEntry(t, store, sessionID, entryID, "op-1", harness.EntryInput, rawInputEntryPayload(sessionID, entryID, "op-1"))
-	insertRawEntry(t, store, sessionID, assistantID, "op-1", harness.EntryAssistant, rawAssistantEntryPayload(sessionID, assistantID, "op-1", [][2]string{{"call-1", resultID}}))
+	insertRawEntry(t, store, sessionID, assistantID, "op-1", harness.EntryAssistant, rawAssistantEntryPayload(sessionID, assistantID, "op-1", entryID, [][2]string{{"call-1", resultID}}))
 	insertRawEntry(t, store, sessionID, resultID, "op-1", harness.EntryToolResult, rawToolResultPayload(sessionID, resultID, "op-1", assistantID, "call-1"))
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-1"}, rawRunningOperationPayload(sessionID, "op-1", entryID))
 	return sessionID
@@ -3597,7 +3902,7 @@ func seedCorruptSiblingFailedHook(t *testing.T, store harness.Storage) string {
 		if entry.Kind == harness.EntryAssistant {
 			hookID := newRawSessionID(t)
 			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
-				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "hook broke"))
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "observed", "hook broke"))
 			return sessionID
 		}
 	}
@@ -3803,6 +4108,9 @@ type corruptSiblingRow struct {
 	name   string
 	seed   func(t *testing.T, store harness.Storage) string
 	mutate func(t *testing.T, snap *sessionSnapshot)
+	// detail pins the exact validator rule a row must surface, so a codec
+	// or incidental earlier corruption cannot mask the intended one.
+	detail string
 }
 
 // TestPublicRecoverCorruptSibling proves the recovery-side corruption row with
@@ -4096,12 +4404,13 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		},
 		{
-			name: "validator: active hook effect repeats a settled hook",
-			seed: seedCorruptSiblingHookResult,
+			name:   "validator: active hook effect repeats a settled hook",
+			seed:   seedCorruptSiblingHookResult,
+			detail: `repeats hook "cap.hook.one"`,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, corruptSiblingOtherEntry))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one","hook_extension_id":"ext.raw","input_arguments_base64":""}`, corruptSiblingOtherEntry))
 				})
 			},
 		},
@@ -4116,12 +4425,13 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		},
 		{
-			name: "validator: active hook effect after a failed hook",
-			seed: seedCorruptSiblingFailedHook,
+			name:   "validator: active hook effect after a failed hook",
+			seed:   seedCorruptSiblingFailedHook,
+			detail: `addresses call "call-1" after its failed hook`,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.two"}`, corruptSiblingOtherEntry))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.two","hook_extension_id":"ext.raw","input_arguments_base64":""}`, corruptSiblingOtherEntry))
 				})
 			},
 		},
@@ -4212,24 +4522,98 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		},
 		{
-			name: "validator: hook active effect reserves a pending tool-result identity",
-			seed: seedCorruptSiblingPendingCall,
+			name:   "validator: hook active effect reserves a pending tool-result identity",
+			detail: "already reserved by call",
+			seed:   seedCorruptSiblingPendingCall,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				reserved := snapReservedResultID(t, snap)
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, reserved))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one","hook_extension_id":"ext.raw","input_arguments_base64":""}`, reserved))
 				})
 			},
 		},
 		{
-			name: "validator: hook active effect reserves an already committed entry",
-			seed: seedCorruptSiblingPendingCall,
+			name:   "validator: hook active effect reserves an already committed entry",
+			detail: "reserves committed entry",
+			seed:   seedCorruptSiblingPendingCall,
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				input := snapEntryOf(snap, harness.EntryInput)
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one"}`, input.ID))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"tool_call_id":"call-1","hook_id":"cap.hook.one","hook_extension_id":"ext.raw","input_arguments_base64":""}`, input.ID))
+				})
+			},
+		},
+		{
+			name:   "validator: active request hook effect provenance omits a committed hook",
+			detail: "omits committed hook result",
+			seed:   seedCorruptSiblingRunning,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				input := snapEntryOf(snap, harness.EntryInput)
+				hookEntry := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hookEntry, "op-1", harness.EntryHookResult, fmt.Sprintf(
+					`{"session_id":%q,"entry_id":%q,"operation_id":"op-1","hook_id":"cap.hook.one","extension_id":"ext.raw","request_id":"request-corrupt","status":"success","evidence":"observed","input_evidence":{"boundary_entry_id":%q},"consequence":{}}`,
+					sessionID, hookEntry, input.ID))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.two","hook_extension_id":"ext.raw2","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q}}`, newRawSessionID(t), input.ID))
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q,"hook_results":[{"session_id":%q,"entry_id":%q}]}`, input.ID, sessionID, hookEntry))
+				})
+			},
+		},
+		{
+			name:   "validator: running request state names a boundary its checkpoint covered",
+			detail: "already covered by checkpoint entry",
+			seed:   seedCorruptSiblingRunning,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				input := snapEntryOf(snap, harness.EntryInput)
+				comp := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, comp, "op-1", harness.EntryCompaction, rawCompactionEntryPayload(sessionID, comp, "op-1", "seeded summary", input.ID))
+				sessReg := snapRegisterOf(snap, harness.RegisterSession, "")
+				sessReg.Payload = editStateObject(t, sessReg.Payload, func(state map[string]json.RawMessage) {
+					state["checkpoint_entry_id"] = json.RawMessage(`"` + comp + `"`)
+				})
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","checkpoint_entry_id":%q,"boundary_entry_id":%q}`, comp, input.ID))
+				})
+			},
+		},
+		{
+			name:   "validator: active request hook effect references a boundary its checkpoint covered",
+			detail: "already covered by checkpoint entry",
+			seed:   seedCorruptSiblingRunning,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				input := snapEntryOf(snap, harness.EntryInput)
+				comp := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, comp, "op-1", harness.EntryCompaction, rawCompactionEntryPayload(sessionID, comp, "op-1", "seeded summary", input.ID))
+				sessReg := snapRegisterOf(snap, harness.RegisterSession, "")
+				sessReg.Payload = editStateObject(t, sessReg.Payload, func(state map[string]json.RawMessage) {
+					state["checkpoint_entry_id"] = json.RawMessage(`"` + comp + `"`)
+				})
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q,"checkpoint_entry_id":%q}}`, newRawSessionID(t), input.ID, comp))
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","checkpoint_entry_id":%q,"boundary_entry_id":%q}`, comp, input.ID))
+				})
+			},
+		},
+		{
+			name:   "validator: active tool effect provenance omits its committed hook effect",
+			detail: "omits committed hook result",
+			seed:   seedCorruptSiblingPendingCall,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult,
+					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-1"))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1","final_arguments":{"x":1}}`, snapReservedResultID(t, snap)))
 				})
 			},
 		},
@@ -4294,7 +4678,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapAppendOperation(snap, sessionID, "op-2", rawSettledOperationPayload(sessionID, "op-2", input2, settlement2))
 				snapAppendEntry(snap, sessionID, input2, "op-2", harness.EntryInput, rawInputEntryPayload(sessionID, input2, "op-2"))
 				snapAppendEntry(snap, sessionID, assistant2, "op-2", harness.EntryAssistant,
-					rawAssistantEntryPayload(sessionID, assistant2, "op-2", [][2]string{{"call-9", reserved}}))
+					rawAssistantEntryPayload(sessionID, assistant2, "op-2", input2, [][2]string{{"call-9", reserved}}))
 				snapAppendEntry(snap, sessionID, reserved, "op-2", harness.EntryToolResult,
 					rawToolResultPayload(sessionID, reserved, "op-2", assistant2, "call-9"))
 				snapAppendEntry(snap, sessionID, settlement2, "op-2", harness.EntryOperationSettlement,
@@ -4328,7 +4712,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapMakeFork(t, snap)
 				snapStripOperation(t, snap)
 				assistant, result := newRawSessionID(t), newRawSessionID(t)
-				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant, rawCopiedAssistantPayload(sessionID, assistant, nil))
+				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant, rawCopiedAssistantPayload(sessionID, assistant, corruptSiblingBoundaryFor(t, snap), nil))
 				snapAppendEntry(snap, sessionID, result, "", harness.EntryToolResult, rawCopiedResultPayload(sessionID, result, assistant, "call-1"))
 			},
 		},
@@ -4341,7 +4725,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapStripOperation(t, snap)
 				assistant, result := newRawSessionID(t), newRawSessionID(t)
 				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant,
-					rawCopiedAssistantPayload(sessionID, assistant, [][2]string{{"call-1", corruptSiblingOtherEntry}}))
+					rawCopiedAssistantPayload(sessionID, assistant, corruptSiblingBoundaryFor(t, snap), [][2]string{{"call-1", corruptSiblingOtherEntry}}))
 				snapAppendEntry(snap, sessionID, result, "", harness.EntryToolResult, rawCopiedResultPayload(sessionID, result, assistant, "call-1"))
 			},
 		},
@@ -4386,7 +4770,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				snapStripOperation(t, snap)
 				assistant := newRawSessionID(t)
 				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant,
-					rawCopiedAssistantPayload(sessionID, assistant, [][2]string{{"call-1", corruptSiblingOtherEntry}}))
+					rawCopiedAssistantPayload(sessionID, assistant, corruptSiblingBoundaryFor(t, snap), [][2]string{{"call-1", corruptSiblingOtherEntry}}))
 			},
 		},
 		{
@@ -4414,10 +4798,11 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				sessionID := snapSessionID(snap)
 				snapMakeFork(t, snap)
 				snapStripOperation(t, snap)
-				snap.entries = nil // the copied prefix is one assistant entry
-				assistant := newRawSessionID(t)
+				snap.entries = nil // the copied prefix is one input and one assistant entry
+				input, assistant := newRawSessionID(t), newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, input, "", harness.EntryInput, rawCopiedInputPayload(sessionID, input))
 				snapAppendEntry(snap, sessionID, assistant, "", harness.EntryAssistant,
-					string(editPayloadObject(t, json.RawMessage(rawCopiedAssistantPayload(sessionID, assistant, nil)), func(obj map[string]json.RawMessage) {
+					string(editPayloadObject(t, json.RawMessage(rawCopiedAssistantPayload(sessionID, assistant, input, nil)), func(obj map[string]json.RawMessage) {
 						obj["usage"] = json.RawMessage(`{"input_tokens":2,"cached_input_tokens":0,"output_tokens":0}`)
 					})))
 			},
@@ -4554,6 +4939,78 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			},
 		})
 	}
+
+	// The forbidden input_arguments_base64 membership inventory: a member its
+	// binding never permits corrupts the Session at the shared decode before
+	// recovery copies or settles anything. Each row keeps every other shape
+	// fact consistent, so the membership is the only defect.
+	rows = append(rows,
+		corruptSiblingRow{
+			name:   "codec wire: request-bound hook result carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingRunning,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				sessionID := snapSessionID(snap)
+				input := snapEntryOf(snap, harness.EntryInput)
+				hook := newRawSessionID(t)
+				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult, fmt.Sprintf(
+					`{"session_id":%q,"entry_id":%q,"operation_id":"op-1","hook_id":"cap.hook.one","extension_id":"ext.raw","request_id":"request-corrupt","status":"success","evidence":"observed","input_evidence":{"boundary_entry_id":%q},"consequence":{},"input_arguments_base64":""}`,
+					sessionID, hook, input.ID))
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q,"hook_results":[{"session_id":%q,"entry_id":%q}]}`, input.ID, sessionID, hook))
+				})
+			},
+		},
+		corruptSiblingRow{
+			name:   "codec wire: request-bound hook active effect carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingRunning,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				input := snapEntryOf(snap, harness.EntryInput)
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q},"input_arguments_base64":""}`, newRawSessionID(t), input.ID))
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q}`, input.ID))
+				})
+			},
+		},
+		corruptSiblingRow{
+			name:   "codec wire: conversation model active effect carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingRunning,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				input := snapEntryOf(snap, harness.EntryInput)
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q,"request_id":"request-corrupt","model":{"provider":"prov","model":"m"},"purpose":"conversation","evidence":{"boundary_entry_id":%q},"input_arguments_base64":""}`, newRawSessionID(t), input.ID))
+					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q}`, input.ID))
+				})
+			},
+		},
+		corruptSiblingRow{
+			name:   "codec wire: maintenance model active effect carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingRunning,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q,"request_id":"maintenance-corrupt","model":{"provider":"prov","model":"compact"},"purpose":"maintenance","input_arguments_base64":""}`, newRawSessionID(t)))
+				})
+			},
+		},
+		corruptSiblingRow{
+			name:   "codec wire: concrete tool active effect carries the input_arguments_base64 member",
+			seed:   seedCorruptSiblingPendingCall,
+			detail: `forbids the "input_arguments_base64" member`,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
+				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1","final_arguments":{},"input_arguments_base64":""}`, snapReservedResultID(t, snap)))
+				})
+			},
+		},
+	)
 
 	// The register-wire inventory: rejected session- and operation-register
 	// payload mutations on the plain running graph.
@@ -4697,6 +5154,8 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				{
 					_, err := h.ReadSessionHeader(ctx, targetID)
 					testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "corrupt session after recovery = err %v, want the corruption error", err)
+					testassert.Require(t, row.detail == "" || strings.Contains(err.Error(), row.detail),
+						"corrupt session after recovery = err %v, want the %q rule for row %q", err, row.detail, row.name)
 				}
 				rec, err := h.ReadOperation(ctx, siblingID, "op-sib")
 				testassert.Require(t, err == nil && rec.State.Status == harness.OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == recoveredInterruptionDetail, "repaired sibling after recovery = %+v err %v, want the terminal interruption with the recovery detail", rec, err)
@@ -4840,20 +5299,15 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							// the copied tool result carries tool-owned
-							// formatted metadata that the fork must preserve
-							// in its encoded durable form
-							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
-								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
-								Metadata: json.RawMessage(`{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`),
-							}}
-						},
-					}, nil
+					return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+						// the copied tool result carries tool-owned
+						// formatted metadata that the fork must preserve
+						// in its encoded durable form
+						return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+							Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
+							Metadata: json.RawMessage(`{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`),
+						}}
+					}), nil
 				},
 			}, nil
 		}
@@ -5040,6 +5494,13 @@ func TestPublicForkArchivedSource(t *testing.T) {
 		testassert.Equal(t, res.Session.State.Lifecycle, harness.LifecycleOpen)
 		src, err := f2.h.ReadSessionHeader(ctx, source)
 		testassert.Require(t, err == nil && src.Lifecycle == harness.LifecycleArchived, "source after fork = %+v err %v, want it archived without reopening", src, err)
+		// The destination's turn settles before the convergence barrier: a model
+		// intent must not race the convergence cancellation, which stays a
+		// publication failure rather than a relabeled interruption.
+		{
+			rec := awaitTerminal(t, f2.h, res.Session.Identity.SessionID, "fork-1")
+			testassert.Require(t, rec.State.Status == harness.OperationSuccess, "fork operation = %+v, want the settled destination turn", rec.State)
+		}
 		{
 			err := converge(t, f2)
 			testassert.NoError(t, err)
@@ -5602,16 +6063,18 @@ func TestPublicCompositionProductionIsolation(t *testing.T) {
 // resource lifetime rows through public operations on both stores: each
 // admitted execution — root, queued-drain, and Fork alike — opens its effects
 // exactly once after its commit over the committed admission carrying the
-// prepared capture, closes them exactly once after its terminal settlement,
-// and closes before the successor opens; a plain successful turn's closer
-// observes its own durable terminal.
+// prepared capture, opens exactly one fresh conversation invocation, closes
+// that invocation after its effects settle, closes the execution exactly once
+// after its terminal settlement, and closes before the successor opens; a
+// plain successful turn's closer observes its own durable terminal.
 func TestPublicExecutionResourceLifetime(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
 		events := make(chan string, 32)
 		var (
-			openMu sync.Mutex
-			opens  []harness.OperationAdmission
+			openMu   sync.Mutex
+			opens    []harness.OperationAdmission
+			requests []harness.InvocationRequest
 		)
 		script := newScriptModel() // every turn completes with the default ready settlement
 		f := newPublicFixture(t, store, script, nil)
@@ -5625,11 +6088,22 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 					openMu.Unlock()
 					events <- "open:" + adm.OperationID
 					return harness.Execution{
-						Model:         script.effect,
-						CompactModel:  script.effect,
-						NormalizeTool: publicNormalize,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+						OpenInvocation: func(_ context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+							openMu.Lock()
+							requests = append(requests, request)
+							openMu.Unlock()
+							events <- fmt.Sprintf("invocation:%s:%s", adm.OperationID, request.Purpose)
+							return harness.InvocationExecution{
+								Model:         script.effect,
+								NormalizeTool: publicNormalize,
+								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+								},
+								Close: func() error {
+									events <- fmt.Sprintf("invocation-close:%s:%s", adm.OperationID, request.Purpose)
+									return nil
+								},
+							}, nil
 						},
 						Close: func() error {
 							rec, err := f.h.ReadOperation(ctx, adm.SessionID, adm.OperationID)
@@ -5663,12 +6137,16 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		nextEvent("open:op-1") // the root execution opens after its commit
+		nextEvent("invocation:op-1:conversation")
 		{
 			_, err := submit(t, f.h, source, "op-2", harness.MessageModeQueued, "queued")
 			testassert.NoError(t, err)
 		}
-		nextEvent("close:op-1:success") // closed once, with its own terminal settlement already durable
-		nextEvent("open:op-2")          // the drain's successor opens only after that close
+		nextEvent("invocation-close:op-1:conversation") // the invocation closes after its effects settle
+		nextEvent("close:op-1:success")                 // closed once, with its own terminal settlement already durable
+		nextEvent("open:op-2")                          // the drain's successor opens only after that close
+		nextEvent("invocation:op-2:conversation")
+		nextEvent("invocation-close:op-2:conversation")
 		nextEvent("close:op-2:success")
 
 		// Fork shares the same lifetime: the destination execution opens
@@ -5682,6 +6160,8 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 		})
 		testassert.NoError(t, err)
 		nextEvent("open:fork-op")
+		nextEvent("invocation:fork-op:conversation")
+		nextEvent("invocation-close:fork-op:conversation")
 		nextEvent("close:fork-op:success")
 		{
 			err := converge(t, f)
@@ -5696,6 +6176,15 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 		}
 		testassert.Require(t, opens[0].SessionID == source && opens[1].SessionID == source, "root/queued opens name sessions %q and %q, want the source", opens[0].SessionID, opens[1].SessionID)
 		testassert.Equal(t, opens[2].SessionID, res.Session.Identity.SessionID)
+		testassert.Equal(t, len(requests), 3) // one conversation invocation per opened execution
+		seenIDs := map[string]bool{}
+		for i, request := range requests {
+			testassert.Require(t, request.ID != "", "invocation %d carries an empty identity", i)
+			testassert.Require(t, !seenIDs[request.ID], "invocation %d repeats identity %q", i, request.ID)
+			seenIDs[request.ID] = true
+			testassert.Equal(t, request.Purpose, harness.InvocationPurposeConversation)
+			testassert.Require(t, reflect.DeepEqual(request.Model, publicModelRef), "invocation %d model = %+v, want the captured conversation model", i, request.Model)
+		}
 	})
 }
 
@@ -5739,7 +6228,13 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 				testassert.NoError(t, err)
 			}
 			testassert.Require(t, hookWire.HookID == "cap.hook.one" && hookWire.ToolCallID == "call-1" && hookWire.Status == "interrupted" && hookWire.Error == recoveredInterruptionDetail, "interrupted hook result = %+v, want the recovery-settled interrupted evidence", hookWire)
-			assertRecoveredOperation(t, store, sessionID, "op-1", append(pre, hook), "", pending)
+			// The call under the active hook effect is proven unstarted but
+			// uncertain: the hook may have taken effect.
+			assertRecoveredOperation(t, store, sessionID, "op-1", append(pre, hook), "", []recoveredToolResult{{
+				ID:       pending[0],
+				Content:  "Pre-tool hook outcome unknown; the hook may have taken effect. The tool was not executed.\n\nTool call interrupted.",
+				Evidence: "not_started",
+			}})
 			assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 			h := harnessOver(t, store)
@@ -5750,20 +6245,52 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 		})
 	})
 
-	t.Run("quiet gap preserves settled hook evidence without replay", func(t *testing.T) {
+	t.Run("active hook effect with a later unstarted sibling", func(t *testing.T) {
 		eachStore(t, func(t *testing.T, store harness.Storage) {
 			ctx := context.Background()
-			sessionID, _, pending := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
-			hookID := newRawSessionID(t)
-			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
-				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "hook broke"))
+			sessionID, hookReserved, pending := seedRunningOperationShape(t, store, "hook", "op-1", []string{"call-1", "call-2"})
+			state := recoverOpStateAt(t, store, sessionID, "op-1")
+			testassert.Require(t, state.ActiveEffect != nil && state.ActiveEffect.Kind == "hook" && state.ActiveEffect.ResultEntryID == hookReserved && state.ActiveEffect.ToolCallID == "call-1", "seeded operation = %+v, want the committed hook effect intent on call-1", state)
 
 			pre := recoverEntries(t, store, sessionID)
 			{
 				err := harness.Recover(ctx, store)
 				testassert.NoError(t, err)
 			}
-			assertRecoveredOperation(t, store, sessionID, "op-1", pre, "", pending)
+			entries := recoverEntries(t, store, sessionID)
+			testassert.Require(t, len(entries) > len(pre), "%v", "recovery committed no hook result")
+			hook := entries[len(pre)]
+			testassert.Require(t, hook.Kind == harness.EntryHookResult && hook.ID == hookReserved, "recovery commit %s is %s, want the interrupted hook result under the reserved identity %s", hook.ID, hook.Kind, hookReserved)
+			// The hooked call's concrete tool never executed, and the later
+			// sibling is plainly unstarted: distinct stored contents and
+			// evidence.
+			assertRecoveredOperation(t, store, sessionID, "op-1", append(pre, hook), "", []recoveredToolResult{
+				{ID: pending[0], Content: "Pre-tool hook outcome unknown; the hook may have taken effect. The tool was not executed.\n\nTool call interrupted.", Evidence: "not_started"},
+				{ID: pending[1], Content: "Tool call interrupted.", Evidence: "not_started"},
+			})
+			assertRecoverIdempotent(t, store, sessionID, "op-1")
+
+			assertNextRequestAfterColdRecovery(t, store, sessionID, map[string]string{
+				"call-1": "Pre-tool hook outcome unknown; the hook may have taken effect. The tool was not executed.\n\nTool call interrupted.",
+				"call-2": "Tool call interrupted.",
+			})
+		})
+	})
+
+	t.Run("quiet gap preserves settled hook evidence without replay", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			sessionID, _, pending := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "observed", "hook broke"))
+
+			pre := recoverEntries(t, store, sessionID)
+			{
+				err := harness.Recover(ctx, store)
+				testassert.NoError(t, err)
+			}
+			assertRecoveredOperation(t, store, sessionID, "op-1", pre, "", plainInterruptedResults(pending...))
 			assertRecoverIdempotent(t, store, sessionID, "op-1")
 
 			h := harnessOver(t, store)
@@ -5771,6 +6298,33 @@ func TestPublicRecoverHookShapes(t *testing.T) {
 				_, err := h.ReadOperation(ctx, sessionID, "op-1")
 				testassert.NoError(t, err)
 			}
+		})
+	})
+
+	t.Run("quiet gap preserves an unknown hook outcome's uncertainty", func(t *testing.T) {
+		eachStore(t, func(t *testing.T, store harness.Storage) {
+			ctx := context.Background()
+			sessionID, _, pending := seedRunningOperationShape(t, store, "", "op-1", []string{"call-1"})
+			hookID := newRawSessionID(t)
+			insertRawEntry(t, store, sessionID, hookID, "op-1", harness.EntryHookResult,
+				rawFailedHookResultPayload(sessionID, hookID, "op-1", "cap.hook.one", "call-1", "error", "unknown", "hook broke"))
+
+			pre := recoverEntries(t, store, sessionID)
+			{
+				err := harness.Recover(ctx, store)
+				testassert.NoError(t, err)
+			}
+			// The committed unknown hook outcome leaves the concrete call
+			// proven unstarted but uncertain: the hook may have taken effect.
+			uncertain := "Pre-tool hook outcome unknown; the hook may have taken effect. The tool was not executed.\n\nTool call interrupted."
+			assertRecoveredOperation(t, store, sessionID, "op-1", pre, "", []recoveredToolResult{{
+				ID:       pending[0],
+				Content:  uncertain,
+				Evidence: "not_started",
+			}})
+			assertRecoverIdempotent(t, store, sessionID, "op-1")
+
+			assertNextRequestAfterColdRecovery(t, store, sessionID, map[string]string{"call-1": uncertain})
 		})
 	})
 
@@ -5859,18 +6413,32 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		// The wire compaction entry carries its model as the string
 		// "provider/model" form; the copy observes the identity members only.
 		type compactionWire struct {
-			OperationID           string              `json:"operation_id"`
-			Summary               string              `json:"summary"`
-			BoundaryEntryID       string              `json:"boundary_entry_id"`
-			ConfigurationRevision string              `json:"configuration_revision"`
-			Usage                 *harness.UsageCount `json:"usage"`
+			OperationID           string `json:"operation_id"`
+			BoundaryEntryID       string `json:"boundary_entry_id"`
+			ConfigurationRevision string `json:"configuration_revision"`
+			Messages              []struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+			Facts []struct {
+				Usage *harness.UsageCount `json:"usage"`
+			} `json:"facts"`
 		}
 		var sourceWire compactionWire
 		{
 			err := json.Unmarshal(sourceComp.Payload, &sourceWire)
 			testassert.NoError(t, err)
 		}
-		testassert.Require(t, sourceWire.OperationID == "c-1" && sourceWire.Summary == "summary one" && sourceWire.Usage != nil, "source compaction entry = %+v, want the c-1-owned committed summary with usage", sourceWire)
+		sourceSummary := ""
+		if len(sourceWire.Messages) > 0 && len(sourceWire.Messages[0].Content) > 0 {
+			sourceSummary = sourceWire.Messages[0].Content[0].Text
+		}
+		sourceUsage := (*harness.UsageCount)(nil)
+		if len(sourceWire.Facts) > 0 {
+			sourceUsage = sourceWire.Facts[0].Usage
+		}
+		testassert.Require(t, sourceWire.OperationID == "c-1" && sourceSummary == "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]" && sourceUsage != nil, "source compaction entry = %+v, want the c-1-owned committed summary with usage", sourceWire)
 
 		res, err := f.h.Fork(ctx, harness.ForkRequest{
 			SourceSessionID: source,
@@ -5923,7 +6491,15 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 			err := json.Unmarshal(copied.Payload, &copiedWire)
 			testassert.NoError(t, err)
 		}
-		testassert.Require(t, copiedWire.OperationID == "" && copiedWire.Usage == nil && copiedWire.Summary == "summary one", "got %v, want %v; copied compaction entry usage = %+v, want none; got %v, want %v", copiedWire.OperationID, "", copiedWire.Usage, copiedWire.Summary, "summary one")
+		copiedSummary := ""
+		if len(copiedWire.Messages) > 0 && len(copiedWire.Messages[0].Content) > 0 {
+			copiedSummary = copiedWire.Messages[0].Content[0].Text
+		}
+		copiedUsage := (*harness.UsageCount)(nil)
+		if len(copiedWire.Facts) > 0 {
+			copiedUsage = copiedWire.Facts[0].Usage
+		}
+		testassert.Require(t, copiedWire.OperationID == "" && copiedUsage == nil && copiedSummary == "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]", "got %v, want %v; copied compaction entry usage = %+v, want none; got %v, want %v", copiedWire.OperationID, "", copiedUsage, copiedSummary, "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]")
 		expectedBoundary, ok := idMap[sourceWire.BoundaryEntryID]
 		testassert.Require(t, ok, "the source boundary %q is not inside the copied prefix", sourceWire.BoundaryEntryID)
 		testassert.Require(t, copiedWire.BoundaryEntryID == expectedBoundary && copiedWire.ConfigurationRevision == sourceWire.ConfigurationRevision, "got %v, want %v; got %v, want %v", copiedWire.BoundaryEntryID, expectedBoundary, copiedWire.ConfigurationRevision, sourceWire.ConfigurationRevision)
@@ -5935,14 +6511,14 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		testassert.NoError(t, err)
 		var destState struct {
 			State struct {
-				CompactionEntryID string `json:"compaction_entry_id"`
+				CheckpointEntryID string `json:"checkpoint_entry_id"`
 			} `json:"state"`
 		}
 		{
 			err := json.Unmarshal(destReg.Payload, &destState)
 			testassert.NoError(t, err)
 		}
-		testassert.Equal(t, destState.State.CompactionEntryID, copied.ID)
+		testassert.Equal(t, destState.State.CheckpointEntryID, copied.ID)
 		destView, err := f.h.ReadSessionView(ctx, dest)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(harness.UsageByModelForTest(destView.TotalUsage, compactModelRef).ByModel) == 0, "destination usage = %+v, want no inherited compact-model counts", destView.TotalUsage)
@@ -5972,7 +6548,7 @@ func rawSessionRegisterWithCompaction(sessionID, currentOp, compactionEntryID st
 	return fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q},`+
 			`"state":{"lifecycle":"open","current_agent_type":"coder","current_operation_id":%q,`+
-			`"compaction_entry_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
+			`"checkpoint_entry_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
 		sessionID, now, currentOp, compactionEntryID, now)
 }
 
@@ -5986,16 +6562,20 @@ func rawCompactAdmission(sessionID, operationID string) string {
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
 			`"context_window":4096,"output_reserve":2048,`+
 			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"},`+
+			`"strategy":{"id":"melta.summary/v1","requires_context_window":true}},"admitted_at":%q}`,
 		sessionID, operationID, rawToolDefinition, now)
 }
 
 // rawCompactionEntryPayload builds one committed compaction entry payload.
 func rawCompactionEntryPayload(sessionID, entryID, operationID, summary, boundaryID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"summary":%q,"boundary_entry_id":%q,`+
-			`"model":{"provider":"prov","model":"gpt-x"},"configuration_revision":"rev-1"}`,
-		sessionID, entryID, operationID, summary, boundaryID)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"strategy_id":"melta.summary/v1",`+
+			`"messages":[{"role":"assistant","source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}]}],`+
+			`"boundary_entry_id":%q,"configuration_revision":"rev-1",`+
+			`"facts":[{"request_id":%q,"model":{"provider":"prov","model":"gpt-x"},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}],`+
+			`"consumed_request_id":"request-seed","evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, operationID, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]", boundaryID, "maintainer-"+entryID, boundaryID)
 }
 
 // rawSettledSuccessOperation seeds one settled success message Operation —
@@ -6011,8 +6591,8 @@ func rawSettledSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 			sessionID, inputID, operationID, inputText))
 	insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant,
 		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[]}`,
-			sessionID, assistantID, operationID, assistantText))
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+			sessionID, assistantID, operationID, assistantText, "request-a-"+assistantID, inputID))
 	insertRawEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement,
 		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"success"}`, sessionID, settlementID, operationID))
 	insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID},
@@ -6045,7 +6625,7 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "compact-op"},
 			fmt.Sprintf(`{"admission":%s,"state":{"status":"running","started_at":%q,`+
-				`"active_effect":{"kind":"model","result_entry_id":%q},"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
+				`"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"maintainer-live","model":{"provider":"prov","model":"compact-x"},"purpose":"maintenance"},"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
 				rawCompactAdmission(sessionID, "compact-op"), now, reserved))
 
 		// The seeded shape: a running compact request with a live model intent.
@@ -6081,14 +6661,14 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		var sessWire struct {
 			State struct {
 				CurrentOperationID string `json:"current_operation_id"`
-				CompactionEntryID  string `json:"compaction_entry_id"`
+				CheckpointEntryID  string `json:"checkpoint_entry_id"`
 			} `json:"state"`
 		}
 		{
 			err := json.Unmarshal(sessReg.Payload, &sessWire)
 			testassert.NoError(t, err)
 		}
-		testassert.Require(t, sessWire.State.CurrentOperationID == "" && sessWire.State.CompactionEntryID == compactionID, "recovered session state = %+v, want the cleared current Operation and the previous projection", sessWire.State)
+		testassert.Require(t, sessWire.State.CurrentOperationID == "" && sessWire.State.CheckpointEntryID == compactionID, "recovered session state = %+v, want the cleared current Operation and the previous projection", sessWire.State)
 
 		// The next admission over the repaired state projects the prior
 		// summary, the post-boundary entries, and the interruption signal —
@@ -6096,6 +6676,22 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		script := newScriptModel(publicTurn())
 		f := newPublicFixture(t, store, script, nil)
 		defer f.close()
+
+		// The recovered live maintenance producer lost its usage report with
+		// the process: its Operation estimate is unknown, not a zero that
+		// pretends no producer ran, and the Session total stays unknown.
+		{
+			view, err := f.h.ReadSessionView(ctx, sessionID)
+			testassert.NoError(t, err)
+			var compactEstimate *float64
+			for _, summary := range view.Operations {
+				if summary.OperationID == "compact-op" {
+					compactEstimate = summary.EstimatedCostUSD
+				}
+			}
+			testassert.Require(t, compactEstimate == nil, "recovered compact Operation estimate = %s, want absent: the lost live maintenance producer stays unknown", estimateText(compactEstimate))
+			testassert.Require(t, view.EstimatedCostUSD == nil, "recovered Session estimate = %s, want absent", estimateText(view.EstimatedCostUSD))
+		}
 		{
 			_, err := submit(t, f.h, sessionID, "op-next", harness.MessageModeRegular, "next question")
 			testassert.NoError(t, err)
@@ -6116,5 +6712,199 @@ func TestPublicRecoverRunningCompactOperation(t *testing.T) {
 		for i := range want {
 			testassert.Require(t, got[i] == want[i], "next admission projection[%d] = %q, want %q", i, got[i], want[i])
 		}
+	})
+}
+
+// TestPublicRecoverRunningAutomaticMaintenanceWitnessesProducer proves the
+// automatic-maintenance recovery sibling: process loss retains no Facts, so
+// the settlement of a running Operation with a suspended conversation request
+// recovers the live model producer from the committed maintenance intent —
+// the request witness names the maintenance producer instead of the suspended
+// request, the Model names the effective compact model, the absent Usage
+// report stays absent with no fabricated Facts or evidence, the token totals
+// stay integer-empty, and the read-time estimate for the Operation and the
+// Session is unknown, neither zero nor a partial known sum. No effect
+// replays.
+func TestPublicRecoverRunningAutomaticMaintenanceWitnessesProducer(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		sessionID, entryID := newRawSessionID(t), newRawSessionID(t)
+		reserved := newRawSessionID(t)
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}, rawSessionRegister(sessionID, "maint-op"))
+		insertRawEntry(t, store, sessionID, entryID, "maint-op", harness.EntryInput, rawInputEntryPayload(sessionID, entryID, "maint-op"))
+		insertRawRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "maint-op"},
+			fmt.Sprintf(`{"admission":%s,"state":{"status":"running","started_at":%q,`+
+				`"running_request":{"request_id":"request-suspended","boundary_entry_id":%q,"hook_results":[]},`+
+				`"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"maintainer-live","model":{"provider":"cprov","model":"compact-x"},"purpose":"maintenance"},`+
+				`"pending_tool_calls":[],"usage":{"by_model":[]}}}`,
+				rawAdmission(sessionID, "maint-op", entryID), now, entryID, reserved))
+
+		pre := recoverEntries(t, store, sessionID)
+		{
+			err := harness.Recover(ctx, store)
+			testassert.NoError(t, err)
+		}
+		// Settled with no replay: the reserved identity is consumed, the
+		// committed tail is exactly the signal and the settlement, and a second
+		// run writes nothing.
+		assertRecoveredOperation(t, store, sessionID, "maint-op", pre, reserved, nil)
+		assertRecoverIdempotent(t, store, sessionID, "maint-op")
+
+		// The settlement recovers the producer from the maintenance intent:
+		// the witness is the maintenance producer, never the suspended
+		// conversation request, and the Model is the effective compact model.
+		// The missing report stays missing; the recovery fabricates no Facts,
+		// evidence, or maintenance-provenance marker.
+		entries := recoverEntries(t, store, sessionID)
+		settlement := entries[len(entries)-1]
+		testassert.Equal(t, settlement.Kind, harness.EntryOperationSettlement)
+		var wire struct {
+			RequestID       string          `json:"request_id"`
+			Model           json.RawMessage `json:"model"`
+			Usage           json.RawMessage `json:"usage"`
+			Facts           json.RawMessage `json:"facts"`
+			Evidence        json.RawMessage `json:"evidence"`
+			CompactionUsage bool            `json:"compaction_usage"`
+		}
+		testassert.NoError(t, json.Unmarshal(settlement.Payload, &wire))
+		testassert.Require(t, wire.RequestID == "maintainer-live", "recovered settlement witness = %q, want the maintenance producer identity, not the suspended conversation request", wire.RequestID)
+		testassert.Require(t, string(wire.Model) == `{"provider":"cprov","model":"compact-x"}`, "recovered settlement model = %s, want the effective compact model named from the maintenance intent", wire.Model)
+		testassert.Require(t, wire.Usage == nil && wire.Facts == nil && wire.Evidence == nil && !wire.CompactionUsage, "recovered settlement = %s, want no usage report, no Facts, no evidence, no maintenance provenance marker", settlement.Payload)
+
+		// The integer token totals are unchanged and no estimate is persisted
+		// anywhere in the durable state.
+		opReg := operationRegister(t, store, sessionID, "maint-op")
+		sessReg := sessionRegister(t, store, sessionID)
+		testassert.Require(t, bytes.Contains(opReg.Payload, []byte(`"usage":{"by_model":[]}`)) && !bytes.Contains(opReg.Payload, []byte("cost")), "terminal operation register = %s, want the empty integer totals with no persisted estimate", opReg.Payload)
+		testassert.Require(t, !bytes.Contains(sessReg.Payload, []byte("cost")), "session register = %s, want no persisted estimate", sessReg.Payload)
+
+		// The read-time estimate: the maintenance Operation is unknown, not
+		// zero, and the Session total stays unknown.
+		f := newPublicFixture(t, store, newScriptModel(publicTurn()), nil)
+		defer f.close()
+		{
+			view, err := f.h.ReadSessionView(ctx, sessionID)
+			testassert.NoError(t, err)
+			var maintainerEstimate *float64
+			for _, summary := range view.Operations {
+				if summary.OperationID == "maint-op" {
+					maintainerEstimate = summary.EstimatedCostUSD
+				}
+			}
+			testassert.Require(t, maintainerEstimate == nil, "recovered maintenance Operation estimate = %s, want absent: the unreported live producer stays unknown", estimateText(maintainerEstimate))
+			testassert.Require(t, view.EstimatedCostUSD == nil, "recovered Session estimate = %s, want absent", estimateText(view.EstimatedCostUSD))
+		}
+	})
+}
+
+// publicBindingMutator is the accepted conversation-execution policy: its
+// first Plan incurs one model pass, rewrites the Strategy field of the
+// caller's own supplied binding to the touched marker, and folds the output
+// into one checkpoint; every later Plan returns none. publicTouchedStrategy
+// records any dispatch through the rewritten field.
+type publicBindingMutator struct {
+	binding  *harness.StrategyBinding
+	touched  *publicTouchedStrategy
+	plans    atomic.Int64
+	consumes atomic.Int64
+}
+
+func (s *publicBindingMutator) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
+	if s.plans.Add(1) == 1 {
+		s.binding.Strategy = s.touched // the caller rewrites its own supplied binding mid-Execution
+		return harness.PlanOutput{Kind: harness.PlanModel, Model: &harness.ModelPlan{
+			Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "binding snapshot pass"}}}}},
+		}}, nil
+	}
+	return harness.PlanOutput{Kind: harness.PlanNone}, nil
+}
+
+func (s *publicBindingMutator) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
+	s.consumes.Add(1)
+	zero := 0
+	authored, err := model.NewMessage(model.Message{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "snapshot checkpoint"}}})
+	if err != nil {
+		return harness.PlanOutput{}, err
+	}
+	return harness.PlanOutput{Kind: harness.PlanCheckpoint, Checkpoint: &harness.CheckpointPlan{
+		BoundaryEntryID: in.Input.BoundaryEntryID,
+		Items:           []harness.CheckpointItem{{Retain: &zero}, {Context: &authored}},
+	}}, nil
+}
+
+type publicTouchedStrategy struct{ calls atomic.Int64 }
+
+func (s *publicTouchedStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
+	s.calls.Add(1)
+	return harness.PlanOutput{Kind: harness.PlanNone}, nil
+}
+
+func (s *publicTouchedStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
+	s.calls.Add(1)
+	return harness.PlanOutput{Kind: harness.PlanNone}, nil
+}
+
+// TestPublicExecutionOwnsTheAcceptedBindingValue proves the opened Execution's
+// binding snapshot through the public submit flow: the admitted Execution
+// copies the resolved StrategyBinding value before any callback, so a policy
+// that rewrites the caller's own supplied binding during the first automatic
+// procedure still faces its accepted implementation at Consume and at the
+// same Execution's later procedure — never the replacement and never a panic
+// — and the checkpoint keeps the original captured provenance.
+func TestPublicExecutionOwnsTheAcceptedBindingValue(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		// attempt 1: the first procedure's maintenance model pass;
+		// attempt 2: the conversation turn with one tool call (the
+		// continuation round); attempt 3: the continuation turn's answer.
+		script := newScriptModel(
+			publicAttempt{stream: publicUsageTurnStream(model.Usage{InputTokens: 1, OutputTokens: 1})},
+			publicTurn("call-1"),
+			publicTurn(),
+		)
+		f := newPublicFixture(t, store, script, nil)
+		defer f.close()
+		mutator := &publicBindingMutator{}
+		touched := &publicTouchedStrategy{}
+		mutator.touched = touched
+		binding := &harness.StrategyBinding{ID: "test.strategy/v1", Strategy: mutator}
+		mutator.binding = binding
+		f.defaultPrep.Capture = publicCapture()
+		f.defaultPrep.Capture.Strategy = harness.StrategyCapture{ID: "test.strategy/v1"}
+		open := f.defaultPrep.Open
+		f.defaultPrep.Open = func(ctx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+			exec, err := open(ctx, admission)
+			if err != nil {
+				return exec, err
+			}
+			exec.Strategy = binding
+			return exec, nil
+		}
+		session := createSession(t, f.h)
+		{
+			_, err := submit(t, f.h, session, "op-1", harness.MessageModeRegular, "hello")
+			testassert.NoError(t, err)
+		}
+		awaitTerminal(t, f.h, session, "op-1")
+		{
+			err := converge(t, f)
+			testassert.NoError(t, err)
+		}
+		testassert.Equal(t, mutator.plans.Load(), int64(2)) // the accepted implementation runs every procedure of this Execution
+		testassert.Equal(t, mutator.consumes.Load(), int64(1))
+		testassert.Equal(t, touched.calls.Load(), int64(0)) // the rewritten field is never dispatched
+		entries, err := store.ReadEntries(context.Background(), session, 0)
+		testassert.NoError(t, err)
+		owned := 0
+		for _, entry := range entries {
+			if entry.Kind != harness.EntryCompaction || entry.OperationID != "op-1" {
+				continue
+			}
+			owned++
+			payload := string(entry.Payload)
+			testassert.Require(t, strings.Contains(payload, `"strategy_id":"test.strategy/v1"`), "checkpoint payload %s, want the accepted binding provenance", payload)
+			testassert.Require(t, strings.Contains(payload, "snapshot checkpoint"), "checkpoint payload %s, want the accepted implementation's authored message", payload)
+		}
+		testassert.Equal(t, owned, 1)
 	})
 }

@@ -888,6 +888,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	member, err := h.admitBackgroundMember(c, memberChild, childID, req.MaxConcurrent)
 	c.mu.Unlock()
 	if err != nil {
+		h.releasePrepared(&prepared) // the cap rejection drops the prepared child execution
 		return LaunchChildResult{}, err
 	}
 	h.observeInvalidation(c) // the child member admission carries no Job identity
@@ -905,6 +906,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 		return h.launchTransaction(tx, view, req, child, capture, content)
 	})
 	if err != nil {
+		h.releasePrepared(&prepared) // the launch transaction failed: no child execution was adopted
 		h.markCorrupt(req.ParentSessionID, err)
 		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 			if rerr := h.rematerialize(prepCtx, c, req.ParentSessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
@@ -917,6 +919,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	}
 
 	if err := h.backgroundHandoffFailure(c, member); err != nil {
+		h.releasePrepared(&prepared) // the rejected handoff settles its member and drops the prepared execution
 		return LaunchChildResult{}, h.settleRejectedChildLaunch(ctx, c, member, childID, req.OperationID, err)
 	}
 	// The committed child installs as a stable cell with its validated durable
@@ -925,6 +928,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	childCoordinator, childRelease, err := h.acquireCoordinator(ctx, childID)
 	if err != nil {
 		// the durable running Operation stays for recovery; no delivery
+		h.releasePrepared(&prepared) // the child materialization failed: the launch never adopts
 		h.recordStorageFailure(err)
 		h.claimFinishBackgroundMember(c, member.completionID)
 		return LaunchChildResult{}, err

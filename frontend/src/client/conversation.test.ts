@@ -37,7 +37,15 @@ const items: ConversationItem[] = [
     content: 'stopped by user', related_member: { kind: 'job', id: 'job1' },
   },
   {
-    item_id: 'c1', kind: 'compaction', committed_at: '0', operation_id: 'op-c1', summary: 'earlier work summarized', model: 'prov/compact',
+    item_id: 'c1', kind: 'context_checkpoint', committed_at: '0', operation_id: 'op-c1', strategy: 'melta.summary/v1', model: 'prov/compact',
+    messages: [
+      { role: 'assistant', source: 'prov/compact', content: [{ kind: 'text', text: 'earlier work summarized' }], refusal: 'declined' },
+      { role: 'assistant', source: 'prov/model', tool_calls: [{ id: 'c-call', name: 'echo', arguments_base64: 'eyJ4IjoxfQ==', extra: { call: 'x' } }] },
+      { role: 'tool', tool_call_id: 'c-call', content: [{ kind: 'text', text: 'call result text' }] },
+      { role: 'user', name: 'memo', extra: { vendor: 1 } },
+      { role: 'system', content: [{ kind: 'text', text: 'identical note' }] },
+      { role: 'user', content: [{ kind: 'text', text: 'identical note' }] },
+    ],
   },
   {
     item_id: 'o1', kind: 'operation_end', committed_at: '0', operation_id: 'op-o1', status: 'success', detail: 'all done',
@@ -81,10 +89,47 @@ describe('Conversation item variants', () => {
     expect(toolCalls?.[1].querySelector('.status')?.textContent).toContain('error');
     expect(target.textContent).toContain('Interrupted');
     expect(target.textContent).toContain('job1');
-    expect(target.textContent).toContain('earlier work summarized');
-    expect(target.textContent).toContain('prov/compact');
+    const checkpoint = target.querySelector('.system-msg.checkpoint');
+    expect(checkpoint?.textContent).toContain('earlier work summarized');
+    expect(checkpoint?.textContent).toContain('prov/compact');
+    expect(checkpoint?.textContent).toContain('declined');
+    expect(target.querySelector('.opaque-item')).toBeNull();
     expect(target.textContent).toContain('all done');
     expect(target.textContent).toContain('opaque-extra');
+  });
+
+  it('renders call-only and extras-only checkpoint messages as visible inspection output', async () => {
+    const { target } = await mountConversation();
+    const checkpoint = target.querySelector('.system-msg.checkpoint');
+    // The call-only message: its tool call members are visible, not omitted.
+    expect(checkpoint?.textContent).toContain('c-call');
+    expect(checkpoint?.textContent).toContain('echo');
+    expect(checkpoint?.textContent).toContain('eyJ4IjoxfQ==');
+    // The tool result member is visible.
+    expect(checkpoint?.textContent).toContain('tool result');
+    expect(checkpoint?.textContent).toContain('call result text');
+    // The extras-only message: name and message extras are visible.
+    expect(checkpoint?.textContent).toContain('name');
+    expect(checkpoint?.textContent).toContain('memo');
+    expect(checkpoint?.textContent).toContain('vendor');
+    expect(target.querySelector('.opaque-item')).toBeNull();
+  });
+
+  it('renders checkpoint message roles and per-message sources as inspectable fields', async () => {
+    const { target } = await mountConversation();
+    const checkpoint = target.querySelector('.system-msg.checkpoint');
+    const fields = [...(checkpoint?.querySelectorAll('.opaque-field') ?? [])].map((el) => el.textContent?.replace(/\s+/g, ' ').trim());
+    // Same-text system/user messages stay distinguishable through their roles.
+    expect(fields).toContain('role system');
+    expect(fields).toContain('role user');
+    expect(fields).toContain('role tool');
+    expect(fields).toContain('role assistant');
+    // A retained assistant's own source stays visible even when it differs
+    // from the checkpoint's maintenance producer identity.
+    expect(fields).toContain('source prov/model');
+    expect(fields).toContain('source prov/compact');
+    const contents = [...(checkpoint?.querySelectorAll('.signal-content') ?? [])].map((el) => el.textContent?.trim());
+    expect(contents.filter((text) => text === 'identical note').length).toBe(2);
   });
 
   it('does not interpret assistant content as controls (XSS)', async () => {

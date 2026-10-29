@@ -197,7 +197,7 @@ func renderItems(items []protocol.ConversationItem, width int) string {
 					if call.Content != nil {
 						content = *call.Content
 					}
-					b.WriteString(terminal.RenderToolResult(call.Name, call.Arguments, content, *call.Status == protocol.ToolCallStatusSuccess, false, width, metadata))
+					b.WriteString(terminal.RenderToolResult(call.Name, call.Arguments, content, *call.Status == protocol.ToolCallStatusSuccess, call.Evidence != nil && *call.Evidence == protocol.Unknown, false, width, metadata))
 				}
 			}
 		case "signal":
@@ -205,11 +205,46 @@ func renderItems(items []protocol.ConversationItem, width int) string {
 			if err == nil {
 				b.WriteString(terminal.RenderSystemMsg(s.Content))
 			}
-		case "compaction":
-			compact, err := item.AsCompactionItem()
+		case "context_checkpoint":
+			checkpoint, err := item.AsCheckpointItem()
 			if err == nil {
-				raw, _ := json.Marshal(compact)
-				b.WriteString(terminal.RenderSystemMsg("Committed compaction: " + string(raw)))
+				b.WriteString(terminal.RenderSystemMsg("Context checkpoint"))
+				for _, m := range checkpoint.Messages {
+					// Every admitted message field stays inspectable beside
+					// the content and refusal rendering: the role and
+					// per-message source as labeled values, the name and
+					// tool-result members as labeled values, and the tool
+					// calls and message extras through the raw-field/JSON
+					// pattern.
+					b.WriteString(terminal.RenderSystemMsg("role: " + string(m.Role)))
+					if m.Source != nil {
+						b.WriteString(terminal.RenderSystemMsg("source: " + string(*m.Source)))
+					}
+					if m.Name != nil {
+						b.WriteString(terminal.RenderSystemMsg("name: " + *m.Name))
+					}
+					if m.Content != nil {
+						if text := contentText(*m.Content); text != "" {
+							b.WriteString(terminal.RenderSystemMsg(text))
+						}
+					}
+					if m.Refusal != nil {
+						b.WriteString(terminal.RenderWarningMsg("Refusal: " + *m.Refusal))
+					}
+					if m.ToolCalls != nil {
+						for _, call := range *m.ToolCalls {
+							raw, _ := json.Marshal(call)
+							b.WriteString(terminal.RenderSystemMsg("tool call: " + string(raw)))
+						}
+					}
+					if m.ToolCallId != nil {
+						b.WriteString(terminal.RenderSystemMsg("tool result: " + *m.ToolCallId))
+					}
+					if m.Extra != nil {
+						raw, _ := json.Marshal(m.Extra)
+						b.WriteString(terminal.RenderSystemMsg("extra: " + string(raw)))
+					}
+				}
 			}
 		case "operation_end":
 			end, err := item.AsOperationEndItem()
@@ -424,7 +459,11 @@ func (c *CLI) acceptEvent(delivery eventDelivery) {
 	case "tool_finished":
 		e, err := event.AsToolFinishedEvent()
 		if err == nil {
-			c.progressLocked(e.Scope, "\nTool activity "+e.CallId+": "+string(e.Status)+"\n")
+			label := string(e.Status)
+			if e.Evidence != nil && *e.Evidence == protocol.Unknown { // an unknown outcome is never shown as a clean, safe cancellation
+				label = "outcome unknown"
+			}
+			c.progressLocked(e.Scope, "\nTool activity "+e.CallId+": "+label+"\n")
 		}
 	case "session_changed":
 		e, err := event.AsSessionChangedEvent()

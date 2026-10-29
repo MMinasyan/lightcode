@@ -69,8 +69,8 @@ func wireItemID(t *testing.T, item protocol.ConversationItem) string {
 		v, err := item.AsSignalItem()
 		testassert.NoError(t, err)
 		return v.ItemId
-	case "compaction":
-		v, err := item.AsCompactionItem()
+	case "context_checkpoint":
+		v, err := item.AsCheckpointItem()
 		testassert.NoError(t, err)
 		return v.ItemId
 	case "operation_end":
@@ -364,7 +364,7 @@ type usageSeedSessionState struct {
 	Lifecycle          harness.SessionLifecycle `json:"lifecycle"`
 	CurrentAgentType   string                   `json:"current_agent_type"`
 	CurrentOperationID string                   `json:"current_operation_id,omitempty"`
-	CompactionEntryID  string                   `json:"compaction_entry_id,omitempty"`
+	CheckpointEntryID  string                   `json:"checkpoint_entry_id,omitempty"`
 	Usage              usageWireTotals          `json:"usage"`
 	LastActivity       time.Time                `json:"last_activity"`
 }
@@ -385,7 +385,7 @@ func usageSeedSession(t *testing.T, store harness.Storage, sessionID, currentOp,
 			Lifecycle:          harness.LifecycleOpen,
 			CurrentAgentType:   agentType,
 			CurrentOperationID: currentOp,
-			CompactionEntryID:  compactionID,
+			CheckpointEntryID:  compactionID,
 			Usage:              totals,
 			LastActivity:       now,
 		},
@@ -413,12 +413,16 @@ func usageSeedMessageOperation(t *testing.T, store harness.Storage, sessionID, o
 		Content     json.RawMessage          `json:"content"`
 		ToolCalls   []harness.ToolCallRecord `json:"tool_calls"`
 		Usage       *harness.UsageCount      `json:"usage,omitempty"`
+		RequestID   string                   `json:"request_id"`
+		Advertised  []string                 `json:"advertised_names"`
+		Evidence    json.RawMessage          `json:"evidence"`
 	}{
 		SessionID: sessionID, EntryID: assistantID, OperationID: operationID,
 		Status: "completed", Source: usageWireRef{Provider: "prov", Model: "m"},
 		Content:   json.RawMessage(`[{"kind":"text","text":"answer ` + operationID + `"}]`),
 		ToolCalls: []harness.ToolCallRecord{},
 		Usage:     assistantUsage,
+		RequestID: "request-a-" + assistantID, Advertised: []string{}, Evidence: json.RawMessage(`{"boundary_entry_id":"` + inputID + `"}`),
 	})
 	testassert.NoError(t, err)
 	settlementExtra := ""
@@ -681,20 +685,29 @@ func TestHistoryGeneratedClientCompactionRetainsOldCursor(t *testing.T) {
 		// Exactly one compaction item, carrying the real scripted model's
 		// summary, and the compact Operation's settlement beside it — the
 		// first page's two newest items.
-		var compactions []*protocol.CompactionItem
+		var compactions []*protocol.CheckpointItem
 		compactionAt := -1
 		for i, item := range walked {
-			if itemKind(t, item) != "compaction" {
+			if itemKind(t, item) != "context_checkpoint" {
 				continue
 			}
 			testassert.Require(t, compactionAt < 0, "second compaction item at walk position %d", i)
-			value, err := item.AsCompactionItem()
+			value, err := item.AsCheckpointItem()
 			testassert.Require(t, err == nil, "compaction item %d: %v", i, err)
 			compactions = append(compactions, &value)
 			compactionAt = i
 		}
 		testassert.Equal(t, compactionAt, firstPageLen-2)
-		if len(compactions) != 1 || compactions[0].Summary != "done" || compactions[0].Model != "prov/m" {
+		firstText := ""
+		if len(compactions) == 1 && len(compactions[0].Messages) > 0 && compactions[0].Messages[0].Content != nil {
+			parts := *compactions[0].Messages[0].Content
+			if len(parts) > 0 {
+				if text, terr := parts[0].AsTextPart(); terr == nil {
+					firstText = text.Text
+				}
+			}
+		}
+		if len(compactions) != 1 || firstText != "[Previous conversation summary]\n\ndone\n\n[End of summary. Continue from here.]" || compactions[0].Model == nil || *compactions[0].Model != "prov/m" {
 			body, _ := json.Marshal(compactions)
 			t.Fatalf("compaction items = %s, want exactly the real model summary", body)
 		}
@@ -1036,7 +1049,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		lifecycleInsertEntry(t, store, busy, busyInput, "b-op-1", harness.EntryInput,
 			compactRawInputEntry(busy, busyInput, "b-op-1", "user", "running"))
 		lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: busy, Kind: harness.RegisterOperation, OperationID: "b-op-1"},
-			compactRawOperationRegister(compactRawMessageAdmission(busy, "b-op-1", busyInput), compactRawRunningModelState(time.Now().UTC().Format(time.RFC3339Nano), newLifecycleID(t))))
+			compactRawOperationRegister(compactRawMessageAdmission(busy, "b-op-1", busyInput), compactRawRunningModelState(time.Now().UTC().Format(time.RFC3339Nano), newLifecycleID(t), busyInput)))
 
 		// A modelless Session: the Agent type resolves but selects no model.
 		modelless := newLifecycleID(t)

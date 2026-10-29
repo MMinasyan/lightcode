@@ -389,7 +389,7 @@ describe('conversation rendering', () => {
       { item_id: 'u1', kind: 'input', committed_at: '0', origin: 'user', content: [{ kind: 'text', text: 'hello user' }] },
       { item_id: 'a1', kind: 'assistant', committed_at: '0', operation_id: 'op-a1', status: 'completed', source: 'prov/model', content: [{ kind: 'text', text: '**bold** reply' }], refusal: 'refused here', tool_calls: [{ id: 'c1', name: 'read_file', arguments: '{"path":"a.go"}', status: 'success', content: 'ok', normalized_arguments: { raw: JSON.rawJSON('9007199254740993'), huge: JSON.rawJSON('1e400') }, metadata: { note: { n: JSON.rawJSON('9007199254740993') } } }] },
       { item_id: 's1', kind: 'signal', committed_at: '0', subtype: 'interruption', content: 'stopped' },
-      { item_id: 'c1', kind: 'compaction', committed_at: '0', summary: 'summary here', model: 'prov/compact' },
+      { item_id: 'c1', kind: 'context_checkpoint', committed_at: '0', strategy: 'summarize', model: 'prov/compact', messages: [{ role: 'assistant', source: 'prov/compact', content: [{ kind: 'text', text: 'summary here' }] }] },
       { item_id: 'o1', kind: 'operation_end', committed_at: '0', operation_id: 'op-o1', status: 'failure', detail: 'failed detail' },
     ];
     vi.mocked(sdk.GetSessionHydration).mockResolvedValue(json(200, hydration({
@@ -3658,6 +3658,45 @@ describe('usage details and global warnings', () => {
     expect(target.textContent).toContain('123456789012345678901');
     // Exactly one model row plus the header; absence is not displayed as zero.
     expect(target.querySelectorAll('dialog .row')).toHaveLength(2);
+    // An absent estimate is displayed as unknown, never as a zero.
+    expect(target.querySelector('dialog .estimate')?.textContent).toContain('unknown');
+  });
+
+  it('renders a present session cost estimate as an approximate USD value', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(json(200, hydration({
+      usage: {
+        totals: {
+          by_model: [
+            { model: 'p/m', usage: { input_tokens: '10', cached_input_tokens: '2', output_tokens: '3' } },
+          ],
+          estimated_cost_usd: 0.015,
+        },
+        context: { used_tokens: '12', context_window: 100 },
+      },
+    })));
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Show token usage"]') as HTMLElement).click();
+    await settle();
+    expect(target.querySelector('dialog .estimate')?.textContent).toContain('$0.015');
+  });
+
+  it('renders a known-zero session cost estimate as zero', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(json(200, hydration({
+      usage: {
+        totals: { by_model: [], estimated_cost_usd: 0 },
+        context: { used_tokens: '0', context_window: 0 },
+      },
+    })));
+    const { target } = await mountApp(connection);
+    (target.querySelector('[aria-label="Show token usage"]') as HTMLElement).click();
+    await settle();
+    const estimate = target.querySelector('dialog .estimate')?.textContent ?? '';
+    expect(estimate).toContain('$0');
+    expect(estimate).not.toContain('unknown');
   });
 
   it('falls back to GetWarnings globals when no hydration is displayed', async () => {

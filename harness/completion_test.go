@@ -70,6 +70,7 @@ func completionChildGraph(parentID string, running bool, status OperationState, 
 		assistant := validAssistantEntry(childFixtureOp)
 		assistant.SessionID = completionChildID
 		assistant.EntryID = hexID(2)
+		assistant.RequestID = hexID(2)
 		assistant.Content = []model.ContentPart{{Kind: model.PartText, Text: assistantText}}
 		entries = append(entries, testEntry{env: Entry{SessionID: completionChildID, ID: hexID(2), OperationID: childFixtureOp, Kind: EntryAssistant, Sequence: 2, CommittedAt: testTime}, assistant: &assistant})
 	}

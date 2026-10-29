@@ -48,10 +48,10 @@ func runtimeNormalize(call model.ToolCall) (json.RawMessage, error) {
 // prepConfigDocument points the configured provider at the fixture's keyless
 // local endpoint with discovery disabled and a generous window, so ordinary
 // rows never accidentally test compaction. The "zero" model keeps the
-// zero-window rejection row.
+// zero-window rejection row. "m" carries the capture-pricing fixture rates.
 func prepConfigDocument(endpoint, tag string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
-		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096},`+
+		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096,"cost":{"input":1.5,"output":3,"cache_read":0.5,"cache_write":0.25}},`+
 			`"zero":{"name":"Z","context_window":0}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `}}}`
 }
 
@@ -775,12 +775,16 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 				}
 				<-arrived
 				// The reload varies the selected definition's permission
-				// constraints, so the revision-2 capture differs from the
-				// revision-1 one on both members.
+				// constraints and the selected model's catalog price, so the
+				// revision-2 capture differs from the revision-1 one on all
+				// three members.
 				reloadAgents := strings.Replace(prepAgentsDocument,
 					`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"]}`,
 					`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"], "readonly": true, "write_dir": "/tmp/reload"}`, 1)
 				writeServiceFile(t, agents.PathForConfig(e.configPath), reloadAgents)
+				writeServiceFile(t, e.configPath, strings.Replace(prepConfigDocument(e.server.URL, "A"),
+					`"cost":{"input":1.5,"output":3,"cache_read":0.5,"cache_write":0.25}`,
+					`"cost":{"input":9,"output":3,"cache_read":0.5,"cache_write":0.25}`, 1))
 				{
 					_, err := e.reload()
 					testassert.NoError(t, err)
@@ -807,12 +811,24 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 					inFlight = e.awaitTerminal(session, "op-2", harness.OperationSuccess)
 				}
 				testassert.Require(t, inFlight.Admission.Execution.ConfigurationRevision == "1" && !inFlight.Admission.Execution.Readonly && inFlight.Admission.Execution.WriteDir == "", "got %v, want %v; reloaded constraints leaked into the committed capture: readonly=%v write_dir=%q, want the captured false \"\"", inFlight.Admission.Execution.ConfigurationRevision, "1", inFlight.Admission.Execution.Readonly, inFlight.Admission.Execution.WriteDir)
+				// The committed capture keeps the revision-1 catalog price:
+				// the concurrent rate edit never repriced it.
+				{
+					captured := inFlight.Admission.Execution.Pricing
+					testassert.Require(t, captured != nil && captured.Input != nil && *captured.Input == 1.5 && captured.Output != nil && *captured.Output == 3,
+						"in-flight capture pricing = %+v, want the revision-1 catalog rates", captured)
+				}
 
 				// The next capture uses revision 2 and the reloaded
 				// constraints.
 				e.admitOrBuffer(session, "op-next", "next")
 				next := e.awaitTerminal(session, "op-next", harness.OperationSuccess)
 				testassert.Require(t, next.Admission.Execution.ConfigurationRevision == "2" && next.Admission.Execution.Readonly && next.Admission.Execution.WriteDir == "/tmp/reload", "got %v, want %v; next admission constraints = readonly %v write_dir %q, want the reloaded true \"/tmp/reload\"", next.Admission.Execution.ConfigurationRevision, "2", next.Admission.Execution.Readonly, next.Admission.Execution.WriteDir)
+				{
+					captured := next.Admission.Execution.Pricing
+					testassert.Require(t, captured != nil && captured.Input != nil && *captured.Input == 9,
+						"next capture pricing = %+v, want the reloaded revision-2 catalog rate", captured)
+				}
 				testassert.NoError(t, e.converge())
 
 				if tc.kind == "drained" {
@@ -1019,6 +1035,36 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 			}},
 			{"write_dir", func(c harness.ExecutionCapture) harness.ExecutionCapture {
 				c.WriteDir = "/tmp/hook-elsewhere"
+				return c
+			}},
+			{"strategy id", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Strategy.ID = "other.strategy/v1"
+				return c
+			}},
+			{"strategy requirement", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Strategy.RequiresContextWindow = !c.Strategy.RequiresContextWindow
+				return c
+			}},
+			{"strategy settings", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Strategy.Settings = json.RawMessage(`{"hook":1}`)
+				return c
+			}},
+			{"conversation pricing", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Pricing = &harness.ModelPricing{Input: ptrTo(9.0)}
+				return c
+			}},
+			{"conversation pricing dropped", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Pricing = nil
+				return c
+			}},
+			{"conversation pricing rate pointee", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				if c.Pricing != nil && c.Pricing.Input != nil {
+					*c.Pricing.Input = 9.0 // in-place on the hook's owned clone
+				}
+				return c
+			}},
+			{"compact pricing", func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				c.Compact.Pricing = &harness.ModelPricing{Input: ptrTo(9.0)}
 				return c
 			}},
 		}
@@ -1327,6 +1373,7 @@ func TestPreparationExecutionLifetimeAndCleanup(t *testing.T) {
 			e.admit(session, "op-1", "one")
 			rec := e.awaitTerminal(session, "op-1", harness.OperationFailure)
 			testassert.Require(t, rec.State.Terminal != nil && strings.Contains(rec.State.Terminal.Detail, errOpen.Error()), "operation state = %+v, want the failure carrying the opening error", rec.State)
+			e.awaitEvent("op-close") // the execution's own Close unwinds the opened Operation scope after the settlement
 			events := e.events.all()
 			testassert.Require(t, slices.Contains(events, "op-open:op-1") && !slices.Contains(events, "ag-open") && !slices.Contains(events, "ag-close") && slices.Contains(events, "op-close"), "events = %v, want the Operation scope constructed before the failure; events = %v, want no Agent scope constructed through the failed opening; events = %v, want the owned Operation scope unwound", events, events, events)
 			testassert.Equal(t, e.agOpens.Load(), 0)
@@ -1517,10 +1564,11 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 		entries, err := store.ReadEntries(context.Background(), session, 0)
 		testassert.NoError(t, err)
 		type hookWire struct {
-			HookID     string          `json:"hook_id"`
-			ToolCallID string          `json:"tool_call_id"`
-			Status     string          `json:"status"`
-			Arguments  json.RawMessage `json:"arguments"`
+			HookID      string          `json:"hook_id"`
+			ExtensionID string          `json:"extension_id"`
+			ToolCallID  string          `json:"tool_call_id"`
+			Status      string          `json:"status"`
+			Arguments   json.RawMessage `json:"arguments"`
 		}
 		var hookResults []hookWire
 		for _, entry := range entries {
@@ -1532,10 +1580,11 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 			hookResults = append(hookResults, wire)
 		}
 		wantIDs := []string{"arg.runtime", "arg.workspace", "arg.operation", "arg.agent"}
+		wantExtensions := []string{"hooks", "caps", "ops", "ags"} // the owning plugin identity of each scope's hook
 		testassert.Require(t, len(hookResults) == len(wantIDs), "committed hook results = %+v, want one per argument hook", hookResults)
 		for i, want := range wantIDs {
 			got := hookResults[i]
-			testassert.Require(t, got.HookID == want && got.ToolCallID == "call-1" && got.Status == "success", "hook result %d = %+v, want hook %q succeeding for call-1", i, got, want)
+			testassert.Require(t, got.HookID == want && got.ExtensionID == wantExtensions[i] && got.ToolCallID == "call-1" && got.Status == "success", "hook result %d = %+v, want hook %q from plugin %q succeeding for call-1", i, got, want, wantExtensions[i])
 		}
 		testassert.Require(t, string(hookResults[3].Arguments) == `{"repaired":"arg.agent"}`, "last committed arguments = %s, want the final hook's replacement", hookResults[3].Arguments)
 

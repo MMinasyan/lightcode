@@ -527,8 +527,7 @@ func TestSubmitRejectsClosedActiveChild(t *testing.T) {
 func TestStopGatedLaunchWaitsForMaterialization(t *testing.T) {
 	store := freshSessionStore(t)
 	gate := newLaunchGate(store, "read")
-	exec := validExecution()
-	exec.Model = quickModel()
+	exec := effectExecution(quickModel(), func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} })
 	stub := newPrepareStub(PreparedExecution{
 		Capture: testCapture(),
 		Open: func(_ context.Context, _ OperationAdmission) (Execution, error) {
@@ -613,8 +612,7 @@ func TestStopRacingStartSettlesWithoutStarting(t *testing.T) {
 		mu    sync.Mutex
 		opens []string
 	)
-	exec := validExecution()
-	exec.Model = quickModel()
+	exec := effectExecution(quickModel(), func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} })
 	stub := newPrepareStub(PreparedExecution{
 		Capture: testCapture(),
 		Open: func(_ context.Context, admission OperationAdmission) (Execution, error) {
@@ -1145,7 +1143,7 @@ func TestStopHeldPreparationRegistersAfterReopen(t *testing.T) {
 
 // TestArchiveGateRejectsLiveMembers proves the archive gate: a Session with a
 // claimed-but-unfinished member is rejected on both lifecycle paths —
-// ArchiveSession with the dedicated text, and the sweep's skip.
+// ArchiveSession with the shared quiescence rejection, and the sweep's skip.
 func TestArchiveGateRejectsLiveMembers(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, nil)
@@ -1159,7 +1157,7 @@ func TestArchiveGateRejectsLiveMembers(t *testing.T) {
 
 	{
 		_, err := h.ArchiveSession(context.Background(), testSessionID)
-		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "session has live background work; stop it first"), "ArchiveSession = %v, want the live-background rejection", err)
+		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "archiving requires a quiescent Session"), "ArchiveSession = %v, want the live-background rejection", err)
 	}
 	deleted, err := h.SweepSession(context.Background(), testSessionID, SweepPolicy{ArchiveAfter: time.Hour}, testTime.Add(2*time.Hour))
 	testassert.NoError(t, err)

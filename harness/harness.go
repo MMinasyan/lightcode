@@ -46,25 +46,150 @@ type PreparationRequest struct {
 	RequestKind RequestKind
 }
 
-// PreparedExecution is the outcome of one preparation: the durable capture
-// plus the one required opener that turns the committed admission into the
-// execution the Harness runs. A preparation returns values and an opener,
-// never short-lived resources: failed admission discards the values only. No
-// returned function is durable.
+// PreparedExecution is the outcome of one preparation: the durable capture,
+// the one required opener that turns the committed admission into the
+// execution the Harness runs, and the optional release of the reservation the
+// successful preparation transferred to its caller. A preparation returns
+// values, an opener and one reservation, never short-lived resources: failed
+// admission discards the values and the Harness releases the reservation it
+// was handed. Nil Release means the preparation reserved nothing. No returned
+// function is durable.
 type PreparedExecution struct {
 	Capture ExecutionCapture
 	Open    func(context.Context, OperationAdmission) (Execution, error)
+	// Release disposes the reserved resources one successful Prepare
+	// transferred to its caller. The Harness runs it exactly once: on every
+	// path that discards the prepared execution, and after the opened
+	// execution's Close on the path that adopts it. A release failure is a
+	// cleanup failure retained through Wait; it never rewrites a committed
+	// terminal.
+	Release func() error
 }
 
-// ToolArgumentsHook is one effectful argument hook: before a concrete tool
-// call prepares, it may rewrite the call's raw argument bytes. Its successful
+// HookMode declares one hook's participation contract at its boundary. A pure
+// hook validates and coalesces its changed value in memory with no effect
+// transaction; an effectful hook's execution is its own Harness-settled
+// Operation effect with durable hook_result evidence.
+type HookMode string
+
+const (
+	HookModePure      HookMode = "pure"
+	HookModeEffectful HookMode = "effectful"
+)
+
+func validHookMode(mode HookMode) bool {
+	return mode == HookModePure || mode == HookModeEffectful
+}
+
+// ExecutionEvidence describes one effect execution's knowledge independently
+// of its status: not_started is proven unstarted work, observed is a valid
+// terminal execution response (including cooperative interruption), and
+// unknown is possible execution without a valid terminal response.
+type ExecutionEvidence string
+
+const (
+	ExecutionNotStarted ExecutionEvidence = "not_started"
+	ExecutionObserved   ExecutionEvidence = "observed"
+	ExecutionUnknown    ExecutionEvidence = "unknown"
+)
+
+func validExecutionEvidence(evidence ExecutionEvidence) bool {
+	switch evidence {
+	case ExecutionNotStarted, ExecutionObserved, ExecutionUnknown:
+		return true
+	}
+	return false
+}
+
+// EffectError carries one hook's declared execution knowledge through a
+// binding-infrastructure failure to the Harness: the declared Evidence reaches
+// the shared accepting validator unchanged. Unwrap exposes the underlying
+// cause for classification.
+type EffectError struct {
+	Evidence ExecutionEvidence
+	Err      error
+}
+
+func (e *EffectError) Error() string { return e.Err.Error() }
+func (e *EffectError) Unwrap() error { return e.Err }
+
+// ToolArgumentsHook is one argument hook: before a concrete tool call
+// prepares, it may rewrite the call's raw argument bytes. Its successful
 // replacement must be exactly one JSON object the execution's normalizer
 // accepts; it can never replace the call identity, tool name, or another
-// call's arguments. Every execution is a Harness-settled Operation effect
-// with durable hook_result evidence. Run receives owned call data.
+// call's arguments. An effectful hook's execution is a Harness-settled
+// Operation effect with durable hook_result evidence; a pure hook coalesces
+// in memory. Run receives owned call data.
 type ToolArgumentsHook struct {
-	ID  string
-	Run func(context.Context, model.ToolCall) (json.RawMessage, error)
+	ID          string
+	ExtensionID string
+	Mode        HookMode
+	Run         func(context.Context, model.ToolCall) (json.RawMessage, error)
+}
+
+// RequestHookInput is one request hook's owned input: the bound request
+// identity, the frozen canonical conversation messages and canonical
+// references they were projected from, the captured rendered prompt, and the
+// captured eligible tool catalog. The CanonicalMessages are the round-frozen
+// projection without any request contribution, CapturedPrompt the captured
+// baseline the current Prompt evolved from, and Catalog the full eligible
+// catalog behind whatever Tools are currently visible. Every mutable member is
+// a deep-owned copy; the hook cannot reach the coordinator's state.
+type RequestHookInput struct {
+	RequestID         string
+	CanonicalMessages []model.Message        // the round-frozen canonical view, contributions excluded
+	Messages          []model.Message        // the effective conversation view accepted so far
+	CheckpointEntryID string                 // the named current checkpoint, empty when uncompacted
+	BoundaryEntryID   string                 // the canonical boundary of the consumed projection
+	CapturedPrompt    string                 // the captured baseline prompt text
+	Prompt            string                 // the effective prompt text
+	Catalog           []model.ToolDefinition // the full captured eligible catalog
+	Tools             []model.ToolDefinition // the currently visible tool view
+}
+
+// RequestConsequence is one request hook's closed contribution: absent members
+// mean unchanged. A present Prompt replaces the complete prompt text (a
+// present-empty Prompt removes the prompt); Messages are complete request-only
+// messages appended to the conversation view; a present ToolNames replaces the
+// visible tool view with those names selected from the captured catalog
+// (present-empty advertises none).
+type RequestConsequence struct {
+	Prompt    *string
+	Messages  []model.Message
+	ToolNames []string
+}
+
+// RequestHook is one selected request-boundary hook: it runs after steering
+// and before any model effect, receives the current effective request view,
+// and contributes an optional complete prompt replacement, request-only
+// messages, and tool visibility. Run receives deep-owned values.
+type RequestHook struct {
+	ID          string
+	ExtensionID string
+	Mode        HookMode
+	Run         func(context.Context, RequestHookInput) (RequestConsequence, error)
+}
+
+// ToolOutputInput is one output hook's owned input: the settled tool outcome
+// and the current model-facing content text. Outcome is an owned copy for
+// every hook invocation — the hook can never reach the stored value — and
+// Content is the producer's original content for the first hook and each
+// preceding hook's return for every later one.
+type ToolOutputInput struct {
+	Outcome ToolOutcome
+	Content string
+}
+
+// ToolOutputHook is one selected after-tool output hook: pure model-facing
+// output shaping over one settled tool outcome. Run receives owned values and
+// returns the shaped content text; a hook error or a return that fails the
+// unchanged result-shape rule aborts the chain and the call settles with its
+// original content. Shaping is text only: it can never change the settled
+// status, evidence, usage or metadata.
+type ToolOutputHook struct {
+	ID          string
+	ExtensionID string
+	Run         func(context.Context, ToolOutputInput) (string, error)
 }
 
 // RetryPolicy decides one failed physical model attempt: it receives the
@@ -74,44 +199,93 @@ type ToolArgumentsHook struct {
 // delay ends the effect with that failure; the Harness owns every wait.
 type RetryPolicy func(error, int) (time.Duration, bool)
 
-// Execution is one opened execution: the physical model-request callback the
-// Harness retries and assembles, the tool effect function, the Operation's
-// resolved automatic permission policy, the required pure
-// argument-normalization callback, the selected argument hooks, plus the
-// cleanup of any external resources backing them. A successful Model, Tool
-// and NormalizeTool must be non-nil, and every ToolHooks entry requires a
-// non-empty unique ID and a non-nil Run; a nil Retry selects the private
-// standard retry classifier; Close is optional when the concrete execution
-// needs no external disposal. The opener owns provisional cleanup on error.
-type Execution struct {
-	// Model is the one physical model-request callback. Each invocation makes
-	// exactly one physical attempt and returns its accepted stream or that
-	// attempt's failure; retry, assembly and settlement are Harness-owned.
+// InvocationPurpose names which Engine call one opened invocation serves: the
+// conversation Agent run or one maintenance model request.
+type InvocationPurpose string
+
+const (
+	InvocationPurposeConversation InvocationPurpose = "conversation"
+	InvocationPurposeMaintenance  InvocationPurpose = "maintenance"
+)
+
+// InvocationRequest is the Harness-issued identity of one Engine call: a
+// fresh per-call identity, the purpose it serves, and the model that call
+// runs on. The opener is the request's owner.
+type InvocationRequest struct {
+	ID      string
+	Purpose InvocationPurpose
+	Model   model.ModelRef
+}
+
+// InvocationExecution is one opened Engine invocation: the physical
+// model-request callback the Harness retries and assembles, the tool effect
+// function, the required pure argument-normalization callback, the selected
+// argument hooks, the selected output-shaping hooks, plus the cleanup of the
+// external resources backing them — the existing callback contracts bound to
+// that invocation. A successful Model, Tool and NormalizeTool must be
+// non-nil, and every ToolHooks and ToolOutputHooks entry requires a
+// non-empty unique ID and a non-nil Run. Close is optional; the opened
+// invocation's resources are released exactly once after its effects settle
+// and their result is consumed, before the owning execution closes.
+type InvocationExecution struct {
+	// Model is the one physical model-request callback. Each invocation of
+	// it makes exactly one physical attempt and returns its accepted stream
+	// or that attempt's failure; retry, assembly and settlement are
+	// Harness-owned.
 	Model func(context.Context, model.Request) (model.Stream, error)
-	// CompactModel is the physical model-request callback for the compaction
-	// summarizer, built over the effective compact model's transport from the
-	// same configuration revision the capture records. Each invocation makes
-	// exactly one physical attempt, like Model.
-	CompactModel func(context.Context, model.Request) (model.Stream, error)
-	// Retry classifies one failed physical attempt for the next-attempt
-	// decision. Nil selects the private standard classifier.
-	Retry RetryPolicy
 	Tool  func(context.Context, model.ToolCall) PreparedTool
-	// Permissions is the automatic policy resolved for this Operation from the
-	// same immutable configuration revision its capture records. The zero
-	// PermissionPolicy is the built-in policy.
-	Permissions PermissionPolicy
 	// NormalizeTool is pure, terminating argument validation and defaulting
 	// with no filesystem, service, permission or effect I/O. It receives an
 	// owned call and returns one owned JSON object preserving unrelated
 	// accepted fields; its error is a per-call validation failure.
 	NormalizeTool func(model.ToolCall) (json.RawMessage, error)
-	// ToolHooks are the selected argument hooks in configured order. Each runs
-	// as its own effect after the advertisement gate and before concrete
-	// preparation; the first receives the original raw call arguments, every
-	// later one the preceding committed replacement.
+	// ToolHooks are the selected argument hooks in configured order. Each
+	// runs after the advertisement gate and before concrete preparation; the
+	// first receives the original raw call arguments, every later one the
+	// preceding committed value.
 	ToolHooks []ToolArgumentsHook
-	Close     func() error
+	// ToolOutputHooks are the selected output-shaping hooks in configured
+	// order. They run over one settled tool outcome before its result
+	// commits: the first receives the producer's original content, every
+	// later one the preceding hook's return. They are pure and can never
+	// change the settled status, evidence, usage or metadata.
+	ToolOutputHooks []ToolOutputHook
+	// RequestHooks are the selected request-boundary hooks in configured
+	// order. They run inside the Operation's request source, after steering
+	// and before the automatic-maintenance orchestration and any model
+	// effect.
+	RequestHooks []RequestHook
+	Close        func() error
+}
+
+// Execution is one opened execution: the required invocation opener the
+// Harness drives once per Engine call, the Operation's retry classifier and
+// permission evaluator, plus the cleanup of the Operation resources backing
+// them. OpenInvocation must be non-nil; it opens the conversation run's
+// invocation and a distinct maintenance invocation per strategy model
+// request, each with its own opened resources and Close. A nil Retry selects
+// the private standard retry classifier; a nil Permissions evaluator selects
+// the built-in policy; Close is optional when the concrete execution needs no
+// external disposal. The opener owns provisional cleanup on error.
+type Execution struct {
+	// OpenInvocation opens one Engine invocation's callback contracts over
+	// the Harness-issued request. Successful opening transfers the invoked
+	// resources to the Harness, which closes the invocation once after its
+	// effects settle, before the owning Execution.Close.
+	OpenInvocation func(context.Context, InvocationRequest) (InvocationExecution, error)
+	// Retry classifies one failed physical attempt for the next-attempt
+	// decision. Nil selects the private standard classifier.
+	Retry RetryPolicy
+	// Permissions is the permission evaluator deciding this Operation's
+	// prepared calls, resolved from the same immutable configuration
+	// revision its capture records. Nil selects the included built-in
+	// policy (the zero PermissionPolicy).
+	Permissions PermissionEvaluator
+	// Strategy is the selected context strategy binding of this Operation,
+	// resolved from the same immutable configuration revision its capture
+	// records. Nil selects the included summary policy binding.
+	Strategy *StrategyBinding
+	Close    func() error
 }
 
 // ToolOutcome is one owned tool plan's complete outcome: the model-visible
@@ -249,6 +423,13 @@ type coordinator struct {
 	steering []*pendingMessage // regular input waiting for the next model boundary
 	queued   []*pendingMessage // queued input waiting for the next Agent turn end
 	run      *activeExecution  // non-nil while one execution is in flight
+
+	// pendingFacts holds the active execution's accumulated uncommitted
+	// maintenance facts — incurred by procedures that settled at none —
+	// until the next successful checkpoint or terminal publication accounts
+	// them exactly once. Process-local only: never durable, never a
+	// crash-survival guarantee.
+	pendingFacts []maintenanceFact
 
 	group             *backgroundGroup // nil until the first member
 	bgState           bgState          // starts as bgOpen at every construction site; the zero value is never observed
@@ -679,8 +860,8 @@ func (h *Harness) ReopenSession(ctx context.Context, sessionID string) (SessionR
 
 // ArchiveSession archives one open idle Session: it changes the lifecycle to
 // archived with one sampled UTC time, leaves last activity unchanged, and
-// clears the process-local buffers only after the commit. Archiving a running
-// Session is rejected; archiving an already archived Session is a no-write
+// only ever reaches an idle archived Session — a Session that holds any busy
+// state is rejected. Archiving an already archived Session is a no-write
 // success.
 func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (SessionRecord, error) {
 	c, release, err := h.acquireCoordinator(ctx, sessionID)
@@ -701,18 +882,14 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 			c.mu.Unlock()
 			return SessionRecord{}, notFoundSession(sessionID)
 		}
-		if c.graph.Session.State.CurrentOperationID != "" {
+		if !c.quiescentLocked() { // the shared lifecycle gate: no transition crosses busy state
 			c.mu.Unlock()
-			return SessionRecord{}, invalidInput("session %q already runs operation %q; archiving requires an idle Session", sessionID, c.graph.Session.State.CurrentOperationID)
+			return SessionRecord{}, invalidInput("session %q is busy; archiving requires a quiescent Session", sessionID)
 		}
 		if c.graph.Session.State.Lifecycle == LifecycleArchived { // archiving archived is a no-write success
 			result := ownSessionRecord(c.graph.Session)
 			c.mu.Unlock()
 			return result, nil
-		}
-		if liveBackground(c) { // claimed members count: they remain until finished
-			c.mu.Unlock()
-			return SessionRecord{}, invalidInput("session has live background work; stop it first")
 		}
 		expected := c.graph.Session.Revision
 		now := time.Now().UTC() // the one sampled archive time
@@ -759,9 +936,8 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 		}
 		c.graph.Session = updated
 		result := ownSessionRecord(updated)
-		c.steering, c.queued = nil, nil // the buffers clear only after the commit
 		c.mu.Unlock()
-		h.observeInvalidation(c) // the durable archive advance covers the buffer clear
+		h.observeInvalidation(c) // the durable archive advance
 		return result, nil
 	}
 }
@@ -834,10 +1010,9 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 // archived Session past its threshold. A gone candidate reports the
 // not-found class and a corrupt one the corruption class, both left
 // unchanged. Deletion uses the same post-commit coordinator invalidation as
-// DeleteSession; archiving adopts the committed record and clears the
-// buffers under the same hold. It reports whether the deletion transition
-// committed: the flag is true only after the deleting transaction and its
-// post-commit adoption succeeded.
+// DeleteSession; archiving adopts the committed record under the same hold.
+// It reports whether the deletion transition committed: the flag is true only
+// after the deleting transaction and its post-commit adoption succeeded.
 func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy SweepPolicy, now time.Time) (bool, error) {
 	if now.IsZero() {
 		return false, invalidInput("sweep time must not be zero")
@@ -854,15 +1029,15 @@ func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy Swe
 // waiting, it checks the coordinator under its mutex — held across the whole
 // transaction and post-commit adoption — and applies at most one transition
 // against the explicit sweep time: archive for an open idle Session past its
-// threshold, deletion for an archived Session past its threshold. A reserved,
-// running, process-locally buffered, or live-background Session takes the
-// same no-transition outcome, so one busy Session never makes a caller wait
-// on unrelated execution; a gone candidate reports the not-found class and a
-// corrupt register the corruption class, both left unchanged. Deletion uses
-// the same post-commit coordinator invalidation as DeleteSession; archiving
-// adopts the committed record and clears the buffers under the same hold. It
-// reports whether the deletion transition committed: the flag is true only
-// after the deleting transaction and its post-commit adoption succeeded.
+// threshold, deletion for an archived Session past its threshold. A reserved
+// or quiescence-failing Session (running, buffered, or live-background) takes
+// the same no-transition outcome, so one busy Session never makes a caller
+// wait on unrelated execution; a gone candidate reports the not-found class
+// and a corrupt register the corruption class, both left unchanged. Deletion
+// uses the same post-commit coordinator invalidation as DeleteSession;
+// archiving adopts the committed record under the same hold. It reports
+// whether the deletion transition committed: the flag is true only after the
+// deleting transaction and its post-commit adoption succeeded.
 func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string, policy SweepPolicy, now time.Time) (bool, error) {
 	c.mu.Lock()
 	if c.reserved != nil { // a reserved candidate skips like every other busy state: the pass never waits on admission work
@@ -873,7 +1048,7 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 		c.mu.Unlock()
 		return false, notFoundSession(sessionID)
 	}
-	if c.run != nil || len(c.steering) > 0 || len(c.queued) > 0 || liveBackground(c) { // running, buffered, or live background work: left unchanged
+	if !c.quiescentLocked() { // running, buffered, or live background work: left unchanged
 		c.mu.Unlock()
 		return false, nil
 	}
@@ -942,13 +1117,23 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 	}
 	if didArchive {
 		c.graph.Session = archived
-		c.steering, c.queued = nil, nil // like ArchiveSession: the buffers clear only after the commit
 	}
 	c.mu.Unlock()
 	if didArchive {
 		h.observeInvalidation(c) // the durable sweep archive advance
 	}
 	return false, nil
+}
+
+// quiescentLocked applies the one lifecycle gate under the caller-held
+// coordinator mutex: a Session is quiescent only when it carries no durable
+// active Operation, no installed execution run, no process-local steering or
+// queued input, and no live owned background work. ArchiveSession rejects a
+// Session outside this set with the invalid-input class and the sweep skips
+// it; a durable terminal alone is not retirement. Each entry point retains
+// its own reservation check beside this predicate.
+func (c *coordinator) quiescentLocked() bool {
+	return c.graph.Session.State.CurrentOperationID == "" && c.run == nil && len(c.steering) == 0 && len(c.queued) == 0 && !liveBackground(c)
 }
 
 // bumpLocalRevision advances the coordinator-local revision under the
@@ -962,9 +1147,10 @@ func (c *coordinator) bumpLocalRevision() {
 
 // discardBuffers clears both process-local FIFOs under the caller-held
 // coordinator mutex, reporting whether the discard changed any buffered item
-// and advanced the local revision. Lifecycle and sweep clears ride their newer
-// Session register and the deletion invalidation clears an absent coordinator,
-// so neither goes through here.
+// and advanced the local revision. Archive and sweep never touch the buffers:
+// the shared quiescent predicate only lets them commit against empty buffers,
+// and the deletion invalidation clears an absent coordinator, so none of those
+// transitions goes through here.
 func (c *coordinator) discardBuffers() bool {
 	changed := len(c.steering) > 0 || len(c.queued) > 0
 	if changed {
@@ -1315,9 +1501,11 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 	// later cancellation
 	record, existing, err := h.publishAdmission(prepCtx, c, view, capture, req)
 	if err != nil {
+		h.releasePrepared(&prepared) // the publication failed: this admission discards the prepared execution with its reservation
 		return OperationRecord{}, nil, "", publicationError(ctx, err)
 	}
 	if existing {
+		h.releasePrepared(&prepared) // the identity resolved to another admission's Operation: nothing here adopts
 		return ownOperationRecord(record), nil, DispositionExisting, nil
 	}
 	return ownOperationRecord(record), &prepared, DispositionAdmitted, nil
@@ -1330,8 +1518,11 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 // prepared execution with its owned durable capture plus the combined context
 // and its cleanup. A preparation failure returns with the combined context
 // already cleaned up; on success the caller keeps it live through publication
-// and runs the cleanup when publication returns. Caller or Harness
-// cancellation before or after preparation publishes nothing.
+// and runs the cleanup when publication returns. A returned reservation is
+// released on every discard — a nil opener, an invalid capture, or
+// cancellation observed after preparation — so only an adopted prepared
+// execution ever carries one. Caller or Harness cancellation before or after
+// preparation publishes nothing.
 func (h *Harness) prepareExecution(ctx context.Context, session PreparationSession, kind RequestKind) (PreparedExecution, ExecutionCapture, context.Context, context.CancelFunc, error) {
 	prepCtx, cancel := context.WithCancel(h.ctx)
 	stop := context.AfterFunc(ctx, cancel)
@@ -1357,23 +1548,41 @@ func (h *Harness) prepareExecution(ctx context.Context, session PreparationSessi
 	}
 	if prepared.Open == nil {
 		cleanup()
+		h.releasePrepared(&prepared)
 		return PreparedExecution{}, ExecutionCapture{}, nil, nil, invalidInput("prepared execution requires a non-nil opener")
 	}
 	if err := validateExecutionCapture(prepared.Capture); err != nil {
 		cleanup()
+		h.releasePrepared(&prepared)
 		return PreparedExecution{}, ExecutionCapture{}, nil, nil, invalidInput("prepared execution capture: %v", err)
 	}
 	capture := ownCapture(prepared.Capture)
 
 	if err := ctx.Err(); err != nil { // caller cancellation wins when both contexts are done
 		cleanup()
+		h.releasePrepared(&prepared)
 		return PreparedExecution{}, ExecutionCapture{}, nil, nil, err
 	}
 	if err := h.ctx.Err(); err != nil {
 		cleanup()
+		h.releasePrepared(&prepared)
 		return PreparedExecution{}, ExecutionCapture{}, nil, nil, h.ctx.Err()
 	}
 	return prepared, capture, prepCtx, cleanup, nil
+}
+
+// releasePrepared runs one preparation reservation's release exactly once and
+// retains its failure through the cleanup channel the Harness keeps for Wait,
+// never rewriting a committed terminal. A nil Release means the preparation
+// reserved nothing. Clearing the copied Release enforces once-only ownership
+// within one holder.
+func (h *Harness) releasePrepared(prepared *PreparedExecution) {
+	if prepared == nil || prepared.Release == nil {
+		return
+	}
+	release := prepared.Release
+	prepared.Release = nil
+	h.recordCleanupFailure(release())
 }
 
 // publicationError keeps the caller-facing cancellation class at the
@@ -1645,8 +1854,8 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 	c.mu.Unlock()
 	h.observeInvalidation(c)
 	go func() {
-		res, closeExecution, err := h.execute(c, operationID, prepared, run.execCtx)
-		_ = h.finishExecution(c, run, operationID, res, err, closeExecution)
+		res, closeInvocation, closeExecution, err := h.execute(c, operationID, prepared, run.execCtx)
+		_ = h.finishExecution(c, run, operationID, prepared, res, err, closeInvocation, closeExecution)
 		retired := false
 		c.mu.Lock()
 		if c.run == run { // a buffered drain may have installed the next execution already
@@ -1720,7 +1929,9 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 		})
 		if err != nil || disposition != DispositionAdmitted || prepared == nil {
 			// one failed delivery attempt is final for the item: the selected
-			// head leaves its buffer as the attempt's final outcome
+			// head leaves its buffer as the attempt's final outcome; an
+			// admission that does not adopt its prepared execution already
+			// released it
 			c.mu.Lock()
 			dropped := c.dropBufferedLocked(item)
 			if dropped {
@@ -1737,10 +1948,12 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 	}
 }
 
-// recordStorageFailure retains the first storage-class failure that stopped
-// admitted work; later failures never replace it.
+// recordStorageFailure retains the first storage-class failure or marked
+// publication failure that stopped admitted work — whatever the cause's own
+// identity, Is/As preserved through the wrapper; later failures never replace
+// it.
 func (h *Harness) recordStorageFailure(err error) {
-	if err == nil || !errors.Is(err, ErrStorage) {
+	if err == nil || (!errors.Is(err, ErrStorage) && !isPublicationFailure(err)) {
 		return
 	}
 	h.mu.Lock()
@@ -1902,6 +2115,9 @@ func ownCapture(c ExecutionCapture) ExecutionCapture {
 	} else {
 		out.Capabilities = append([]string(nil), c.Capabilities...)
 	}
+	out.Pricing = c.Pricing.Clone()
+	out.Compact.Pricing = c.Compact.Pricing.Clone()
+	out.Strategy.Settings = model.CloneRaw(c.Strategy.Settings)
 	return out
 }
 
@@ -1934,8 +2150,14 @@ func ownOperationRecord(rec OperationRecord) OperationRecord {
 	out.State.PendingToolCalls = make([]PendingToolCall, len(rec.State.PendingToolCalls))
 	copy(out.State.PendingToolCalls, rec.State.PendingToolCalls)
 	if rec.State.ActiveEffect != nil {
-		effect := *rec.State.ActiveEffect
-		out.State.ActiveEffect = &effect
+		out.State.ActiveEffect = ownActiveEffect(rec.State.ActiveEffect)
+	}
+	if rec.State.Request != nil {
+		request := *rec.State.Request
+		if rec.State.Request.HookResults != nil {
+			request.HookResults = append([]EntryRef(nil), rec.State.Request.HookResults...)
+		}
+		out.State.Request = &request
 	}
 	if rec.State.SettledAt != nil {
 		stamped := *rec.State.SettledAt
@@ -1946,4 +2168,23 @@ func ownOperationRecord(rec OperationRecord) OperationRecord {
 		out.State.Terminal = &terminal
 	}
 	return out
+}
+
+// ownActiveEffect returns an independent owned copy of one active effect:
+// nested evidence, model pointee, raw selection bytes, and provenance lists
+// are deep-copied so a public read can never alias the coordinator's state.
+func ownActiveEffect(effect *ActiveEffect) *ActiveEffect {
+	out := *effect
+	if effect.Model != nil {
+		modelRef := *effect.Model
+		out.Model = &modelRef
+	}
+	if effect.Evidence != nil {
+		out.Evidence = copyRequestEvidencePointer(effect.Evidence)
+	}
+	out.FinalArguments = model.CloneRaw(effect.FinalArguments)
+	if effect.ContributionIDs != nil {
+		out.ContributionIDs = append([]HookIdentity(nil), effect.ContributionIDs...)
+	}
+	return &out
 }

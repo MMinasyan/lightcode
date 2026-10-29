@@ -30,9 +30,10 @@ const (
 
 	// sqliteSchemaVersion is the only accepted schema version; it is stamped
 	// into PRAGMA user_version at initialization and checked at open. Version
-	// 7 is the changed capture and settlement payloads; the SQL tables are
-	// unchanged.
-	sqliteSchemaVersion = 7
+	// 13 is the operation-state unreported_maintenance payload member and the
+	// removal of the captured model-pricing cache_write rate; the SQL tables
+	// are unchanged.
+	sqliteSchemaVersion = 13
 
 	// sqlitePoolDSN configures every physical connection of the long-lived
 	// pool: write-ahead logging, full synchronous durability, immediate
@@ -55,7 +56,7 @@ const sqliteEntriesDDL = `CREATE TABLE entries (
     operation_id    TEXT    NOT NULL,
     kind            TEXT    NOT NULL CHECK (kind IN (
         'input', 'assistant', 'tool_result', 'signal',
-        'hook_result', 'compaction', 'operation_settlement'
+        'hook_result', 'context_checkpoint', 'operation_settlement'
     )),
     committed_at_ns INTEGER NOT NULL CHECK (committed_at_ns > 0),
     payload         TEXT    NOT NULL CHECK (json_valid(payload)),

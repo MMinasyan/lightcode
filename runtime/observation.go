@@ -299,14 +299,17 @@ func toolStartedEvent(scope protocol.Scope, callID string, ordinal int64, name s
 	return event
 }
 
-// toolFinishedEvent builds one committed tool-result hint.
-func toolFinishedEvent(scope protocol.Scope, callID string, status model.ToolResultStatus) Event {
+// toolFinishedEvent builds one committed tool-result hint carrying the
+// result's closed execution evidence.
+func toolFinishedEvent(scope protocol.Scope, callID string, status model.ToolResultStatus, evidence harness.ExecutionEvidence) Event {
 	var event Event
+	value := protocol.ExecutionEvidence(evidence)
 	_ = event.FromToolFinishedEvent(protocol.ToolFinishedEvent{ // plain members; the marshal cannot fail
-		Kind:   protocol.ToolFinished,
-		Scope:  scope,
-		CallId: callID,
-		Status: protocol.ToolCallStatus(status),
+		Kind:     protocol.ToolFinished,
+		Scope:    scope,
+		CallId:   callID,
+		Status:   protocol.ToolCallStatus(status),
+		Evidence: &value,
 	})
 	return event
 }
@@ -368,7 +371,7 @@ func (a *observationAdapter) observe(fact harness.HarnessFact) {
 			return []Event{toolStartedEvent(scope, fact.CallID, fact.Ordinal, fact.Name)}
 		case harness.FactToolFinished:
 			scope := operationEventScope(identity.Workspace, fact.SessionID, fact.OperationID)
-			return []Event{toolFinishedEvent(scope, fact.CallID, fact.Status)}
+			return []Event{toolFinishedEvent(scope, fact.CallID, fact.Status, fact.Evidence)}
 		}
 		return nil
 	})

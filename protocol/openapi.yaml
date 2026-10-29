@@ -1,13 +1,13 @@
 # Lightcode Runtime protocol — the single source of truth for HTTP paths,
 # request/response DTOs, closed enums, error payloads, and SSE event frames.
-# Wire version "2" is the protocol identity, independent of the binary
+# Wire version "6" is the protocol identity, independent of the binary
 # release version. This file is hand-maintained; the Go and TypeScript
 # artifacts under protocol/ and frontend/src/generated/protocol/ are
 # generated from it and are never hand-edited.
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "2"
+  version: "6"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -801,6 +801,16 @@ components:
         - error
         - denied
         - interrupted
+    ExecutionEvidence:
+      description: >-
+        One settled tool call's execution knowledge, independent of its
+        status: proven unstarted work, a produced terminal outcome, or a
+        possibly-executed-but-unverified external outcome.
+      type: string
+      enum:
+        - not_started
+        - observed
+        - unknown
     SystemRole:
       type: string
       enum:
@@ -878,7 +888,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "2"
+            - "6"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -1135,6 +1145,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ModelUsage"
+        estimated_cost_usd:
+          type: number
+          format: double
+          description: Approximate total cost in USD computed at read time from the model prices captured at each producer's admission (rates are USD per million tokens). Absent means unknown, never zero; a present zero is a known zero estimate.
     UsageContext:
       type: object
       additionalProperties: false
@@ -1328,6 +1342,21 @@ components:
           $ref: "#/components/schemas/ToolCallStatus"
         content:
           type: string
+        original_content:
+          type: string
+          description: >-
+            The producer's original unshaped result content behind the
+            model-facing content: carried beside content for client
+            inspection and never sent to the model.
+        shaping_failure:
+          type: string
+          description: >-
+            The bounded processing-failure diagnostic of an aborted pure
+            output-shaping chain, present only beside a settled result whose
+            shaping failed; the stored content then carries the original
+            outcome.
+        evidence:
+          $ref: "#/components/schemas/ExecutionEvidence"
         metadata:
           $ref: "#/components/schemas/ToolMetadata"
         extra:
@@ -1433,31 +1462,82 @@ components:
           type: string
         related_member:
           $ref: "#/components/schemas/BackgroundMember"
-    CompactionItem:
+    CheckpointItem:
       type: object
       additionalProperties: false
       required:
         - item_id
         - kind
         - committed_at
-        - summary
-        - model
+        - strategy
+        - messages
       properties:
         item_id:
           type: string
         kind:
           type: string
           enum:
-            - compaction
+            - context_checkpoint
         committed_at:
           type: string
           format: date-time
         operation_id:
           type: string
-        summary:
+        strategy:
           type: string
         model:
           $ref: "#/components/schemas/ModelRef"
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/Message"
+    Message:
+      type: object
+      additionalProperties: false
+      required:
+        - role
+      properties:
+        role:
+          type: string
+          enum:
+            - system
+            - user
+            - assistant
+            - tool
+        source:
+          $ref: "#/components/schemas/ModelRef"
+        content:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContentPart"
+        refusal:
+          type: string
+        name:
+          type: string
+        tool_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageToolCall"
+        tool_call_id:
+          type: string
+        extra:
+          $ref: "#/components/schemas/JSONObject"
+    MessageToolCall:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - arguments_base64
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        arguments_base64:
+          type: string
+        extra:
+          $ref: "#/components/schemas/JSONObject"
     OperationEndItem:
       type: object
       additionalProperties: false
@@ -1492,7 +1572,7 @@ components:
         - $ref: "#/components/schemas/InputItem"
         - $ref: "#/components/schemas/AssistantItem"
         - $ref: "#/components/schemas/SignalItem"
-        - $ref: "#/components/schemas/CompactionItem"
+        - $ref: "#/components/schemas/CheckpointItem"
         - $ref: "#/components/schemas/OperationEndItem"
       discriminator:
         propertyName: kind
@@ -1500,7 +1580,7 @@ components:
           input: "#/components/schemas/InputItem"
           assistant: "#/components/schemas/AssistantItem"
           signal: "#/components/schemas/SignalItem"
-          compaction: "#/components/schemas/CompactionItem"
+          context_checkpoint: "#/components/schemas/CheckpointItem"
           operation_end: "#/components/schemas/OperationEndItem"
     ConversationPage:
       type: object
@@ -2547,6 +2627,8 @@ components:
           type: string
         status:
           $ref: "#/components/schemas/ToolCallStatus"
+        evidence:
+          $ref: "#/components/schemas/ExecutionEvidence"
     Event:
       oneOf:
         - $ref: "#/components/schemas/ConfigurationChangedEvent"

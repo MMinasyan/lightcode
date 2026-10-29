@@ -4,6 +4,7 @@
 // replayed; positions are not sequence numbers. Events that do not address the
 // accepted Operation are refused by the caller without mutating this state.
 import type {
+  ExecutionEvidence,
   RefusalDeltaEvent,
   TextDeltaEvent,
   ToolCallStatus,
@@ -18,6 +19,7 @@ export interface ToolActivity {
   callID: string;
   name: string;
   status: ToolCallStatus | null;
+  evidence: ExecutionEvidence | null;
 }
 
 export type PieceKind = 'text' | 'refusal';
@@ -128,11 +130,16 @@ export class ProvisionalActivity implements Readable<ProvisionalActivity> {
       const index = state.tools.findIndex((tool) => tool.callID === event.call_id);
       if (index === -1) {
         state.tools = [...state.tools, event.kind === 'tool_started'
-          ? { callID: event.call_id, name: event.name, status: null }
-          : { callID: event.call_id, name: '', status: event.status }];
+          ? { callID: event.call_id, name: event.name, status: null, evidence: null }
+          : { callID: event.call_id, name: '', status: event.status, evidence: event.evidence ?? null }];
       } else {
         state.tools = state.tools.map((tool, i) => (i === index
-          ? { ...tool, name: event.kind === 'tool_started' ? event.name : tool.name, status: event.kind === 'tool_started' ? null : event.status }
+          ? {
+              ...tool,
+              name: event.kind === 'tool_started' ? event.name : tool.name,
+              status: event.kind === 'tool_started' ? null : event.status,
+              evidence: event.kind === 'tool_started' ? null : (event.evidence ?? null),
+            }
           : tool));
       }
     }

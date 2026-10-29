@@ -169,7 +169,7 @@ export function itemID(item: ConversationItem): string {
     case 'input':
     case 'assistant':
     case 'signal':
-    case 'compaction':
+    case 'context_checkpoint':
     case 'operation_end':
       if (typeof candidate.item_id !== 'string' || candidate.item_id === '') {
         throw new Error(`conversation item ${candidate.kind} has an empty item_id`);

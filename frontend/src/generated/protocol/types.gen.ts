@@ -16,6 +16,11 @@ export type InputOrigin = 'user' | 'runtime' | 'plugin';
 
 export type ToolCallStatus = 'success' | 'error' | 'denied' | 'interrupted';
 
+/**
+ * One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
+ */
+export type ExecutionEvidence = 'not_started' | 'observed' | 'unknown';
+
 export type SystemRole = 'system' | 'user' | 'developer';
 
 export type ModelSource = 'bundled' | 'discovered' | 'user';
@@ -46,7 +51,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '2';
+    protocol_version: '6';
 };
 
 /**
@@ -154,6 +159,10 @@ export type ModelUsage = {
 
 export type UsageTotals = {
     by_model: Array<ModelUsage>;
+    /**
+     * Approximate total cost in USD computed at read time from the model prices captured at each producer's admission (rates are USD per million tokens). Absent means unknown, never zero; a present zero is a known zero estimate.
+     */
+    estimated_cost_usd?: number;
 };
 
 export type UsageContext = {
@@ -232,6 +241,15 @@ export type ToolCallView = {
     normalized_arguments?: JsonObject;
     status?: ToolCallStatus;
     content?: string;
+    /**
+     * The producer's original unshaped result content behind the model-facing content: carried beside content for client inspection and never sent to the model.
+     */
+    original_content?: string;
+    /**
+     * The bounded processing-failure diagnostic of an aborted pure output-shaping chain, present only beside a settled result whose shaping failed; the stored content then carries the original outcome.
+     */
+    shaping_failure?: string;
+    evidence?: ExecutionEvidence;
     metadata?: ToolMetadata;
     extra?: JsonObject;
 };
@@ -268,13 +286,32 @@ export type SignalItem = {
     related_member?: BackgroundMember;
 };
 
-export type CompactionItem = {
+export type CheckpointItem = {
     item_id: string;
-    kind: 'compaction';
+    kind: 'context_checkpoint';
     committed_at: string;
     operation_id?: string;
-    summary: string;
-    model: ModelRef;
+    strategy: string;
+    model?: ModelRef;
+    messages: Array<Message>;
+};
+
+export type Message = {
+    role: 'system' | 'user' | 'assistant' | 'tool';
+    source?: ModelRef;
+    content?: Array<ContentPart>;
+    refusal?: string;
+    name?: string;
+    tool_calls?: Array<MessageToolCall>;
+    tool_call_id?: string;
+    extra?: JsonObject;
+};
+
+export type MessageToolCall = {
+    id: string;
+    name: string;
+    arguments_base64: string;
+    extra?: JsonObject;
 };
 
 export type OperationEndItem = {
@@ -293,8 +330,8 @@ export type ConversationItem = ({
 } & AssistantItem) | ({
     kind: 'signal';
 } & SignalItem) | ({
-    kind: 'compaction';
-} & CompactionItem) | ({
+    kind: 'context_checkpoint';
+} & CheckpointItem) | ({
     kind: 'operation_end';
 } & OperationEndItem);
 
@@ -731,6 +768,7 @@ export type ToolFinishedEvent = {
     scope: Scope;
     call_id: string;
     status: ToolCallStatus;
+    evidence?: ExecutionEvidence;
 };
 
 export type Event = ({

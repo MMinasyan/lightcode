@@ -146,10 +146,14 @@ func projectOperation(record harness.OperationRecord) protocol.Operation {
 	return projectOperationSummary(summary)
 }
 
-// projectOperationSummary maps one value-only Operation summary to its
-// generated header: the same projection rule the full-register adapter
-// consumes.
+// projectOperationSummary maps one value-only summary to its generated
+// header: the same projection rule the full-register adapter consumes, plus
+// the read-only approximate USD estimate the composed view carries. A summary
+// assembled from a raw register carries no estimate, so the optional wire
+// member stays absent there.
 func projectOperationSummary(summary harness.OperationSummary) protocol.Operation {
+	usage := projectUsage(summary.Usage)
+	usage.EstimatedCostUsd = summary.EstimatedCostUSD
 	op := protocol.Operation{
 		AdmittedAt:  summary.AdmittedAt.UTC(),
 		AgentType:   summary.AgentType,
@@ -157,7 +161,7 @@ func projectOperationSummary(summary harness.OperationSummary) protocol.Operatio
 		OperationId: summary.OperationID,
 		RequestKind: protocol.OperationRequestKind(summary.RequestKind),
 		Status:      protocol.OperationStatus(summary.Status),
-		Usage:       projectUsage(summary.Usage),
+		Usage:       usage,
 	}
 	if summary.SettledAt != nil {
 		settled := summary.SettledAt.UTC()
@@ -275,12 +279,17 @@ func projectConversationItem(sessionID string, fact harness.HistoryFact, results
 	case harness.EntrySignal:
 		err = item.FromSignalItem(projectSignalItem(id, fact))
 	case harness.EntryCompaction:
-		err = item.FromCompactionItem(protocol.CompactionItem{
+		messages, messageErr := projectMessages(fact.Checkpoint.Messages)
+		if messageErr != nil {
+			return nil, fmt.Errorf("project checkpoint entry %q: %w", fact.EntryID, messageErr)
+		}
+		err = item.FromCheckpointItem(protocol.CheckpointItem{
 			ItemId:      id,
 			CommittedAt: fact.CommittedAt.UTC(),
 			OperationId: operationAttribution(fact.OperationID),
-			Summary:     fact.Compaction.Summary,
-			Model:       fact.Compaction.Model.String(),
+			Strategy:    fact.Checkpoint.StrategyID,
+			Model:       checkpointDisplayModel(fact.Checkpoint),
+			Messages:    messages,
 		})
 	case harness.EntryOperationSettlement:
 		err = item.FromOperationEndItem(protocol.OperationEndItem{
@@ -349,8 +358,10 @@ func projectAssistantItem(id string, fact harness.HistoryFact, results map[strin
 // the native JSON string encoding supplies the UTF-8 replacement. A terminal
 // result matched by the call's reserved result identity contributes its
 // status, its model-visible content (an empty success content stays present),
-// and its preserved tool-owned metadata for every terminal status alike; a
-// pending call omits all three and never gains a fabricated outcome.
+// its original unshaped content beside it, its bounded shaping failure when a
+// pure output-shaping chain aborted, its preserved tool-owned metadata for
+// every terminal status alike, and its committed execution evidence; a
+// pending call omits them all and never gains a fabricated outcome.
 func projectToolCall(call harness.ToolCallRecord, results map[string]harness.ToolResultEntry) (protocol.ToolCallView, error) {
 	arguments, err := base64.StdEncoding.Strict().DecodeString(call.ArgumentsBase64)
 	if err != nil {
@@ -375,8 +386,16 @@ func projectToolCall(call harness.ToolCallRecord, results map[string]harness.Too
 	}
 	status := protocol.ToolCallStatus(result.Status)
 	content := result.Content
+	evidence := protocol.ExecutionEvidence(result.Evidence)
 	view.Status = &status
 	view.Content = &content
+	view.Evidence = &evidence
+	original := result.OriginalContent
+	view.OriginalContent = &original
+	if result.ShapingFailure != "" {
+		failure := result.ShapingFailure
+		view.ShapingFailure = &failure
+	}
 	if len(result.Metadata) > 0 {
 		metadata := protocol.ToolMetadata(result.Metadata)
 		view.Metadata = &metadata
@@ -399,6 +418,72 @@ func projectSignalItem(id string, fact harness.HistoryFact) protocol.SignalItem 
 		item.RelatedMember = &protocol.BackgroundMember{Kind: protocol.BackgroundMemberKind(member.Kind), Id: member.ID}
 	}
 	return item
+}
+
+// projectMessages maps one validated checkpoint message list to its
+// generated wire messages: the role, the content parts through the shared
+// part projector, the optional producing source, refusal, name and extras,
+// and the retained tool exchange members with their raw argument bytes
+// preserved as canonical base64.
+func projectMessages(messages []model.Message) ([]protocol.Message, error) {
+	out := make([]protocol.Message, 0, len(messages))
+	for _, m := range messages {
+		content, err := projectContentParts(m.Content)
+		if err != nil {
+			return nil, err
+		}
+		wire := protocol.Message{Role: protocol.MessageRole(m.Role)}
+		if len(content) > 0 {
+			wire.Content = &content
+		}
+		if !m.Source.IsZero() {
+			source := m.Source.String()
+			wire.Source = &source
+		}
+		if m.Refusal != "" {
+			refusal := m.Refusal
+			wire.Refusal = &refusal
+		}
+		if m.Name != "" {
+			name := m.Name
+			wire.Name = &name
+		}
+		if len(m.Extra) > 0 {
+			wire.Extra = extraObject(m.Extra)
+		}
+		if len(m.ToolCalls) > 0 {
+			calls := make([]protocol.MessageToolCall, 0, len(m.ToolCalls))
+			for _, call := range m.ToolCalls {
+				view := protocol.MessageToolCall{
+					Id:              call.ID,
+					Name:            call.Name,
+					ArgumentsBase64: base64.StdEncoding.EncodeToString(call.Arguments),
+				}
+				if len(call.Extra) > 0 {
+					view.Extra = extraObject(call.Extra)
+				}
+				calls = append(calls, view)
+			}
+			wire.ToolCalls = &calls
+		}
+		if m.ToolCallID != "" {
+			callID := m.ToolCallID
+			wire.ToolCallId = &callID
+		}
+		out = append(out, wire)
+	}
+	return out, nil
+}
+
+// checkpointDisplayModel renders the checkpoint's optional display
+// provenance: the lead producing maintenance model when the procedure
+// recorded facts, absent when no model produced the checkpoint.
+func checkpointDisplayModel(entry *harness.ContextCheckpointEntry) *protocol.ModelRef {
+	if len(entry.Facts) == 0 {
+		return nil
+	}
+	model := entry.Facts[0].Model.String()
+	return &model
 }
 
 // projectContentParts maps one validated content list to its generated
@@ -658,8 +743,10 @@ func resolveSessionSelection(agentType string, captured *configuration) sessionS
 // display estimate plus the context window of the shared selection
 // resolution.
 func projectSessionUsage(view harness.SessionReadView, measured *harness.UsageCount, selection sessionSelection) protocol.UsageProjection {
+	totals := projectUsage(view.TotalUsage)
+	totals.EstimatedCostUsd = view.EstimatedCostUSD
 	return protocol.UsageProjection{
-		Totals:  projectUsage(view.TotalUsage),
+		Totals:  totals,
 		Context: protocol.UsageContext{UsedTokens: projectUsedTokens(measured), ContextWindow: sessionContextWindow(view, selection)},
 	}
 }

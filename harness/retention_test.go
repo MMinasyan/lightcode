@@ -90,6 +90,7 @@ func TestFinalReleaseLeavesNoIdleGraph(t *testing.T) {
 	reservation()
 	testassert.Require(t, err == nil && disposition == DispositionAdmitted, "admission = %q err %v, want a new admission", disposition, err)
 	testassert.Require(t, prepared != nil, "the admission returned no prepared execution")
+	h.releasePrepared(prepared) // this fixture never installs the execution: the reservation it was handed releases here
 	{
 		_, err := h.Submit(ctx, SubmitRequest{
 			SessionID:   buffered,

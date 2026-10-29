@@ -127,9 +127,20 @@ func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
 		},
 		{
 			EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa08", OperationID: "op-2", Sequence: 6, CommittedAt: convTime, Kind: harness.EntryCompaction,
-			Compaction: &harness.CompactionEntry{
+			Checkpoint: &harness.ContextCheckpointEntry{
 				SessionID: convSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa08", OperationID: "op-2",
-				Summary: "summary two", Model: model.ModelRef{Provider: "prov", Model: "m2"},
+				StrategyID: "melta.summary/v1",
+				Messages: []model.Message{
+					{Role: model.RoleAssistant, Source: model.ModelRef{Provider: "prov", Model: "m2"}, Content: []model.ContentPart{{Kind: model.PartText, Text: "summary two"}}, Refusal: "declined"},
+				},
+				BoundaryEntryID:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06",
+				ConfigurationRevision: "rev-1",
+				Facts: []harness.MaintenanceFact{{
+					RequestID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa11",
+					Model:     model.ModelRef{Provider: "prov", Model: "m2"},
+					Input:     []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "transcript"}}}},
+				}},
+				Evidence: &harness.RequestEvidence{BoundaryEntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06"},
 			},
 		},
 		{
@@ -190,8 +201,8 @@ func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
 	testassert.Require(t, completion.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06"), "completion item_id = %q, want the fixture entry's namespace identity", completion.ItemId)
 
 	// The compaction and terminal outcomes, each at its own entry's identity.
-	compaction, err := items[4].AsCompactionItem()
-	testassert.Require(t, err == nil && compaction.Summary == "summary two" && compaction.Model == "prov/m2" && compaction.OperationId != nil && *compaction.OperationId == "op-2", "compaction item = %+v err %v, want the op-2 compaction", compaction, err)
+	compaction, err := items[4].AsCheckpointItem()
+	testassert.Require(t, err == nil && len(compaction.Messages) == 1 && compaction.Messages[0].Role == protocol.MessageRoleAssistant && compaction.Messages[0].Content != nil && compaction.Messages[0].Refusal != nil && *compaction.Messages[0].Refusal == "declined" && compaction.Strategy == "melta.summary/v1" && compaction.Model != nil && *compaction.Model == "prov/m2" && compaction.OperationId != nil && *compaction.OperationId == "op-2", "compaction item = %+v err %v, want the op-2 compaction carrying its refusal", compaction, err)
 	testassert.Require(t, compaction.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa08"), "compaction item_id = %q, want the fixture entry's namespace identity", compaction.ItemId)
 	failureEnd, err := items[5].AsOperationEndItem()
 	testassert.Require(t, err == nil && failureEnd.Status == protocol.OperationEndItemStatusFailure && failureEnd.Detail == "boom", "failure end item = %+v err %v, want the failure detail", failureEnd, err)
@@ -1064,11 +1075,20 @@ func TestConversationProjectionCompactionTwiceRetainsEarlierItems(t *testing.T) 
 		var sawEnds int
 		for _, item := range items {
 			switch itemKind(t, item) {
-			case "compaction":
-				compaction, err := item.AsCompactionItem()
+			case "context_checkpoint":
+				compaction, err := item.AsCheckpointItem()
 				testassert.NoError(t, err)
 				compactions++
-				testassert.Require(t, compaction.Summary != "" && compaction.Model == "prov/m", "compaction item = %+v, want the summary and model", compaction)
+				compactionText := ""
+				if len(compaction.Messages) > 0 && compaction.Messages[0].Content != nil {
+					parts := *compaction.Messages[0].Content
+					if len(parts) > 0 {
+						if text, terr := parts[0].AsTextPart(); terr == nil {
+							compactionText = text.Text
+						}
+					}
+				}
+				testassert.Require(t, compactionText != "" && compaction.Model != nil && *compaction.Model == "prov/m", "compaction item = %+v, want the summary and model", compaction)
 			case "input":
 				input, err := item.AsInputItem()
 				testassert.NoError(t, err)
@@ -1211,4 +1231,51 @@ func TestConversationProjectionOverEmptySession(t *testing.T) {
 	session := projectionSession(t, r, "/tmp/conv-empty", "solo").Identity.SessionID
 	items := projectSessionItems(t, r, session)
 	testassert.Require(t, items != nil && len(items) == 0, "items = %v, want the present empty list", items)
+}
+
+// TestProjectCheckpointMessageWireFields proves the checkpoint message wire
+// fields: refusal, name, extras and the retained tool exchange members ride
+// the generated Message with byte-preserving arguments, and a checkpoint no
+// model produced omits the singular display model instead of fabricating
+// one.
+func TestProjectCheckpointMessageWireFields(t *testing.T) {
+	arguments := []byte{0x7b, 0xff, 0x00, 0x7d} // not valid JSON
+	facts := []harness.HistoryFact{
+		{
+			EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa21", Sequence: 1, CommittedAt: convTime, Kind: harness.EntryCompaction,
+			Checkpoint: &harness.ContextCheckpointEntry{
+				SessionID: convSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa21",
+				StrategyID: "test.strategy/v1",
+				Messages: []model.Message{
+					{
+						Role:      model.RoleAssistant,
+						Source:    model.ModelRef{Provider: "prov", Model: "m2"},
+						Content:   []model.ContentPart{{Kind: model.PartText, Text: "calling"}},
+						Refusal:   "declined",
+						Name:      "named",
+						Extra:     model.Extra{"vendor": json.RawMessage(`1`)},
+						ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: arguments, Extra: model.Extra{"call": json.RawMessage(`"x"`)}}},
+					},
+					{Role: model.RoleTool, ToolCallID: "call-1", Content: []model.ContentPart{{Kind: model.PartText, Text: "done"}}},
+				},
+				BoundaryEntryID:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa21",
+				ConfigurationRevision: "rev-1",
+			},
+		},
+	}
+	items, err := projectConversation(convSessionID, facts)
+	testassert.NoError(t, err)
+	testassert.Require(t, len(items) == 1, "items = %+v, want the one checkpoint item", items)
+	item, err := items[0].AsCheckpointItem()
+	testassert.NoError(t, err)
+	testassert.Require(t, item.Model == nil, "model = %v, want absent when no model produced the checkpoint", item.Model)
+	testassert.Equal(t, item.Strategy, "test.strategy/v1")
+	testassert.Require(t, len(item.Messages) == 2, "messages = %+v, want the retained tool exchange pair", item.Messages)
+	call := item.Messages[0]
+	testassert.Require(t, call.Refusal != nil && *call.Refusal == "declined" && call.Name != nil && *call.Name == "named" && call.Extra != nil && string((*call.Extra)["vendor"]) == `1`, "wire message = %+v, want refusal, name and extras preserved", call)
+	testassert.Require(t, call.ToolCalls != nil && len(*call.ToolCalls) == 1, "tool calls = %+v, want the retained call", call.ToolCalls)
+	wireCall := (*call.ToolCalls)[0]
+	testassert.Require(t, wireCall.Id == "call-1" && wireCall.Name == "echo" && wireCall.ArgumentsBase64 == base64.StdEncoding.EncodeToString(arguments) && wireCall.Extra != nil && string((*wireCall.Extra)["call"]) == `"x"`, "wire tool call = %+v, want byte-preserving arguments and extras", wireCall)
+	result := item.Messages[1]
+	testassert.Require(t, result.Role == protocol.MessageRoleTool && result.ToolCallId != nil && *result.ToolCallId == "call-1" && result.Content != nil, "wire tool result = %+v, want the paired result message", result)
 }

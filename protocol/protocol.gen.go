@@ -37,13 +37,13 @@ func (e AgentScopeKind) Valid() bool {
 
 // Defines values for AssistantItemKind.
 const (
-	Assistant AssistantItemKind = "assistant"
+	AssistantItemKindAssistant AssistantItemKind = "assistant"
 )
 
 // Valid indicates whether the value is a known member of the AssistantItemKind enum.
 func (e AssistantItemKind) Valid() bool {
 	switch e {
-	case Assistant:
+	case AssistantItemKindAssistant:
 		return true
 	default:
 		return false
@@ -89,15 +89,15 @@ func (e BackgroundMemberKind) Valid() bool {
 	}
 }
 
-// Defines values for CompactionItemKind.
+// Defines values for CheckpointItemKind.
 const (
-	Compaction CompactionItemKind = "compaction"
+	ContextCheckpoint CheckpointItemKind = "context_checkpoint"
 )
 
-// Valid indicates whether the value is a known member of the CompactionItemKind enum.
-func (e CompactionItemKind) Valid() bool {
+// Valid indicates whether the value is a known member of the CheckpointItemKind enum.
+func (e CheckpointItemKind) Valid() bool {
 	switch e {
-	case Compaction:
+	case ContextCheckpoint:
 		return true
 	default:
 		return false
@@ -158,15 +158,36 @@ func (e ErrorCode) Valid() bool {
 	}
 }
 
+// Defines values for ExecutionEvidence.
+const (
+	NotStarted ExecutionEvidence = "not_started"
+	Observed   ExecutionEvidence = "observed"
+	Unknown    ExecutionEvidence = "unknown"
+)
+
+// Valid indicates whether the value is a known member of the ExecutionEvidence enum.
+func (e ExecutionEvidence) Valid() bool {
+	switch e {
+	case NotStarted:
+		return true
+	case Observed:
+		return true
+	case Unknown:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for HealthProtocolVersion.
 const (
-	N2 HealthProtocolVersion = "2"
+	N6 HealthProtocolVersion = "6"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N2:
+	case N6:
 		return true
 	default:
 		return false
@@ -263,6 +284,30 @@ func (e JobScopeKind) Valid() bool {
 	}
 }
 
+// Defines values for MessageRole.
+const (
+	MessageRoleAssistant MessageRole = "assistant"
+	MessageRoleSystem    MessageRole = "system"
+	MessageRoleTool      MessageRole = "tool"
+	MessageRoleUser      MessageRole = "user"
+)
+
+// Valid indicates whether the value is a known member of the MessageRole enum.
+func (e MessageRole) Valid() bool {
+	switch e {
+	case MessageRoleAssistant:
+		return true
+	case MessageRoleSystem:
+		return true
+	case MessageRoleTool:
+		return true
+	case MessageRoleUser:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ModelField.
 const (
 	ModelFieldContextWindow    ModelField = "context_window"
@@ -343,16 +388,16 @@ func (e OpaquePartKind) Valid() bool {
 
 // Defines values for OperationRequestKind.
 const (
-	Compact OperationRequestKind = "compact"
-	Message OperationRequestKind = "message"
+	OperationRequestKindCompact OperationRequestKind = "compact"
+	OperationRequestKindMessage OperationRequestKind = "message"
 )
 
 // Valid indicates whether the value is a known member of the OperationRequestKind enum.
 func (e OperationRequestKind) Valid() bool {
 	switch e {
-	case Compact:
+	case OperationRequestKindCompact:
 		return true
-	case Message:
+	case OperationRequestKindMessage:
 		return true
 	default:
 		return false
@@ -874,6 +919,22 @@ type BackgroundMember struct {
 // BackgroundMemberKind defines model for BackgroundMember.Kind.
 type BackgroundMemberKind string
 
+// CheckpointItem defines model for CheckpointItem.
+type CheckpointItem struct {
+	CommittedAt time.Time          `json:"committed_at"`
+	ItemId      string             `json:"item_id"`
+	Kind        CheckpointItemKind `json:"kind"`
+	Messages    []Message          `json:"messages"`
+
+	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
+	Model       *ModelRef `json:"model,omitempty"`
+	OperationId *string   `json:"operation_id,omitempty"`
+	Strategy    string    `json:"strategy"`
+}
+
+// CheckpointItemKind defines model for CheckpointItem.Kind.
+type CheckpointItemKind string
+
 // CodeRevertError defines model for CodeRevertError.
 type CodeRevertError struct {
 	union json.RawMessage
@@ -897,21 +958,6 @@ type CodeSnapshotGroup struct {
 type CompactRequest struct {
 	OperationId string `json:"operation_id"`
 }
-
-// CompactionItem defines model for CompactionItem.
-type CompactionItem struct {
-	CommittedAt time.Time          `json:"committed_at"`
-	ItemId      string             `json:"item_id"`
-	Kind        CompactionItemKind `json:"kind"`
-
-	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
-	Model       ModelRef `json:"model"`
-	OperationId *string  `json:"operation_id,omitempty"`
-	Summary     string   `json:"summary"`
-}
-
-// CompactionItemKind defines model for CompactionItem.Kind.
-type CompactionItemKind string
 
 // ConfigurationChangedEvent defines model for ConfigurationChangedEvent.
 type ConfigurationChangedEvent struct {
@@ -1015,6 +1061,9 @@ type Event struct {
 	union json.RawMessage
 }
 
+// ExecutionEvidence One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
+type ExecutionEvidence string
+
 // ForkRequest defines model for ForkRequest.
 type ForkRequest struct {
 	BoundaryItemId string        `json:"boundary_item_id"`
@@ -1104,6 +1153,35 @@ type JobScope struct {
 
 // JobScopeKind defines model for JobScope.Kind.
 type JobScopeKind string
+
+// Message defines model for Message.
+type Message struct {
+	Content *[]ContentPart `json:"content,omitempty"`
+
+	// Extra One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+	Extra   *JSONObject `json:"extra,omitempty"`
+	Name    *string     `json:"name,omitempty"`
+	Refusal *string     `json:"refusal,omitempty"`
+	Role    MessageRole `json:"role"`
+
+	// Source A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
+	Source     *ModelRef          `json:"source,omitempty"`
+	ToolCallId *string            `json:"tool_call_id,omitempty"`
+	ToolCalls  *[]MessageToolCall `json:"tool_calls,omitempty"`
+}
+
+// MessageRole defines model for Message.Role.
+type MessageRole string
+
+// MessageToolCall defines model for MessageToolCall.
+type MessageToolCall struct {
+	ArgumentsBase64 string `json:"arguments_base64"`
+
+	// Extra One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
+	Extra *JSONObject `json:"extra,omitempty"`
+	Id    string      `json:"id"`
+	Name  string      `json:"name"`
+}
 
 // ModelEdit defines model for ModelEdit.
 type ModelEdit struct {
@@ -1582,6 +1660,9 @@ type ToolCallView struct {
 	Arguments string  `json:"arguments"`
 	Content   *string `json:"content,omitempty"`
 
+	// Evidence One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
+	Evidence *ExecutionEvidence `json:"evidence,omitempty"`
+
 	// Extra One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
 	Extra *JSONObject `json:"extra,omitempty"`
 	Id    string      `json:"id"`
@@ -1591,14 +1672,23 @@ type ToolCallView struct {
 	Name     string        `json:"name"`
 
 	// NormalizedArguments One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
-	NormalizedArguments *JSONObject     `json:"normalized_arguments,omitempty"`
-	Status              *ToolCallStatus `json:"status,omitempty"`
+	NormalizedArguments *JSONObject `json:"normalized_arguments,omitempty"`
+
+	// OriginalContent The producer's original unshaped result content behind the model-facing content: carried beside content for client inspection and never sent to the model.
+	OriginalContent *string `json:"original_content,omitempty"`
+
+	// ShapingFailure The bounded processing-failure diagnostic of an aborted pure output-shaping chain, present only beside a settled result whose shaping failed; the stored content then carries the original outcome.
+	ShapingFailure *string         `json:"shaping_failure,omitempty"`
+	Status         *ToolCallStatus `json:"status,omitempty"`
 }
 
 // ToolFinishedEvent defines model for ToolFinishedEvent.
 type ToolFinishedEvent struct {
-	CallId string                `json:"call_id"`
-	Kind   ToolFinishedEventKind `json:"kind"`
+	CallId string `json:"call_id"`
+
+	// Evidence One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
+	Evidence *ExecutionEvidence    `json:"evidence,omitempty"`
+	Kind     ToolFinishedEventKind `json:"kind"`
 
 	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope  Scope          `json:"scope"`
@@ -1662,6 +1752,9 @@ type UsageProjection struct {
 // UsageTotals defines model for UsageTotals.
 type UsageTotals struct {
 	ByModel []ModelUsage `json:"by_model"`
+
+	// EstimatedCostUsd Approximate total cost in USD computed at read time from the model prices captured at each producer's admission (rates are USD per million tokens). Absent means unknown, never zero; a present zero is a known zero estimate.
+	EstimatedCostUsd *float64 `json:"estimated_cost_usd,omitempty"`
 }
 
 // Warning defines model for Warning.
@@ -2160,31 +2253,31 @@ func (t *ConversationItem) MergeSignalItem(v SignalItem) error {
 	return err
 }
 
-// AsCompactionItem returns the union data inside the ConversationItem as a CompactionItem
-func (t ConversationItem) AsCompactionItem() (CompactionItem, error) {
-	var body CompactionItem
+// AsCheckpointItem returns the union data inside the ConversationItem as a CheckpointItem
+func (t ConversationItem) AsCheckpointItem() (CheckpointItem, error) {
+	var body CheckpointItem
 	err := json.Unmarshal(t.union, &body)
 	return body, err
 }
 
-// FromCompactionItem overwrites any union data inside the ConversationItem as the provided CompactionItem
-func (t *ConversationItem) FromCompactionItem(v CompactionItem) error {
+// FromCheckpointItem overwrites any union data inside the ConversationItem as the provided CheckpointItem
+func (t *ConversationItem) FromCheckpointItem(v CheckpointItem) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	b, err = runtime.JSONMerge(b, []byte(`{"kind":"compaction"}`))
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"context_checkpoint"}`))
 	t.union = b
 	return err
 }
 
-// MergeCompactionItem performs a merge with any union data inside the ConversationItem, using the provided CompactionItem
-func (t *ConversationItem) MergeCompactionItem(v CompactionItem) error {
+// MergeCheckpointItem performs a merge with any union data inside the ConversationItem, using the provided CheckpointItem
+func (t *ConversationItem) MergeCheckpointItem(v CheckpointItem) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	b, err = runtime.JSONMerge(b, []byte(`{"kind":"compaction"}`))
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"context_checkpoint"}`))
 	if err != nil {
 		return err
 	}
@@ -2244,8 +2337,8 @@ func (t ConversationItem) ValueByDiscriminator() (interface{}, error) {
 	switch discriminator {
 	case "assistant":
 		return t.AsAssistantItem()
-	case "compaction":
-		return t.AsCompactionItem()
+	case "context_checkpoint":
+		return t.AsCheckpointItem()
 	case "input":
 		return t.AsInputItem()
 	case "operation_end":

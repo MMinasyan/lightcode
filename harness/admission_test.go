@@ -93,21 +93,21 @@ func newTestHarness(t *testing.T, store Storage, prepare func(context.Context, P
 	return h
 }
 
-// validExecution returns the fixtures' execution: a model function that never
-// returns, so an auto-started execution keeps its Operation current without
-// settling it, a tool function returning an empty plan, and the required pure
-// normalizer. Admission fixtures observe a stable running state.
+// validExecution returns the fixtures' execution: an opener whose invocations
+// carry a model function that never returns, so an auto-started execution
+// keeps its Operation current without settling it, a tool function returning
+// an empty plan, and the required pure normalizer. Admission fixtures observe
+// a stable running state.
 func validExecution() Execution {
-	return Execution{
-		Model: func(context.Context, model.Request) (model.Stream, error) {
-			select {} // the fixture owns the admitted Operation's state assertions
-		},
-		CompactModel: func(context.Context, model.Request) (model.Stream, error) {
-			select {}
-		},
-		Tool:          func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
-		NormalizeTool: objectNormalize,
-	}
+	return Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
+		return InvocationExecution{
+			Model: func(context.Context, model.Request) (model.Stream, error) {
+				select {} // the fixture owns the admitted Operation's state assertions
+			},
+			Tool:          func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} },
+			NormalizeTool: objectNormalize,
+		}, nil
+	}}
 }
 
 // preparedExecuting returns a prepared execution with a valid capture and an
@@ -120,11 +120,14 @@ func preparedExecuting(exec Execution) PreparedExecution {
 }
 
 // modelPrepared returns the fixtures' prepared execution whose opener yields
-// the given physical model request function over the default tool function.
+// invocations carrying the given physical model request function over the
+// default tool function.
 func modelPrepared(modelFn func(context.Context, model.Request) (model.Stream, error)) PreparedExecution {
 	exec := validExecution()
 	if modelFn != nil {
-		exec.Model = modelFn
+		exec = Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
+			return invocationExecution(modelFn, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }), nil
+		}}
 	}
 	return preparedExecuting(exec)
 }
@@ -136,7 +139,8 @@ func validPrepared() PreparedExecution { return preparedExecuting(validExecution
 
 // mustAdmitWithoutExecution runs the reserved admission body without
 // installing the execution — the shape the effect fixtures need to drive the
-// private wrappers directly on the admitted Operation.
+// private wrappers directly on the admitted Operation. The returned prepared
+// execution is never adopted, so its reservation releases here.
 func mustAdmitWithoutExecution(t *testing.T, h *Harness, sessionID, operationID string, content []model.ContentPart) (OperationRecord, SubmitDisposition) {
 	t.Helper()
 	c := leaseCoordinator(t, h, sessionID)
@@ -152,6 +156,7 @@ func mustAdmitWithoutExecution(t *testing.T, h *Harness, sessionID, operationID 
 	})
 	testassert.NoError(t, err)
 	testassert.Require(t, disposition == DispositionAdmitted && prepared != nil, "disposition %q (prepared %v), want a new admission", disposition, prepared != nil)
+	h.releasePrepared(prepared) // this helper never installs the execution: the reservation it was handed releases here
 	return rec, disposition
 }
 
@@ -1165,7 +1170,9 @@ func TestHarnessCancellationGatesPublication(t *testing.T) {
 func TestReadOperationReturnsOwnedRecords(t *testing.T) {
 	t.Run("active effect pointer", func(t *testing.T) {
 		fixture := validTestGraph()
-		fixture.ops[0].State.ActiveEffect = &ActiveEffect{Kind: EffectModel, ResultEntryID: hexID(3)}
+		effect, request := conversationModelEffect(hexID(3))
+		fixture.ops[0].State.ActiveEffect = effect
+		fixture.ops[0].State.Request = request
 		h := newTestHarness(t, fixture.storage(t), nil)
 		rec, err := h.ReadOperation(context.Background(), testSessionID, testOpID)
 		testassert.NoError(t, err)

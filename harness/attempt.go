@@ -39,7 +39,10 @@ type attemptResult struct {
 // classification, select the standard policy for a nil Retry, stop on a
 // false classification or a negative delay, and run the backoff behind the
 // cancellation check. An accepted stream never re-enters retry: the caller
-// owns assembly and closure exactly once after acceptance.
+// owns assembly and closure exactly once after acceptance. Every physical
+// attempt receives its own deep-owned copy of the logical request, so no
+// callback can reach the next attempt's view, the retained evidence, or the
+// captured catalog.
 func runModelAttempts(ctx context.Context, req model.Request, attempt func(context.Context, model.Request) (model.Stream, error), retry RetryPolicy) attemptResult {
 	if retry == nil {
 		retry = standardRetryPolicy
@@ -48,7 +51,11 @@ func runModelAttempts(ctx context.Context, req model.Request, attempt func(conte
 		if ctx.Err() != nil { // observed cancellation before an attempt interrupts; no output and no assembly call
 			return attemptResult{kind: attemptInterrupted}
 		}
-		stream, attemptErr := attempt(ctx, req)
+		owned, err := model.NewRequest(req)
+		if err != nil { // the shared validator is the boundary owner; a request it rejects is a boundary violation, never dispatched
+			return attemptResult{kind: attemptInvalid, err: &agent.ProtocolError{Boundary: "model", Detail: err.Error()}}
+		}
+		stream, attemptErr := attempt(ctx, owned) // every physical attempt receives its own deep-owned copy through the shared model constructor
 		if attemptErr == nil && stream != nil {
 			return attemptResult{kind: attemptAccepted, stream: stream}
 		}

@@ -35,11 +35,22 @@ func projectionAssistant(entryID, text string, sequence int64) testEntry {
 func projectionCompaction(entryID, boundaryID string, sequence int64) testEntry {
 	v := validCompactionEntry(testOpID)
 	v.EntryID = entryID
+	v.Facts[0].RequestID = "maintenance-" + entryID
 	v.BoundaryEntryID = boundaryID
 	return testEntry{
 		env:        Entry{SessionID: testSessionID, ID: entryID, OperationID: testOpID, Kind: EntryCompaction, Sequence: sequence, CommittedAt: testTime},
 		compaction: &v,
 	}
+}
+
+// setSummaryMessage rewrites one fixture compaction's checkpoint message to
+// the given summary text and producing source.
+func setSummaryMessage(v *contextCheckpointEntry, summary string, source model.ModelRef) {
+	v.Messages = []model.Message{{
+		Role:    model.RoleAssistant,
+		Source:  source,
+		Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\n" + summary + "\n\n[End of summary. Continue from here.]"}},
+	}}
 }
 
 // projectionFollowUp returns one settled follow-up message Operation and its
@@ -80,17 +91,12 @@ func projectionMessages(t *testing.T, h *Harness, c *coordinator) []model.Messag
 	return msgs
 }
 
-// wantSummaryMessage builds the exact summary message the projection must
+// wantSummaryMessage returns the one summary message the projection must
 // carry for the given compaction payload.
-func wantSummaryMessage(t *testing.T, compaction compactionEntry) model.Message {
+func wantSummaryMessage(t *testing.T, compaction contextCheckpointEntry) model.Message {
 	t.Helper()
-	msg, err := model.NewMessage(model.Message{
-		Role:    model.RoleAssistant,
-		Source:  compaction.Model,
-		Content: []model.ContentPart{{Kind: model.PartText, Text: "[Previous conversation summary]\n\n" + compaction.Summary + "\n\n[End of summary. Continue from here.]"}},
-	})
-	testassert.NoError(t, err)
-	return msg
+	testassert.Require(t, len(compaction.Messages) == 1, "fixture compaction carries %d messages, want the one summary message", len(compaction.Messages))
+	return compaction.Messages[0]
 }
 
 // assertProjectionEqual compares the projected messages against the expected
@@ -102,7 +108,7 @@ func assertProjectionEqual(t *testing.T, got, want []model.Message) {
 }
 
 // TestRequestSourceSummarizedProjection proves the summarized projection: with
-// the Session register's CompactionEntryID set, the projected messages are
+// the Session register's CheckpointEntryID set, the projected messages are
 // exactly the system message, one summary message carrying the payload's
 // verbatim framing and model identity, and the post-boundary entries in
 // sequence order — nothing at or before the boundary projects.
@@ -115,7 +121,7 @@ func TestRequestSourceSummarizedProjection(t *testing.T) {
 	later.assistant.OperationID = "op-2"
 	fixture.entries = append(fixture.entries, followInput, later, followSettlement)
 	fixture.ops = append(fixture.ops, followOp)
-	fixture.session.State.CompactionEntryID = hexID(3)
+	fixture.session.State.CheckpointEntryID = hexID(3)
 	h, c := newProjectionFixture(t, fixture)
 
 	got := projectionMessages(t, h, c)
@@ -158,10 +164,9 @@ func TestRequestSourceTwoSequentialCompactions(t *testing.T) {
 	thirdInput, thirdSettlement, thirdOp := projectionFollowUp(hexID(6), "op-3", "third", hexID(8), 6, 8)
 	fixture.entries = append(fixture.entries, thirdInput, thirdSettlement, secondSettlement)
 	fixture.ops = append(fixture.ops, secondOp, thirdOp)
-	fixture.session.State.CompactionEntryID = hexID(5)
+	fixture.session.State.CheckpointEntryID = hexID(5)
 	second := *fixture.entries[4].compaction
-	second.Summary = "Second summary."
-	second.Model = model.ModelRef{Provider: "other", Model: "sum-2"}
+	setSummaryMessage(&second, "Second summary.", model.ModelRef{Provider: "other", Model: "sum-2"})
 	fixture.entries[4].compaction = &second
 	h, c := newProjectionFixture(t, fixture)
 
@@ -199,7 +204,7 @@ func TestRequestSourceProjectsEntriesAfterTheBoundary(t *testing.T) {
 		laterInput, laterSettlement, laterOp := projectionFollowUp(hexID(5), "op-2", "later", hexID(6), 5, 6)
 		fixture.entries = append(fixture.entries, laterInput, laterSettlement)
 		fixture.ops = append(fixture.ops, laterOp)
-		fixture.session.State.CompactionEntryID = hexID(4)
+		fixture.session.State.CheckpointEntryID = hexID(4)
 		h, c := newProjectionFixture(t, fixture)
 
 		got := projectionMessages(t, h, c)
@@ -218,10 +223,9 @@ func TestRequestSourceProjectsEntriesAfterTheBoundary(t *testing.T) {
 			projectionCompaction(hexID(3), hexID(2), 3),
 			projectionCompaction(hexID(4), hexID(3), 4),
 		)
-		fixture.session.State.CompactionEntryID = hexID(4)
+		fixture.session.State.CheckpointEntryID = hexID(4)
 		second := *fixture.entries[3].compaction
-		second.Summary = "Second summary."
-		second.Model = model.ModelRef{Provider: "other", Model: "sum-2"}
+		setSummaryMessage(&second, "Second summary.", model.ModelRef{Provider: "other", Model: "sum-2"})
 		fixture.entries[3].compaction = &second
 		h, c := newProjectionFixture(t, fixture)
 

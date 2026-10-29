@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,10 +149,18 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			compactions++
 			var wire struct {
 				OperationID string `json:"operation_id"`
-				Summary     string `json:"summary"`
+				Messages    []struct {
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"messages"`
 			}
 			testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
-			testassert.Require(t, wire.OperationID == "op-2" && wire.Summary == "native summary one", "compaction entry = %+v, want op-2's committed summary", wire)
+			wireSummary := ""
+			if len(wire.Messages) > 0 && len(wire.Messages[0].Content) > 0 {
+				wireSummary = wire.Messages[0].Content[0].Text
+			}
+			testassert.Require(t, wire.OperationID == "op-2" && wireSummary == "[Previous conversation summary]\n\nnative summary one\n\n[End of summary. Continue from here.]", "compaction entry = %+v, want op-2's committed summary", wire)
 		}
 		testassert.Equal(t, compactions, 1)
 
@@ -178,6 +187,54 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			}
 		}
 		testassert.Require(t, sawInvalidation && sawDelta, "observation set: invalidation %v delta %v, want both", sawInvalidation, sawDelta)
+	})
+}
+
+// TestCompactLifecycleNativeCompactionAgentScopeCount counts the Agent-tier
+// scope constructions during one pressure-triggered submission on the native
+// pipeline: the conversation Engine call and the automatic summary Engine
+// call each open their own Agent-tier scope under one Operation.
+func TestCompactLifecycleNativeCompactionAgentScopeCount(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
+		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
+		var agOpens atomic.Int64
+		r, err := e.open(context.Background(), e.storagePlugin(store),
+			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
+		testassert.NoError(t, err)
+		ctx := context.Background()
+
+		e.server.setScript(func(_ context.Context, body string) []string {
+			if !strings.Contains(body, `"model":"k"`) && !strings.Contains(body, `"model": "k"`) {
+				if lastUserText(body) == "first question" {
+					// The seed report: {5000,10} overflows the window 8192
+					// minus the reserve 4096.
+					return append(textTurnEvents("seeded answer"),
+						`{"usage":{"prompt_tokens":5000,"completion_tokens":10,"total_tokens":5010}}`)
+				}
+				return nil // conversation turns: the default completed text turn
+			}
+			return append(textTurnEvents("native summary one"),
+				`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)
+		})
+
+		session, err := r.createSession(ctx, e.dataDir, "tight")
+		testassert.NoError(t, err)
+		sessionID := session.Identity.SessionID
+
+		submitThroughRuntime(t, r, sessionID, "op-1", "first question")
+		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess) // the seed turn commits the overflowing report
+
+		before := agOpens.Load()
+		submitThroughRuntime(t, r, sessionID, "op-2", "the overflowing checkpoint")
+		op2 := awaitOperation(t, r, sessionID, "op-2", harness.OperationSuccess)
+		testassert.Require(t, op2.State.Status == harness.OperationSuccess, "overflowing operation = %+v, want the compacted success", op2.State)
+		after := agOpens.Load()
+		testassert.Require(t, after-before == 2, "Agent-tier scope openings during the pressure-triggered submission = %d, want the conversation Engine call and the summary Engine call each open one", after-before)
+
+		submitConvergedThroughRuntime(t, r, sessionID, "op-3", "second question", harness.OperationSuccess)
+		testassert.NoError(t, r.Close(ctx))
 	})
 }
 
@@ -233,7 +290,8 @@ func rawMessageAdmission(sessionID, operationID, entryID string, v rawAdmissionV
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":%q,"model":%q},`+
 			`"context_window":4096,"output_reserve":%d,`+
 			`"system_prompt":%q,"tools":%s,"readonly":false,"write_dir":"",`+
-			`"compact":{"model":{"provider":%q,"model":%q},"system_prompt":%q}},"admitted_at":%q}`,
+			`"compact":{"model":{"provider":%q,"model":%q},"system_prompt":%q},`+
+			`"strategy":{"id":"melta.summary/v1","requires_context_window":true}},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, v.agentType,
 		v.model.Provider, v.model.Model, v.outputReserve,
 		v.systemPrompt, v.tools,
@@ -258,10 +316,13 @@ func compactRawOperationRegister(admission, state string) string {
 	return fmt.Sprintf(`{"admission":%s,"state":%s}`, admission, state)
 }
 
-func compactRawRunningModelState(now, reserved string) string {
+func compactRawRunningModelState(now, reserved, boundary string) string {
 	return fmt.Sprintf(
-		`{"status":"running","started_at":%q,"active_effect":{"kind":"model","result_entry_id":%q},"pending_tool_calls":[],"usage":{"by_model":[]}}`,
-		now, reserved)
+		`{"status":"running","started_at":%q,`+
+			`"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"request-live-%s","model":{"provider":"prov","model":"m"},"purpose":"conversation","evidence":{"boundary_entry_id":%q}},`+
+			`"running_request":{"request_id":"request-live-%s","boundary_entry_id":%q,"hook_results":[]},`+
+			`"pending_tool_calls":[],"usage":{"by_model":[]}}`,
+		now, reserved, reserved, boundary, reserved, boundary)
 }
 
 func compactRawSuccessState(now, settlementEntry, sessionID, usage string) string {
@@ -276,11 +337,11 @@ func compactRawInputEntry(sessionID, entryID, operationID, origin, text string) 
 		sessionID, entryID, operationID, origin, text)
 }
 
-func compactRawAssistantEntry(sessionID, entryID, operationID, text string) string {
+func compactRawAssistantEntry(sessionID, entryID, operationID, boundaryID, text string) string {
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}],"tool_calls":[]}`,
-		sessionID, entryID, operationID, text)
+			`"source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, operationID, text, "request-a-"+entryID, boundaryID)
 }
 
 func compactRawSettlementEntry(sessionID, entryID, operationID, extra string) string {
@@ -291,9 +352,12 @@ func compactRawSettlementEntry(sessionID, entryID, operationID, extra string) st
 
 func compactRawCompactionEntry(sessionID, entryID, operationID, summary, boundaryID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"summary":%q,"boundary_entry_id":%q,`+
-			`"model":{"provider":"prov","model":"m"},"configuration_revision":"rev-1"}`,
-		sessionID, entryID, operationID, summary, boundaryID)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"strategy_id":"melta.summary/v1",`+
+			`"messages":[{"role":"assistant","source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}]}],`+
+			`"boundary_entry_id":%q,"configuration_revision":"rev-1",`+
+			`"facts":[{"request_id":%q,"model":{"provider":"prov","model":"m"},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}],`+
+			`"consumed_request_id":%q,"evidence":{"boundary_entry_id":%q}}`,
+		sessionID, entryID, operationID, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]", boundaryID, "maintainer-"+entryID, "request-"+operationID, boundaryID)
 }
 
 // compactRawSuccessOperation seeds one settled success message Operation:
@@ -306,7 +370,7 @@ func compactRawSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	inputID, assistantID, settlementID := newLifecycleID(t), newLifecycleID(t), newLifecycleID(t)
 	lifecycleInsertEntry(t, store, sessionID, inputID, operationID, harness.EntryInput, compactRawInputEntry(sessionID, inputID, operationID, "user", inputText))
-	lifecycleInsertEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, compactRawAssistantEntry(sessionID, assistantID, operationID, assistantText))
+	lifecycleInsertEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant, compactRawAssistantEntry(sessionID, assistantID, operationID, inputID, assistantText))
 	lifecycleInsertEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement, compactRawSettlementEntry(sessionID, settlementID, operationID, ""))
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: operationID},
 		compactRawOperationRegister(compactRawMessageAdmission(sessionID, operationID, inputID), compactRawSuccessState(now, settlementID, sessionID, `{"by_model":[]}`)))
