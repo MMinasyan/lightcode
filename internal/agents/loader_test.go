@@ -43,7 +43,7 @@ func TestResolveBuiltinsInheritThroughPrimary(t *testing.T) {
 
 	explore, err := cfg.Resolve("explore")
 	testassert.NoError(t, err)
-	testassert.Require(t, explore.Model == "test/secondary-model" && explore.SystemPrompt == SystemPromptSimple && explore.LSP && explore.Subagent && explore.Readonly, "got %v, want %v; got %v, want %v; explore booleans = lsp:%v subagent:%v readonly:%v", explore.Model, "test/secondary-model", explore.SystemPrompt, SystemPromptSimple, explore.LSP, explore.Subagent, explore.Readonly)
+	testassert.Require(t, explore.Model == "test/secondary-model" && explore.SystemPrompt == SystemPromptSimple && explore.Subagent && explore.Readonly, "got %v, want %v; got %v, want %v; explore booleans = subagent:%v readonly:%v", explore.Model, "test/secondary-model", explore.SystemPrompt, SystemPromptSimple, explore.Subagent, explore.Readonly)
 
 	review, err := cfg.Resolve("review")
 	testassert.NoError(t, err)
@@ -136,11 +136,11 @@ func TestBuiltinsExposeConcreteRootAndCodeOnlyCompact(t *testing.T) {
 
 	primary, err := cfg.Resolve("primary")
 	testassert.NoError(t, err)
-	testassert.Require(t, primary.SystemPrompt == SystemPromptFull && reflect.DeepEqual(primary.Tools, StandardTools) && primary.LSP && !primary.Readonly && !primary.Subagent, "primary = %+v, want full prompt and standard tools; primary booleans = lsp:%v readonly:%v subagent:%v", primary, primary.LSP, primary.Readonly, primary.Subagent)
+	testassert.Require(t, primary.SystemPrompt == SystemPromptFull && reflect.DeepEqual(primary.Tools, StandardTools) && !primary.Readonly && !primary.Subagent, "primary = %+v, want full prompt and standard tools; primary booleans = readonly:%v subagent:%v", primary, primary.Readonly, primary.Subagent)
 
 	compactAgent, err := cfg.Resolve("compact")
 	testassert.NoError(t, err)
-	testassert.Require(t, compactAgent.SystemPrompt == SystemPromptNone && compactAgent.Prompt == retainedSummarizerPrompt && len(compactAgent.Tools) == 0 && !compactAgent.LSP && compactAgent.Readonly && !compactAgent.Subagent, "compact prompt = system:%q body:%q; compact capability fields = %+v", compactAgent.SystemPrompt, compactAgent.Prompt, compactAgent)
+	testassert.Require(t, compactAgent.SystemPrompt == SystemPromptNone && compactAgent.Prompt == retainedSummarizerPrompt && len(compactAgent.Tools) == 0 && compactAgent.Readonly && !compactAgent.Subagent, "compact prompt = system:%q body:%q; compact capability fields = %+v", compactAgent.SystemPrompt, compactAgent.Prompt, compactAgent)
 }
 
 func TestToolsPresenceControlsInheritanceEmptyAndSubset(t *testing.T) {

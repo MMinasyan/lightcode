@@ -120,6 +120,12 @@ func TestResolvePermissionPolicyFallbackChain(t *testing.T) {
 			PermissionRequest{PermissionFileRead, "/w/.env"}, true},
 		{"zero policy is the built-in policy", "", "", "/w",
 			PermissionRequest{PermissionCommandRun, "echo hi"}, true},
+		{"workspace rule explicitly decides workspace.inspect with allow", "",
+			levelJSON(rulesJSON(ruleJSON("workspace.inspect", "/w", permissionAccessAllow))), "/w",
+			PermissionRequest{"workspace.inspect", "/w"}, true},
+		{"global rule explicitly decides workspace.inspect with deny over an allow default",
+			levelJSON(rulesJSON(ruleJSON("workspace.inspect", "*", permissionAccessDeny)), `"default":"allow"`), "", "/w",
+			PermissionRequest{"workspace.inspect", "/w"}, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,18 +236,15 @@ func TestResolvePermissionPolicyBuiltins(t *testing.T) {
 	t.Run("root path metacharacters stay literal path data", func(t *testing.T) {
 		root := "/w/[x]"
 		testassert.Check(t, policy.evaluate(root, PermissionRequest{PermissionFileRead, root + "/a.txt"}), "%v", "file under a metacharacter root denied, want allow")
-		testassert.Check(t, policy.evaluate(root, PermissionRequest{PermissionWorkspaceInspect, root}), "%v", "inspect of the metacharacter root denied, want allow")
-		testassert.Check(t, !policy.evaluate(root, PermissionRequest{PermissionWorkspaceInspect, "/w/y"}), "%v", "inspect of a different root allowed, want deny")
 	})
 	t.Run("command run allows any canonical command target", func(t *testing.T) {
 		for _, target := range []string{"*", "git push origin main", "rm -rf /tmp/x", "echo\nls"} {
 			testassert.Check(t, policy.evaluate("/w", PermissionRequest{PermissionCommandRun, target}), "built-in command.run of %q denied, want allow", target)
 		}
 	})
-	t.Run("workspace inspect allows only the canonical root", func(t *testing.T) {
-		testassert.Check(t, policy.evaluate("/w", PermissionRequest{PermissionWorkspaceInspect, "/w"}), "%v", "built-in inspect of the root denied, want allow")
-		for _, target := range []string{"/w/keys", "/etc", "*", ""} {
-			testassert.Check(t, !policy.evaluate("/w", PermissionRequest{PermissionWorkspaceInspect, target}), "built-in inspect of %q allowed, want deny", target)
+	t.Run("workspace.inspect carries no built-in rule and falls to the final deny", func(t *testing.T) {
+		for _, target := range []string{"/w", "/w/keys", "/etc", "*", ""} {
+			testassert.Check(t, !policy.evaluate("/w", PermissionRequest{"workspace.inspect", target}), "built-in inspect of %q allowed, want deny", target)
 		}
 	})
 	t.Run("sleep allows the fixed target only", func(t *testing.T) {
@@ -526,16 +529,15 @@ func TestPermissionLevelDecideSemantics(t *testing.T) {
 // boundary as literals, so the constants may never drift from them.
 func TestPermissionNamesKeepPublishedLiterals(t *testing.T) {
 	want := map[string]string{
-		PermissionFileRead:         "file.read",
-		PermissionFileWrite:        "file.write",
-		PermissionCommandRun:       "command.run",
-		PermissionWorkspaceInspect: "workspace.inspect",
-		PermissionSleep:            "sleep",
-		PermissionChildLaunch:      "child.launch",
-		PermissionProcessOwn:       "process.own",
+		PermissionFileRead:    "file.read",
+		PermissionFileWrite:   "file.write",
+		PermissionCommandRun:  "command.run",
+		PermissionSleep:       "sleep",
+		PermissionChildLaunch: "child.launch",
+		PermissionProcessOwn:  "process.own",
 	}
 	// distinct literals: a duplicated value would collapse the map.
-	testassert.Equal(t, len(want), 7)
+	testassert.Equal(t, len(want), 6)
 	for name, literal := range want {
 		testassert.Check(t, name == literal, "permission constant %q = %q, want the published literal", name, literal)
 	}

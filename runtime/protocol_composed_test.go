@@ -1,7 +1,7 @@
 package runtime_test
 
 // The phase-composed mounted flow: one real production composition (the
-// shipped tools, jobs, tasks, adaptation, and LSP plugins over memory or the
+// shipped tools, jobs, tasks, and adaptation plugins over memory or the
 // shipped SQLite set), one mounted authenticated protocol server, one real
 // discovery record, the generated Go client, and one authenticated SSE
 // stream. The scenario drives the complete create → model/tool/child/Job →
@@ -30,7 +30,6 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
-	"github.com/MMinasyan/lightcode/internal/plugins/lsp"
 	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/plugins/tasks"
 	"github.com/MMinasyan/lightcode/internal/plugins/tools"
@@ -985,12 +984,12 @@ func TestProtocolComposedFlow(t *testing.T) {
 	t.Run("memory", func(t *testing.T) {
 		run(t, []runtime.Plugin{
 			composedMemoryStorage(storage.NewMemory()),
-			tools.Plugin(), adaptation.Plugin(), lsp.Plugin(), jobs.Plugin(), tasks.Plugin(),
+			tools.Plugin(), adaptation.Plugin(), jobs.Plugin(), tasks.Plugin(),
 			composedCustomPlugin(),
 		})
 	})
 	t.Run("sqlite", func(t *testing.T) {
-		run(t, []runtime.Plugin{sqlite.Plugin(), tools.Plugin(), adaptation.Plugin(), lsp.Plugin(), jobs.Plugin(), tasks.Plugin(), composedCustomPlugin()})
+		run(t, []runtime.Plugin{sqlite.Plugin(), tools.Plugin(), adaptation.Plugin(), jobs.Plugin(), tasks.Plugin(), composedCustomPlugin()})
 	})
 }
 

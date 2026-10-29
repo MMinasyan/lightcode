@@ -29,7 +29,6 @@ var builtins = map[string]Definition{
 		SystemPrompt: SystemPromptFull,
 		Prompt:       stringPtr(""),
 		Tools:        toolsPtr(StandardTools),
-		LSP:          boolPtr(true),
 		Readonly:     boolPtr(false),
 		WriteDir:     stringPtr(""),
 		Description:  stringPtr(""),
@@ -38,7 +37,6 @@ var builtins = map[string]Definition{
 	"secondary": {
 		SystemPrompt: SystemPromptSimple,
 		Prompt:       stringPtr(secondaryPrompt),
-		LSP:          boolPtr(true),
 		Readonly:     boolPtr(false),
 		Description:  stringPtr(secondaryDescription),
 		Subagent:     boolPtr(true),
@@ -58,7 +56,6 @@ var builtins = map[string]Definition{
 		SystemPrompt: SystemPromptNone,
 		Prompt:       stringPtr(defaultSummarizerPrompt),
 		Tools:        toolsPtr(nil),
-		LSP:          boolPtr(false),
 		Readonly:     boolPtr(true),
 		WriteDir:     stringPtr(""),
 		Description:  stringPtr(""),

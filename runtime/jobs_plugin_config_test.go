@@ -24,7 +24,7 @@ func jobsComposedDoc(plugins string) string {
 
 // TestComposedJobsPluginPublication composes the shipped five-plugin
 // registration through the OpenForTest bridge and proves the plugins.jobs
-// publication matrix: the five compiled sections publish together with a
+// publication matrix: the four compiled sections publish together with a
 // well-formed jobs object (unknown keys ignored, a null member retaining its
 // default), a consumed-range violation, a wrong consumed-field type, and a
 // null section each fail publication with the jobs decoder's text through the
@@ -32,11 +32,11 @@ func jobsComposedDoc(plugins string) string {
 // untouched so the next success continues the generation sequence.
 func TestComposedJobsPluginPublication(t *testing.T) {
 	ctx := context.Background()
-	const fiveSections = `"sqlite":{},"tools":{},"adaptation":{},"lsp":{}`
-	accept := jobsComposedDoc(`{` + fiveSections + `,"jobs":{"max_background_processes":5,"unknown_member":1,"max_output_bytes":null}}`)
-	violation := jobsComposedDoc(`{` + fiveSections + `,"jobs":{"max_output_bytes":1023}}`)
-	badType := jobsComposedDoc(`{` + fiveSections + `,"jobs":{"max_output_bytes":"many"}}`)
-	nullSection := jobsComposedDoc(`{` + fiveSections + `,"jobs":null}`)
+	const fourSections = `"sqlite":{},"tools":{},"adaptation":{}`
+	accept := jobsComposedDoc(`{` + fourSections + `,"jobs":{"max_background_processes":5,"unknown_member":1,"max_output_bytes":null}}`)
+	violation := jobsComposedDoc(`{` + fourSections + `,"jobs":{"max_output_bytes":1023}}`)
+	badType := jobsComposedDoc(`{` + fourSections + `,"jobs":{"max_output_bytes":"many"}}`)
+	nullSection := jobsComposedDoc(`{` + fourSections + `,"jobs":null}`)
 
 	e := newComposeEnv(t)
 	writeToolsConfig(t, e.configPath, accept)

@@ -50,11 +50,9 @@ const (
 	SizeSimple = "simple"
 	SizeFull   = "full"
 
-	WarnRulesTooLarge        = "rules_too_large"
-	WarnRulesNotFound        = "rules_not_found"
-	WarnRulesReadError       = "rules_read_error"
-	WarnLSPInstallFailed     = "lsp_install_failed"
-	WarnLSPServerUnavailable = "lsp_server_unavailable"
+	WarnRulesTooLarge  = "rules_too_large"
+	WarnRulesNotFound  = "rules_not_found"
+	WarnRulesReadError = "rules_read_error"
 )
 
 const agentPromptHeading = "## Your Role and Instructions"

@@ -261,9 +261,6 @@ func applyDefinition(out *Resolved, def Definition) {
 			out.Capabilities = append([]string(nil), (*def.Capabilities)...)
 		}
 	}
-	if def.LSP != nil {
-		out.LSP = *def.LSP
-	}
 	if def.Readonly != nil {
 		out.Readonly = *def.Readonly
 	}
@@ -352,9 +349,6 @@ func copyDefinition(def Definition) Definition {
 	}
 	if def.Capabilities != nil {
 		def.Capabilities = toolsPtr(*def.Capabilities)
-	}
-	if def.LSP != nil {
-		def.LSP = boolPtr(*def.LSP)
 	}
 	if def.Readonly != nil {
 		def.Readonly = boolPtr(*def.Readonly)

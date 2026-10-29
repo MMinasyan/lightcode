@@ -1188,8 +1188,8 @@ func TestRemovedOwnerTransportSymbols(t *testing.T) {
 	// the shutdown endpoint and its trigger, the adapter lease/attachment
 	// machinery, the HTTP service and its handlers, the serve/stop command
 	// bodies, and the transport package with its client. Unqualified Client
-	// and NewClient stay out of the list: they name the surviving provider and
-	// LSP clients, which have nothing to do with this transport.
+	// and NewClient stay out of the list: they name the surviving generated
+	// protocol clients, which have nothing to do with this transport.
 	symbols := []string{
 		"owner.lock",
 		"IsStale",

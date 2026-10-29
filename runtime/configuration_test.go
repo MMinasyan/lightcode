@@ -36,7 +36,6 @@ const testAgentsDocument = `{
     "prompt": "plan prompt",
     "tools": ["plan_tool", "plan_tool", "read_file"],
     "capabilities": ["cap-b", "cap-a"],
-    "lsp": false,
     "readonly": true,
     "write_dir": "/tmp/plan",
     "description": "planner",
@@ -104,7 +103,7 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 		if def.Name != "plan" {
 			continue
 		}
-		testassert.Require(t, !def.LSP && def.Readonly && def.WriteDir == "/tmp/plan" && def.Description == "planner" && def.Subagent && !def.Builtin, "resolved plan lost its retained fields: %+v", def)
+		testassert.Require(t, def.Readonly && def.WriteDir == "/tmp/plan" && def.Description == "planner" && def.Subagent && !def.Builtin, "resolved plan lost its retained fields: %+v", def)
 	}
 	testassert.Require(t, len(snapshot.catalogWarnings) == 0 && len(snapshot.agentWarnings) == 0, "valid input produced warnings: catalog %+v agents %+v", snapshot.catalogWarnings, snapshot.agentWarnings)
 }

@@ -362,7 +362,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	}()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, fmt.Sprintf(`{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"DESKTOP_TEST_KEY"},"discovery":false,"models":{"root":{"context_window":65536,"max_output_tokens":512},"child":{"context_window":65536,"max_output_tokens":512}}}}}`, modelServer.URL+"/v1"))
-	writeServiceFile(t, agents.PathForConfig(configPath), `{"primary":{"model":"prov/root","system_prompt":"simple","tools":["run_command","task"],"lsp":false},"secondary":{"model":"prov/child","system_prompt":"simple","tools":[],"lsp":false}}`)
+	writeServiceFile(t, agents.PathForConfig(configPath), `{"primary":{"model":"prov/root","system_prompt":"simple","tools":["run_command","task"]},"secondary":{"model":"prov/child","system_prompt":"simple","tools":[]}}`)
 	var owner *runtime.Runtime
 	openOwner := func() string {
 		var err error

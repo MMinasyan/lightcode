@@ -540,7 +540,7 @@ func projectModelListEntry(prov *catalog.Provider, entry *catalog.Model) protoco
 // the existing agentTypes() projection — the one selected-model and
 // write-dir normalization producer admission already uses. Required array
 // members are owned non-nil lists even when the definition carries none, and
-// no private definition field (system prompt, LSP flag) is exposed.
+// no private definition field (system prompt, prompt body) is exposed.
 func projectAgents(captured *configuration) []protocol.Agent {
 	out := make([]protocol.Agent, 0, len(captured.definitions))
 	for _, at := range captured.agentTypes() {

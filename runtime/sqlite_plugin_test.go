@@ -518,8 +518,8 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 }
 
 // TestBuiltinRegistrationComposes proves the shipped registration set — the
-// SQLite storage plugin, the native tools, the bundled adaptation, the LSP
-// tools, and the background jobs plugin — composes through the real
+// SQLite storage plugin, the native tools, the bundled adaptation, and the
+// background jobs plugin — composes through the real
 // construction path: the complete declared set opens over the real plugin's
 // database, reload publishes, and shutdown converges leaving exactly the
 // plugin-owned files.
