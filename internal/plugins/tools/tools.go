@@ -123,12 +123,9 @@ func (in *instance) openCodeGroup(tc runtime.ToolContext) (codeGroupStore, error
 	return codeGroupStore{CodeStore: store}, nil
 }
 
-// codeGroupStore adapts one per-call snapshot.CodeStore to the shared
-// internal/tool SnapshotStore interface. The shared bodies type-assert and
-// prefer the transactional path — the promoted SnapshotResolvedEntry plus the
-// discard/retain/lock/identity methods — so Snapshot and CurrentTurn exist
-// only to satisfy the interface; the transactional path preempts them. They
-// are interface compliance, not dead code.
+// codeGroupStore adapts one per-call snapshot.CodeStore to the complete
+// internal/tool SnapshotStore interface. The embedded CodeStore provides the
+// entry capture, discard, and identity methods directly.
 type codeGroupStore struct {
 	*snapshot.CodeStore
 }
@@ -136,13 +133,6 @@ type codeGroupStore struct {
 // CurrentTurn pins the group's single turn: an Operation-backed code group
 // holds one preimage set, not a session turn history.
 func (codeGroupStore) CurrentTurn() int { return 1 }
-
-// Snapshot satisfies the plain SnapshotStore surface through the resolved
-// entry capture; it never runs because the transactional path preempts it.
-func (s codeGroupStore) Snapshot(turn int, absPath string) error {
-	_, _, err := s.SnapshotResolvedEntry(turn, absPath, absPath)
-	return err
-}
 
 // immediateError is the normalization-class immediate outcome: status error
 // carrying the bounded validation diagnostic, per the tool-boundary

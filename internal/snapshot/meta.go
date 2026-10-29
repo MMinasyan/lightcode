@@ -40,8 +40,10 @@ type SnapshotMeta struct {
 	LastWrite     *SnapshotContentIdentity `json:"last_write,omitempty"`
 }
 
-// SnapshotContentIdentity identifies the state produced by the session's
-// latest successful mutation for a snapshot entry.
+// SnapshotContentIdentity identifies the state a completed producer mutation
+// left for a snapshot entry. The pre-mutation proof clear and any uncertain
+// mutation failure leave LastWrite nil, and a restore against a nil LastWrite
+// skips the entry instead of guessing.
 type SnapshotContentIdentity struct {
 	Hash   string `json:"hash,omitempty"`
 	Absent bool   `json:"absent,omitempty"`

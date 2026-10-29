@@ -20,7 +20,7 @@ func TestRevertSkipsCreatedDirectoryLeavesWithoutRecordedIdentity(t *testing.T) 
 		snapshotEntry(t, store, turn, createdPath, createdPath)
 		testassert.NoError(t, os.Mkdir(createdPath, 0o755))
 
-		affected, err := store.RevertCode(0)
+		affected, err := revertGroup(store, 0)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(affected.Restored) == 0 && len(affected.Skipped) == 1 && affected.Skipped[0].Path == createdPath, "restored = %v, want none; skipped = %+v, want %s", affected.Restored, affected.Skipped, createdPath)
 		if info, err := os.Lstat(createdPath); err != nil || !info.IsDir() {
@@ -38,7 +38,7 @@ func TestRevertSkipsCreatedDirectoryLeavesWithoutRecordedIdentity(t *testing.T) 
 		testassert.NoError(t, os.Mkdir(createdPath, 0o755))
 		testassert.NoError(t, os.WriteFile(childPath, []byte("child"), 0o644))
 
-		affected, err := store.RevertCode(0)
+		affected, err := revertGroup(store, 0)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(affected.Restored) == 0 && len(affected.Skipped) == 1 && affected.Skipped[0].Path == createdPath, "restored = %v, want none; skipped = %+v, want %s", affected.Restored, affected.Skipped, createdPath)
 		{
@@ -63,7 +63,7 @@ func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
 		testassert.NoError(t, os.MkdirAll(entryDir, 0o700))
 		testassert.NoError(t, writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: dirtyPath, Existed: false}))
 
-		_, err := store.RevertCode(0)
+		_, err := revertGroup(store, 0)
 		testassert.Require(t, err != nil, "RevertCode succeeded for legacy Existed:false with hash match; want unconditional refusal")
 		testassert.Require(t, strings.Contains(err.Error(), "legacy delete refused"), "error %v does not mention legacy delete refused", err)
 		{
@@ -84,7 +84,7 @@ func TestLegacyCreatedDeleteRequiresCleanPathHash(t *testing.T) {
 		testassert.NoError(t, os.MkdirAll(entryDir, 0o700))
 		testassert.NoError(t, writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: victimDirty, Existed: false}))
 
-		affected, err := store.RevertCode(0)
+		affected, err := revertGroup(store, 0)
 		testassert.Require(t, err != nil, "RevertCode succeeded for mismatched legacy delete hash, want refusal")
 		testassert.Require(t, len(affected.Restored) == 0, "affected = %v, want none", affected)
 		{
@@ -108,7 +108,7 @@ func TestLegacyMissingLeafRestoreRequiresTargetProof(t *testing.T) {
 		writeLegacySnapshotForMissingLeafProof(t, store, requested, target)
 		testassert.NoError(t, os.Remove(target))
 
-		affected, err := store.RevertCode(0)
+		affected, err := revertGroup(store, 0)
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(affected.Restored, []string{requested}), "affected = %v, want [%s]", affected, requested)
 		{
@@ -136,7 +136,7 @@ func TestLegacyMissingLeafRestoreRequiresTargetProof(t *testing.T) {
 		testassert.NoError(t, os.Remove(linkDir))
 		testassert.NoError(t, os.Symlink(secretDir, linkDir))
 
-		affected, err := store.RevertCode(0)
+		affected, err := revertGroup(store, 0)
 		testassert.Require(t, err != nil, "RevertCode succeeded for repointed symlink parent, want refusal")
 		testassert.Require(t, len(affected.Restored) == 0, "affected = %v, want none", affected)
 		{
@@ -172,7 +172,7 @@ func TestPR11Closure_LegacyExistedFalseDeletesAreRefused(t *testing.T) {
 		testassert.NoError(t, writeJSON(filepath.Join(entryDir, "meta.json"),
 			SnapshotMeta{OriginalPath: createdPath, Existed: false}))
 
-		_, err := store.RevertCode(0)
+		_, err := revertGroup(store, 0)
 		testassert.Require(t, err != nil, "RevertCode succeeded for legacy Existed:false, want refusal")
 		testassert.Require(t, strings.Contains(err.Error(), "legacy delete refused"), "error %v does not mention legacy delete refused", err)
 		{
@@ -190,7 +190,7 @@ func TestPR11Closure_LegacyExistedFalseDeletesAreRefused(t *testing.T) {
 		testassert.NoError(t, writeJSON(filepath.Join(entryDir, "meta.json"),
 			SnapshotMeta{OriginalPath: absentPath, Existed: false}))
 
-		_, err := store.RevertCode(0)
+		_, err := revertGroup(store, 0)
 		testassert.Require(t, err != nil, "RevertCode succeeded for legacy Existed:false with absent target, want refusal")
 		testassert.Require(t, strings.Contains(err.Error(), "legacy delete refused"), "error %v does not mention legacy delete refused", err)
 	})
@@ -215,7 +215,7 @@ func TestPR11Closure_HardlinkRefusedOnSnapshotRestore(t *testing.T) {
 	testassert.NoError(t, os.Link(outside, target))
 	recordSnapshotContent(t, store, turn, entryID, "outside-content")
 
-	_, err := store.RevertCode(0)
+	_, err := revertGroup(store, 0)
 	testassert.Require(t, err != nil, "RevertCode succeeded with hardlinked restore target; want refusal")
 	msg := strings.ToLower(err.Error())
 	testassert.Require(t, strings.Contains(msg, "hardlink") || strings.Contains(msg, "link count") || strings.Contains(msg, "nlink"), "error %v does not mention hardlink/link count/nlink", err)
@@ -241,7 +241,7 @@ func TestPR11Closure_HardlinkRefusedOnSnapshotCreatedDelete(t *testing.T) {
 	testassert.NoError(t, os.Link(outside, createdPath))
 	recordSnapshotContent(t, store, turn, entryID, "outside-content")
 
-	_, err := store.RevertCode(0)
+	_, err := revertGroup(store, 0)
 	testassert.Require(t, err != nil, "RevertCode succeeded deleting hardlinked created-file leaf; want refusal")
 	msg := strings.ToLower(err.Error())
 	testassert.Require(t, strings.Contains(msg, "hardlink") || strings.Contains(msg, "link count") || strings.Contains(msg, "nlink"), "error %v does not mention hardlink/link count/nlink", err)
@@ -272,7 +272,7 @@ func TestPR11Closure_HardlinkedSymlinkRefusedOnSnapshotCreatedDelete(t *testing.
 	assertHardlinkedSymlink(t, createdPath)
 	recordSnapshotContent(t, store, turn, entryID, "outside-target")
 
-	_, err := store.RevertCode(0)
+	_, err := revertGroup(store, 0)
 	testassert.Require(t, err != nil, "RevertCode succeeded deleting hardlinked symlink created leaf; want refusal")
 	msg := strings.ToLower(err.Error())
 	testassert.Require(t, strings.Contains(msg, "hardlink") || strings.Contains(msg, "link count") || strings.Contains(msg, "nlink"), "error %v does not mention hardlink/link count/nlink", err)
@@ -313,7 +313,7 @@ func TestPR11Closure_ModernDeleteBoundToEntryID(t *testing.T) {
 	testassert.NoError(t, writeJSON(filepath.Join(entryDir, "meta.json"),
 		SnapshotMeta{OriginalPath: victimPath, CanonicalPath: victimPath, Existed: false}))
 
-	_, err := store.RevertCode(0)
+	_, err := revertGroup(store, 0)
 	testassert.Require(t, err != nil, "RevertCode succeeded with tampered meta.json; want refusal")
 	{
 		got, readErr := os.ReadFile(victimPath)
@@ -355,7 +355,7 @@ func TestPR11Closure_ModernRestoreBoundToEntryID(t *testing.T) {
 	testassert.NoError(t, writeJSON(filepath.Join(entryDir, "meta.json"),
 		SnapshotMeta{OriginalPath: victimPath, CanonicalPath: realVictim, Existed: true}))
 
-	_, err = store.RevertCode(0)
+	_, err = revertGroup(store, 0)
 	testassert.Require(t, err != nil, "RevertCode succeeded with tampered modern restore meta.json; want refusal")
 	testassert.Require(t, strings.Contains(err.Error(), "modern restore refused"), "error %v does not mention modern restore refusal", err)
 	{

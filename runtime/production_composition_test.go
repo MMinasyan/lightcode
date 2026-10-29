@@ -202,18 +202,12 @@ func chainImmediateDenied(callID string) harness.PreparedTool {
 	}}
 }
 
-// chainCodeGroup adapts one per-call snapshot.CodeStore to the shared
-// SnapshotStore interface, mirroring the shipped plugin's group wrapper: the
-// transactional path preempts the plain methods; they are interface
-// compliance only.
+// chainCodeGroup adapts one per-call snapshot.CodeStore to the complete
+// shared SnapshotStore interface, mirroring the shipped plugin's group
+// wrapper: the embedded CodeStore provides the entry and identity methods.
 type chainCodeGroup struct{ *snapshot.CodeStore }
 
 func (chainCodeGroup) CurrentTurn() int { return 1 }
-
-func (s chainCodeGroup) Snapshot(turn int, absPath string) error {
-	_, _, err := s.SnapshotResolvedEntry(turn, absPath, absPath)
-	return err
-}
 
 // chainWriteTool is the combined scenario's prod_write capability: the
 // shared write preparation (the per-call code group opened fresh from the

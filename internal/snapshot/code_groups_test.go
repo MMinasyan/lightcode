@@ -13,7 +13,7 @@ import (
 
 // stageGroupCapture drives one real CodeStore capture in the given group
 // directory: the current target content is captured as the preimage, content
-// is written, and the post-write identity is recorded and retained.
+// is written, and the post-write identity is recorded.
 func stageGroupCapture(t *testing.T, groupDir, target string, turn int, content []byte) {
 	t.Helper()
 	code := mustOpenCodeStore(t, groupDir)
@@ -27,7 +27,6 @@ func stageGroupCapture(t *testing.T, groupDir, target string, turn int, content 
 		err := code.RecordSnapshotContent(turn, entryID, content)
 		testassert.Require(t, err == nil, "RecordSnapshotContent(%s): %v", target, err)
 	}
-	code.RetainSnapshotEntry(turn, entryID)
 }
 
 // stageTwoGroups seeds the shared two-group prologue: an entry-new and an

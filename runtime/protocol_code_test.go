@@ -33,8 +33,8 @@ func codeGroupRoot(r *Runtime, sessionID, entryID string) string {
 }
 
 // captureCodeMutation drives one real CodeStore capture exactly like a
-// mutating tool: the on-disk preimage is captured, content is written, and the
-// post-mutation identity is recorded and retained.
+// mutating tool: the on-disk preimage is captured, content is written, and
+// the post-mutation identity is recorded.
 func captureCodeMutation(t *testing.T, groupRoot, displayPath, target string, content []byte) {
 	t.Helper()
 	group, err := snapshot.OpenCodeStore(groupRoot)
@@ -49,7 +49,6 @@ func captureCodeMutation(t *testing.T, groupRoot, displayPath, target string, co
 		err := group.RecordSnapshotContent(1, entryID, content)
 		testassert.Require(t, err == nil, "RecordSnapshotContent(%s): %v", target, err)
 	}
-	group.RetainSnapshotEntry(1, entryID)
 }
 
 // submitCodeOperation submits one regular message and waits for its admitted
@@ -985,7 +984,6 @@ func recordRetainedMutation(t *testing.T, sessionDir string, turn int, display, 
 		err := store.RecordSnapshotContent(turn, entryID, content)
 		testassert.Require(t, err == nil, "RecordSnapshotContent turn %d: %v", turn, err)
 	}
-	store.RetainSnapshotEntry(turn, entryID)
 }
 
 // assertCanariesUntouched verifies the hazardous conversation and claim files

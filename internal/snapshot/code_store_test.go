@@ -13,6 +13,12 @@ import (
 	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
+// revertGroup drives the real whole-invocation restore producer over the
+// fixture's known group directory, as production does.
+func revertGroup(store *CodeStore, afterTurn int) (RevertResult, error) {
+	return RevertCodeGroups([]string{filepath.Dir(store.snapshotsDir)}, afterTurn)
+}
+
 // TestCodeStoreArtifactOnlyGroupReopenAndRestore proves that an isolated
 // target code group can be captured, reopened, listed and restored through
 // CodeStore alone, with no conversation state, Project record, claim,
@@ -37,7 +43,6 @@ func TestCodeStoreArtifactOnlyGroupReopenAndRestore(t *testing.T) {
 	entryID, created, err := code.SnapshotResolvedEntry(1, abs, abs)
 	testassert.NoError(t, err)
 	testassert.Require(t, created, "SnapshotResolvedEntry created = false, want true")
-	code.RetainSnapshotEntry(1, entryID)
 
 	mutated := []byte("mutated\n")
 	testassert.NoError(t, os.WriteFile(target, mutated, 0o644))
@@ -62,7 +67,7 @@ func TestCodeStoreArtifactOnlyGroupReopenAndRestore(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Require(t, len(reopenedTurns) == 1 && len(reopenedTurns[0].Files) == 1, "reopened ListTurns = %+v, want one turn with one file", reopenedTurns)
 
-	result, err := reopened.RevertCode(0)
+	result, err := revertGroup(reopened, 0)
 	testassert.NoError(t, err)
 	testassert.Require(t, len(result.Restored) == 1 && result.Restored[0] == abs && len(result.Skipped) == 0, "RevertCode restored = %v, want [%s]; RevertCode skipped = %+v, want none", result.Restored, abs, result.Skipped)
 	got, err := os.ReadFile(target)
@@ -98,7 +103,6 @@ func TestCodeStoreTwoGroupsRestoreIndependently(t *testing.T) {
 		testassert.Require(t, err == nil, "OpenCodeStore(%s): %v", groupDir, err)
 		entryID, created, err := code.SnapshotResolvedEntry(1, target, target)
 		testassert.Require(t, err == nil && created, "SnapshotResolvedEntry(%s) = (%v, %v), want one created entry", groupDir, entryID, err)
-		code.RetainSnapshotEntry(1, entryID)
 		{
 			err := os.WriteFile(target, mutated, 0o644)
 			testassert.Require(t, err == nil, "mutate %s: %v", target, err)
@@ -116,7 +120,7 @@ func TestCodeStoreTwoGroupsRestoreIndependently(t *testing.T) {
 	// B's file stays mutated and B's snapshot tree stays intact.
 	restoreA, err := OpenCodeStore(groupADir)
 	testassert.NoError(t, err)
-	resultA, err := restoreA.RevertCode(0)
+	resultA, err := revertGroup(restoreA, 0)
 	testassert.NoError(t, err)
 	testassert.Require(t, len(resultA.Restored) == 1 && resultA.Restored[0] == fileA && len(resultA.Skipped) == 0, "RevertCode(A) = %+v, want exactly %s restored", resultA, fileA)
 	gotA, err := os.ReadFile(fileA)
@@ -131,7 +135,7 @@ func TestCodeStoreTwoGroupsRestoreIndependently(t *testing.T) {
 	// Restoring group B independently restores its own preimage.
 	restoreB, err := OpenCodeStore(groupBDir)
 	testassert.NoError(t, err)
-	resultB, err := restoreB.RevertCode(0)
+	resultB, err := revertGroup(restoreB, 0)
 	testassert.NoError(t, err)
 	testassert.Require(t, len(resultB.Restored) == 1 && resultB.Restored[0] == fileB && len(resultB.Skipped) == 0, "RevertCode(B) = %+v, want exactly %s restored", resultB, fileB)
 	gotB, err = os.ReadFile(fileB)
@@ -178,6 +182,36 @@ func TestCodeStoreRejectsInvalidTurn(t *testing.T) {
 		_, _, err := store.SnapshotResolvedEntry(0, path, path)
 		testassert.Require(t, err != nil, "SnapshotResolvedEntry(0) error = nil, want error")
 	}
+}
+
+// TestReplaceSnapshotIdentityReturnsOwnedPrior proves the identity
+// replacement contract: the pre-mutation clear returns the identity the entry
+// owned, a nil replacement leaves no proof, and a later replacement owns the
+// prior it displaced.
+func TestReplaceSnapshotIdentityReturnsOwnedPrior(t *testing.T) {
+	store := newTestCodeGroup(t)
+	const turn = 1
+	path := filepath.Join(t.TempDir(), "file.txt")
+	testassert.NoError(t, os.WriteFile(path, []byte("before"), 0o644))
+	entryID, created, err := store.SnapshotResolvedEntry(turn, path, path)
+	testassert.NoError(t, err)
+	testassert.Require(t, created, "SnapshotResolvedEntry created = false, want true")
+
+	prior, err := store.ReplaceSnapshotIdentity(turn, entryID, nil)
+	testassert.NoError(t, err)
+	testassert.Require(t, prior == nil, "clear of a fresh entry prior = %+v, want nil", prior)
+
+	testassert.NoError(t, store.RecordSnapshotContent(turn, entryID, []byte("first")))
+	prior, err = store.ReplaceSnapshotIdentity(turn, entryID, nil)
+	testassert.NoError(t, err)
+	testassert.Require(t, prior != nil && prior.Hash == hashBytes([]byte("first")), "clear prior = %+v, want the first write's identity", prior)
+	prior, err = store.ReplaceSnapshotIdentity(turn, entryID, prior)
+	testassert.NoError(t, err)
+	testassert.Require(t, prior == nil, "restore prior = %+v, want the cleared nil identity", prior)
+
+	meta, err := store.ListTurns()
+	testassert.NoError(t, err)
+	testassert.Require(t, len(meta) == 1 && len(meta[0].Files) == 1 && meta[0].Files[0].LastWrite != nil && meta[0].Files[0].LastWrite.Hash == hashBytes([]byte("first")), "ListTurns = %+v, want the restored proof recorded", meta)
 }
 
 func TestSnapshotMetaJSONRoundTrip(t *testing.T) {
@@ -227,7 +261,7 @@ func TestSnapshotDeduplicatesSymlinkAndRealPath(t *testing.T) {
 
 			testassert.NoError(t, os.WriteFile(realPath, []byte("v2"), 0o644))
 			recordSnapshotContent(t, store, turn, entryID, "v2")
-			affected, err := store.RevertCode(0)
+			affected, err := revertGroup(store, 0)
 			testassert.NoError(t, err)
 			testassert.Require(t, len(affected.Restored) == 1, "affected = %v, want one path", affected)
 			got, err := os.ReadFile(realPath)
@@ -254,7 +288,7 @@ func TestSnapshotResolvedPreservesOriginalPathForListing(t *testing.T) {
 	testassert.Equal(t, entries[0].Files[0].OriginalPath, linkPath)
 	testassert.NoError(t, os.WriteFile(realPath, []byte("v2"), 0o644))
 	recordSnapshotContent(t, store, turn, entryID, "v2")
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 	testassert.NoError(t, err)
 	testassert.Require(t, reflect.DeepEqual(affected.Restored, []string{linkPath}), "affected = %v, want original requested path %q", affected, linkPath)
 	{
@@ -275,53 +309,13 @@ func TestSnapshotResolvedEntryReportsCreatedOnlyForNewEntry(t *testing.T) {
 	entryID2, created, err := store.SnapshotResolvedEntry(turn, path, path)
 	testassert.NoError(t, err)
 	testassert.Require(t, entryID2 == entryID && !created, "second SnapshotResolvedEntry = (%q, %v), want same existing entry %q", entryID2, created, entryID)
+	// Only the call whose created flag is true may discard: the entry it
+	// created is removed, and an existing entry's flag keeps it alive.
 	testassert.NoError(t, store.DiscardSnapshotEntry(turn, entryID))
-	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil {
-		t.Fatal(err)
-	} else if len(entries) != 1 {
-		t.Fatalf("snapshot entries after one discard = %d, want one retained by second user", len(entries))
-	}
-	testassert.NoError(t, store.DiscardSnapshotEntry(turn, entryID2))
 	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatal(err)
 	} else if len(entries) != 0 {
-		t.Fatalf("snapshot entries after discard = %d, want none", len(entries))
-	}
-}
-
-func TestSnapshotResolvedEntryRetainPreventsConcurrentDiscard(t *testing.T) {
-	store := newTestCodeGroup(t)
-	const turn = 1
-	path := filepath.Join(t.TempDir(), "file.txt")
-	testassert.NoError(t, os.WriteFile(path, []byte("before"), 0o644))
-
-	entryID, created, err := store.SnapshotResolvedEntry(turn, path, path)
-	testassert.NoError(t, err)
-	testassert.Require(t, created, "first SnapshotResolvedEntry was not created")
-	entryID2, created, err := store.SnapshotResolvedEntry(turn, path, path)
-	testassert.NoError(t, err)
-	testassert.Require(t, entryID2 == entryID && !created, "second SnapshotResolvedEntry = (%q, %v), want same existing entry %q", entryID2, created, entryID)
-	store.RetainSnapshotEntry(turn, entryID2)
-	testassert.NoError(t, store.DiscardSnapshotEntry(turn, entryID))
-	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil {
-		t.Fatal(err)
-	} else if len(entries) != 1 {
-		t.Fatalf("snapshot entries after retained discard = %d, want one", len(entries))
-	}
-}
-
-func TestSnapshotResolvedRetainsEntryAgainstLaterDiscard(t *testing.T) {
-	store := newTestCodeGroup(t)
-	const turn = 1
-	path := filepath.Join(t.TempDir(), "file.txt")
-	testassert.NoError(t, os.WriteFile(path, []byte("before"), 0o644))
-	entryID := snapshotEntry(t, store, turn, path, path)
-	store.RetainSnapshotEntry(turn, entryID)
-	testassert.NoError(t, store.DiscardSnapshotEntry(turn, hashString(path)))
-	if entries, err := os.ReadDir(filepath.Join(store.snapshotsDir, "1")); err != nil {
-		t.Fatal(err)
-	} else if len(entries) != 1 {
-		t.Fatalf("snapshot entries after discard of retained snapshot = %d, want one", len(entries))
+		t.Fatalf("snapshot entries after discarding the created entry = %d, want none", len(entries))
 	}
 }
 
@@ -342,7 +336,7 @@ func TestSnapshotFirstWriteWinsAndNewFileDeletesOnRevert(t *testing.T) {
 	recordSnapshotContent(t, store, turn, createdEntry, "new")
 
 	{
-		_, err := store.RevertCode(0)
+		_, err := revertGroup(store, 0)
 		testassert.NoError(t, err)
 	}
 	{
@@ -377,7 +371,7 @@ func TestRevertSkipsCanonicalPathReplacedBySymlinkAndContinues(t *testing.T) {
 	testassert.NoError(t, os.Remove(linkPath))
 	testassert.NoError(t, os.Symlink(repointedTarget, linkPath))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.NoError(t, err)
 	testassert.Require(t, reflect.DeepEqual(affected.Restored, []string{ownedPath}) && len(affected.Skipped) == 1 && affected.Skipped[0].Path == linkPath, "restored = %v, want [%s]; skipped = %+v, want %s", affected.Restored, ownedPath, affected.Skipped, linkPath)
@@ -413,7 +407,7 @@ func TestRevertSkipsExistingFileReplacedByDirectoryAndContinues(t *testing.T) {
 	testassert.NoError(t, os.Remove(dirPath))
 	testassert.NoError(t, os.Mkdir(dirPath, 0o755))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.NoError(t, err)
 	testassert.Require(t, reflect.DeepEqual(affected.Restored, []string{ownedPath}) && len(affected.Skipped) == 1 && affected.Skipped[0].Path == dirPath, "restored = %v, want [%s]; skipped = %+v, want %s", affected.Restored, ownedPath, affected.Skipped, dirPath)
@@ -443,7 +437,7 @@ func TestRevertOldSnapshotMetaFallsBackToOriginalPath(t *testing.T) {
 	}))
 	testassert.NoError(t, os.WriteFile(path, []byte("after"), 0o644))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.NoError(t, err)
 	testassert.Require(t, reflect.DeepEqual(affected.Restored, []string{path}), "affected = %v, want [%s]", affected, path)
@@ -469,7 +463,7 @@ func TestRevertOldSnapshotMetaRestoresMissingRegularPathWithOldHash(t *testing.T
 	}))
 	testassert.NoError(t, os.Remove(path))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.NoError(t, err)
 	testassert.Require(t, reflect.DeepEqual(affected.Restored, []string{path}), "affected = %v, want [%s]", affected, path)
@@ -489,7 +483,7 @@ func TestRevertSkipsExistingFileSnapshotWithoutRecordedLastWriteIdentity(t *test
 	snapshotEntry(t, store, turn, path, path)
 	testassert.NoError(t, os.WriteFile(path, []byte("after"), 0o644))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 	testassert.NoError(t, err)
 	testassert.Require(t, len(affected.Restored) == 0 && len(affected.Skipped) == 1 && affected.Skipped[0].Path == path, "restored = %v, want none; skipped = %+v, want %s", affected.Restored, affected, path)
 	{
@@ -520,7 +514,7 @@ func TestRevertOldSnapshotMetaRestoresCurrentSymlinkTargetWhenHashMatches(t *tes
 	}))
 	testassert.NoError(t, os.WriteFile(originalTarget, []byte("after"), 0o644))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.NoError(t, err)
 	testassert.Require(t, reflect.DeepEqual(affected.Restored, []string{linkPath}), "affected = %v, want [%s]", affected, linkPath)
@@ -544,7 +538,7 @@ func TestRevertOldSnapshotMetaRefusesGoneSymlinkTarget(t *testing.T) {
 	testassert.NoError(t, writeJSON(filepath.Join(entryDir, "meta.json"), SnapshotMeta{OriginalPath: linkPath, Existed: true}))
 	testassert.NoError(t, os.Remove(linkPath))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "target missing and cannot be proven"), "RevertCode error = %v, want missing legacy target refusal", err)
 	testassert.Require(t, len(affected.Restored) == 0, "affected = %v, want none on refused restore", affected)
@@ -568,7 +562,7 @@ func TestRevertOldSnapshotMetaRefusesCurrentSymlinkPath(t *testing.T) {
 	testassert.NoError(t, os.Remove(linkPath))
 	testassert.NoError(t, os.Symlink(repointedTarget, linkPath))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "legacy snapshot target hash changed"), "RevertCode error = %v, want legacy hash-change refusal", err)
 	testassert.Require(t, len(affected.Restored) == 0, "affected = %v, want none on refused restore", affected)
@@ -597,7 +591,7 @@ func TestRevertModernSnapshotSkipsFinalTargetSwappedToSymlink(t *testing.T) {
 	testassert.NoError(t, os.Remove(target))
 	testassert.NoError(t, os.Symlink(secret, target))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.NoError(t, err)
 	testassert.Require(t, len(affected.Restored) == 0 && len(affected.Skipped) == 1 && affected.Skipped[0].Path == target, "restored = %v, want none; skipped = %+v, want %s", affected.Restored, affected, target)
@@ -618,7 +612,7 @@ func TestRevertExistedFalseSkipsSymlinkWithoutRecordedIdentity(t *testing.T) {
 	snapshotEntry(t, store, turn, createdPath, createdPath)
 	testassert.NoError(t, os.Symlink(secret, createdPath))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.NoError(t, err)
 	testassert.Require(t, len(affected.Restored) == 0 && len(affected.Skipped) == 1 && affected.Skipped[0].Path == createdPath, "restored = %v, want none; skipped = %+v, want %s", affected.Restored, affected, createdPath)
@@ -654,7 +648,7 @@ func TestRevertExistedFalseRefusesRepointedParent(t *testing.T) {
 	testassert.NoError(t, os.Remove(linkRoot))
 	testassert.NoError(t, os.Symlink(repointedRoot, linkRoot))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "canonical path changed"), "RevertCode error = %v, want canonical path changed error", err)
 	testassert.Require(t, len(affected.Restored) == 0, "affected = %v, want none on refused delete", affected)
@@ -680,7 +674,7 @@ func TestRevertCodeRestoresLaterSnapshotsAndDeletesLaterSnapshotDirs(t *testing.
 	testassert.NoError(t, os.WriteFile(path, []byte("new"), 0o644))
 	recordSnapshotContent(t, store, 2, entryID, "new")
 
-	affected, err := store.RevertCode(1)
+	affected, err := revertGroup(store, 1)
 	testassert.NoError(t, err)
 	testassert.Require(t, reflect.DeepEqual(affected.Restored, []string{path}), "affected = %v, want [%s]", affected, path)
 	{
@@ -726,7 +720,7 @@ func TestRevertCodeReportsRestoredAndSkippedStateInSameTurn(t *testing.T) {
 	testassert.NoError(t, os.Remove(secondPath))
 	testassert.NoError(t, os.Symlink(secret, secondPath))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 	testassert.NoError(t, err)
 	containsFirst := false
 	for _, p := range affected.Restored {
@@ -757,7 +751,7 @@ func TestRevertSkipBlocksOlderSnapshotForSameFile(t *testing.T) {
 
 	testassert.NoError(t, os.WriteFile(path, []byte("first"), 0o644))
 
-	affected, err := store.RevertCode(0)
+	affected, err := revertGroup(store, 0)
 	testassert.NoError(t, err)
 	testassert.Require(t, len(affected.Restored) == 0 && len(affected.Skipped) == 1 && affected.Skipped[0].Path == path, "restored = %v, want none; skipped = %+v, want one skipped %s", affected.Restored, affected, path)
 	{

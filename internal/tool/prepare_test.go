@@ -413,7 +413,7 @@ func TestPrepareReadRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 
 func TestPrepareWriteRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 	realA, realB, root := workspaceRepointFixture(t, "x")
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 
 	args, err := NormalizeWriteArgs(map[string]any{"path": filepath.Join(realA, "f.txt"), "content": "y"})
 	testassert.NoError(t, err)
@@ -434,7 +434,7 @@ func TestPrepareWriteRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 
 func TestPreparePatchRevalidatesRepointedWorkspaceRoot(t *testing.T) {
 	realA, realB, root := workspaceRepointFixture(t, "hi")
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 	input := applyPatchInput(t, "*** Update File: "+filepath.Join(realA, "f.txt")+"\n@@\n-hi\n+bye")
 
 	args, err := NormalizePatchArgs(map[string]any{"input": input})
@@ -513,7 +513,7 @@ func TestPreparedEditAndWritePaths(t *testing.T) {
 	path := filepath.Join(dir, "sub", "file.txt")
 	testassert.NoError(t, os.Mkdir(filepath.Join(dir, "sub"), 0o755))
 	testassert.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 
 	// Prepared write through the exported entry (no tracker, nil-tracker
 	// target path) overwrites content.
@@ -591,7 +591,7 @@ func TestPrepareWriteAndEditDiscardSnapshotClaimOnPostSnapshotRevalidationFailur
 	// must fail on the changed canonical target AND discard the snapshot
 	// claim; neither file may be mutated.
 	repointTo(real1)
-	store := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
+	store := &recordingCodeGroupStore{testCodeGroupStore: newTempCodeGroupStore(t), onSnapshot: func(call int) {
 		if call == 1 {
 			repointTo(real2)
 		}
@@ -604,13 +604,15 @@ func TestPrepareWriteAndEditDiscardSnapshotClaimOnPostSnapshotRevalidationFailur
 		_, err := prepared.Execute(context.Background())
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "approved canonical path changed"), "write Execute error = %v, want post-snapshot canonical change refusal", err)
 	}
-	testassert.Require(t, len(store.discards) == 1 && store.discards[0] == real1, "write discards = %v, want the unmutated snapshot claim for %s discarded once", store.discards, real1)
+	testassert.Require(t, len(store.discards) == 1 && store.discards[0] == store.entryIDFor(real1), "write discards = %v, want the unmutated snapshot claim for %s discarded once", store.discards, real1)
+	assertEntryDiscarded(t, store, real1)
+	assertSnapshotEntryCount(t, store.groupDir, "1", 0)
 	assertFileContent(t, real1, "before")
 	assertFileContent(t, real2, "before")
 
 	// Edit path: same window, same discard-before-mutation behavior.
 	repointTo(real1)
-	store2 := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
+	store2 := &recordingCodeGroupStore{testCodeGroupStore: newTempCodeGroupStore(t), onSnapshot: func(call int) {
 		if call == 1 {
 			repointTo(real2)
 		}
@@ -623,7 +625,9 @@ func TestPrepareWriteAndEditDiscardSnapshotClaimOnPostSnapshotRevalidationFailur
 		_, err := editPrepared.Execute(context.Background())
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "approved canonical path changed"), "edit Execute error = %v, want post-snapshot canonical change refusal", err)
 	}
-	testassert.Require(t, len(store2.discards) == 1 && store2.discards[0] == real1, "edit discards = %v, want the unmutated snapshot claim for %s discarded once", store2.discards, real1)
+	testassert.Require(t, len(store2.discards) == 1 && store2.discards[0] == store2.entryIDFor(real1), "edit discards = %v, want the unmutated snapshot claim for %s discarded once", store2.discards, real1)
+	assertEntryDiscarded(t, store2, real1)
+	assertSnapshotEntryCount(t, store2.groupDir, "1", 0)
 	assertFileContent(t, real1, "before")
 	assertFileContent(t, real2, "before")
 }
@@ -631,7 +635,7 @@ func TestPrepareWriteAndEditDiscardSnapshotClaimOnPostSnapshotRevalidationFailur
 func TestPreparePatchExecutesParsedPatchWithoutReparse(t *testing.T) {
 	dir := t.TempDir()
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hi"), 0o644))
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n-hi\n+bye")
 
 	args := map[string]any{"input": input}
@@ -659,7 +663,7 @@ func TestPreparePatchClosureRevalidatesRepointedTarget(t *testing.T) {
 	testassert.NoError(t, os.WriteFile(real2, []byte("hi"), 0o644))
 	link := filepath.Join(dir, "link.txt")
 	testassert.NoError(t, os.Symlink(real1, link))
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 	input := applyPatchInput(t, "*** Update File: link.txt\n@@\n-hi\n+bye")
 
 	prepared, err := PreparePatchCall(dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -682,7 +686,7 @@ func TestPreparePatchPartialFailureReportsCommittedFiles(t *testing.T) {
 	second := filepath.Join(dir, "second.txt")
 	testassert.NoError(t, os.WriteFile(first, []byte("one"), 0o644))
 	testassert.NoError(t, os.WriteFile(second, []byte("two"), 0o644))
-	store := &applyPatchStore{turn: 1}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newTempCodeGroupStore(t)}
 	// After the first op commits its snapshot, tamper with the second op's
 	// file: the per-op current-content check must refuse it and the partial
 	// summary must report the committed first file.
@@ -710,7 +714,7 @@ func TestPrepareWriteRevalidatesWriteDirWitness(t *testing.T) {
 	testassert.NoError(t, os.Mkdir(realB, 0o755))
 	wd := filepath.Join(root, "wd")
 	testassert.NoError(t, os.Symlink(realA, wd))
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 
 	// The target is addressed directly through the real directory while the
 	// write-dir witness goes through the symlink; the target canonical path
@@ -784,7 +788,7 @@ func TestNormalizePatchArgsStrictInputType(t *testing.T) {
 	args, err = NormalizePatchArgs(map[string]any{})
 	testassert.NoError(t, err)
 	{
-		_, err := PreparePatchCall(t.TempDir(), "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, args)
+		_, err := PreparePatchCall(t.TempDir(), "", "", CapabilityOptions{}, newTempCodeGroupStore(t), args)
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "input is empty"), "PreparePatchCall error = %v, want patch-syntax error", err)
 	}
 }
@@ -835,7 +839,7 @@ func patchWriteDirWitnessInput(t *testing.T, target string) string {
 func TestPreparePatchRevalidatesWriteDirWitness(t *testing.T) {
 	t.Run("prepared_closure", func(t *testing.T) {
 		f := newPatchWriteDirWitnessFixture(t)
-		store := &applyPatchStore{turn: 1}
+		store := newTempCodeGroupStore(t)
 		rootCanonical, err := bindWorkspaceRoot(f.root)
 		testassert.NoError(t, err)
 		writeDirCanonical, err := bindWriteDir(f.root, "apply_patch", f.wd)
@@ -870,7 +874,7 @@ func TestPreparePatchRejectsOutsideWriteDirAtPreparation(t *testing.T) {
 	input := applyPatchInput(t, "*** Add File: "+filepath.Join(outside, "new.txt")+"\n+data")
 	args, err := NormalizePatchArgs(map[string]any{"input": input})
 	testassert.NoError(t, err)
-	prepared, err := PreparePatchCall(root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: inside}, &applyPatchStore{turn: 1}, args)
+	prepared, err := PreparePatchCall(root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: inside}, newTempCodeGroupStore(t), args)
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "outside write_dir"), "PreparePatchCall error = %v, want outside-write_dir rejection at preparation", err)
 	testassert.Require(t, prepared == nil, "prepared call = %+v, want nil after preparation rejection", prepared)
 	{
@@ -883,7 +887,7 @@ func TestPreparePatchRejectsOutsideWriteDirAtPreparation(t *testing.T) {
 	args, err = NormalizePatchArgs(map[string]any{"input": input})
 	testassert.NoError(t, err)
 	{
-		_, err := PreparePatchCall(root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: inside}, &applyPatchStore{turn: 1}, args)
+		_, err := PreparePatchCall(root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: inside}, newTempCodeGroupStore(t), args)
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "outside write_dir"), "PreparePatchCall error = %v, want outside-write_dir source rejection at preparation", err)
 	}
 
@@ -891,7 +895,7 @@ func TestPreparePatchRejectsOutsideWriteDirAtPreparation(t *testing.T) {
 	input = applyPatchInput(t, "*** Update File: "+filepath.Join(inside, "a.txt")+"\n@@\n-x\n+fixed")
 	args, err = NormalizePatchArgs(map[string]any{"input": input})
 	testassert.NoError(t, err)
-	prepared, err = PreparePatchCall(root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: inside}, &applyPatchStore{turn: 1}, args)
+	prepared, err = PreparePatchCall(root, rootCanonical, writeDirCanonical, CapabilityOptions{WriteDir: inside}, newTempCodeGroupStore(t), args)
 	testassert.NoError(t, err)
 	{
 		_, err := prepared.Execute(context.Background())

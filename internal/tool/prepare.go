@@ -417,73 +417,55 @@ func prepareWrite(root string, store SnapshotStore, args map[string]any, approve
 }
 
 // writeMutation opens the write target (creating required parents), replaces
-// its content, and reports whether a mutation may have started.
-func writeMutation(canonical string, content, displayPath string) (string, bool, error) {
-	f, openedExisting, mutationStarted, err := openWriteTargetForMutation(canonical)
+// its content, and reports whether a mutation may have started plus whether
+// the intended bytes are known to have been fully produced.
+func writeMutation(canonical string, content, displayPath string) (string, bool, bool, error) {
+	f, _, err := openWriteTargetForMutation(canonical)
 	if err != nil {
-		return "", mutationStarted, fmt.Errorf("write_file: %w", err)
+		return "", false, false, fmt.Errorf("write_file: %w", err)
 	}
 	defer f.Close()
 
-	if openedExisting {
-		mutationStarted = true
-	}
-	if err := f.Truncate(0); err != nil {
-		return "", mutationStarted, fmt.Errorf("write_file: truncate: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return "", mutationStarted, fmt.Errorf("write_file: seek: %w", err)
-	}
-	if _, err := f.Write([]byte(content)); err != nil {
-		return "", mutationStarted, fmt.Errorf("write_file: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		return "", mutationStarted, fmt.Errorf("write_file: sync: %w", err)
+	// A successful open has created or opened the target, so any failure from
+	// here on has an uncertain started state.
+	complete, werr := writeReplacement(f, []byte(content))
+	if werr != nil {
+		return "", true, complete, fmt.Errorf("write_file: %w", werr)
 	}
 
-	return fmt.Sprintf("Wrote %s.", displayPath), mutationStarted, nil
+	return fmt.Sprintf("Wrote %s.", displayPath), true, true, nil
 }
 
-// writeWithSnapshotBookkeeping wraps writeMutation with the retained
-// snapshot transaction: preflight, capture, the post-snapshot binding
-// revalidation, and the discard-before-mutation / retain-after-mutation
-// failure behavior.
+// writeWithSnapshotBookkeeping wraps writeMutation with the mandatory snapshot
+// transaction: preflight, capture plus the pre-mutation proof clear, the
+// post-capture binding revalidation, and the abandon-on-proven-non-mutation /
+// produced-identity failure behavior.
 func writeWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, displayAbs, canonical, content, displayPath string) (string, error) {
 	if err := preflightWriteSnapshotTarget(canonical); err != nil {
 		return "", err
 	}
-	snapshot, err := snapshotFileForMutation(store, store.CurrentTurn(), displayAbs, canonical)
+	snapshot, err := captureSnapshotEntry(store, displayAbs, canonical)
 	if err != nil {
 		return "", fmt.Errorf("write_file: snapshot: %w", err)
 	}
-	defer releaseSnapshotMutation(snapshot)
 	// Retained legacy behavior: the binding is revalidated again after the
 	// snapshot was captured, so a target repointed during snapshotting
 	// fails before any mutation, and the unmutated snapshot claim is
-	// discarded exactly like every other pre-mutation failure.
+	// abandoned exactly like every other pre-mutation failure.
 	if err := bound.revalidate(); err != nil {
 		err = fmt.Errorf("write_file: resolve path: %w", err)
-		if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
-			return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
+		if abandonErr := abandonUnmutatedSnapshot(snapshot); abandonErr != nil {
+			return "", fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
 		return "", err
 	}
-	res, mutationStarted, err := writeMutation(canonical, content, displayPath)
+	res, started, complete, err := writeMutation(canonical, content, displayPath)
 	if err != nil {
-		if !mutationStarted {
-			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
-				return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
-			}
-		} else {
-			err = retainFailedMutatedSnapshot(snapshot, canonical, err)
-		}
-		return "", err
+		return "", finishMutationFailure(snapshot, started, complete, []byte(content), err)
 	}
-	if err := recordMutatedSnapshotContent(snapshot, []byte(content)); err != nil {
-		retainMutatedSnapshot(snapshot)
+	if err := recordProducedSnapshotContent(snapshot, []byte(content)); err != nil {
 		return "", fmt.Errorf("write_file: record snapshot identity: %w", err)
 	}
-	retainMutatedSnapshot(snapshot)
 	return res, nil
 }
 
@@ -539,104 +521,89 @@ func prepareEdit(root string, store SnapshotStore, args map[string]any, approved
 }
 
 // editMutation validates the edit against current file content and applies
-// it; mutationStarted reports whether bytes may have landed.
-func editMutation(canonical string, displayPath, oldString, newString string, replaceAll bool) (*editResult, bool, error) {
+// it; mutationStarted reports whether bytes may have landed, and complete
+// whether the updated bytes are known to have been fully produced. produced
+// carries the updated content once it is known, even on a write failure.
+func editMutation(canonical string, displayPath, oldString, newString string, replaceAll bool) (res *editResult, produced []byte, started, complete bool, err error) {
 	if oldString == "" {
-		return nil, false, fmt.Errorf("edit_file: old_string must not be empty")
+		return nil, nil, false, false, fmt.Errorf("edit_file: old_string must not be empty")
 	}
 	if oldString == newString {
-		return nil, false, fmt.Errorf("edit_file: old_string and new_string are identical")
+		return nil, nil, false, false, fmt.Errorf("edit_file: old_string and new_string are identical")
 	}
 
 	if _, err := ensureRegularExistingTarget(canonical); err != nil {
-		return nil, false, fmt.Errorf("edit_file: %w", err)
+		return nil, nil, false, false, fmt.Errorf("edit_file: %w", err)
 	}
 
 	f, err := openExistingMutationFile(canonical, os.O_RDWR)
 	if err != nil {
-		return nil, false, fmt.Errorf("edit_file: %w", err)
+		return nil, nil, false, false, fmt.Errorf("edit_file: %w", err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, false, fmt.Errorf("edit_file: stat: %w", err)
+		return nil, nil, false, false, fmt.Errorf("edit_file: stat: %w", err)
 	}
 	if err := ensureRegularFileInfo(canonical, info); err != nil {
-		return nil, false, fmt.Errorf("edit_file: %w", err)
+		return nil, nil, false, false, fmt.Errorf("edit_file: %w", err)
 	}
 
 	data, err := io.ReadAll(f)
 	if err != nil {
-		return nil, false, fmt.Errorf("edit_file: %w", err)
+		return nil, nil, false, false, fmt.Errorf("edit_file: %w", err)
 	}
 	content := string(data)
 
-	res, err := ApplyEdit(content, oldString, newString, replaceAll, displayPath)
+	edit, err := ApplyEdit(content, oldString, newString, replaceAll, displayPath)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, false, err
 	}
+	produced = []byte(edit.UpdatedContent)
 
-	mutationStarted := true
-	if err := f.Truncate(0); err != nil {
-		return nil, mutationStarted, fmt.Errorf("edit_file: truncate: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, mutationStarted, fmt.Errorf("edit_file: seek: %w", err)
-	}
-	if _, err := f.Write([]byte(res.UpdatedContent)); err != nil {
-		return nil, mutationStarted, fmt.Errorf("edit_file: write: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		return nil, mutationStarted, fmt.Errorf("edit_file: sync: %w", err)
+	complete, werr := writeReplacement(f, produced)
+	if werr != nil {
+		return nil, produced, true, complete, fmt.Errorf("edit_file: %w", werr)
 	}
 
 	return &editResult{
-		Result:         res.Summary,
-		UpdatedContent: res.UpdatedContent,
-		LineRanges:     res.LineRanges,
-		Count:          res.Count,
-	}, mutationStarted, nil
+		Result:         edit.Summary,
+		UpdatedContent: edit.UpdatedContent,
+		LineRanges:     edit.LineRanges,
+		Count:          edit.Count,
+	}, produced, true, true, nil
 }
 
-// editWithSnapshotBookkeeping wraps editMutation with the retained snapshot
-// transaction: preflight, capture, the post-snapshot binding revalidation,
-// and the discard-before-mutation / retain-after-mutation failure behavior.
+// editWithSnapshotBookkeeping wraps editMutation with the mandatory snapshot
+// transaction: preflight, capture plus the pre-mutation proof clear, the
+// post-capture binding revalidation, and the abandon-on-proven-non-mutation /
+// produced-identity failure behavior.
 func editWithSnapshotBookkeeping(bound boundCall, store SnapshotStore, displayAbs, canonical, displayPath, oldString, newString string, replaceAll bool) (string, error) {
 	if err := preflightEditSnapshotTarget(canonical); err != nil {
 		return "", err
 	}
-	snapshot, err := snapshotFileForMutation(store, store.CurrentTurn(), displayAbs, canonical)
+	snapshot, err := captureSnapshotEntry(store, displayAbs, canonical)
 	if err != nil {
 		return "", fmt.Errorf("edit_file: snapshot: %w", err)
 	}
-	defer releaseSnapshotMutation(snapshot)
 	// Retained legacy behavior: the binding is revalidated again after the
 	// snapshot was captured, so a target repointed during snapshotting
 	// fails before any mutation, and the unmutated snapshot claim is
-	// discarded exactly like every other pre-mutation failure.
+	// abandoned exactly like every other pre-mutation failure.
 	if err := bound.revalidate(); err != nil {
 		err = fmt.Errorf("edit_file: resolve path: %w", err)
-		if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
-			return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
+		if abandonErr := abandonUnmutatedSnapshot(snapshot); abandonErr != nil {
+			return "", fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
 		return "", err
 	}
-	res, mutationStarted, err := editMutation(canonical, displayPath, oldString, newString, replaceAll)
+	res, produced, started, complete, err := editMutation(canonical, displayPath, oldString, newString, replaceAll)
 	if err != nil {
-		if !mutationStarted {
-			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
-				return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
-			}
-		} else {
-			err = retainFailedMutatedSnapshot(snapshot, canonical, err)
-		}
-		return "", err
+		return "", finishMutationFailure(snapshot, started, complete, produced, err)
 	}
-	if err := recordMutatedSnapshotContent(snapshot, []byte(res.UpdatedContent)); err != nil {
-		retainMutatedSnapshot(snapshot)
+	if err := recordProducedSnapshotContent(snapshot, produced); err != nil {
 		return "", fmt.Errorf("edit_file: record snapshot identity: %w", err)
 	}
-	retainMutatedSnapshot(snapshot)
 	return res.Result, nil
 }
 

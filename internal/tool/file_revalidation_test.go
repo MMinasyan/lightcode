@@ -32,7 +32,7 @@ func TestFileToolsRefuseRepointedApprovedSymlink(t *testing.T) {
 	testassert.NoError(t, err)
 	writeArgs, err := NormalizeWriteArgs(map[string]any{"path": link, "content": "after"})
 	testassert.NoError(t, err)
-	writeCall, err := PrepareWriteCall(root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, writeArgs)
+	writeCall, err := PrepareWriteCall(root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), writeArgs)
 	testassert.NoError(t, err)
 	editArgs, err := NormalizeEditArgs(map[string]any{
 		"path":       link,
@@ -40,7 +40,7 @@ func TestFileToolsRefuseRepointedApprovedSymlink(t *testing.T) {
 		"new_string": "after",
 	})
 	testassert.NoError(t, err)
-	editCall, err := PrepareEditCall(root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, editArgs)
+	editCall, err := PrepareEditCall(root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), editArgs)
 	testassert.NoError(t, err)
 
 	testassert.NoError(t, os.Remove(link))
@@ -77,7 +77,7 @@ func TestFileToolsRefuseFinalTargetReplacedBySymlink(t *testing.T) {
 	testassert.NoError(t, err)
 	writeArgs, err := NormalizeWriteArgs(map[string]any{"path": target, "content": "after"})
 	testassert.NoError(t, err)
-	writeCall, err := PrepareWriteCall(root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, writeArgs)
+	writeCall, err := PrepareWriteCall(root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), writeArgs)
 	testassert.NoError(t, err)
 	editArgs, err := NormalizeEditArgs(map[string]any{
 		"path":       target,
@@ -85,7 +85,7 @@ func TestFileToolsRefuseFinalTargetReplacedBySymlink(t *testing.T) {
 		"new_string": "after",
 	})
 	testassert.NoError(t, err)
-	editCall, err := PrepareEditCall(root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, editArgs)
+	editCall, err := PrepareEditCall(root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), editArgs)
 	testassert.NoError(t, err)
 
 	testassert.NoError(t, os.Remove(target))

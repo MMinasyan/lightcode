@@ -16,95 +16,13 @@ func applyPatchInput(t *testing.T, s string) string {
 	return "*** Begin Patch\n" + s + "\n*** End Patch"
 }
 
-// applyPatchStore is a SnapshotStore that tolerates non-existent files
-// (recording "didn't exist" as the captured state) and records every
-// call. The real snapshot store does this; the test store used by
-// edit_file tests assumes a pre-existing file, which is wrong for
-// apply_patch's Add and Move-destination cases.
-
-type applyPatchStore struct {
-	turn            int
-	calls           []snapshotCall
-	seen            map[string]string
-	identityRecords []snapshotIdentityRecord
-	onSnapshot      func(call int)
-	// failOnCall, when > 0, makes the Nth snapshot call return errFail
-	// (used to simulate a mid-write failure at the second op).
-	failOnCall int
-	errFail    error
-	// discards records every DiscardSnapshotEntry call (entry IDs) so tests
-	// can observe the discard-before-mutation snapshot behavior.
-	discards []string
-}
-
-func (s *applyPatchStore) Snapshot(turn int, absPath string) error {
-	return s.SnapshotResolved(turn, absPath, absPath)
-}
-
-func (s *applyPatchStore) SnapshotResolved(turn int, originalPath, canonicalPath string) error {
-	s.calls = append(s.calls, snapshotCall{turn: turn, path: originalPath, canonical: canonicalPath})
-	if s.onSnapshot != nil {
-		s.onSnapshot(len(s.calls))
-	}
-	if s.failOnCall > 0 && len(s.calls) == s.failOnCall {
-		return s.errFail
-	}
-	if s.seen == nil {
-		s.seen = map[string]string{}
-	}
-	data, err := os.ReadFile(canonicalPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			s.seen[canonicalPath] = "" // captured "didn't exist"
-			return nil
-		}
-		return err
-	}
-	s.seen[canonicalPath] = string(data)
-	return nil
-}
-
-func (s *applyPatchStore) SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (string, bool, error) {
-	if err := s.SnapshotResolved(turn, originalPath, canonicalPath); err != nil {
-		return "", false, err
-	}
-	return canonicalPath, true, nil
-}
-
-func (s *applyPatchStore) DiscardSnapshotEntry(_ int, entryID string) error {
-	s.discards = append(s.discards, entryID)
-	return nil
-}
-
-func (s *applyPatchStore) RetainSnapshotEntry(int, string) {}
-
-func (s *applyPatchStore) RecordSnapshotContent(turn int, entryID string, content []byte) error {
-	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{
-		turn:    turn,
-		entryID: entryID,
-		content: string(content),
-	})
-	return nil
-}
-
-func (s *applyPatchStore) RecordSnapshotAbsence(turn int, entryID string) error {
-	s.identityRecords = append(s.identityRecords, snapshotIdentityRecord{
-		turn:    turn,
-		entryID: entryID,
-		absent:  true,
-	})
-	return nil
-}
-
-func (s *applyPatchStore) CurrentTurn() int { return s.turn }
-
 func TestApplyPatchAllOrNothingValidationFailure(t *testing.T) {
 	// First op is a successful Add; second op is an Update of a
 	// non-existent file. Validation runs the existence check before any
 	// write, so the Add must not land (validate-first all-or-nothing).
 	dir := t.TempDir()
 	newPath := filepath.Join(dir, "new.txt")
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 
 	input := applyPatchInput(t, "*** Add File: new.txt\n+hello\n*** Update File: ghost.go\n@@\n-missing\n+replacement")
 	_, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -122,7 +40,7 @@ func TestApplyPatchAllOrNothingPartialApplyError(t *testing.T) {
 	// the Delete fails, so the Add is not written either.
 	dir := t.TempDir()
 	newPath := filepath.Join(dir, "new.txt")
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 
 	input := applyPatchInput(t, "*** Add File: new.txt\n+hi\n*** Delete File: ghost.txt")
 	_, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -142,10 +60,10 @@ func TestApplyPatchMidWriteFailureReturnsExitError(t *testing.T) {
 	// error message.
 	dir := t.TempDir()
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "x.txt"), []byte("alpha\nBEFORE\nbeta"), 0o644))
-	store := &applyPatchStore{
-		turn:       1,
-		failOnCall: 2, // the second snapshot call fails
-		errFail:    errors.New("simulated disk full"),
+	store := &recordingCodeGroupStore{
+		testCodeGroupStore: newTempCodeGroupStore(t),
+		failOnCall:         2, // the second snapshot call fails
+		errFail:            errors.New("simulated disk full"),
 	}
 
 	input := applyPatchInput(t, "*** Add File: new.txt\n+hi\n*** Update File: x.txt\n@@\n alpha\n-BEFORE\n+AFTER\n beta")
@@ -160,7 +78,7 @@ func TestApplyPatchRefusesUpdateWhenContentChangesAfterValidation(t *testing.T) 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target.txt")
 	testassert.NoError(t, os.WriteFile(path, []byte("alpha\nBEFORE\nbeta"), 0o644))
-	store := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
+	store := &recordingCodeGroupStore{testCodeGroupStore: newTempCodeGroupStore(t), onSnapshot: func(call int) {
 		if call == 1 {
 			testassert.NoError(t, os.WriteFile(path, []byte("alpha\nCHANGED\nbeta"), 0o644))
 		}
@@ -176,7 +94,7 @@ func TestApplyPatchRefusesDeleteWhenContentChangesAfterValidation(t *testing.T) 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target.txt")
 	testassert.NoError(t, os.WriteFile(path, []byte("delete me"), 0o644))
-	store := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
+	store := &recordingCodeGroupStore{testCodeGroupStore: newTempCodeGroupStore(t), onSnapshot: func(call int) {
 		if call == 1 {
 			testassert.NoError(t, os.WriteFile(path, []byte("changed"), 0o644))
 		}
@@ -193,7 +111,7 @@ func TestApplyPatchRefusesMoveSourceWhenContentChangesAfterDestinationWrite(t *t
 	src := filepath.Join(dir, "old.txt")
 	dst := filepath.Join(dir, "new.txt")
 	testassert.NoError(t, os.WriteFile(src, []byte("old content"), 0o644))
-	store := &applyPatchStore{turn: 1, onSnapshot: func(call int) {
+	store := &recordingCodeGroupStore{testCodeGroupStore: newTempCodeGroupStore(t), onSnapshot: func(call int) {
 		if call == 2 {
 			testassert.NoError(t, os.WriteFile(src, []byte("changed"), 0o644))
 		}
@@ -215,7 +133,7 @@ func TestApplyPatchRecordsSnapshotIdentityForAddUpdateAndDelete(t *testing.T) {
 	addPath := filepath.Join(dir, "new.txt")
 	testassert.NoError(t, os.WriteFile(updatePath, []byte("a\nB\nc"), 0o644))
 	testassert.NoError(t, os.WriteFile(deletePath, []byte("remove me"), 0o644))
-	store := &applyPatchStore{turn: 4}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 4)}
 
 	input := applyPatchInput(t, "*** Add File: new.txt\n+created\n*** Update File: update.txt\n@@\n a\n-B\n+B2\n c\n*** Delete File: delete.txt")
 	{
@@ -223,9 +141,9 @@ func TestApplyPatchRecordsSnapshotIdentityForAddUpdateAndDelete(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 
-	assertSnapshotIdentityContent(t, store.identityRecords, 4, addPath, "created")
-	assertSnapshotIdentityContent(t, store.identityRecords, 4, updatePath, "a\nB2\nc")
-	assertSnapshotIdentityAbsent(t, store.identityRecords, 4, deletePath)
+	assertSnapshotIdentityContent(t, store.identityRecords, 4, store.entryIDFor(addPath), "created")
+	assertSnapshotIdentityContent(t, store.identityRecords, 4, store.entryIDFor(updatePath), "a\nB2\nc")
+	assertSnapshotIdentityAbsent(t, store.identityRecords, 4, store.entryIDFor(deletePath))
 }
 
 func TestApplyPatchSnapshotsEveryTouchedFile(t *testing.T) {
@@ -234,7 +152,7 @@ func TestApplyPatchSnapshotsEveryTouchedFile(t *testing.T) {
 	updated := filepath.Join(dir, "x.txt")
 	testassert.NoError(t, os.WriteFile(src, []byte("a\nB\nc"), 0o644))
 	testassert.NoError(t, os.WriteFile(updated, []byte("a\nB\nc"), 0o644))
-	store := &applyPatchStore{turn: 7}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 7)}
 
 	input := applyPatchInput(t, "*** Update File: x.txt\n@@\n a\n-B\n+B2\n c\n*** Update File: old.go\n*** Move to: new.go\n@@\n a\n-B\n+B2\n c")
 	{
@@ -253,7 +171,7 @@ func TestApplyPatchAddFailsIfFileExists(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "exists.txt")
 	testassert.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
-	store := &applyPatchStore{turn: 1}
+	store := newRecordingCodeGroupStore(t)
 
 	input := applyPatchInput(t, "*** Add File: exists.txt\n+new")
 	_, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -269,7 +187,7 @@ func TestApplyPatchMoveFailsIfDestinationExists(t *testing.T) {
 	dst := filepath.Join(dir, "new.go")
 	testassert.NoError(t, os.WriteFile(src, []byte("alpha\nBEFORE\nbeta"), 0o644))
 	testassert.NoError(t, os.WriteFile(dst, []byte("preexisting"), 0o644))
-	store := &applyPatchStore{turn: 1}
+	store := newRecordingCodeGroupStore(t)
 
 	input := applyPatchInput(t, "*** Update File: old.go\n*** Move to: new.go\n@@\n alpha\n-BEFORE\n+AFTER\n beta")
 	_, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -287,7 +205,7 @@ func TestApplyPatchCanonicalCollisionRejectedBeforeApply(t *testing.T) {
 	// catches the canonical collision.
 	dir := t.TempDir()
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hi"), 0o644))
-	store := &applyPatchStore{turn: 1}
+	store := newRecordingCodeGroupStore(t)
 	// "a.txt" and "./a.txt" are different raw paths but resolve to the same canonical.
 	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n-hi\n+bye\n*** Update File: ./a.txt\n@@\n-hi\n+there")
 	_, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -302,7 +220,7 @@ func TestApplyPatchCanonicalCollisionSymlinkRejected(t *testing.T) {
 	link := filepath.Join(dir, "link.txt")
 	testassert.NoError(t, os.WriteFile(real, []byte("content"), 0o644))
 	testassert.NoError(t, os.Symlink(real, link))
-	store := &applyPatchStore{turn: 1}
+	store := newRecordingCodeGroupStore(t)
 	// Two raw paths resolving to the same canonical via symlink.
 	input := applyPatchInput(t, "*** Update File: real.txt\n@@\n content\n+changed\n*** Delete File: link.txt")
 	_, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -318,7 +236,7 @@ func TestApplyPatchFuzzyMatchPreservesActualTrailingWhitespaceContext(t *testing
 
 	input := applyPatchInput(t, "*** Update File: a.go\n@@\n alpha\n-BEFORE\n+AFTER\n beta")
 	{
-		_, err := execPatch(t, dir, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"input": input})
+		_, err := execPatch(t, dir, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"input": input})
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, readFile(t, path), "alpha   \nAFTER\nbeta")
@@ -331,7 +249,7 @@ func TestApplyPatchFuzzyMatchPreservesActualUnicodeContext(t *testing.T) {
 
 	input := applyPatchInput(t, "*** Update File: a.go\n@@\n say \"hello\"\n-BEFORE\n+AFTER\n beta")
 	{
-		_, err := execPatch(t, dir, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"input": input})
+		_, err := execPatch(t, dir, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"input": input})
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, readFile(t, path), "say \u201Chello\u201D\nAFTER\nbeta")
@@ -343,7 +261,7 @@ func TestApplyPatchSyntheticEOFContextDoesNotCreateTrailingNewline(t *testing.T)
 	testassert.NoError(t, os.WriteFile(path, []byte("foo\nbar"), 0o644))
 
 	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n foo\n-bar\n+baz\n ")
-	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"input": input})
+	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"input": input})
 	testassert.NoError(t, err)
 	testassert.Equal(t, readFile(t, path), "foo\nbaz")
 	rows := previewRowsFor(t, ApplyPatchPreviewMetadata(res.Previews), "a.txt")
@@ -356,7 +274,7 @@ func TestApplyPatchSyntheticEOFRemoveFails(t *testing.T) {
 	testassert.NoError(t, os.WriteFile(path, []byte("foo"), 0o644))
 
 	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n-\n+bar")
-	_, err := execPatch(t, dir, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"input": input})
+	_, err := execPatch(t, dir, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"input": input})
 	testassert.Require(t, err != nil, "Execute err = nil, want synthetic EOF remove to fail")
 	testassert.Require(t, strings.HasPrefix(err.Error(), "Failed to find expected lines in a.txt:"), "err = %v, want expected-lines failure", err)
 	testassert.Equal(t, readFile(t, path), "foo")
@@ -368,7 +286,7 @@ func TestApplyPatchRealEOFContextPreservesTrailingNewline(t *testing.T) {
 	testassert.NoError(t, os.WriteFile(path, []byte("foo\nbar\n"), 0o644))
 
 	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n foo\n-bar\n+baz\n ")
-	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"input": input})
+	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"input": input})
 	testassert.NoError(t, err)
 	testassert.Equal(t, readFile(t, path), "foo\nbaz\n")
 	rows := previewRowsFor(t, ApplyPatchPreviewMetadata(res.Previews), "a.txt")
@@ -382,7 +300,7 @@ func TestApplyPatchRealEmptyRemoveStillWorks(t *testing.T) {
 
 	input := applyPatchInput(t, "*** Update File: a.txt\n@@\n foo\n-\n+bar\n baz")
 	{
-		_, err := execPatch(t, dir, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"input": input})
+		_, err := execPatch(t, dir, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"input": input})
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, readFile(t, path), "foo\nbar\nbaz")

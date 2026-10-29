@@ -55,12 +55,27 @@ func executeParsedPatch(root, rootCanonical string, store SnapshotStore, p *patc
 	}
 
 	// Phase 2: apply (mutations). Each op tracks its own committed state
-	// so a later op's failure can report the earlier committed files.
+	// so a later op's failure can report the earlier committed files. The
+	// already-approved Workspace root, write-dir and canonical target
+	// witnesses ride to each op's snapshot-to-I/O boundary.
 	previews := make([]AppliedFilePreview, 0, len(plans))
 	committed := make([]appliedOp, 0, len(plans))
 	for i := range plans {
 		pl := &plans[i]
-		preview, err := applyOne(pl, store, &committed)
+		srcBound := boundCall{
+			root: root, toolName: "apply_patch", path: pl.op.path,
+			rootCanonical: rootCanonical, canonical: pl.canonicalPath,
+			writeDir: writeDir, writeDirCanonical: writeDirCanonical,
+		}
+		var dstBound boundCall
+		if pl.moveCanonical != "" {
+			dstBound = boundCall{
+				root: root, toolName: "apply_patch", path: pl.op.movePath,
+				rootCanonical: rootCanonical, canonical: pl.moveCanonical,
+				writeDir: writeDir, writeDirCanonical: writeDirCanonical,
+			}
+		}
+		preview, err := applyOne(pl, store, &committed, srcBound, dstBound)
 		if err != nil {
 			return "", nil, err
 		}
@@ -352,15 +367,16 @@ func hunkTransformPreservingMatchedContext(h hunk, matchedLines []string, synthe
 // partial-failure summary in *ExitError so the model sees the committed-files
 // A/M/D list. committed is the running list of ops that have already landed on
 // disk; applyOne appends to it on success and reads it for partial-failure
-// summaries.
-func applyOne(pl *applyPlan, store SnapshotStore, committed *[]appliedOp) ([]AppliedFilePreview, error) {
+// summaries. srcBound and dstBound carry the approved witnesses to each
+// mutation's snapshot-to-I/O boundary.
+func applyOne(pl *applyPlan, store SnapshotStore, committed *[]appliedOp, srcBound, dstBound boundCall) ([]AppliedFilePreview, error) {
 	if err := revalidateApplyPlan(pl); err != nil {
 		return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + err.Error()}
 	}
 
 	// Move: write the destination first (so it lands), then snapshot + delete the source.
 	if pl.op.movePath != "" {
-		if err := writeWithSnapshot(store, pl.moveDisplay, pl.moveCanonical, pl.newContent, true); err != nil {
+		if err := writeWithSnapshot(store, dstBound, pl.moveDisplay, pl.moveCanonical, pl.newContent, true); err != nil {
 			return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + err.Error()}
 		}
 		*committed = append(*committed, appliedOp{kind: "M", path: pl.op.movePath})
@@ -370,7 +386,7 @@ func applyOne(pl *applyPlan, store SnapshotStore, committed *[]appliedOp) ([]App
 	}
 
 	// Now the original-path mutation (Add / Update / Delete), tracked separately for Move.
-	origErr := applyOriginalMutation(pl, store, committed)
+	origErr := applyOriginalMutation(pl, store, committed, srcBound)
 	if origErr != nil {
 		return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + origErr.Error()}
 	}
@@ -445,11 +461,11 @@ func buildOpPreviews(pl *applyPlan) []AppliedFilePreview {
 	return nil
 }
 
-func applyOriginalMutation(pl *applyPlan, store SnapshotStore, committed *[]appliedOp) error {
+func applyOriginalMutation(pl *applyPlan, store SnapshotStore, committed *[]appliedOp, srcBound boundCall) error {
 	if pl.moveCanonical != "" {
 		// For Move the source-path delete is the original-path mutation; the
 		// kind is "D" of the source.
-		if err := deleteWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath); err != nil {
+		if err := deleteWithSnapshot(store, srcBound, pl.displayAbsPath, pl.canonicalPath); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "D", path: pl.op.path})
@@ -458,17 +474,17 @@ func applyOriginalMutation(pl *applyPlan, store SnapshotStore, committed *[]appl
 
 	switch pl.op.kind {
 	case opAdd:
-		if err := writeWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath, pl.newContent, true); err != nil {
+		if err := writeWithSnapshot(store, srcBound, pl.displayAbsPath, pl.canonicalPath, pl.newContent, true); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "A", path: pl.op.path})
 	case opUpdate:
-		if err := writeWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath, pl.newContent, false); err != nil {
+		if err := writeWithSnapshot(store, srcBound, pl.displayAbsPath, pl.canonicalPath, pl.newContent, false); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "M", path: pl.op.path})
 	case opDelete:
-		if err := deleteWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath); err != nil {
+		if err := deleteWithSnapshot(store, srcBound, pl.displayAbsPath, pl.canonicalPath); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "D", path: pl.op.path})
@@ -476,106 +492,85 @@ func applyOriginalMutation(pl *applyPlan, store SnapshotStore, committed *[]appl
 	return nil
 }
 
-// writeWithSnapshot snapshots the target then writes the new content. The
-// snapshot is retained on any post-snapshot error so the partial state is
-// recoverable via the turn revert. forNew enforces the Add / Move-dest
-// exclusive-create guarantee: if the path was validated to not exist and
-// OpenForWrite reports it now does (concurrent create between validate and
-// apply), the write is refused.
-func writeWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath, content string, forNew bool) error {
-	var snap snapshotEntry
-	hasSnap := false
-	if store != nil {
-		s, err := snapshotFileForMutation(store, store.CurrentTurn(), displayAbsPath, canonicalPath)
-		if err != nil {
-			return fmt.Errorf("snapshot: %w", err)
+// writeWithSnapshot captures the target's preimage, clears the LastWrite
+// proof, revalidates the approved witnesses, then writes the new content.
+// A failure that proves no mutation ran abandons the snapshot; a failure with
+// known-complete produced bytes records them; an uncertain started mutation
+// retains the preimage with nil identity. forNew enforces the Add /
+// Move-dest exclusive-create guarantee: if the path was validated to not
+// exist and OpenForWrite reports it now does (concurrent create between
+// validate and apply), the write is refused.
+func writeWithSnapshot(store SnapshotStore, bound boundCall, displayAbsPath, canonicalPath, content string, forNew bool) error {
+	snap, err := captureSnapshotEntry(store, displayAbsPath, canonicalPath)
+	if err != nil {
+		return fmt.Errorf("snapshot: %w", err)
+	}
+	// The fail-closed root/write-dir/target revalidators run after capture
+	// and before any open/truncate; a newly resolved target is never
+	// substituted.
+	if err := bound.revalidate(); err != nil {
+		err = fmt.Errorf("apply_patch: resolve path: %w", err)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
-		snap = s
-		hasSnap = true
-		defer releaseSnapshotMutation(snap)
+		return err
 	}
 
-	f, existed, _, err := openWriteTargetForMutation(canonicalPath)
+	f, existed, err := openWriteTargetForMutation(canonicalPath)
 	if err != nil {
-		if hasSnap {
-			_ = discardUnmutatedSnapshot(snap)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
 		return fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
 
 	if forNew && existed {
+		appearedErr := fmt.Errorf("path %s appeared during apply (Add requires the path to not exist)", canonicalPath)
 		_ = f.Close()
-		if hasSnap {
-			_ = discardUnmutatedSnapshot(snap)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", appearedErr, abandonErr)
 		}
-		return fmt.Errorf("path %s appeared during apply (Add requires the path to not exist)", canonicalPath)
+		return appearedErr
 	}
 
-	if err := f.Truncate(0); err != nil {
-		if hasSnap {
-			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
-		}
-		return fmt.Errorf("truncate: %w", err)
+	complete, werr := writeReplacement(f, []byte(content))
+	if werr != nil {
+		return finishMutationFailure(snap, true, complete, []byte(content), werr)
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		if hasSnap {
-			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
-		}
-		return fmt.Errorf("seek: %w", err)
-	}
-	if _, err := f.Write([]byte(content)); err != nil {
-		if hasSnap {
-			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
-		}
-		return fmt.Errorf("write: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		if hasSnap {
-			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
-		}
-		return fmt.Errorf("sync: %w", err)
-	}
-	if hasSnap {
-		if err := recordMutatedSnapshotContent(snap, []byte(content)); err != nil {
-			retainMutatedSnapshot(snap)
-			return fmt.Errorf("record snapshot identity: %w", err)
-		}
-	}
-	if hasSnap {
-		retainMutatedSnapshot(snap)
+	if err := recordProducedSnapshotContent(snap, []byte(content)); err != nil {
+		return fmt.Errorf("record snapshot identity: %w", err)
 	}
 	return nil
 }
 
-// deleteWithSnapshot snapshots the target then removes it. The snapshot
-// captures the file's content so RevertCode can restore it.
-func deleteWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath string) error {
-	var snap snapshotEntry
-	hasSnap := false
-	if store != nil {
-		s, err := snapshotFileForMutation(store, store.CurrentTurn(), displayAbsPath, canonicalPath)
-		if err != nil {
-			return fmt.Errorf("snapshot: %w", err)
+// deleteWithSnapshot captures the target's preimage, clears the LastWrite
+// proof, revalidates the approved witnesses, then removes it. The snapshot
+// captures the file's content so the restore traversal can recover it. A
+// failed absence record leaves nil proof and preserves the preimage for a
+// later restore skip.
+func deleteWithSnapshot(store SnapshotStore, bound boundCall, displayAbsPath, canonicalPath string) error {
+	snap, err := captureSnapshotEntry(store, displayAbsPath, canonicalPath)
+	if err != nil {
+		return fmt.Errorf("snapshot: %w", err)
+	}
+	// The fail-closed root/write-dir/target revalidators run after capture
+	// and before the remove; a newly resolved target is never substituted.
+	if err := bound.revalidate(); err != nil {
+		err = fmt.Errorf("apply_patch: resolve path: %w", err)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
-		snap = s
-		hasSnap = true
-		defer releaseSnapshotMutation(snap)
+		return err
 	}
 	if err := safefs.RemoveLeaf(canonicalPath); err != nil {
-		if hasSnap {
-			_ = discardUnmutatedSnapshot(snap)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
 		return fmt.Errorf("remove: %w", err)
 	}
-	if hasSnap {
-		if err := recordMutatedSnapshotAbsence(snap); err != nil {
-			retainMutatedSnapshot(snap)
-			return fmt.Errorf("record snapshot identity: %w", err)
-		}
-	}
-	if hasSnap {
-		retainMutatedSnapshot(snap)
+	if err := recordProducedSnapshotAbsence(snap); err != nil {
+		return fmt.Errorf("record snapshot identity: %w", err)
 	}
 	return nil
 }

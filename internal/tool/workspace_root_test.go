@@ -24,7 +24,7 @@ func TestFileToolsResolveRelativePathsFromWorkspaceRoot(t *testing.T) {
 	testassert.Require(t, strings.Contains(out, "old"), "read output = %q, want root file content", out)
 
 	{
-		_, err := execEdit(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
+		_, err := execEdit(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 			"path":       "existing.txt",
 			"old_string": "old",
 			"new_string": "new",
@@ -37,7 +37,7 @@ func TestFileToolsResolveRelativePathsFromWorkspaceRoot(t *testing.T) {
 	}
 
 	{
-		_, err := execWrite(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{"path": "created.txt", "content": "created"})
+		_, err := execWrite(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"path": "created.txt", "content": "created"})
 		testassert.NoError(t, err)
 	}
 	{

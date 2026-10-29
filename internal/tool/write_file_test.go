@@ -35,7 +35,7 @@ func TestPreparedWriteCreatesNewFileAndParentDirs(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "nested", "new.txt")
 
-	result, err := execWrite(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
+	result, err := execWrite(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 		"path":    path,
 		"content": "created",
 	})
@@ -49,7 +49,7 @@ func TestPreparedWriteWritesContentExactlyIncludingTrailingNewline(t *testing.T)
 	path := filepath.Join(root, "exact.txt")
 
 	{
-		_, err := execWrite(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
+		_, err := execWrite(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 			"path":    path,
 			"content": "no trailing newline",
 		})
@@ -58,7 +58,7 @@ func TestPreparedWriteWritesContentExactlyIncludingTrailingNewline(t *testing.T)
 	assertFileContent(t, path, "no trailing newline")
 
 	{
-		_, err := execWrite(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
+		_, err := execWrite(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 			"path":    path,
 			"content": "with trailing newline\n",
 		})
@@ -70,7 +70,7 @@ func TestPreparedWriteWritesContentExactlyIncludingTrailingNewline(t *testing.T)
 func TestPreparedWriteWithSnapshotSnapshotsBeforeWrite(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	root := filepath.Dir(path)
-	store := &recordingSnapshotStore{turn: 9, before: map[string]string{}}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 9)}
 
 	result, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":    path,
@@ -80,7 +80,7 @@ func TestPreparedWriteWithSnapshotSnapshotsBeforeWrite(t *testing.T) {
 	testassert.Equal(t, result, "Wrote "+path+".")
 	testassert.Equal(t, len(store.calls), 1)
 	testassert.Require(t, store.calls[0].turn == 9 && store.calls[0].path == path, "snapshot call = %+v, want turn=9 path=%q", store.calls[0], path)
-	testassert.Require(t, store.before[path] == "before", "snapshot saw %q, want pre-write content", store.before[path])
+	assertEntryPreimage(t, store, path, "before")
 	assertFileContent(t, path, "after")
 }
 
@@ -92,7 +92,7 @@ func TestPreparedWriteWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testi
 	linkDir := filepath.Join(root, "linked")
 	testassert.NoError(t, os.Symlink(realDir, linkDir))
 	requested := filepath.Join(linkDir, "file.txt")
-	store := &recordingSnapshotStore{turn: 10, before: map[string]string{}}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"), 10)}
 
 	result, err := execWrite(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":    requested,
@@ -103,6 +103,6 @@ func TestPreparedWriteWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testi
 	testassert.Equal(t, result, "Wrote "+requested+".")
 	testassert.Equal(t, len(store.calls), 1)
 	testassert.Require(t, store.calls[0].path == requested && store.calls[0].canonical == target, "snapshot call = %+v, want original=%q canonical=%q", store.calls[0], requested, target)
-	testassert.Require(t, store.before[target] == "before", "snapshot saw %q, want pre-write content", store.before[target])
+	assertEntryPreimage(t, store, target, "before")
 	assertFileContent(t, target, "after")
 }
