@@ -233,8 +233,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": internal/catalog imports "+imp+"; the catalog may import only the standard library, "+atomicfsPkg+", and the public "+modelPkg+" identity it forwards")
 			}
 		case "internal/agents":
-			if imp != modelPkg && !std[imp] {
-				problems = append(problems, rel+": internal/agents imports "+imp+"; the agents definitions may import only the standard library and the public "+modelPkg+" identity parsing")
+			if imp != modelPkg && imp != promptPkg && !std[imp] {
+				problems = append(problems, rel+": internal/agents imports "+imp+"; the agents definitions may import only the standard library, the public "+modelPkg+" identity parsing, and the shared "+promptPkg+" default summarizer bytes")
 			}
 		case "internal/storage":
 			if imp != harnessPkg && imp != sqliteDriverPkg && !std[imp] {

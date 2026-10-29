@@ -119,13 +119,13 @@ func discovery(t *testing.T, handler http.Handler) (clienthost.Options, *client.
 
 // discoveryRecord builds one private discovery document for the given owner.
 func discoveryRecord(endpoint, owner string) []byte {
-	raw, _ := json.Marshal(map[string]string{"endpoint": endpoint, "instance_id": owner, "protocol_version": string(protocol.N7), "credential": strings.Repeat("1", 64)})
+	raw, _ := json.Marshal(map[string]string{"endpoint": endpoint, "instance_id": owner, "protocol_version": string(protocol.N8), "credential": strings.Repeat("1", 64)})
 	return raw
 }
 
 func health(w http.ResponseWriter, owner string) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N7})
+	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N8})
 }
 
 func fixture(t *testing.T) (*CLI, *scriptedTransport) {

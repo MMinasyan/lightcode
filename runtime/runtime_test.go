@@ -1528,50 +1528,48 @@ func TestRuntimeStandardToolsAreOwnerProvidedCapabilities(t *testing.T) {
 	})
 }
 
-// TestRuntimeSettingsSectionsHaveOneOwner proves the settings-owner collision:
-// an optional Plugin claiming one of the baseline services' own section IDs
-// rejects during composition before its validator or factory runs, while an
-// unrelated plugin keeps its own settings owner beside the usable baseline
-// sections.
+// TestRuntimeSettingsSectionsHaveOneOwner proves the settings-owner split:
+// a registered Plugin whose ID names a baseline section owns only its own
+// plugins entry, while the top-level tools and jobs sections stay the
+// directly constructed baseline services' inputs and never share bytes.
 func TestRuntimeSettingsSectionsHaveOneOwner(t *testing.T) {
-	t.Run("a plugin claiming the tools section collides", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		claimed := e.ordinaryPlugin("tools", ScopeRuntime, "tools.cap") // the nil validator is the permissive case
-		wantFailedOpen(t, e, []Plugin{claimed}, ErrComposition)
-		e.assertNoOwnershipSideEffects(t)
-	})
-
-	t.Run("a plugin claiming the jobs section collides", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		validated := 0
-		claimed := e.ordinaryPlugin("jobs", ScopeRuntime, "jobs.cap")
-		claimed.ValidateConfig = func(json.RawMessage) error {
-			validated++
+	e := newOwnerEnv(t)
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+
+		`,"tools":{"read_max_lines":7},"jobs":{"max_background_processes":3},`+
+		`"plugins":{"capowner":{"kept":1},"tools":{"kept":"plugin tools"},"jobs":{"kept":"plugin jobs"}}}`)
+	received := map[string]json.RawMessage{}
+	validator := func(id string) func(json.RawMessage) error {
+		return func(raw json.RawMessage) error {
+			received[id] = append(json.RawMessage(nil), raw...)
 			return nil
 		}
-		_, err := e.open(context.Background(), claimed)
-		testassert.Require(t, errors.Is(err, ErrComposition), "open with a plugin owning the jobs section = %v, want the composition collision", err)
-		testassert.Require(t, validated == 0 && len(e.events.all()) == 0, "validator ran %d times with events %v, want the collision to precede validation and construction", validated, e.events.all())
-		e.assertNoOwnershipSideEffects(t)
-	})
+	}
+	plugins := []Plugin{
+		e.ordinaryPlugin("capowner", ScopeRuntime, "capowner.cap"),
+		e.ordinaryPlugin("tools", ScopeRuntime, "tools.cap"),
+		e.ordinaryPlugin("jobs", ScopeRuntime, "jobs.cap"),
+	}
+	plugins[0].ValidateConfig = validator("capowner")
+	plugins[1].ValidateConfig = validator("tools")
+	plugins[2].ValidateConfig = validator("jobs")
+	e.fixtureStore(storage.NewMemory())
+	r, err := e.open(context.Background(), plugins...)
+	testassert.NoError(t, err)
+	defer func() { testassert.NoError(t, r.Close(context.Background())) }()
 
-	t.Run("an unrelated plugin keeps its own settings owner", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+
-			`,"plugins":{"capowner":{"kept":1},"tools":{"read_max_lines":7},"jobs":{"max_background_processes":3}}}`)
-		var received json.RawMessage
-		own := e.ordinaryPlugin("capowner", ScopeRuntime, "capowner.cap")
-		own.ValidateConfig = func(raw json.RawMessage) error {
-			received = raw
-			return nil
-		}
-		e.fixtureStore(storage.NewMemory())
-		r, err := e.open(context.Background(), own)
-		testassert.NoError(t, err)
-		defer func() { testassert.NoError(t, r.Close(context.Background())) }()
-		testassert.Equal(t, string(received), `{"kept":1}`)
-		testassert.Require(t, slices.Contains(e.events.all(), "open:capowner"), "events = %v, want the unrelated plugin's factory to open", e.events.all())
-	})
+	testassert.Equal(t, string(received["capowner"]), `{"kept":1}`)
+	testassert.Equal(t, string(received["tools"]), `{"kept":"plugin tools"}`)
+	testassert.Equal(t, string(received["jobs"]), `{"kept":"plugin jobs"}`)
+	snapshot := r.config.current()
+	testassert.Require(t, snapshot != nil, "no published configuration")
+	testassert.Equal(t, compactJSON(t, snapshot.tools), `{"read_max_lines":7}`)
+	testassert.Equal(t, compactJSON(t, snapshot.jobs), `{"max_background_processes":3}`)
+	invocation := Invocation{snapshot: snapshot}
+	testassert.Equal(t, string(invocation.Config("tools")), `{"kept":"plugin tools"}`)
+	testassert.Equal(t, string(invocation.Config("jobs")), `{"kept":"plugin jobs"}`)
+	testassert.Equal(t, compactJSON(t, invocation.toolsSettings()), `{"read_max_lines":7}`)
+	testassert.Equal(t, compactJSON(t, invocation.jobsSettings()), `{"max_background_processes":3}`)
+	testassert.Require(t, string(invocation.Config("tools")) != string(invocation.toolsSettings()), "the plugin and baseline tools channels share bytes")
 }
 
 // --- restart recovery before execution ---

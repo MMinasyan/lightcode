@@ -252,7 +252,7 @@ type StrategyCapture struct {
 }
 
 // CompactCapture is the effective compaction configuration of one capture:
-// the model the compaction summarizer runs on, the compact type's system
+// the model the compaction summarizer runs on, the effective summarizer
 // prompt, and that final effective model's captured pricing — the
 // conversation model's pricing exactly when the fallback kept the
 // conversation model and its transport. Equality of two compact captures is

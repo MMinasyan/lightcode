@@ -434,7 +434,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		}))
 		t.Cleanup(server.Close)
 		writeServiceFile(t, sh.configPath, warnCompactConfigDocument(server.URL))
-		writeServiceFile(t, agents.PathForConfig(sh.configPath), agentsWithCompact(`{"model":"prov/m2"}`))
+		writeServiceFile(t, agents.PathForConfig(sh.configPath), prepAgentsDocument)
 		owner, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		comp := mustComposition(t, compactToolsPlugin())
@@ -534,12 +534,13 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 	})
 }
 
-// warnCompactConfigDocument points both the conversation and the compact
-// model at the given failing endpoint with must-preserve metadata.
+// warnCompactConfigDocument points both the conversation and the top-level
+// compact model at the given failing endpoint with must-preserve metadata.
 func warnCompactConfigDocument(endpoint string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PREP_COMPACT_KEY",
 		`{"m":{"name":"M","context_window":4096,"protocol_metadata":{"must_preserve":["proto_keep"]}},`+
-			`"m2":{"name":"M2","context_window":2048,"protocol_metadata":{"must_preserve":["proto_keep"]}}}`) + `}}`
+			`"m2":{"name":"M2","context_window":2048,"protocol_metadata":{"must_preserve":["proto_keep"]}}}`) + `},
+		"compaction":{"model":"prov/m2"}}`
 }
 
 // TestWarningStoreReadOwnsReturnedWarnings pins the shared read producer's

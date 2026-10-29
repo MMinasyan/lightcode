@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -103,7 +104,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 			t.Fatalf("decode versioned health: %v", err)
 		}
 		versionedResponse.Body.Close()
-		testassert.Equal(t, health.ProtocolVersion, protocol.N7)
+		testassert.Equal(t, health.ProtocolVersion, protocol.N8)
 	})
 }
 
@@ -502,45 +503,150 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 			t.Fatalf("list around corruption = %s, want only the valid sibling", body)
 		}
 
-		// An invalid settings write fails invalid before any candidate work,
-		// with the previous revision intact.
+		// Settings transport validation: a complete settings body whose
+		// plugins value is an object instead of the required document string
+		// is a method-shape rejection before any candidate work. Negative
+		// session days are supported input.
+		const settingsSessions = `{"auto_archive":true,"archive_after_days":-5,"delete_after_archive_days":0}`
+		buildSettings := func(values map[string]string, plugins, extra string) string {
+			parts := []string{`"sessions":` + settingsSessions}
+			for _, name := range []string{"tools", "jobs", "compaction"} {
+				if value, ok := values[name]; ok {
+					parts = append(parts, `"`+name+`":`+value)
+				}
+			}
+			if plugins != "" {
+				parts = append(parts, `"plugins":`+plugins)
+			}
+			if extra != "" {
+				parts = append(parts, extra)
+			}
+			return `{"settings":{` + strings.Join(parts, ",") + `}}`
+		}
+		baseSettingsValues := func() map[string]string {
+			return map[string]string{"tools": "{}", "jobs": "{}", "compaction": "{}"}
+		}
 		before, err := client.GetConfigurationWithResponse(ctx)
 		testassert.Require(t, err == nil && before.JSON200 != nil, "read before invalid settings: %v", err)
 		invalidSettings := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/configuration/settings"), ps.credential,
-			`{"settings":{"sessions":{"auto_archive":true,"archive_after_days":-5,"delete_after_archive_days":0},"plugins":{"unknown-plugin":{}}}}`)
+			buildSettings(baseSettingsValues(), `{"unknown-plugin":{}}`, ""))
 		testassert.Equal(t, invalidSettings.StatusCode, http.StatusBadRequest)
 		{
 			typed := decodeProtocolError(t, invalidSettings)
-			testassert.Require(t, typed.Code == protocol.Invalid, "invalid settings error = %+v, want invalid", typed)
+			testassert.Require(t, typed.Code == protocol.Invalid && strings.Contains(typed.Message, "plugins"), "invalid settings shape error = %+v, want invalid naming plugins", typed)
 		}
 		after, err := client.GetConfigurationWithResponse(ctx)
 		testassert.Require(t, err == nil && after.JSON200 != nil, "read after invalid settings: %v", err)
-		testassert.Require(t, after.JSON200.ConfigurationRevision.Generation == before.JSON200.ConfigurationRevision.Generation, "an invalid candidate changed the published revision")
+		testassert.Require(t, after.JSON200.ConfigurationRevision.Generation == before.JSON200.ConfigurationRevision.Generation, "an invalid settings shape changed the published revision")
 
-		// The settings outer shape stays closed and its plugins member is a
-		// required complete map: a missing or null member, a wrong-typed
-		// member, a null document value, and an unknown settings member are
-		// all invalid-request failures before any candidate work.
-		for _, row := range []struct{ name, body string }{
-			{"missing plugins member", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0}}}`},
-			{"null plugins member", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0},"plugins":null}}`},
-			{"wrong-typed plugins member", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0},"plugins":[]}}`},
-			{"null document value", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0},"plugins":{"alpha":null}}}`},
-			{"unknown settings member", `{"settings":{"sessions":{"auto_archive":true,"archive_after_days":1,"delete_after_archive_days":0},"plugins":{},"forged":1}}`},
+		// A schema-valid unknown plugin document reaches the candidate and is
+		// refused there, with the existing owning-file/revision/warning/event
+		// observation.
+		unknownSub, err := r.Subscribe(64)
+		testassert.NoError(t, err)
+		defer unknownSub.Close()
+		unknownBaseline, unknownGeneration, unknownWarn := runtimeMutationBaseline(t, r)
+		unknownPlugin := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/configuration/settings"), ps.credential,
+			buildSettings(baseSettingsValues(), `{"unknown-plugin":"{}"}`, ""))
+		testassert.Equal(t, unknownPlugin.StatusCode, http.StatusUnprocessableEntity)
+		{
+			typed := decodeProtocolError(t, unknownPlugin)
+			testassert.Require(t, typed.Code == protocol.Configuration, "unknown plugin settings error = %+v, want configuration", typed)
+		}
+		assertRuntimeMutationRefused(t, r, unknownSub, unknownBaseline, unknownGeneration, unknownWarn,
+			fmt.Errorf("mounted unknown plugin settings: %w", ErrConfiguration), ErrConfiguration)
+
+		// The settings outer shape is closed and its three baseline objects and
+		// plugins map are required: missing, null, array, number, boolean and
+		// string members are all method-boundary invalid-request failures.
+		shapeRows := []struct {
+			name, body, member string
+		}{}
+		for _, member := range []string{"tools", "jobs", "compaction"} {
+			values := baseSettingsValues()
+			delete(values, member)
+			shapeRows = append(shapeRows, struct{ name, body, member string }{member + " missing", buildSettings(values, "{}", ""), member})
+			for _, wrong := range []struct{ name, value string }{
+				{"null", "null"}, {"array", "[]"}, {"number", "7"}, {"boolean", "true"}, {"string", `"value"`},
+			} {
+				values := baseSettingsValues()
+				values[member] = wrong.value
+				shapeRows = append(shapeRows, struct{ name, body, member string }{member + " " + wrong.name, buildSettings(values, "{}", ""), member})
+			}
+		}
+		for _, row := range []struct{ name, body, member string }{
+			{"missing plugins member", buildSettings(baseSettingsValues(), "", ""), "plugins"},
+			{"null plugins member", buildSettings(baseSettingsValues(), "null", ""), "plugins"},
+			{"wrong-typed plugins member", buildSettings(baseSettingsValues(), "[]", ""), "plugins"},
+			{"null document value", buildSettings(baseSettingsValues(), `{"alpha":null}`, ""), "alpha"},
+			{"unknown settings member", buildSettings(baseSettingsValues(), "{}", `"forged":1`), "forged"},
 		} {
+			shapeRows = append(shapeRows, row)
+		}
+		for _, row := range shapeRows {
 			response := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/configuration/settings"), ps.credential, row.body)
 			if response.StatusCode != http.StatusBadRequest {
 				response.Body.Close()
 				t.Fatalf("%s = %d, want the typed invalid 400", row.name, response.StatusCode)
 			}
-			{
-				typed := decodeProtocolError(t, response)
-				testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want invalid", row.name, typed)
-			}
+			typed := decodeProtocolError(t, response)
+			testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want invalid", row.name, typed)
+			testassert.Require(t, strings.Contains(typed.Message, row.member), "%s diagnostic = %q, want the addressed member %q", row.name, typed.Message, row.member)
 		}
 		finalRead, err := client.GetConfigurationWithResponse(ctx)
 		testassert.Require(t, err == nil && finalRead.JSON200 != nil, "read after settings shape failures: %v", err)
 		testassert.Require(t, finalRead.JSON200.ConfigurationRevision.Generation == before.JSON200.ConfigurationRevision.Generation, "a rejected settings shape changed the published revision")
+
+		// Unknown members in the three baseline objects stay opaque: null,
+		// arrays, scalars and exact large/exponent numeric lexemes survive the
+		// accepted settings write without transport recursion or number
+		// coercion.
+		opaqueValues := map[string]string{
+			"tools":      `{"command_timeout":60,"max_output_bytes":4096,"read_line_max_chars":3000,"read_max_lines":100,"unknown_null":null,"unknown_array":[1,2],"unknown_scalar":"x","exact":9007199254740993}`,
+			"jobs":       `{"max_background_processes":5,"max_output_bytes":8192,"read_line_max_chars":4000,"unknown_null":null,"unknown_array":[],"unknown_scalar":false,"big":1e400}`,
+			"compaction": `{"unknown_null":null,"unknown_array":[{"deep":null}],"unknown_scalar":1,"exact":9007199254740993,"big":1e400}`,
+		}
+		accepted := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/configuration/settings"), ps.credential,
+			buildSettings(opaqueValues, "{}", ""))
+		testassert.Equal(t, accepted.StatusCode, http.StatusOK)
+		acceptedBody, err := io.ReadAll(accepted.Body)
+		accepted.Body.Close()
+		testassert.NoError(t, err)
+		testassert.Require(t, strings.Contains(string(acceptedBody), `"exact":9007199254740993`) && strings.Contains(string(acceptedBody), `"big":1e400`), "accepted settings result = %s, want the opaque exact lexemes preserved", acceptedBody)
+
+		// Valid objects whose consumed values are invalid remain candidate
+		// failures: the boundary accepts the object shape, then the owning
+		// validator refuses the complete candidate under the existing
+		// ownership/revision/warning/event observations.
+		refusalSub, err := r.Subscribe(64)
+		testassert.NoError(t, err)
+		defer refusalSub.Close()
+		refusalFile, refusalGeneration, refusalWarn := runtimeMutationBaseline(t, r)
+		for _, row := range []struct {
+			name   string
+			values map[string]string
+		}{
+			{"tools zero", map[string]string{"tools": `{"max_output_bytes":0}`}},
+			{"jobs range", map[string]string{"jobs": `{"max_background_processes":0}`}},
+			{"malformed compaction model", map[string]string{"compaction": `{"model":"bad"}`}},
+			{"empty compaction prompt", map[string]string{"compaction": `{"prompt":""}`}},
+			{"null compaction prompt", map[string]string{"compaction": `{"prompt":null}`}},
+		} {
+			values := baseSettingsValues()
+			for name, value := range row.values {
+				values[name] = value
+			}
+			response := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/configuration/settings"), ps.credential,
+				buildSettings(values, "{}", ""))
+			if response.StatusCode != http.StatusUnprocessableEntity {
+				response.Body.Close()
+				t.Fatalf("%s = %d, want the typed configuration 422", row.name, response.StatusCode)
+			}
+			typed := decodeProtocolError(t, response)
+			testassert.Require(t, typed.Code == protocol.Configuration, "%s error = %+v, want configuration", row.name, typed)
+			assertRuntimeMutationRefused(t, r, refusalSub, refusalFile, refusalGeneration, refusalWarn,
+				fmt.Errorf("mounted settings refusal %s: %w", row.name, ErrConfiguration), ErrConfiguration)
+		}
 
 		// A restore attempt against a busy Session answers the conflict
 		// class from the one idle gate.

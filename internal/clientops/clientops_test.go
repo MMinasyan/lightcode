@@ -102,7 +102,7 @@ type dispatchCase struct {
 var dispatchCases = []dispatchCase{
 	{
 		name: "GetHealth", operation: "GetHealth",
-		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"7"}`,
+		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"8"}`,
 		method: "GET", path: "/v1/health",
 	},
 	{
@@ -243,10 +243,10 @@ var dispatchCases = []dispatchCase{
 	},
 	{
 		name: "UpdateConfigurationSettings", operation: "UpdateConfigurationSettings",
-		params: `{"body":{"plugins":{"raw":"{\"n\":9007199254740993}"},"sessions":{}}}`,
-		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"3"}}`,
+		params: `{"body":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"plugins":{"raw":"{\"n\":9007199254740993}"}}}`,
+		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"3"},"result":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"plugins":{"raw":"{\"n\":9007199254740993}"}}}`,
 		method: "PUT", path: "/v1/configuration/settings",
-		body: `{"plugins":{"raw":"{\"n\":9007199254740993}"},"sessions":{}}`,
+		body: `{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"plugins":{"raw":"{\"n\":9007199254740993}"}}`,
 	},
 	{
 		name: "SetAgentTypeModel", operation: "SetAgentTypeModel",
@@ -416,7 +416,7 @@ func TestCallAcceptsEmptyEnvelopePositives(t *testing.T) {
 	for _, params := range []json.RawMessage{nil, json.RawMessage(`{}`)} {
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
-			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"7"}`), nil
+			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"8"}`), nil
 		}
 		result, err := clientops.Call(context.Background(), c, "GetHealth", params)
 		testassert.Require(t, err == nil, "Call(GetHealth, %q) = %v", params, err)

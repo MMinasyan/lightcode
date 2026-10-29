@@ -191,6 +191,26 @@ func (in Invocation) Config(pluginID string) json.RawMessage {
 	return append(json.RawMessage(nil), raw...)
 }
 
+// toolsSettings returns the captured snapshot's owned top-level tools
+// section, or nil when the revision carries none. The baseline tools' section
+// is independent of every plugin's own configuration, including a registered
+// plugin that happens to share the "tools" ID.
+func (in Invocation) toolsSettings() json.RawMessage {
+	if in.snapshot == nil {
+		return nil
+	}
+	return append(json.RawMessage(nil), in.snapshot.tools...)
+}
+
+// jobsSettings returns the captured snapshot's owned top-level jobs section,
+// or nil when the revision carries none.
+func (in Invocation) jobsSettings() json.RawMessage {
+	if in.snapshot == nil {
+		return nil
+	}
+	return append(json.RawMessage(nil), in.snapshot.jobs...)
+}
+
 // AgentTypes returns the captured snapshot's owned roster projection of the
 // loaded Agent definitions, preserving the snapshot's ordering. The zero
 // Invocation returns an empty roster.
@@ -292,8 +312,7 @@ type composition struct {
 }
 
 // newComposition validates the complete selected plugin set before any
-// factory can run: unique nonempty plugin IDs that are not one of the baseline
-// services' own configuration section IDs, valid scopes, non-nil Open, at
+// factory can run: unique nonempty plugin IDs, valid scopes, non-nil Open, at
 // least one provider, unique nonempty export IDs globally and unique nonempty
 // dependency IDs per plugin, assignable provider types, lifetime-compatible
 // PreparationHook declarations (Runtime or Workspace scope only), Tool
@@ -330,11 +349,6 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			return nil, fmt.Errorf("plugin %q: duplicate plugin ID: %w", p.ID, ErrComposition)
 		}
 		seenPluginIDs[p.ID] = true
-		for _, section := range baselineSections() {
-			if p.ID == section.id {
-				return nil, fmt.Errorf("plugin %q: the %q settings section belongs to the directly constructed baseline service: %w", p.ID, section.id, ErrComposition)
-			}
-		}
 		if p.Scope.rank() == 0 {
 			return nil, fmt.Errorf("plugin %q: invalid scope %q: %w", p.ID, p.Scope, ErrComposition)
 		}

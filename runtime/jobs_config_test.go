@@ -9,16 +9,16 @@ import (
 	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
-// jobsComposedDoc wraps one plugins section in the shared composed provider
-// document, the same split the tools publication matrix uses: direct decoder
-// tests live in the jobs package, and the composed half drives the real
-// configuration service here. Config writes go through the package's existing
-// writeToolsConfig helper.
-func jobsComposedDoc(plugins string) string {
-	return strings.TrimSuffix(composedConfigDocument, "}") + `,"plugins":` + plugins + `}`
+// jobsComposedDoc appends top-level baseline roots to the shared composed
+// provider document, the same split the tools publication matrix uses: direct
+// decoder tests live in the jobs package, and the composed half drives the
+// real configuration service here. Config writes go through the package's
+// existing writeToolsConfig helper.
+func jobsComposedDoc(roots string) string {
+	return strings.TrimSuffix(composedConfigDocument, "}") + `,` + roots + `}`
 }
 
-// TestComposedJobsSettingsPublication proves the plugins.jobs publication
+// TestComposedJobsSettingsPublication proves the top-level jobs publication
 // matrix over the directly constructed baseline: the baseline sections publish
 // together with a well-formed jobs object (unknown keys ignored, a null
 // member retaining its default), a consumed-range violation, a wrong
@@ -28,11 +28,10 @@ func jobsComposedDoc(plugins string) string {
 // generation sequence.
 func TestComposedJobsSettingsPublication(t *testing.T) {
 	ctx := context.Background()
-	const baselineSections = `"tools":{}`
-	accept := jobsComposedDoc(`{` + baselineSections + `,"jobs":{"max_background_processes":5,"unknown_member":1,"max_output_bytes":null}}`)
-	violation := jobsComposedDoc(`{` + baselineSections + `,"jobs":{"max_output_bytes":1023}}`)
-	badType := jobsComposedDoc(`{` + baselineSections + `,"jobs":{"max_output_bytes":"many"}}`)
-	nullSection := jobsComposedDoc(`{` + baselineSections + `,"jobs":null}`)
+	accept := jobsComposedDoc(`"tools":{},"jobs":{"max_background_processes":5,"unknown_member":1,"max_output_bytes":null}`)
+	violation := jobsComposedDoc(`"tools":{},"jobs":{"max_output_bytes":1023}`)
+	badType := jobsComposedDoc(`"tools":{},"jobs":{"max_output_bytes":"many"}`)
+	nullSection := jobsComposedDoc(`"tools":{},"jobs":null`)
 
 	e := newComposeEnv(t)
 	writeToolsConfig(t, e.configPath, accept)

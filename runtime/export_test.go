@@ -23,16 +23,22 @@ func OpenForTest(ctx context.Context, dataDir, configPath string, plugins []Plug
 }
 
 // ConfiguredInvocationForTest builds one configured Invocation whose
-// captured snapshot carries the given per-plugin sections, for the external
-// tests that exercise a plugin's real Invocation.Config channel — outside
-// this package only the zero Invocation is constructible. It is absent from
-// production builds.
-func ConfiguredInvocationForTest(sections map[string]string) (Invocation, error) {
+// captured snapshot carries the given top-level baseline sections and
+// per-plugin sections, for the external tests that exercise the real
+// Invocation settings channels — outside this package only the zero
+// Invocation is constructible. It is absent from production builds.
+func ConfiguredInvocationForTest(tools, jobs, compaction string, sections map[string]string) (Invocation, error) {
 	plugins := make(map[string]json.RawMessage, len(sections))
 	for id, section := range sections {
 		plugins[id] = json.RawMessage(section)
 	}
-	snapshot, err := newConfiguration(1, capturedConfigDocument{Plugins: plugins}, catalog.BuildResult{}, []byte("{}"), nil, nil, nil, nil)
+	doc := capturedConfigDocument{
+		Tools:      json.RawMessage(tools),
+		Jobs:       json.RawMessage(jobs),
+		Compaction: json.RawMessage(compaction),
+		Plugins:    plugins,
+	}
+	snapshot, err := newConfiguration(1, doc, catalog.BuildResult{}, []byte("{}"), nil, nil, nil, nil)
 	if err != nil {
 		return Invocation{}, err
 	}

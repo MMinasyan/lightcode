@@ -281,7 +281,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		health, err := client.GetHealthWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, health.JSON200 != nil && health.HTTPResponse.StatusCode == http.StatusOK, "health = (%d, %v), want the 200 typed body", health.HTTPResponse.StatusCode, health.JSON200)
-		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N7, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N7)
+		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N8, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N8)
 
 		workspace := filepath.Join(e.home, "mounted")
 		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "solo"})
@@ -1061,7 +1061,10 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 				ArchiveAfterDays:       archiveDays,
 				DeleteAfterArchiveDays: archiveDays,
 			},
-			Plugins: protocol.PluginsSettings{},
+			Tools:      json.RawMessage("{}"),
+			Jobs:       json.RawMessage("{}"),
+			Compaction: json.RawMessage("{}"),
+			Plugins:    protocol.PluginsSettings{},
 		}})
 		testassert.NoError(t, err)
 		if settings.JSON200 == nil || !settings.JSON200.Result.Sessions.AutoArchive || settings.JSON200.Result.Sessions.ArchiveAfterDays != archiveDays {
@@ -1091,8 +1094,11 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			{"non-object document", protocol.PluginsSettings{"core": `1`}},
 		} {
 			response, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: protocol.Settings{
-				Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: archiveDays, DeleteAfterArchiveDays: archiveDays},
-				Plugins:  row.plugins,
+				Sessions:   protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: archiveDays, DeleteAfterArchiveDays: archiveDays},
+				Tools:      json.RawMessage("{}"),
+				Jobs:       json.RawMessage("{}"),
+				Compaction: json.RawMessage("{}"),
+				Plugins:    row.plugins,
 			}})
 			testassert.Require(t, err == nil, "%s: UpdateConfigurationSettings: %v", row.name, err)
 			if response.HTTPResponse.StatusCode != http.StatusUnprocessableEntity || response.JSONDefault == nil || response.JSONDefault.Code != protocol.Configuration {

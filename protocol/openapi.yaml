@@ -1,13 +1,13 @@
 # Lightcode Runtime protocol — the single source of truth for HTTP paths,
 # request/response DTOs, closed enums, error payloads, and SSE event frames.
-# Wire version "7" is the protocol identity, independent of the binary
+# Wire version "8" is the protocol identity, independent of the binary
 # release version. This file is hand-maintained; the Go and TypeScript
 # artifacts under protocol/ and frontend/src/generated/protocol/ are
 # generated from it and are never hand-edited.
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "7"
+  version: "8"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -838,7 +838,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "7"
+            - "8"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -1831,6 +1831,33 @@ components:
           type: integer
         delete_after_archive_days:
           type: integer
+    ToolsSettings:
+      type: object
+      description: >-
+        The baseline standard tools' configuration object, carried with its
+        accepted raw members and exact numeric lexemes. An absent section is
+        the empty object, whose defaults the tools apply at consumption.
+      additionalProperties: true
+      x-go-type: json.RawMessage
+    JobsSettings:
+      type: object
+      description: >-
+        The baseline background jobs configuration object, carried with its
+        accepted raw members and exact numeric lexemes. An absent section is
+        the empty object, whose defaults the jobs service applies at
+        consumption.
+      additionalProperties: true
+      x-go-type: json.RawMessage
+    CompactionSettings:
+      type: object
+      description: >-
+        The baseline compaction configuration object: an optional independent
+        summarizer model reference and an optional custom nonempty prompt,
+        carried with its accepted raw members and exact numeric lexemes. An
+        absent section is the empty object, whose defaults apply at
+        consumption.
+      additionalProperties: true
+      x-go-type: json.RawMessage
     PluginConfigDocument:
       type: string
       description: >-
@@ -1849,10 +1876,19 @@ components:
       additionalProperties: false
       required:
         - sessions
+        - tools
+        - jobs
+        - compaction
         - plugins
       properties:
         sessions:
           $ref: "#/components/schemas/SessionsSettings"
+        tools:
+          $ref: "#/components/schemas/ToolsSettings"
+        jobs:
+          $ref: "#/components/schemas/JobsSettings"
+        compaction:
+          $ref: "#/components/schemas/CompactionSettings"
         plugins:
           $ref: "#/components/schemas/PluginsSettings"
     Agent:

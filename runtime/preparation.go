@@ -435,25 +435,21 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
 	}
-	// The compact configuration rides the same one-revision snapshot: the
-	// resolved compact Agent type carries the selection's model and prompt.
-	// Its resolution failure is an admission failure — the compact builtin is
-	// always present and no retained prompt source exists to fall back to.
-	compactType, err := harness.ResolveAgentType("compact", snapshot.agentTypes())
-	if err != nil {
-		return harness.ExecutionCapture{}, nil, fmt.Errorf("compact agent type: %w", err)
-	}
+	// The compact configuration is the top-level compaction section of the
+	// same one-revision snapshot; it is independent of the selectable compact
+	// Agent definition.
+	compaction := snapshot.compactionValues
 	// The effective compact model is one fallback chain ending at the
-	// conversation model: the compact type's model — when it names a
-	// different model at all — must resolve in the catalog, build a transport
-	// over a resolved credential; otherwise the conversation model and its
-	// transport are kept. The recorded compact configuration is always the
-	// final effective model's.
+	// conversation model: the configured compaction model — when it names a
+	// different model at all — must resolve in the catalog and build a
+	// transport over a resolved credential; otherwise the conversation model
+	// and its transport are kept. The recorded compact configuration is
+	// always the final effective model's.
 	compactRef := sel.agent.Model
 	compactTransport := transport
 	compactCost := entry.Cost
-	if !compactType.Model.IsZero() && compactType.Model != sel.agent.Model {
-		compactProvider, compactEntry, lookupErr := snapshot.catalog.Lookup(catalog.ModelRef{Provider: compactType.Model.Provider, Model: compactType.Model.Model})
+	if !compaction.model.IsZero() && compaction.model != sel.agent.Model {
+		compactProvider, compactEntry, lookupErr := snapshot.catalog.Lookup(catalog.ModelRef{Provider: compaction.model.Provider, Model: compaction.model.Model})
 		if lookupErr == nil {
 			keyMissing := false
 			compactKey := ""
@@ -462,9 +458,9 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 				keyMissing = compactKey == ""
 			}
 			if !keyMissing {
-				built, buildErr := p.concreteTransport(compactProvider, compactEntry, compactType.Model, compactKey)
+				built, buildErr := p.concreteTransport(compactProvider, compactEntry, compaction.model, compactKey)
 				if buildErr == nil {
-					compactRef = compactType.Model
+					compactRef = compaction.model
 					compactTransport = built
 					compactCost = compactEntry.Cost
 				}
@@ -514,7 +510,7 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 		Pricing:               capturedPricing(entry.Cost),
 		Compact: harness.CompactCapture{
 			Model:        compactRef,
-			SystemPrompt: compactType.Prompt,
+			SystemPrompt: compaction.prompt,
 			Pricing:      capturedPricing(compactCost),
 		},
 		Strategy: harness.StrategyCapture{

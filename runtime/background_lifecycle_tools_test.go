@@ -209,7 +209,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 			return stopStream("done"), nil
 		}
 	}
-	invocation, err := ConfiguredInvocationForTest(map[string]string{"jobs": `{"max_background_processes":1}`})
+	invocation, err := ConfiguredInvocationForTest("", `{"max_background_processes":1}`, "", nil)
 	testassert.NoError(t, err)
 	th := newToolsHarnessWith(t, modelFn, toolsHarnessOpts{
 		realJobs:      true,

@@ -88,13 +88,13 @@ function bridge(script: Script = {}) {
       }
       return json(200, {
         configuration_revision: { instance_id: INSTANCE, generation: '1' },
-        settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+        settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, tools: {}, jobs: {}, compaction: {}, plugins: {} },
         agents: [],
         providers: [],
       });
     }
     if (operation === 'UpdateConfigurationSettings') {
-      return json(200, { configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: { sessions: {}, plugins: {} } });
+      return json(200, { configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: { sessions: {}, tools: {}, jobs: {}, compaction: {}, plugins: {} } });
     }
     if (operation === 'ListProviders') {
       return json(200, {
@@ -220,7 +220,7 @@ async function mountReal(script: Script = {}) {
 function configurationView(generation: string, agentName: string) {
   return {
     configuration_revision: { instance_id: INSTANCE, generation },
-    settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+    settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, tools: {}, jobs: {}, compaction: {}, plugins: {} },
     agents: [{ name: agentName, description: agentName, subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] }],
     providers: [],
   };
@@ -564,7 +564,7 @@ describe('real generated stack over the byte bridge', () => {
 describe('Step 8 real generated captures over the byte bridge', () => {
   const RAW_CONFIGURATION = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
     + '"settings":{"sessions":{"auto_archive":true,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1e400},'
-    + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}"}},"agents":[],"providers":[]}';
+    + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"plugins":{}},"agents":[],"providers":[]}';
 
   const forkInput = {
     item_id: 'i1',
@@ -608,7 +608,7 @@ describe('Step 8 real generated captures over the byte bridge', () => {
     const put = calls.find((call) => call.operation === 'UpdateConfigurationSettings');
     expect(put?.params).toBe(
       '{"body":{"settings":{"sessions":{"auto_archive":true,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1e400},'
-      + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}"}}}}',
+      + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"plugins":{}}}}',
     );
   });
 

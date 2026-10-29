@@ -1495,11 +1495,35 @@ describe('repair', () => {
 
 const RAW_CONFIGURATION = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
   + '"settings":{"sessions":{"auto_archive":false,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1},'
-  + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}"}},'
+  + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"plugins":{}},'
   + '"agents":[],"providers":[]}';
 
 const EXACT_SETTINGS_TEXT = '{"sessions":{"auto_archive":false,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1},'
-  + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}"}}';
+  + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"plugins":{}}';
+
+// One authored baseline shape for the section-reset oracles: every top-level
+// object carries a custom value, the tools object carries the exact int64
+// lexeme, and one optional plugin document stays a string.
+const RESET_SETTINGS_TEXT = '{"sessions":{"auto_archive":false,"archive_after_days":3,"delete_after_archive_days":2},'
+  + '"tools":{"max_output_bytes":9007199254740993,"command_timeout":60},'
+  + '"jobs":{"max_background_processes":5},'
+  + '"compaction":{"model":"prov/m2","prompt":"custom prompt"},'
+  + '"plugins":{"tasks":"{\\"max_concurrent\\":2}"}}';
+
+const RESET_CONFIGURATION = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
+  + '"settings":' + RESET_SETTINGS_TEXT + ',"agents":[],"providers":[]}';
+
+// Raw-document editing fixture: every baseline object carries an exact int64
+// unknown member plus ordinary siblings, so deleting one known member can be
+// observed without any other token moving.
+const RAW_EDIT_SETTINGS_TEXT = '{"sessions":{"auto_archive":false,"archive_after_days":3,"delete_after_archive_days":2},'
+  + '"tools":{"command_timeout":60,"max_output_bytes":4096,"read_max_lines":100,"unknown_tools":9007199254740993},'
+  + '"jobs":{"max_background_processes":5,"read_line_max_chars":4000,"unknown_jobs":9007199254740993},'
+  + '"compaction":{"model":"prov/m2","prompt":"custom prompt","unknown_compaction":9007199254740993},'
+  + '"plugins":{"tasks":"{\\"max_concurrent\\":2}"}}';
+
+const RAW_EDIT_CONFIGURATION = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
+  + '"settings":' + RAW_EDIT_SETTINGS_TEXT + ',"agents":[],"providers":[]}';
 
 function inputItem(itemID: string, origin: 'user' | 'runtime' | 'plugin', operationID?: string) {
   return {
@@ -2593,7 +2617,7 @@ describe('settings editor', () => {
     const connection = settingsRawConnection();
     const { target } = await mountApp(connection);
     await openSettings(target);
-    expect(target.textContent).toContain('Uses plugin defaults');
+    expect(target.querySelector('[aria-label="jobs uses defaults"]')).not.toBeNull();
     const readsBeforeSave = vi.mocked(sdk.GetConfiguration).mock.calls.length;
     (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
     await settle();
@@ -2606,21 +2630,21 @@ describe('settings editor', () => {
     expect(vi.mocked(sdk.GetConfiguration).mock.calls.length).toBeGreaterThanOrEqual(readsBeforeSave + 1);
   });
 
-  it('authors an absent plugin document on its first member edit, one member at a time', async () => {
+  it('authors an absent baseline section on its first member edit, one member at a time', async () => {
     const connection = settingsRawConnection();
     const { target } = await mountApp(connection);
     await openSettings(target);
-    expect(target.textContent).toContain('Uses plugin defaults');
+    expect(target.querySelector('[aria-label="jobs uses defaults"]')).not.toBeNull();
     await changeInput(target, 'jobs max_background_processes', '3');
     await changeInput(target, 'jobs max_output_bytes', '9');
     (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
     await settle();
     await settle();
     const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
-    // The absent document became {}-plus-its-edited-members, composed one member
-    // at a time, and the unedited tools document keeps its exact lexeme.
-    expect(body).toContain('"jobs":"{\\"max_background_processes\\":3,\\"max_output_bytes\\":9}"');
-    expect(body).toContain('"tools":"{\\"max_output_bytes\\":9007199254740993}"');
+    // The absent object became {}-plus-its-edited-members, composed one member
+    // at a time, and the unedited tools object keeps its exact lexeme.
+    expect(body).toContain('"jobs":{"max_background_processes":3,"max_output_bytes":9}');
+    expect(body).toContain('"tools":{"max_output_bytes":9007199254740993}');
   });
 
   it('gates every authored control while a save is pending and sends the complete body with no precondition', async () => {
@@ -2649,6 +2673,179 @@ describe('settings editor', () => {
     expect(vi.mocked(sdk.UpdateConfigurationSettings)).toHaveBeenCalledTimes(1);
     // The success refresh releases the editor.
     expect((target.querySelector('[aria-label="Save settings"]') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('edits compaction settings and the compact Agent model independently', async () => {
+    const connection = settingsRawConnection(
+      '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
+      + '"settings":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1},'
+      + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"plugins":{}},'
+      + '"agents":[{"name":"primary","description":"Primary","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]},'
+      + '{"name":"compact","description":"Compaction","subagent":false,"model":"","readonly":true,"write_dir":"","tools":[],"capabilities":[]}],'
+      + '"providers":[]}',
+    );
+    let selectedCompact = false;
+    vi.mocked(sdk.GetSessionHydration).mockImplementation(async () => json(200, hydration({
+      session: { ...session('root1', NEWER), agent_type: selectedCompact ? 'compact' : 'primary' },
+    })));
+    vi.mocked(sdk.SetSessionAgentType).mockResolvedValue(json(200, { ...session('root1', NEWER), agent_type: 'compact' }));
+    vi.mocked(sdk.ListModels).mockResolvedValue(json(200, {
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      models: [{ ref: 'prov/compact-model', provider: 'prov', provider_name: 'Provider', model: 'compact-model', display_name: 'Compact model', context_window: 1000, max_output_tokens: 10, hidden: false, provider_hidden: false, incomplete: false, source: 'user' }],
+    }));
+    vi.mocked(sdk.SetAgentTypeModel).mockResolvedValue(json(200, {
+      configuration_revision: { instance_id: INSTANCE, generation: '2' },
+      result: { name: 'compact', description: 'Compaction', subagent: false, model: 'prov/compact-model', readonly: true, write_dir: '', tools: [], capabilities: [] },
+    }));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    // Ordinary string controls: the model ref and a real multiline prompt are
+    // entered as plain text, never as quoted JSON or escape sequences.
+    await changeInput(target, 'compaction model', 'prov/compact-model');
+    await changeInput(target, 'compaction prompt', 'first line\nsecond line');
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
+    // The baseline compaction object carries the entered strings exactly and
+    // leaves every other settings member intact; the independently selectable
+    // compact Agent is a configuration-view roster entry, not this object.
+    expect(JSON.parse(body).settings.compaction).toEqual({
+      model: 'prov/compact-model',
+      prompt: 'first line\nsecond line',
+    });
+    expect(body).toContain('"tools":{"max_output_bytes":9007199254740993}');
+    expect(body).toContain('"plugins":{}');
+    expect(vi.mocked(sdk.SetAgentTypeModel)).not.toHaveBeenCalled();
+
+    // The actual compact Agent selection and its type-wide model action use
+    // SetSessionAgentType and SetAgentTypeModel only; they never write the
+    // baseline settings owner.
+    (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
+    await settle();
+    selectedCompact = true;
+    (target.querySelector('[aria-label="Set session agent type compact"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.SetSessionAgentType)).toHaveBeenCalledWith('{"session_id":"root1","body":{"agent_type":"compact"}}');
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true }));
+    await settle();
+    expect(target.textContent).toContain('compact');
+    (target.querySelector('.mp-btn') as HTMLElement).click();
+    await settle();
+    (target.querySelector('.mp .item') as HTMLElement).click();
+    await settle();
+    expect(vi.mocked(sdk.SetAgentTypeModel)).toHaveBeenCalledWith('{"query":{"agent_type":"compact"},"body":{"model":"prov/compact-model"}}');
+    expect(vi.mocked(sdk.UpdateConfigurationSettings)).toHaveBeenCalledTimes(1);
+  });
+
+  it('resets only the tools section to defaults', async () => {
+    const connection = settingsRawConnection(RESET_CONFIGURATION);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Reset tools to defaults"]') as HTMLElement).click();
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
+    const settings = JSON.parse(body).settings;
+    expect(settings.tools).toEqual({});
+    expect(settings.jobs).toEqual({ max_background_processes: 5 });
+    expect(settings.compaction).toEqual({ model: 'prov/m2', prompt: 'custom prompt' });
+    expect(settings.plugins).toEqual({ tasks: '{"max_concurrent":2}' });
+  });
+
+  it('resets only the jobs section to defaults', async () => {
+    const connection = settingsRawConnection(RESET_CONFIGURATION);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Reset jobs to defaults"]') as HTMLElement).click();
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
+    const settings = JSON.parse(body).settings;
+    expect(settings.jobs).toEqual({});
+    expect(settings.tools).toEqual({ max_output_bytes: 9007199254740992, command_timeout: 60 });
+    expect(body).toContain('"max_output_bytes":9007199254740993');
+    expect(settings.compaction).toEqual({ model: 'prov/m2', prompt: 'custom prompt' });
+    expect(settings.plugins).toEqual({ tasks: '{"max_concurrent":2}' });
+  });
+
+  it('resets only the compaction section to defaults', async () => {
+    const connection = settingsRawConnection(RESET_CONFIGURATION);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Reset compaction to defaults"]') as HTMLElement).click();
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
+    const settings = JSON.parse(body).settings;
+    expect(settings.compaction).toEqual({});
+    expect(settings.tools).toEqual({ max_output_bytes: 9007199254740992, command_timeout: 60 });
+    expect(body).toContain('"max_output_bytes":9007199254740993');
+    expect(settings.jobs).toEqual({ max_background_processes: 5 });
+    expect(settings.plugins).toEqual({ tasks: '{"max_concurrent":2}' });
+  });
+
+  it('raw-edits one baseline object and deletes only the named members', async () => {
+    const connection = settingsRawConnection(RAW_EDIT_CONFIGURATION);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    // Delete only prompt from compaction, read_max_lines from tools and
+    // read_line_max_chars from jobs; each replacement is the exact object
+    // text, so unknown large lexemes and sibling members stay untouched.
+    await changeInput(target, 'compaction raw document', '{"model":"prov/m2","unknown_compaction":9007199254740993}');
+    await changeInput(target, 'tools raw document', '{"command_timeout":60,"max_output_bytes":4096,"unknown_tools":9007199254740993}');
+    await changeInput(target, 'jobs raw document', '{"max_background_processes":5,"unknown_jobs":9007199254740993}');
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
+    expect(body).toContain('"compaction":{"model":"prov/m2","unknown_compaction":9007199254740993}');
+    expect(body).not.toContain('custom prompt');
+    expect(body).toContain('"tools":{"command_timeout":60,"max_output_bytes":4096,"unknown_tools":9007199254740993}');
+    expect(body).not.toContain('read_max_lines');
+    expect(body).toContain('"jobs":{"max_background_processes":5,"unknown_jobs":9007199254740993}');
+    expect(body).not.toContain('read_line_max_chars');
+    expect(body).toContain('"plugins":{"tasks":"{\\"max_concurrent\\":2}"}');
+  });
+
+  it('raw-edits compaction to omit model independently with prompt retained', async () => {
+    const connection = settingsRawConnection(RAW_EDIT_CONFIGURATION);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'compaction raw document', '{"prompt":"custom prompt","unknown_compaction":9007199254740993}');
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
+    expect(body).toContain('"compaction":{"prompt":"custom prompt","unknown_compaction":9007199254740993}');
+    expect(body).not.toContain('"model":"prov/m2"');
+    expect(body).toContain('"tools":{"command_timeout":60,"max_output_bytes":4096,"read_max_lines":100,"unknown_tools":9007199254740993}');
+    expect(body).toContain('"jobs":{"max_background_processes":5,"read_line_max_chars":4000,"unknown_jobs":9007199254740993}');
+  });
+
+  it('rejects a non-object raw section draft and keeps the prior exact object', async () => {
+    const connection = settingsRawConnection(RAW_EDIT_CONFIGURATION);
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    await changeInput(target, 'compaction raw document', '[]');
+    expect(target.textContent).toContain('Edit rejected');
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const first = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
+    expect(first).toContain('"compaction":{"model":"prov/m2","prompt":"custom prompt","unknown_compaction":9007199254740993}');
+
+    await changeInput(target, 'compaction raw document', '{"model":"prov/m3","unknown_compaction":9007199254740993}');
+    (target.querySelector('[aria-label="Save settings"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    const second = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[1][0] as never);
+    expect(second).toContain('"compaction":{"model":"prov/m3","unknown_compaction":9007199254740993}');
+    expect(second).not.toContain('custom prompt');
   });
 
   it('displays a known settings save rejection and retains the editor draft', async () => {
@@ -4199,12 +4396,12 @@ describe('read lifetime boundaries', () => {
     await settle();
     await settle();
     expect(target.querySelector('[aria-label="Close settings"]')).toBeNull();
-    expect(target.textContent).not.toContain('Uses plugin defaults');
+    expect(target.querySelector('[aria-label="jobs uses defaults"]')).toBeNull();
     // A reopen is a fresh read, not the superseded body.
     (target.querySelector('[aria-label="Settings"]') as HTMLElement).click();
     await settle();
     await settle();
-    expect(target.textContent).toContain('Uses plugin defaults');
+    expect(target.querySelector('[aria-label="jobs uses defaults"]')).not.toBeNull();
   });
 
   it('a reopened model dialog discards an older same-stamp read and keeps the newer loading', async () => {
@@ -4248,7 +4445,7 @@ describe('read lifetime boundaries', () => {
 // --- First-review correction regressions: settings edit tail and documents ----
 
 const EDITED_SESSIONS_TEXT = '{"sessions":{"auto_archive":false,"archive_after_days":5,"delete_after_archive_days":1},'
-  + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993}"}}';
+  + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"plugins":{}}';
 
 function settingsRawConnection(raw = RAW_CONFIGURATION) {
   const connection = fakeConnection();
@@ -4257,7 +4454,10 @@ function settingsRawConnection(raw = RAW_CONFIGURATION) {
   vi.mocked(sdk.GetConfiguration).mockImplementation(async () => native(200, raw, false));
   vi.mocked(sdk.UpdateConfigurationSettings).mockResolvedValue(json(200, {
     configuration_revision: { instance_id: INSTANCE, generation: '2' },
-    result: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, plugins: {} },
+    result: {
+      sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 },
+      tools: {}, jobs: {}, compaction: {}, plugins: {},
+    },
   }));
   return connection;
 }
@@ -4282,7 +4482,7 @@ describe('settings local edit tail', () => {
     expect(bodyOf(call)).toContain('"delete_after_archive_days":7');
   });
 
-  it('keeps every unedited numeric lexeme of a local plugin edit exact', async () => {
+  it('keeps every unedited numeric lexeme of a local baseline edit exact', async () => {
     const connection = settingsRawConnection();
     const { target } = await mountApp(connection);
     await openSettings(target);
@@ -4292,8 +4492,8 @@ describe('settings local edit tail', () => {
     await settle();
     const body = bodyOf(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls[0][0] as never);
     expect(body).toContain('"archive_after_days":-9223372036854775808');
-    expect(body).toContain('"tools":"{\\"max_output_bytes\\":9007199254740993}"');
-    expect(body).toContain('"jobs":"{\\"max_background_processes\\":3}"');
+    expect(body).toContain('"tools":{"max_output_bytes":9007199254740993}');
+    expect(body).toContain('"jobs":{"max_background_processes":3}');
   });
 
   it('a rejected local edit shows its error, leaves the document unchanged and a later edit recovers', async () => {

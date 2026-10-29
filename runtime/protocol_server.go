@@ -235,7 +235,7 @@ func (ps *ProtocolServer) PublishDiscovery(path string) error {
 	record, err := json.Marshal(discoveryRecord{
 		Endpoint:        ps.endpoint,
 		InstanceId:      ps.instance,
-		ProtocolVersion: string(protocol.N7),
+		ProtocolVersion: string(protocol.N8),
 		Credential:      ps.credential,
 	})
 	if err != nil {
@@ -275,7 +275,7 @@ func (ps *ProtocolServer) verifyReady() error {
 	if err := decodeOneDocument(body, &health); err != nil {
 		return fmt.Errorf("decode health response: %w", err)
 	}
-	if health.InstanceId != ps.instance || health.ProtocolVersion != protocol.N7 {
+	if health.InstanceId != ps.instance || health.ProtocolVersion != protocol.N8 {
 		return fmt.Errorf("health response identity %q/%q does not match this server", health.InstanceId, health.ProtocolVersion)
 	}
 	return nil

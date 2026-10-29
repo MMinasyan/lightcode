@@ -11,6 +11,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -82,6 +83,9 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 		modelEntry := provider.Models["m"]
 		testassert.Require(t, modelEntry != nil && modelEntry.ContextWindow == 9007199254740993, "catalog model = %+v, want the exact integer preserved through the decode", modelEntry)
 	}
+	// The legacy compaction member is unowned now: unknown members are
+	// ignored and the absent model/prompt keep their defaults.
+	testassert.Require(t, snapshot.compactionValues.model.IsZero() && snapshot.compactionValues.prompt == prompt.DefaultSummarizerPrompt, "compaction values = %+v, want the absent-section defaults", snapshot.compactionValues)
 	plugin, ok := snapshot.plugins["alpha"]
 	testassert.Require(t, ok, "plugins = %+v, want the alpha entry", snapshot.plugins)
 	var pluginFields map[string]any

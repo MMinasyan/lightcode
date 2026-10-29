@@ -261,7 +261,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 // unused opaque extra_body members carry the overflow numeric lexemes as
 // exact bytes, plus its malformed-delivery sibling body.
 const opaqueOverflowConfiguration = `{"configuration_revision":{"instance_id":"` + instance + `","generation":"2"},` +
-	`"settings":{"plugins":{}},"agents":[{"name":"primary","description":"primary agent"},{"name":"planner","description":"planning agent"}],` +
+	`"settings":{"sessions":{"auto_archive":true,"archive_after_days":7,"delete_after_archive_days":7},"tools":{},"jobs":{},"compaction":{},"plugins":{}},"agents":[{"name":"primary","description":"primary agent"},{"name":"planner","description":"planning agent"}],` +
 	`"providers":[{"id":"prov","name":"Prov","connected":true,` +
 	`"extra_body":{"n":9007199254740993,"big":1e400},` +
 	`"models":[{"id":"m","name":"M","context_window":4096,"source":"user",` +

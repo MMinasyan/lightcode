@@ -31,23 +31,13 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-const (
-	// toolsSettingsID is the configuration section the standard tools read
-	// their per-call settings from.
-	toolsSettingsID = "tools"
-
-	// jobsSettingsID is the configuration section forwarded verbatim to one
-	// background job start.
-	jobsSettingsID = "jobs"
-
-	// maxDiagnosticBytes is the durable diagnostic bound for the
-	// validation-class diagnostics these tools produce, matching the
-	// Harness's own tool-boundary bound.
-	maxDiagnosticBytes = 512
-)
+// maxDiagnosticBytes is the durable diagnostic bound for the
+// validation-class diagnostics these tools produce, matching the Harness's
+// own tool-boundary bound.
+const maxDiagnosticBytes = 512
 
 // toolSettings is the tools' private configuration, decoded with json.Unmarshal
-// from the plugins.tools section. Nil input and missing or null-valued
+// from the top-level tools section. Nil input and missing or null-valued
 // members keep the defaults; every consumed limit must be positive, and
 // command_timeout must fit its seconds-to-time.Duration conversion. Every
 // other member is ignored, including max_background_processes regardless of
@@ -63,8 +53,8 @@ func defaultToolSettings() toolSettings {
 	return toolSettings{MaxOutputBytes: 15360, ReadMaxLines: 500, ReadLineMaxChars: 5000, CommandTimeout: 120}
 }
 
-// decodeToolSettings decodes one supplied plugins.tools section on top of the
-// defaults and validates every consumed limit.
+// decodeToolSettings decodes one supplied top-level tools section on top of
+// the defaults and validates every consumed limit.
 func decodeToolSettings(raw json.RawMessage) (toolSettings, error) {
 	s := defaultToolSettings()
 	if len(bytes.TrimSpace(raw)) != 0 {
@@ -87,8 +77,9 @@ func decodeToolSettings(raw json.RawMessage) (toolSettings, error) {
 	return s, nil
 }
 
-// validateToolsSettings validates one captured plugins.tools section; the
-// configuration publisher calls it directly for every publication.
+// validateToolsSettings validates one captured top-level tools section; the
+// configuration candidate construction calls it directly for every
+// publication.
 func validateToolsSettings(raw json.RawMessage) error {
 	_, err := decodeToolSettings(raw)
 	return err
@@ -116,7 +107,7 @@ func (s toolSettings) toolsConfig() config.ToolsConfig {
 type standardTools struct{ dataDir string }
 
 func (in *standardTools) settings(inv Invocation) (toolSettings, error) {
-	return decodeToolSettings(inv.Config(toolsSettingsID))
+	return decodeToolSettings(inv.toolsSettings())
 }
 
 // openCodeGroup opens the calling Operation's one disk code group, keyed by
@@ -611,7 +602,7 @@ func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command s
 			Command:    command,
 			TimeoutSec: timeoutSec,
 			Env:        env,
-			Config:     tc.Invocation.Config(jobsSettingsID),
+			Config:     tc.Invocation.jobsSettings(),
 			OnExit: func(er jobs.ExitResult) {
 				_ = tc.Background.DeliverCompletion(context.Background(), sessionID, completionID, legacyCompletionText(er)) // terminal for the job's completion; the exit callback has nowhere to propagate
 			},

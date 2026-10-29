@@ -58,7 +58,7 @@ type ExitResult struct {
 }
 
 // StartRequest is one reserved job's launch input. Config is the opaque
-// plugins.jobs section the caller forwards; Env is the exact child
+// top-level jobs section the caller forwards; Env is the exact child
 // environment; TimeoutSec 0 means no timeout.
 type StartRequest struct {
 	JobID, SessionID, Workspace, Command string
@@ -83,7 +83,7 @@ type Jobs interface {
 }
 
 // settings is the service's private configuration, decoded with json.Unmarshal
-// from the plugins.jobs section. Nil input and missing or null-valued members
+// from the top-level jobs section. Nil input and missing or null-valued members
 // keep the defaults; unknown members are ignored; every consumed field is
 // range-checked against the retained bounds.
 type settings struct {
@@ -96,7 +96,7 @@ func defaultSettings() settings {
 	return settings{MaxBackgroundProcesses: 10, MaxOutputBytes: 15360, ReadLineMaxChars: 5000}
 }
 
-// decodeSettings decodes one supplied plugins.jobs section on top of the
+// decodeSettings decodes one supplied top-level jobs section on top of the
 // defaults and enforces the retained ranges.
 func decodeSettings(raw json.RawMessage) (settings, error) {
 	s := defaultSettings()
@@ -116,7 +116,7 @@ func decodeSettings(raw json.RawMessage) (settings, error) {
 	return s, nil
 }
 
-// ValidateSettings validates one captured plugins.jobs section on top of the
+// ValidateSettings validates one captured top-level jobs section on top of the
 // defaults; the Runtime publisher calls it directly for every publication.
 func ValidateSettings(raw json.RawMessage) error {
 	_, err := decodeSettings(raw)

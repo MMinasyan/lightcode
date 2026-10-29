@@ -34,7 +34,7 @@ func (r *Runtime) getConfiguration(ctx context.Context) (protocol.ConfigurationV
 	}
 	return protocol.ConfigurationView{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Settings:              projectSettings(captured.snapshot.sessions, captured.snapshot.plugins),
+		Settings:              projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.plugins),
 		Agents:                projectAgents(captured.snapshot),
 		Providers:             projectProviders(captured),
 	}, nil
@@ -173,7 +173,7 @@ func (r *Runtime) updateSettings(ctx context.Context, settings protocol.Settings
 	}
 	return protocol.SettingsMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                projectSettings(captured.snapshot.sessions, captured.snapshot.plugins),
+		Result:                projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.plugins),
 	}, nil
 }
 

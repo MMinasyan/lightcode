@@ -39,13 +39,12 @@ func mutationConfigDocument() string {
 }
 
 // mutationSettings is one complete settings shape the tests write: the
-// sessions policy beside one opaque tools document string.
+// sessions policy beside the top-level tools object and no plugin documents.
 func mutationSettings() protocol.Settings {
 	return protocol.Settings{
 		Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 5, DeleteAfterArchiveDays: 2},
-		Plugins: protocol.PluginsSettings{
-			"tools": `{"command_timeout":60,"max_output_bytes":2048,"read_line_max_chars":3000,"read_max_lines":100}`,
-		},
+		Tools:    json.RawMessage(`{"command_timeout":60,"max_output_bytes":2048,"read_line_max_chars":3000,"read_max_lines":100}`),
+		Plugins:  protocol.PluginsSettings{},
 	}
 }
 
@@ -64,17 +63,17 @@ func compactJSON(t *testing.T, data []byte) string {
 	return buf.String()
 }
 
-// opaqueSettingsDocument is the settings round-trip fixture: two compiled
-// plugin sections carrying fields common Runtime does not know plus one
-// int64 lexeme beyond JS number precision, one empty compiled section, and
-// one unowned provider model carrying the same kind of lexeme.
+// opaqueSettingsDocument is the settings round-trip fixture: one compiled
+// plugin section carrying fields common Runtime does not know plus one int64
+// lexeme beyond JS number precision, one empty compiled section, the
+// top-level tools section carrying the same kind of lexeme, and one unowned
+// provider model carrying the same kind of lexeme.
 func opaqueSettingsDocument() string {
 	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "",
 		`{"m":{"name":"One","context_window":9007199254740993}}`) +
-		`},"sessions":{"archive_after_days":3},"plugins":{` +
-		`"alpha":{"kept":1,"exact":9007199254740993},` +
+		`},"sessions":{"archive_after_days":3},` +
 		`"tools":{"max_output_bytes":42,"exact":9007199254740993},` +
-		`"tasks":{}}}`
+		`"plugins":{"alpha":{"kept":1,"exact":9007199254740993},"tasks":{}}}`
 }
 
 // TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments proves
@@ -98,7 +97,6 @@ func TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments(t *testin
 	read := view.Settings.Plugins
 	want := map[string]string{
 		"alpha": `{"kept":1,"exact":9007199254740993}`,
-		"tools": `{"max_output_bytes":42,"exact":9007199254740993}`,
 		"tasks": `{}`,
 	}
 	testassert.Require(t, len(read) == len(want), "settings plugins = %v, want exactly the owned sections %v", read, want)
@@ -271,7 +269,7 @@ func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testi
 	if candidate.snapshot.generation != 2 || svc.current() != candidate.snapshot {
 		t.Fatalf("mutate = generation %d (current published %v), want generation 2 published", candidate.snapshot.generation, svc.current() == candidate.snapshot)
 	}
-	testassert.Equal(t, projectSettings(candidate.snapshot.sessions, candidate.snapshot.plugins).Sessions, wantSettings.Sessions)
+	testassert.Equal(t, projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.plugins).Sessions, wantSettings.Sessions)
 
 	// The owning file: the written members are the marshaled shape, the
 	// unowned members and their exact numeric lexeme survive.
@@ -283,7 +281,7 @@ func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testi
 	var plugins map[string]json.RawMessage
 	testassert.NoError(t, json.Unmarshal(root["plugins"], &plugins))
 	{
-		got, want := compactJSON(t, plugins["tools"]), compactJSON(t, []byte(wantSettings.Plugins["tools"]))
+		got, want := compactJSON(t, root["tools"]), compactJSON(t, wantSettings.Tools)
 		testassert.Equal(t, got, want)
 	}
 	for _, omitted := range []string{"jobs", "tasks"} {
@@ -392,7 +390,7 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	var mu sync.Mutex
 	// The fixture document carries the old alpha section the stale save must
 	// remove wholesale.
-	writeServiceFile(t, h.configPath, strings.TrimSuffix(mutationConfigDocument(), "}")+`,"plugins":{"alpha":{"kept":1},"tools":{"max_output_bytes":42}}}`)
+	writeServiceFile(t, h.configPath, strings.TrimSuffix(mutationConfigDocument(), "}")+`,"tools":{"max_output_bytes":42},"plugins":{"alpha":{"kept":1}}}`)
 	testassert.NoError(t, os.MkdirAll(h.dataDir, 0o700))
 	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), workerAgentsDocument)
 	svc := h.service(context.Background(),
@@ -416,23 +414,23 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	agentsBefore, err := os.ReadFile(agentsPath)
 	testassert.NoError(t, err)
 
-	// The omission domain: the target carries only the tools document; the
-	// old alpha section is removed wholesale even though it is valid.
+	// The omission domain: the target carries the tools object and no plugin
+	// documents; the old alpha section is removed wholesale even though it is
+	// valid.
 	stale := protocol.Settings{
 		Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 7, DeleteAfterArchiveDays: 7},
-		Plugins: protocol.PluginsSettings{
-			"tools": `{"command_timeout":30,"max_output_bytes":1024,"read_line_max_chars":2000,"read_max_lines":50}`,
-		},
+		Tools:    json.RawMessage(`{"command_timeout":30,"max_output_bytes":1024,"read_line_max_chars":2000,"read_max_lines":50}`),
+		Plugins:  protocol.PluginsSettings{},
 	}
 	candidate, err := svc.mutate(context.Background(), editSettings(stale))
 	testassert.NoError(t, err)
-	published := projectSettings(candidate.snapshot.sessions, candidate.snapshot.plugins)
-	testassert.Require(t, len(published.Plugins) == 1 && compactJSON(t, []byte(published.Plugins["tools"])) == compactJSON(t, []byte(stale.Plugins["tools"])), "published plugins = %v, want only the written tools document", published.Plugins)
+	published := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.plugins)
+	testassert.Require(t, len(published.Plugins) == 0 && compactJSON(t, published.Tools) == compactJSON(t, stale.Tools), "published plugins = %v, tools = %s, want no plugin documents and the written tools object", published.Plugins, published.Tools)
 	root := fileRoot(t, h.configPath)
 	var plugins map[string]json.RawMessage
 	testassert.NoError(t, json.Unmarshal(root["plugins"], &plugins))
 	{
-		got, want := compactJSON(t, plugins["tools"]), compactJSON(t, []byte(stale.Plugins["tools"]))
+		got, want := compactJSON(t, root["tools"]), compactJSON(t, stale.Tools)
 		testassert.Equal(t, got, want)
 	}
 	{
@@ -494,7 +492,7 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	candidate, err = svc.mutate(context.Background(), editSettings(protocol.Settings{Sessions: stale.Sessions, Plugins: protocol.PluginsSettings{}}))
 	testassert.NoError(t, err)
 	{
-		got := projectSettings(candidate.snapshot.sessions, candidate.snapshot.plugins).Plugins
+		got := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.plugins).Plugins
 		testassert.Require(t, len(got) == 0, "published plugins after the empty map = %v, want none", got)
 	}
 	root = fileRoot(t, h.configPath)
@@ -767,10 +765,16 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 		return nil
 	}
 	// withSection returns the shared written settings plus one extra owned
-	// section, so a row can target one specific settings owner.
+	// plugin section, so a row can target one specific plugin settings owner.
 	withSection := func(id, document string) protocol.Settings {
 		settings := mutationSettings()
 		settings.Plugins[id] = document
+		return settings
+	}
+	// withTools replaces the written top-level tools object.
+	withTools := func(document string) protocol.Settings {
+		settings := mutationSettings()
+		settings.Tools = json.RawMessage(document)
 		return settings
 	}
 	rows := []struct {
@@ -784,7 +788,7 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 			name:       "the baseline settings owner rejects the written section",
 			validate:   acceptValidator,
 			external:   mutationConfigDocument(),
-			settings:   withSection("tools", `{"max_output_bytes":0}`),
+			settings:   withTools(`{"max_output_bytes":0}`),
 			wantSource: "tools: max_output_bytes must be positive",
 		},
 		{
@@ -1185,10 +1189,10 @@ func TestRuntimeSettingsMutationOwnershipAndResult(t *testing.T) {
 		testassert.NoError(t, err)
 		testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.ConfigurationRevision.InstanceId == "", "mutation revision = %+v, want generation 2 with the empty pre-server instance", mutation.ConfigurationRevision)
 		mutation.Result.Sessions.ArchiveAfterDays = 999
-		mutation.Result.Plugins["tools"] = `{"mutated":true}`
+		mutation.Result.Tools = json.RawMessage(`{"mutated":true}`)
 		fresh, err := r.getConfiguration(ctx)
 		testassert.NoError(t, err)
-		testassert.Require(t, fresh.Settings.Sessions.ArchiveAfterDays == 5 && compactJSON(t, []byte(fresh.Settings.Plugins["tools"])) == compactJSON(t, []byte(mutationSettings().Plugins["tools"])), "a mutation of the returned result reached the published settings: %+v", fresh.Settings)
+		testassert.Require(t, fresh.Settings.Sessions.ArchiveAfterDays == 5 && compactJSON(t, fresh.Settings.Tools) == compactJSON(t, mutationSettings().Tools), "a mutation of the returned result reached the published settings: %+v", fresh.Settings)
 	})
 }
 
@@ -1401,16 +1405,14 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 		got, want := compactJSON(t, root["sessions"]), compactJSON(t, mustMarshal(t, mutationSettings().Sessions))
 		testassert.Equal(t, got, want)
 	}
-	var writtenPlugins map[string]json.RawMessage
-	testassert.NoError(t, json.Unmarshal(root["plugins"], &writtenPlugins))
 	{
-		got, want := compactJSON(t, writtenPlugins["tools"]), compactJSON(t, []byte(mutationSettings().Plugins["tools"]))
+		got, want := compactJSON(t, root["tools"]), compactJSON(t, mutationSettings().Tools)
 		testassert.Equal(t, got, want)
 	}
 
 	// The published projection: the same winning candidate's settings.
-	view := projectSettings(svc.current().sessions, svc.current().plugins)
-	testassert.Require(t, view.Sessions == mutationSettings().Sessions && compactJSON(t, []byte(view.Plugins["tools"])) == compactJSON(t, []byte(mutationSettings().Plugins["tools"])), "published settings = %+v, want the requested shape", view)
+	view := projectSettings(svc.current().sessions, svc.current().tools, svc.current().jobs, svc.current().compaction, svc.current().plugins)
+	testassert.Require(t, view.Sessions == mutationSettings().Sessions && compactJSON(t, view.Tools) == compactJSON(t, mutationSettings().Tools), "published settings = %+v, want the requested shape", view)
 }
 
 // nextConfigurationEvent reads one event and proves it is the configuration

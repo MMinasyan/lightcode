@@ -14,7 +14,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/jobs"
 )
 
 // ErrConfiguration reports a complete candidate failure: nothing was
@@ -59,12 +58,6 @@ type configurationService struct {
 	capabilityIDs []string
 	toolIDs       []string
 
-	// baselineSections are the directly constructed baseline services'
-	// configuration sections: the publisher validates plugins.tools and
-	// plugins.jobs with the services' own validators, because baseline
-	// services are not optional plugin declarations.
-	baselineSections []baselineSection
-
 	// defaultCapabilityIDs is empty, or the single composed ModelAdaptation
 	// export ID installed on the built-in primary definition before ordinary
 	// inheritance. No plugin callback supplies it.
@@ -107,22 +100,6 @@ type configurationCapture struct {
 	credentials map[string]config.EnvValue
 }
 
-// baselineSection pairs one baseline service configuration section with the
-// validator its directly constructed service owns.
-type baselineSection struct {
-	id       string
-	validate func(json.RawMessage) error
-}
-
-// baselineSections returns the fixed baseline section table: tools, then
-// jobs.
-func baselineSections() []baselineSection {
-	return []baselineSection{
-		{id: toolsSettingsID, validate: validateToolsSettings},
-		{id: jobsSettingsID, validate: jobs.ValidateSettings},
-	}
-}
-
 // newConfigurationService binds the service to the composition's owned
 // declarations, the Loader rooted at the home the Runtime resolved once, the
 // Runtime owner context, and the Runtime's passive observation. Neither
@@ -130,13 +107,9 @@ func baselineSections() []baselineSection {
 // locks and TTL records, and the service reads no dotenv: that belongs to
 // Runtime startup, not to any build or reload.
 func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configPath string, obs *observation) *configurationService {
-	baseline := baselineSections()
-	pluginIDs := make(map[string]bool, len(c.plugins)+len(baseline))
+	pluginIDs := make(map[string]bool, len(c.plugins))
 	for _, p := range c.plugins {
 		pluginIDs[p.ID] = true
-	}
-	for _, section := range baseline {
-		pluginIDs[section.id] = true
 	}
 	defaultCapabilityIDs := []string(nil)
 	if c.modelAdaptation != "" {
@@ -150,7 +123,6 @@ func newConfigurationService(owner context.Context, c *composition, loader *cata
 		pluginIDs:            pluginIDs,
 		capabilityIDs:        c.capabilityIDs,
 		toolIDs:              c.toolIDs,
-		baselineSections:     baseline,
 		defaultCapabilityIDs: defaultCapabilityIDs,
 		owner:                owner,
 		obs:                  obs,
@@ -399,13 +371,12 @@ func captureWorkspacePermissions() map[string]json.RawMessage {
 }
 
 // validatePlugins checks the captured plugins section against the compiled
-// declarations and the baseline service sections: it is an object keyed by
-// plugin ID (absent passes nil), every value must be a JSON object, an
-// unknown ID rejects the candidate, and each declared plugin receives step
-// 3's no-settings rule or has its owned input validated unchanged, the two
-// baseline sections receive their services' own validators, constructing and
-// mutating no instance. Cancellation observed between validators prevents
-// later validation and publication; validation starts no service work.
+// declarations: it is an object keyed by plugin ID (absent passes nil), every
+// value must be a JSON object, an unknown ID rejects the candidate, and each
+// declared plugin receives step 3's no-settings rule or has its owned input
+// validated unchanged, constructing and mutating no instance. Cancellation
+// observed between validators prevents later validation and publication;
+// validation starts no service work.
 func (s *configurationService) validatePlugins(ctx context.Context, plugins map[string]json.RawMessage) error {
 	for pluginID, raw := range plugins {
 		if !s.pluginIDs[pluginID] {
@@ -421,14 +392,6 @@ func (s *configurationService) validatePlugins(ctx context.Context, plugins map[
 			return err
 		}
 		if err := acceptSettings(p, plugins[p.ID]); err != nil {
-			return configurationFailure(err)
-		}
-	}
-	for _, section := range s.baselineSections {
-		if err := s.canceled(ctx); err != nil {
-			return err
-		}
-		if err := section.validate(plugins[section.id]); err != nil {
 			return configurationFailure(err)
 		}
 	}

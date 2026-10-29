@@ -33,18 +33,19 @@ import (
 // data root with a scripted or real jobs service; no optional registration is
 // involved in opening them.
 
-const toolsComposedDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"plugins":{"tools":{"read_max_lines":77}}}`
+const toolsComposedDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"tools":{"read_max_lines":77}}`
 
-const toolsComposedInvalidDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"plugins":{"tools":{"max_output_bytes":0}}}`
+const toolsComposedInvalidDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"tools":{"max_output_bytes":0}}`
 
-const toolsComposedNullDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"plugins":{"tools":null}}`
+const toolsComposedNullDocument = `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"tools":null}`
 
 func writeToolsConfig(t *testing.T, path, doc string) {
 	t.Helper()
+	testassert.Require(t, json.Valid([]byte(doc)), "fixture document is not valid JSON: %s", doc)
 	testassert.NoError(t, os.WriteFile(path, []byte(doc), 0o600))
 }
 
-// TestComposedToolsSettingsPublication proves the plugins.tools section
+// TestComposedToolsSettingsPublication proves the top-level tools section
 // publication matrix over the directly composed baseline: a valid section
 // publishes, a consumed-limit violation and a null section fail publication
 // without replacing the live revision, and the next success continues the
@@ -68,6 +69,14 @@ func TestComposedToolsSettingsPublication(t *testing.T) {
 	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with a null tools section = %v, want the publisher's non-object rejection", err)
+	}
+	if current := r.config.current(); current == nil || current.generation != 2 {
+		_ = r.Close(ctx)
+		t.Fatalf("current revision after the null tools rejection = %+v, want the unchanged generation 2", current)
+	}
+	if data, err := os.ReadFile(e.configPath); err != nil || string(data) != toolsComposedNullDocument {
+		_ = r.Close(ctx)
+		t.Fatalf("config file after the null tools rejection = %q (%v), want the unchanged null fixture", data, err)
 	}
 	writeToolsConfig(t, e.configPath, toolsComposedDocument)
 	rev, err := r.Reload(ctx)
@@ -1661,7 +1670,7 @@ func completionTextIn(req model.Request) string {
 func TestBackgroundStartRealProcessDeliversTruncatedSteeringCompletion(t *testing.T) {
 	delivered := make(chan struct{}, 1)
 	bg := &harnessBackground{delivered: delivered}
-	invocation, err := ConfiguredInvocationForTest(map[string]string{"jobs": `{"max_output_bytes":1024}`})
+	invocation, err := ConfiguredInvocationForTest("", `{"max_output_bytes":1024}`, "", nil)
 	testassert.NoError(t, err)
 	var mu sync.Mutex
 	attempt := 0

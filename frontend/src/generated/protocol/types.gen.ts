@@ -51,7 +51,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '7';
+    protocol_version: '8';
 };
 
 /**
@@ -454,6 +454,27 @@ export type SessionsSettings = {
 };
 
 /**
+ * The baseline standard tools' configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the tools apply at consumption.
+ */
+export type ToolsSettings = {
+    [key: string]: unknown;
+};
+
+/**
+ * The baseline background jobs configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the jobs service applies at consumption.
+ */
+export type JobsSettings = {
+    [key: string]: unknown;
+};
+
+/**
+ * The baseline compaction configuration object: an optional independent summarizer model reference and an optional custom nonempty prompt, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults apply at consumption.
+ */
+export type CompactionSettings = {
+    [key: string]: unknown;
+};
+
+/**
  * One compiled plugin's own configuration document: the exact JSON object text the selected plugin declaration owns, carried as a string so the transport never interprets, renumbers or drops its members.
  */
 export type PluginConfigDocument = string;
@@ -467,6 +488,9 @@ export type PluginsSettings = {
 
 export type Settings = {
     sessions: SessionsSettings;
+    tools: ToolsSettings;
+    jobs: JobsSettings;
+    compaction: CompactionSettings;
     plugins: PluginsSettings;
 };
 

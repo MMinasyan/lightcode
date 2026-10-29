@@ -13,13 +13,13 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// TestConfiguredToolsSettingsTakeEffect proves the published
-// plugins.tools values change tool behavior through the real
-// Invocation.Config channel: the configured read_max_lines is the
-// normalization default limit and bounds the executed read window
-// end-to-end, while the zero Invocation keeps the shipped defaults. The
-// configured Invocation comes from the test-only runtime bridge, because
-// outside the runtime package only the zero Invocation is constructible.
+// TestConfiguredToolsSettingsTakeEffect proves the published top-level tools
+// values change tool behavior through the real captured Invocation channel:
+// the configured read_max_lines is the normalization default limit and
+// bounds the executed read window end-to-end, while the zero Invocation keeps
+// the shipped defaults. The configured Invocation comes from the test-only
+// runtime bridge, because outside the runtime package only the zero
+// Invocation is constructible.
 func TestConfiguredToolsSettingsTakeEffect(t *testing.T) {
 	ctx := context.Background()
 	byID, _ := openToolsComposed(t, t.TempDir(), &fakeJobs{}, Plugin{})
@@ -33,7 +33,7 @@ func TestConfiguredToolsSettingsTakeEffect(t *testing.T) {
 		return completed
 	}
 
-	configured, err := ConfiguredInvocationForTest(map[string]string{"tools": `{"read_max_lines":77}`})
+	configured, err := ConfiguredInvocationForTest(`{"read_max_lines":77}`, "", "", nil)
 	testassert.NoError(t, err)
 	raw, err := readTool.Normalize(ToolContext{Invocation: configured}, call(t, `{"path":"a.txt"}`))
 	testassert.NoError(t, err)

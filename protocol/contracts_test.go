@@ -308,3 +308,20 @@ func TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors(t *testing.
 	want := "{\"big\":" + string(members["big"]) + ",\"n\":" + string(members["n"]) + "}"
 	testassert.Require(t, decoded.ToolCalls[0].Metadata != nil && string(*decoded.ToolCalls[0].Metadata) == want, "decoded metadata = %v, want the raw value preserved", decoded.ToolCalls[0].Metadata)
 }
+
+// TestSettingsBaselineSectionsStayRawObjects keeps the top-level tools, jobs
+// and compaction members schema-defined JSON objects generated as the raw
+// message alias: an inline structured type would renumber or reinterpret
+// their members, while a plugin-document string would change the transport
+// shape.
+func TestSettingsBaselineSectionsStayRawObjects(t *testing.T) {
+	settings := componentSchema(t, "Settings")
+	for _, name := range []string{"tools", "jobs", "compaction"} {
+		property, ok := settings.Properties[name]
+		testassert.Require(t, ok && property.Ref == "#/components/schemas/"+strings.ToUpper(name[:1])+name[1:]+"Settings", "Settings.%s = %+v, want its named object component", name, property)
+		component := componentSchema(t, strings.ToUpper(name[:1])+name[1:]+"Settings")
+		testassert.Require(t, component.Type != nil && component.Type.Is("object"), "%sSettings type = %v, want object", name, component.Type)
+		testassert.Require(t, component.Extensions["x-go-type"] == "json.RawMessage", "%sSettings x-go-type = %v, want json.RawMessage", name, component.Extensions["x-go-type"])
+		testassert.Require(t, component.AdditionalProperties.Has != nil && *component.AdditionalProperties.Has, "%sSettings must accept raw members", name)
+	}
+}

@@ -181,13 +181,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N7 HealthProtocolVersion = "7"
+	N8 HealthProtocolVersion = "8"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N7:
+	case N8:
 		return true
 	default:
 		return false
@@ -959,6 +959,9 @@ type CompactRequest struct {
 	OperationId string `json:"operation_id"`
 }
 
+// CompactionSettings The baseline compaction configuration object: an optional independent summarizer model reference and an optional custom nonempty prompt, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults apply at consumption.
+type CompactionSettings = json.RawMessage
+
 // ConfigurationChangedEvent defines model for ConfigurationChangedEvent.
 type ConfigurationChangedEvent struct {
 	ConfigurationRevision ConfigurationRevision         `json:"configuration_revision"`
@@ -1153,6 +1156,9 @@ type JobScope struct {
 
 // JobScopeKind defines model for JobScope.Kind.
 type JobScopeKind string
+
+// JobsSettings The baseline background jobs configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the jobs service applies at consumption.
+type JobsSettings = json.RawMessage
 
 // Message defines model for Message.
 type Message struct {
@@ -1548,9 +1554,18 @@ type SetSessionAgentTypeRequest struct {
 
 // Settings defines model for Settings.
 type Settings struct {
+	// Compaction The baseline compaction configuration object: an optional independent summarizer model reference and an optional custom nonempty prompt, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults apply at consumption.
+	Compaction CompactionSettings `json:"compaction"`
+
+	// Jobs The baseline background jobs configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the jobs service applies at consumption.
+	Jobs JobsSettings `json:"jobs"`
+
 	// Plugins Every owned plugin section as its JSON document string, keyed by the compiled plugin ID; an absent ID uses that plugin's own defaults.
 	Plugins  PluginsSettings  `json:"plugins"`
 	Sessions SessionsSettings `json:"sessions"`
+
+	// Tools The baseline standard tools' configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the tools apply at consumption.
+	Tools ToolsSettings `json:"tools"`
 }
 
 // SettingsMutation defines model for SettingsMutation.
@@ -1696,6 +1711,9 @@ type ToolStartedEvent struct {
 
 // ToolStartedEventKind defines model for ToolStartedEvent.Kind.
 type ToolStartedEventKind string
+
+// ToolsSettings The baseline standard tools' configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the tools apply at consumption.
+type ToolsSettings = json.RawMessage
 
 // UpdateProviderDetailRequest defines model for UpdateProviderDetailRequest.
 type UpdateProviderDetailRequest struct {

@@ -1,7 +1,8 @@
 // The exact-JSON editor helpers: source-context parsing keeps every unedited
 // numeric lexeme (including signed int64 tokens beyond Number precision)
-// exactly as the document carried it, plugin documents stay their exact string
-// values, and the composed patches/fork bodies carry raw user tokens verbatim.
+// exactly as the document carried it, top-level baseline objects stay raw
+// objects, optional plugin documents stay their exact string values, and the
+// composed patches/fork bodies carry raw user tokens verbatim.
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -19,7 +20,8 @@ import {
 
 const CONFIGURATION = '{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"1"},'
   + '"settings":{"sessions":{"auto_archive":false,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1e400},'
-  + '"plugins":{"tools":"{\\"max_output_bytes\\":9007199254740993,\\"command_timeout\\":1e400}"}},"agents":[],"providers":[]}';
+  + '"tools":{"max_output_bytes":9007199254740993,"command_timeout":1e400},"jobs":{},"compaction":{},'
+  + '"plugins":{"tasks":"{\\"max_concurrent\\":2}"}},"agents":[],"providers":[]}';
 
 describe('parseExactJSON', () => {
   it('preserves exact numeric source tokens through the ordinary round trip', () => {
@@ -95,14 +97,16 @@ describe('replaceObjectMembers', () => {
 describe('settings extraction', () => {
   it('keeps the exact settings subtree, numeric tokens and plugin document values', () => {
     const settingsText = extractSettingsText(CONFIGURATION);
-    // The unedited interval tokens survive byte-for-byte.
+    // The unedited interval and baseline-section tokens survive byte-for-byte.
     expect(settingsText).toContain('-9223372036854775808');
     expect(settingsText).toContain('1e400');
     expect(settingsText).toContain('9007199254740993');
     const parsed = parseSettingsObject(settingsText);
     expect(parsed.sessions.auto_archive).toBe(false);
-    // The plugin document is carried as its exact string value.
-    expect(parsed.plugins.tools).toBe('{"max_output_bytes":9007199254740993,"command_timeout":1e400}');
+    // The baseline tools object is carried raw, never as a document string.
+    expect(JSON.stringify(parsed.tools)).toBe('{"max_output_bytes":9007199254740993,"command_timeout":1e400}');
+    // The optional plugin document is carried as its exact string value.
+    expect(parsed.plugins.tasks).toBe('{"max_concurrent":2}');
   });
 
   it('rejects a document without a settings member', () => {
