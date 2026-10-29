@@ -682,6 +682,7 @@ func (h *Harness) runMaintenanceModel(execCtx context.Context, c *coordinator, o
 		}
 		return model.Output{}, closeInvocation, h.settleCompactionFailure(c, operationID, terminal, err, capture, facts)
 	}
+	ownOpenedInvocationDeclarations(&inv) // the accepted invocation owns its declarations before anything else consumes them
 	if err := validateOpenedInvocation(inv); err != nil {
 		if inv.Close != nil {
 			h.recordCleanupFailure(inv.Close()) // an invalid invocation cleans its own opened resources
@@ -1100,6 +1101,10 @@ func (h *Harness) commitCheckpoint(execCtx context.Context, c *coordinator, oper
 			// request keeps its identity and recorded hook results while only
 			// its references advance.
 			rebuilt := rebuiltBoundary(c.graph.Entries, checkpoint.BoundaryEntryID, entryID)
+			// The checkpoint publication records the merged maintenance facts, so it
+			// retires the incomplete-maintenance marker the completed model effects
+			// carried across the gap.
+			nextOp.State.UnreportedMaintenance = false
 			if nextOp.State.Request == nil {
 				if !manual && consumedSource != "" {
 					nextOp.State.Request = &RunningRequest{RequestID: consumedSource, CheckpointEntryID: entryID, BoundaryEntryID: rebuilt}

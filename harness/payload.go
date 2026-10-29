@@ -2864,7 +2864,7 @@ func decodeOptionalModelPricing(obj map[string]json.RawMessage, key string) (*Mo
 	if err != nil {
 		return nil, err
 	}
-	if err := rejectUnknownMembers(pricingObj, "input", "output", "cache_read", "cache_write"); err != nil {
+	if err := rejectUnknownMembers(pricingObj, "input", "output", "cache_read"); err != nil {
 		return nil, fmt.Errorf("member %q: %w", key, err)
 	}
 	v := ModelPricing{}
@@ -2875,7 +2875,6 @@ func decodeOptionalModelPricing(obj map[string]json.RawMessage, key string) (*Mo
 		{"input", &v.Input},
 		{"output", &v.Output},
 		{"cache_read", &v.CacheRead},
-		{"cache_write", &v.CacheWrite},
 	} {
 		raw, err := member(pricingObj, field.key, false)
 		if err != nil {
@@ -2917,7 +2916,6 @@ func validateModelPricing(v ModelPricing) error {
 		{"input", v.Input},
 		{"output", v.Output},
 		{"cache_read", v.CacheRead},
-		{"cache_write", v.CacheWrite},
 	} {
 		if field.rate != nil && (math.IsNaN(*field.rate) || math.IsInf(*field.rate, 0)) {
 			return fmt.Errorf("rate %q must be finite", field.key)
@@ -2968,23 +2966,25 @@ func encodeOperationState(v OperationCurrentState) (json.RawMessage, error) {
 		runningRequest = raw
 	}
 	wire, err := json.Marshal(struct {
-		Status           string             `json:"status"`
-		StartedAt        string             `json:"started_at"`
-		SettledAt        *string            `json:"settled_at,omitempty"`
-		ActiveEffect     json.RawMessage    `json:"active_effect,omitempty"`
-		RunningRequest   json.RawMessage    `json:"running_request,omitempty"`
-		PendingToolCalls []PendingToolCall  `json:"pending_tool_calls"`
-		Usage            json.RawMessage    `json:"usage"`
-		Terminal         *OperationTerminal `json:"terminal,omitempty"`
+		Status                string             `json:"status"`
+		StartedAt             string             `json:"started_at"`
+		SettledAt             *string            `json:"settled_at,omitempty"`
+		ActiveEffect          json.RawMessage    `json:"active_effect,omitempty"`
+		RunningRequest        json.RawMessage    `json:"running_request,omitempty"`
+		PendingToolCalls      []PendingToolCall  `json:"pending_tool_calls"`
+		Usage                 json.RawMessage    `json:"usage"`
+		Terminal              *OperationTerminal `json:"terminal,omitempty"`
+		UnreportedMaintenance bool               `json:"unreported_maintenance,omitempty"`
 	}{
-		Status:           string(v.Status),
-		StartedAt:        startedAt,
-		SettledAt:        settledAt,
-		ActiveEffect:     activeEffect,
-		RunningRequest:   runningRequest,
-		PendingToolCalls: pending,
-		Usage:            usage,
-		Terminal:         v.Terminal,
+		Status:                string(v.Status),
+		StartedAt:             startedAt,
+		SettledAt:             settledAt,
+		ActiveEffect:          activeEffect,
+		RunningRequest:        runningRequest,
+		PendingToolCalls:      pending,
+		Usage:                 usage,
+		Terminal:              v.Terminal,
+		UnreportedMaintenance: v.UnreportedMaintenance,
 	})
 	if err != nil {
 		return nil, err
@@ -2994,7 +2994,7 @@ func encodeOperationState(v OperationCurrentState) (json.RawMessage, error) {
 
 // decodeOperationState reads the state section with exact keys.
 func decodeOperationState(obj map[string]json.RawMessage) (OperationCurrentState, error) {
-	if err := rejectUnknownMembers(obj, "status", "started_at", "settled_at", "active_effect", "running_request", "pending_tool_calls", "usage", "terminal"); err != nil {
+	if err := rejectUnknownMembers(obj, "status", "started_at", "settled_at", "active_effect", "running_request", "pending_tool_calls", "usage", "terminal", "unreported_maintenance"); err != nil {
 		return OperationCurrentState{}, err
 	}
 	status, err := stringMember(obj, "status", true)
@@ -3017,10 +3017,15 @@ func decodeOperationState(obj map[string]json.RawMessage) (OperationCurrentState
 	if err != nil {
 		return OperationCurrentState{}, fmt.Errorf("member %q: %w", "usage", err)
 	}
+	unreported, err := boolMember(obj, "unreported_maintenance", false)
+	if err != nil {
+		return OperationCurrentState{}, fmt.Errorf("member %q: %w", "unreported_maintenance", err)
+	}
 	v := OperationCurrentState{
-		Status:    OperationState(status),
-		StartedAt: started,
-		Usage:     usage,
+		Status:                OperationState(status),
+		StartedAt:             started,
+		Usage:                 usage,
+		UnreportedMaintenance: unreported,
 	}
 	if _, present := obj["settled_at"]; present {
 		settled, err := stringMember(obj, "settled_at", true)

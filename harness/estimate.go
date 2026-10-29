@@ -31,9 +31,9 @@ func capturedPricingFor(capture ExecutionCapture, ref model.ModelRef) *ModelPric
 // (input*input_rate + cached_input*cache_read_rate + output*output_rate)/1e6.
 // An absent usage report is unknown even when every rate is zero; only a
 // nonzero counter requires its rate, so a present zero rate is a known zero
-// and a present all-zero report is a known zero even with absent pricing. No
-// cache-write count is ever invented from the captured cache-write rate, and
-// a non-finite product is unknown.
+// and a present all-zero report is a known zero even with absent pricing.
+// Estimates use the captured input, output, and cache-read rates only, and a
+// non-finite product is unknown.
 func producerEstimateUSD(pricing *ModelPricing, usage *UsageCount) (float64, bool) {
 	if usage == nil {
 		return 0, false
@@ -155,6 +155,20 @@ func estimateGraphCosts(graph *sessionGraph) (map[string]*costEstimate, *costEst
 			for _, fact := range entry.Compaction.Facts {
 				produce(operationID, capturedPricingFor(capture, fact.Model), fact.Usage)
 			}
+		}
+	}
+	// A maintenance procedure whose incurred facts are not yet durably
+	// recorded keeps the owning Operation and the Session estimate unknown
+	// across the gap, even when no surviving producer entry names them.
+	for _, op := range graph.Operations {
+		if op.State.UnreportedMaintenance {
+			estimate, present := byOperation[op.Admission.OperationID]
+			if !present {
+				estimate = &costEstimate{}
+				byOperation[op.Admission.OperationID] = estimate
+			}
+			estimate.unknown = true
+			session.unknown = true
 		}
 	}
 	return byOperation, session

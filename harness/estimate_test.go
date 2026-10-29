@@ -17,14 +17,14 @@ import (
 func rate(v float64) *float64 { return &v }
 
 // conversationPricing/compactPricing are the fixture's captured rate pair:
-// the conversation model at 1/2/4/8 per million and the effective compact
-// model (cprov/compact-x) at 0.5/0.25/0.125/0.0625 per million.
+// the conversation model at 1/2/4 per million and the effective compact
+// model (cprov/compact-x) at 0.5/0.25/0.125 per million.
 func conversationPricing() *ModelPricing {
-	return &ModelPricing{Input: rate(1), Output: rate(2), CacheRead: rate(4), CacheWrite: rate(8)}
+	return &ModelPricing{Input: rate(1), Output: rate(2), CacheRead: rate(4)}
 }
 
 func compactPricing() *ModelPricing {
-	return &ModelPricing{Input: rate(0.5), Output: rate(0.25), CacheRead: rate(0.125), CacheWrite: rate(0.0625)}
+	return &ModelPricing{Input: rate(0.5), Output: rate(0.25), CacheRead: rate(0.125)}
 }
 
 // recomputeFixtureUsage rewrites the operation and Session register usage
@@ -356,25 +356,28 @@ func TestSessionReadViewCostEstimates(t *testing.T) {
 			wantSession: nil,
 		},
 		{
-			name: "a captured cache-write rate alone never invents a charged count",
+			// The completed maintenance model intent left its facts
+			// unrecorded: the marker alone keeps the owning Operation and
+			// the Session unknown even though every surviving producer is
+			// fully priced.
+			name: "the unreported-maintenance marker keeps the operation and session unknown",
 			mutate: func(g *testGraph) {
-				for i := range g.ops {
-					g.ops[i].Admission.Execution.Pricing = &ModelPricing{CacheWrite: rate(9)}
-					g.ops[i].Admission.Execution.Compact.Pricing = &ModelPricing{CacheWrite: rate(9)}
-				}
 				for _, entry := range g.entries {
 					switch entry.env.ID {
-					case hexID(2), hexID(5):
+					case hexID(2):
+						entry.assistant.Usage = &UsageCount{InputTokens: 10, CachedInputTokens: 10, OutputTokens: 10}
+					case hexID(5):
 						entry.assistant.Usage = &UsageCount{}
 					case hexID(8):
 						entry.compaction.Facts[0].Usage = &UsageCount{}
 					}
 				}
+				for i := range g.ops {
+					g.ops[i].State.UnreportedMaintenance = true
+				}
 			},
-			// Only all-zero reports are priced here: the captured cache-write
-			// rate contributes to no count, so the totals are known zeros.
-			wantOp:      map[string]*float64{testOpID: ptrUSD(0), "op-compact": ptrUSD(0)},
-			wantSession: ptrUSD(0),
+			wantOp:      map[string]*float64{testOpID: nil, "op-compact": nil},
+			wantSession: nil,
 		},
 		{
 			name: "a non-finite per-producer estimate is unknown",
@@ -477,17 +480,16 @@ func TestCapturePricingReadOwnership(t *testing.T) {
 	compactPricing := first.Admission.Execution.Compact.Pricing
 	testassert.Require(t, pricing != nil && compactPricing != nil && pricing.Input != nil && compactPricing.Input != nil,
 		"fixture capture = %+v, want captured conversation and compact pricing", first.Admission.Execution)
-	input, output, cacheRead, cacheWrite, compactInput := *pricing.Input, *pricing.Output, *pricing.CacheRead, *pricing.CacheWrite, *compactPricing.Input
+	input, output, cacheRead, compactInput := *pricing.Input, *pricing.Output, *pricing.CacheRead, *compactPricing.Input
 	*pricing.Input = 999
 	*pricing.Output = 999
 	*pricing.CacheRead = 999
-	*pricing.CacheWrite = 999
 	*compactPricing.Input = 999
 	second, err := h.ReadOperation(ctx, testSessionID, testOpID)
 	testassert.NoError(t, err)
 	got := second.Admission.Execution.Pricing
 	gotCompact := second.Admission.Execution.Compact.Pricing
-	testassert.Require(t, got != nil && *got.Input == input && *got.Output == output && *got.CacheRead == cacheRead && *got.CacheWrite == cacheWrite,
+	testassert.Require(t, got != nil && *got.Input == input && *got.Output == output && *got.CacheRead == cacheRead,
 		"a mutation of one read's conversation rate pointees reached the retained capture: %+v", got)
 	testassert.Require(t, gotCompact != nil && *gotCompact.Input == compactInput,
 		"a mutation of one read's compact rate pointee reached the retained capture: %+v", gotCompact)

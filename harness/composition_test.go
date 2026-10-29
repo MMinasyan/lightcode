@@ -91,8 +91,8 @@ func TestRequestHookPurePromptRemoval(t *testing.T) {
 // selection narrows the advertised catalog, a present-empty selection
 // advertises none while the actual captured catalog rides the request, an
 // out-of-catalog name rejects the round before any model callback, and a
-// later selection restoring the full catalog leaves the first hook without
-// durable pure provenance.
+// later selection restoring the full catalog keeps every accepted identity
+// while recording no durable tool-view delta.
 func TestRequestHookPureToolView(t *testing.T) {
 	t.Run("narrowed view advertised", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
@@ -122,7 +122,7 @@ func TestRequestHookPureToolView(t *testing.T) {
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "outside the captured tool catalog"), "round = %v, want the out-of-catalog rejection", err)
 		testassert.Equal(t, calls, 0)
 	})
-	t.Run("restored view drops pure provenance", func(t *testing.T) {
+	t.Run("restored view keeps accepted identities with no delta", func(t *testing.T) {
 		h, store, c, sessionID := newEffectHarness(t, nil)
 		narrow := RequestHook{ID: "req.tools.narrow", ExtensionID: "req-ext", Mode: HookModePure, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
 			return RequestConsequence{ToolNames: []string{}}, nil
@@ -136,7 +136,7 @@ func TestRequestHookPureToolView(t *testing.T) {
 		testassert.Require(t, len(sent.Tools) == 1 && sent.Tools[0].Name == "echo", "dispatch tools = %+v, want the restored full catalog", sent.Tools)
 		assistant := compositionAssistant(t, store, sessionID)
 		testassert.Require(t, assistant.Evidence != nil && assistant.Evidence.ToolNames == nil, "assistant evidence = %+v, want no net tool-view delta", assistant.Evidence)
-		testassert.Require(t, len(assistant.Evidence.HookIDs) == 0, "assistant evidence hook identities = %+v, want the net-restored pure chain unprovened", assistant.Evidence.HookIDs)
+		testassert.Require(t, len(assistant.Evidence.HookIDs) == 2 && assistant.Evidence.HookIDs[0].HookID == "req.tools.narrow" && assistant.Evidence.HookIDs[1].HookID == "req.tools.restore", "assistant evidence hook identities = %+v, want both accepted hooks in configured order", assistant.Evidence.HookIDs)
 	})
 }
 
@@ -167,7 +167,7 @@ func TestRequestHookFrozenInputOwnership(t *testing.T) {
 	testassert.Require(t, len(sent.Tools) == 1 && sent.Tools[0].Name == "echo", "dispatch tools = %+v, want the captured catalog unchanged by hook mutation", sent.Tools)
 	testassert.Require(t, strings.Contains(sent.Messages[0].TextContent(), "system") && !strings.Contains(sent.Messages[0].TextContent(), "mutated"), "dispatch prompt = %q, want the captured prompt unchanged", sent.Messages[0].TextContent())
 	assistant := compositionAssistant(t, store, sessionID)
-	testassert.Require(t, len(assistant.Evidence.HookIDs) == 0 && assistant.Evidence.Prompt == nil && assistant.Evidence.Messages == nil, "assistant evidence = %+v, want no contribution from an empty consequence", assistant.Evidence)
+	testassert.Require(t, len(assistant.Evidence.HookIDs) == 1 && assistant.Evidence.HookIDs[0].HookID == "req.observe" && assistant.Evidence.Prompt == nil && assistant.Evidence.Messages == nil, "assistant evidence = %+v, want the accepted observer identity with no contribution from an empty consequence", assistant.Evidence)
 }
 
 // TestHookFamiliesDisjointForSameIdentity proves the binding-isolation rows:
@@ -235,12 +235,13 @@ func TestHookFamiliesDisjointForSameIdentity(t *testing.T) {
 	testassert.Require(t, toolResult != nil && len(toolResult.HookIDs) == 1 && toolResult.HookIDs[0].HookID == sharedID && toolResult.HookIDs[0].ExtensionID == sharedExt, "tool result hook provenance = %+v, want only the tool-bound family record", toolResult.HookIDs)
 }
 
-// TestArgumentHookChainPureRestoreCoalesces proves the chain coalescing rule:
-// pure replacements whose net consequence against the original raw bytes is
-// unchanged carry no durable provenance at the tool settlement, while an
-// effectful hook in the same chain always records its own result and retains
-// the consumed intermediate bytes of the pure changes it consumed.
-func TestArgumentHookChainPureRestoreCoalesces(t *testing.T) {
+// TestArgumentHookChainPureRestoreKeepsAcceptedIdentities proves the chain
+// provenance rule: every successfully accepted hook identity — pure
+// replacements and an effectful hook alike, changed or restored — stays in the
+// tool settlement's provenance in configured order, while an effectful hook
+// always records its own result and retains the consumed intermediate bytes
+// it actually consumed.
+func TestArgumentHookChainPureRestoreKeepsAcceptedIdentities(t *testing.T) {
 	original := json.RawMessage(`{"x":1}`)
 	spy := &hookToolSpy{}
 	exec := hookFixtureExecution(spy.tool, objectNormalize,
@@ -277,7 +278,7 @@ func TestArgumentHookChainPureRestoreCoalesces(t *testing.T) {
 	testassert.Require(t, len(hookResults) == 1 && hookResults[0].HookID == "cap.effectful", "committed hook results = %+v, want only the effectful hook's own result", hookResults)
 	consumed, derr := base64.StdEncoding.DecodeString(hookResults[0].InputArgumentsBase64)
 	testassert.Require(t, derr == nil && string(consumed) == string(original), "effectful hook result consumed input = %q, want the restored original bytes", consumed)
-	testassert.Require(t, toolResult != nil && len(toolResult.HookIDs) == 1 && toolResult.HookIDs[0].HookID == "cap.effectful", "tool result hook provenance = %+v, want only the effectful identity for a net-unchanged pure prefix", toolResult.HookIDs)
+	testassert.Require(t, toolResult != nil && len(toolResult.HookIDs) == 3 && toolResult.HookIDs[0].HookID == "cap.pure.one" && toolResult.HookIDs[1].HookID == "cap.pure.two" && toolResult.HookIDs[2].HookID == "cap.effectful", "tool result hook provenance = %+v, want every accepted identity in configured order", toolResult.HookIDs)
 	prepared := spy.received()
 	testassert.Require(t, len(prepared) == 1 && string(prepared[0].Arguments) == `{"x":7}`, "preparer received %+v, want the effectful final value", prepared)
 }
@@ -584,7 +585,7 @@ func TestMaterializedEmptyToolSelectionStaysEmpty(t *testing.T) {
 	testassert.Require(t, view.names != nil && len(view.effectiveTools()) == 0, "present-empty selection became the full catalog")
 }
 
-func TestConsumedPureProvenanceCoalesces(t *testing.T) {
+func TestAcceptedPureRequestIdentitiesRecordInOrder(t *testing.T) {
 	capture := testCapture()
 	for _, restored := range []bool{false, true} {
 		view := newRequestView(capture, "", testEntryID, nil)
@@ -596,7 +597,12 @@ func TestConsumedPureProvenanceCoalesces(t *testing.T) {
 			view.recordPure(HookIdentity{ExtensionID: "ext.test", HookID: "pure.restore"}, RequestConsequence{Prompt: &baseline})
 		}
 		evidence := view.evidenceFor()
-		testassert.Check(t, len(evidence.HookIDs) == 0, "restored=%v retained net-unchanged pure provenance: %+v", restored, evidence.HookIDs)
+		want := []HookIdentity{{ExtensionID: "ext.test", HookID: "pure.noop"}}
+		if restored {
+			want = append(want, HookIdentity{ExtensionID: "ext.test", HookID: "pure.change"}, HookIdentity{ExtensionID: "ext.test", HookID: "pure.restore"})
+		}
+		testassert.Check(t, reflect.DeepEqual(evidence.HookIDs, want), "restored=%v contributions = %+v, want every accepted identity in order", restored, evidence.HookIDs)
+		testassert.Check(t, evidence.Prompt == nil && evidence.Messages == nil && evidence.ToolNames == nil, "restored=%v deltas = %+v, want none", restored, evidence)
 	}
 }
 

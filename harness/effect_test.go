@@ -3531,11 +3531,14 @@ func TestModelEffectIntentCancellationBeforePublicationSettlesInterruption(t *te
 }
 
 // TestToolEffectIntentCancellationSettlesInterrupted proves a tool intent
-// transaction aborted by cancellation settles the call's
-// interrupted-before-execution result: the batch stops and the terminal helper
-// interrupts every remaining unstarted call. Both synthetic results carry no
-// metadata member even though the executor plan would have produced
-// well-formed bounded metadata.
+// transaction whose lifetime is interrupted by execution cancellation: the
+// admitted intent transaction runs to completion on the cancellation-free
+// publication context, execution cancellation then prevents the external
+// effect start, and the call settles its interrupted-before-execution result
+// carrying the committed intent while the terminal helper interrupts every
+// remaining unstarted call. Both synthetic results carry no metadata member
+// even though the executor plan would have produced well-formed bounded
+// metadata.
 func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 	modelFn := func(context.Context, model.Request) (model.Stream, error) {
 		return completedTurnStream(testToolCall("call-1"), testToolCall("call-2")), nil
@@ -3555,9 +3558,8 @@ func TestToolEffectIntentCancellationSettlesInterrupted(t *testing.T) {
 	store.txHook = func(step string) error {
 		if step == "replace_register" {
 			replaces++
-			if replaces == 4 { // the tool effect's intent transaction
+			if replaces == 4 { // the tool effect's intent transaction: execution cancellation lands mid-handoff, on the admitted transaction's own lifetime
 				cancel()
-				return context.Canceled
 			}
 		}
 		return nil

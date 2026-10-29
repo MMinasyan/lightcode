@@ -149,8 +149,8 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 	conversationRef := model.ModelRef{Provider: "prov", Model: "m"}
 	m2Ref := model.ModelRef{Provider: "prov", Model: "m2"}
 	fpr := func(v float64) *float64 { return &v }
-	mPricing := &harness.ModelPricing{Input: fpr(1.5), Output: fpr(3), CacheRead: fpr(0.5), CacheWrite: fpr(0.25)}
-	m2Pricing := &harness.ModelPricing{Input: fpr(0.5), Output: fpr(1), CacheRead: fpr(0.125), CacheWrite: fpr(0.0625)}
+	mPricing := &harness.ModelPricing{Input: fpr(1.5), Output: fpr(3), CacheRead: fpr(0.5)}
+	m2Pricing := &harness.ModelPricing{Input: fpr(0.5), Output: fpr(1), CacheRead: fpr(0.125)}
 
 	cases := []struct {
 		name               string
@@ -265,14 +265,16 @@ func TestCapturedPricingDropsNonFiniteCatalogRates(t *testing.T) {
 	cost := &catalog.Cost{
 		Input:      fpr(math.NaN()),
 		Output:     fpr(math.Inf(1)),
-		CacheRead:  fpr(math.Inf(-1)),
+		CacheRead:  fpr(0.5),
 		CacheWrite: fpr(0.25),
 	}
 	got := capturedPricing(cost)
-	testassert.Require(t, got != nil && got.Input == nil && got.Output == nil && got.CacheRead == nil && got.CacheWrite != nil && *got.CacheWrite == 0.25,
-		"capturedPricing(%+v) = %+v, want only the finite rate kept", cost, got)
-	*cost.CacheWrite = 99 // the capture owns its rate pointees
-	testassert.Require(t, *got.CacheWrite == 0.25, "mutating the catalog rate reached the captured pricing: %v", *got.CacheWrite)
+	// The catalog's cache-write metadata is not a captured rate: only the
+	// finite input, output, and cache-read rates are carried.
+	testassert.Require(t, got != nil && got.Input == nil && got.Output == nil && got.CacheRead != nil && *got.CacheRead == 0.5,
+		"capturedPricing(%+v) = %+v, want only the finite captured rate kept", cost, got)
+	*cost.CacheRead = 99 // the capture owns its rate pointees
+	testassert.Require(t, *got.CacheRead == 0.5, "mutating the catalog rate reached the captured pricing: %v", *got.CacheRead)
 }
 
 // compactRecordingServer records every request's model and authorization and

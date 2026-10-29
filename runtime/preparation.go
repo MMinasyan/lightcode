@@ -549,10 +549,9 @@ func capturedPricing(cost *catalog.Cost) *harness.ModelPricing {
 		return nil
 	}
 	return &harness.ModelPricing{
-		Input:      finiteRate(cost.Input),
-		Output:     finiteRate(cost.Output),
-		CacheRead:  finiteRate(cost.CacheRead),
-		CacheWrite: finiteRate(cost.CacheWrite),
+		Input:     finiteRate(cost.Input),
+		Output:    finiteRate(cost.Output),
+		CacheRead: finiteRate(cost.CacheRead),
 	}
 }
 

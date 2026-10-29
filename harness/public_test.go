@@ -1002,10 +1002,13 @@ func (s *publicationCancelStore) Transact(ctx context.Context, fn func(harness.T
 		hook()
 		// the harness-combined publication context may lag the canceled parent
 		// by one AfterFunc hop: wait until the context the transaction actually
-		// runs on observes the cancellation
-		deadline := time.Now().Add(5 * time.Second)
-		for ctx.Err() == nil && time.Now().Before(deadline) {
-			time.Sleep(time.Millisecond)
+		// runs on observes the cancellation. A context without a Done channel
+		// can never observe one, so there is nothing to wait for.
+		if ctx.Done() != nil {
+			deadline := time.Now().Add(5 * time.Second)
+			for ctx.Err() == nil && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
 		}
 	}
 	err := s.Storage.Transact(ctx, fn)

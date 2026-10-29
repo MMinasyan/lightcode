@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/MMinasyan/lightcode/agent"
@@ -44,18 +43,7 @@ type requestView struct {
 	prompt       string // effective prompt text
 	additions    []model.Message
 	names        []string // effective visible tool names; nil means the full captured catalog
-	contributors []requestContribution
-}
-
-// requestContribution records one accepted hook contribution in configured
-// order: its identity and its mode. A pure contribution enters the list only
-// when its accepted consequence actually changed the live effective view; an
-// effectful contribution always enters, including a no-op. The view restores
-// to the entire frozen baseline by clearing pure contributors, never by
-// re-attributing dimensions to their last presenter.
-type requestContribution struct {
-	identity  HookIdentity
-	effectful bool
+	contributors []HookIdentity
 }
 
 // newRequestView freezes the captured prompt and the canonical projection
@@ -139,9 +127,7 @@ func cloneToolDefinitions(tools []model.ToolDefinition) []model.ToolDefinition {
 // the conversation view, and a present ToolNames replaces visibility with
 // those names rebuilt from the captured catalog in catalog order. A selection
 // covering the captured catalog normalizes the live view to the full catalog.
-// It reports whether the consequence actually changed the live view.
-func (v *requestView) applyConsequence(con RequestConsequence) bool {
-	prompt, additions, names := v.prompt, len(v.additions), v.names
+func (v *requestView) applyConsequence(con RequestConsequence) {
 	if con.Prompt != nil {
 		v.prompt = *con.Prompt
 	}
@@ -164,20 +150,15 @@ func (v *requestView) applyConsequence(con RequestConsequence) bool {
 			v.names = ordered
 		}
 	}
-	return prompt != v.prompt || additions != len(v.additions) ||
-		(names == nil) != (v.names == nil) || !slices.Equal(names, v.names)
 }
 
-// recordPure applies one accepted pure consequence and records its identity
-// only when the applied view actually changed. When the view returns to the
-// entire frozen baseline — captured prompt, no additions, full catalog — pure
-// contributors clear, matching the argument chain's restore rule.
+// recordPure applies one accepted pure consequence and records its identity.
+// Every successfully accepted hook identity — pure or effectful, no-op,
+// changed or restored alike — enters the contributors once, in configured
+// order; a rejected or failed consequence never does.
 func (v *requestView) recordPure(identity HookIdentity, con RequestConsequence) {
-	changed := v.applyConsequence(con)
-	if changed {
-		v.contributors = append(v.contributors, requestContribution{identity: identity})
-	}
-	v.clearPureContributorsAtBaseline()
+	v.applyConsequence(con)
+	v.contributors = append(v.contributors, identity)
 }
 
 // recordEffectful applies the codec-adopted committed consequence of one
@@ -185,54 +166,31 @@ func (v *requestView) recordPure(identity HookIdentity, con RequestConsequence) 
 // for a reasserted no-op.
 func (v *requestView) recordEffectful(identity HookIdentity, con RequestConsequence) {
 	v.applyConsequence(con)
-	v.contributors = append(v.contributors, requestContribution{identity: identity, effectful: true})
-	v.clearPureContributorsAtBaseline()
-}
-
-func (v *requestView) clearPureContributorsAtBaseline() {
-	if v.prompt != v.capture.SystemPrompt || len(v.additions) > 0 || v.names != nil {
-		return
-	}
-	kept := v.contributors[:0]
-	for _, c := range v.contributors {
-		if c.effectful {
-			kept = append(kept, c)
-		}
-	}
-	v.contributors = kept
+	v.contributors = append(v.contributors, identity)
 }
 
 // evidenceFor renders one evidence value over the frozen capture baseline.
-// The delta fields and pure provenance are baseline-relative at every consumed
-// boundary: while the view net-changed the baseline, every recorded pure
-// contributor renders in hook order beside every effectful one, and effectful
-// contributions retain their identities even when the view rests at the
-// baseline.
+// The delta fields are baseline-relative at every consumed boundary: only
+// dimensions the view actually changed are recorded. Every accepted hook
+// identity renders in contribution order regardless of the deltas.
 func (v *requestView) evidenceFor() RequestEvidence {
 	evidence := RequestEvidence{
 		CheckpointEntryID: v.checkpoint,
 		BoundaryEntryID:   v.boundary,
 	}
-	promptChanged := v.prompt != v.capture.SystemPrompt
-	if promptChanged {
+	if v.prompt != v.capture.SystemPrompt {
 		prompt := v.prompt
 		evidence.Prompt = &prompt
 	}
 	if len(v.additions) > 0 {
 		evidence.Messages = cloneRequestMessages(v.additions)
 	}
-	namesChanged := v.names != nil && !coversCaptured(v.names, v.capture.Tools)
-	if namesChanged {
+	if v.names != nil && !coversCaptured(v.names, v.capture.Tools) {
 		names := make([]string, len(v.names))
 		copy(names, v.names)
 		evidence.ToolNames = names
 	}
-	netChanged := promptChanged || len(v.additions) > 0 || namesChanged
-	for _, c := range v.contributors {
-		if c.effectful || netChanged {
-			evidence.HookIDs = append(evidence.HookIDs, c.identity)
-		}
-	}
+	evidence.HookIDs = append([]HookIdentity(nil), v.contributors...)
 	return evidence
 }
 

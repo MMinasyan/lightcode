@@ -168,10 +168,9 @@ type UsageTotals struct {
 // the rate was not priced. Each rate is finite; a non-finite rate never
 // reaches a durable capture.
 type ModelPricing struct {
-	Input      *float64 `json:"input,omitempty"`
-	Output     *float64 `json:"output,omitempty"`
-	CacheRead  *float64 `json:"cache_read,omitempty"`
-	CacheWrite *float64 `json:"cache_write,omitempty"`
+	Input     *float64 `json:"input,omitempty"`
+	Output    *float64 `json:"output,omitempty"`
+	CacheRead *float64 `json:"cache_read,omitempty"`
 }
 
 // Equal reports value equality of two pricing values: nil equals only nil,
@@ -181,7 +180,7 @@ func (p *ModelPricing) Equal(q *ModelPricing) bool {
 		return p == nil && q == nil
 	}
 	return rateEqual(p.Input, q.Input) && rateEqual(p.Output, q.Output) &&
-		rateEqual(p.CacheRead, q.CacheRead) && rateEqual(p.CacheWrite, q.CacheWrite)
+		rateEqual(p.CacheRead, q.CacheRead)
 }
 
 func rateEqual(a, b *float64) bool {
@@ -209,10 +208,6 @@ func (p *ModelPricing) Clone() *ModelPricing {
 	if p.CacheRead != nil {
 		v := *p.CacheRead
 		out.CacheRead = &v
-	}
-	if p.CacheWrite != nil {
-		v := *p.CacheWrite
-		out.CacheWrite = &v
 	}
 	return &out
 }
@@ -366,16 +361,22 @@ type OperationTerminal struct {
 // Request, when present, is the one suspended conversation request state
 // published with the first existing effect/checkpoint transition and cleared
 // at the conversation result without a pending batch, the final pending tool
-// result, or the terminal settlement.
+// result, or the terminal settlement. UnreportedMaintenance records the
+// knowledge that a completed maintenance model intent's facts are not yet
+// durably recorded: set when the empty running result clears a completed
+// maintenance intent, preserved across every later transition and recovery,
+// and cleared only by the successful checkpoint or terminal publication that
+// records those facts.
 type OperationCurrentState struct {
-	Status           OperationState     `json:"status"`
-	StartedAt        time.Time          `json:"started_at"`
-	SettledAt        *time.Time         `json:"settled_at,omitempty"`
-	ActiveEffect     *ActiveEffect      `json:"active_effect,omitempty"`
-	Request          *RunningRequest    `json:"running_request,omitempty"`
-	PendingToolCalls []PendingToolCall  `json:"pending_tool_calls"`
-	Usage            UsageTotals        `json:"usage"`
-	Terminal         *OperationTerminal `json:"terminal,omitempty"`
+	Status                OperationState     `json:"status"`
+	StartedAt             time.Time          `json:"started_at"`
+	SettledAt             *time.Time         `json:"settled_at,omitempty"`
+	ActiveEffect          *ActiveEffect      `json:"active_effect,omitempty"`
+	Request               *RunningRequest    `json:"running_request,omitempty"`
+	PendingToolCalls      []PendingToolCall  `json:"pending_tool_calls"`
+	Usage                 UsageTotals        `json:"usage"`
+	Terminal              *OperationTerminal `json:"terminal,omitempty"`
+	UnreportedMaintenance bool               `json:"unreported_maintenance,omitempty"`
 }
 
 // OperationRecord is one decoded Operation register: the payload's admission

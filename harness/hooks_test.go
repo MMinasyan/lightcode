@@ -1070,10 +1070,12 @@ func TestRequestHookDeclaredKnowledgeRows(t *testing.T) {
 // TestArgumentHookPureChainRepairRestoreAndRefusal proves the argument family's
 // pure rows through the real tool effect: a pure repair followed by an exact
 // restore adds zero hook transactions and dispatches the assistant's committed
-// normalization unchanged, a pure refusal settles the call durably with no
-// effect transaction and never reaches the preparer, and an effectful no-op in
-// a net-restored chain still records its own result, retains the consumed pure
-// intermediate bytes as its input, and stays the tool settlement's only provenance.
+// normalization unchanged while keeping every accepted identity, a pure refusal
+// settles the call durably with no effect transaction and never reaches the
+// preparer, and an effectful no-op in a net-restored chain still records its
+// own result, retains the consumed pure intermediate bytes as its input, and
+// every accepted hook stays in the tool settlement's provenance in configured
+// order.
 // The repair row adds the settled D2 positive: a pure-only chain repairs a
 // producer-rejected invalid original, normalizing the original exactly once
 // (rejected) and the replacement exactly once with no re-normalization at
@@ -1109,8 +1111,9 @@ func TestArgumentHookPureChainRepairRestoreAndRefusal(t *testing.T) {
 			if entry.ToolResult == nil {
 				continue
 			}
-			testassert.Require(t, string(entry.ToolResult.NormalizedArguments) == `{"x":1}` && len(entry.ToolResult.HookIDs) == 0,
-				"tool result provenance = %+v %s, want the original consumed value and no pure provenance", entry.ToolResult.NormalizedArguments, entry.ToolResult.HookIDs)
+			testassert.Require(t, string(entry.ToolResult.NormalizedArguments) == `{"x":1}` &&
+				len(entry.ToolResult.HookIDs) == 2 && entry.ToolResult.HookIDs[0].HookID == "cap.pure.one" && entry.ToolResult.HookIDs[1].HookID == "cap.pure.two",
+				"tool result provenance = %+v %s, want the original consumed value and every accepted pure identity in order", entry.ToolResult.NormalizedArguments, entry.ToolResult.HookIDs)
 		}
 	})
 	t.Run("pure refusal settles the call with no durable effect", func(t *testing.T) {
@@ -1189,8 +1192,9 @@ func TestArgumentHookPureChainRepairRestoreAndRefusal(t *testing.T) {
 			if entry.ToolResult == nil {
 				continue
 			}
-			testassert.Require(t, len(entry.ToolResult.HookIDs) == 1 && entry.ToolResult.HookIDs[0].HookID == "cap.effectful.noop" &&
-				string(entry.ToolResult.NormalizedArguments) == `{"x":1}`, "tool result provenance = %+v %s, want only the effectful identity with the restored consumed value", entry.ToolResult.HookIDs, entry.ToolResult.NormalizedArguments)
+			testassert.Require(t, len(entry.ToolResult.HookIDs) == 3 &&
+				entry.ToolResult.HookIDs[0].HookID == "cap.pure.one" && entry.ToolResult.HookIDs[1].HookID == "cap.effectful.noop" && entry.ToolResult.HookIDs[2].HookID == "cap.pure.restore" &&
+				string(entry.ToolResult.NormalizedArguments) == `{"x":1}`, "tool result provenance = %+v %s, want every accepted identity in configured order with the restored consumed value", entry.ToolResult.HookIDs, entry.ToolResult.NormalizedArguments)
 		}
 	})
 	t.Run("pure-only repair of an invalid original normalizes exactly twice and adds no transactions", func(t *testing.T) {
@@ -1694,9 +1698,8 @@ func TestArgumentHookAcceptedSelectionSurvivesEffectExits(t *testing.T) {
 		store.txHook = func(step string) error {
 			if step == "replace_register" {
 				replaces++
-				if replaces == 4 { // the chain committed (hook intent, hook result pair), the preparer ran, and the concrete tool effect intent aborts under cancellation
+				if replaces == 4 { // the chain committed (hook intent, hook result pair), the preparer ran, and execution cancellation lands on the concrete tool effect intent transaction's own lifetime
 					cancel()
-					return fmt.Errorf("%w: injected intent abort", context.Canceled)
 				}
 			}
 			return nil
@@ -1938,11 +1941,11 @@ func TestRequestHookEmptyToolSelectionStaysHidden(t *testing.T) {
 }
 
 // TestRequestHookPureContributorsFollowEffectiveChange proves the settled
-// request provenance policy through the actual pipeline: pure hooks contribute
-// exactly when their accepted consequence changes the live effective view, in
-// hook order; reassertions and no-ops contribute nothing; whole-baseline
-// restoration clears pure contributors while effectful identities persist; and
-// no per-dimension last-setter attribution survives anywhere.
+// request provenance policy through the actual pipeline: every successfully
+// accepted pure or effectful hook identity is recorded in configured order,
+// including reassertions and no-ops; whole-baseline restoration keeps the
+// identities while the recorded value deltas return to the frozen capture;
+// and no per-dimension last-setter attribution survives anywhere.
 func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 	capture := testCapture()
 	basePrompt := capture.SystemPrompt
@@ -1992,7 +1995,7 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 		testassert.Require(t, ev.Prompt != nil && *ev.Prompt == basePrompt+" one two" && promptOf(sent) == basePrompt+" one two",
 			"prompt delta = %v dispatch = %q, want the whole accumulated replacement", ev.Prompt, promptOf(sent))
 	})
-	t.Run("reassertion after a change is not a contributor", func(t *testing.T) {
+	t.Run("reassertion after a change is also a contributor", func(t *testing.T) {
 		ev, sent := drive(t,
 			hook("req.pure.one", func(_ context.Context, in RequestHookInput) (RequestConsequence, error) {
 				changed := in.Prompt + " one"
@@ -2003,11 +2006,11 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 				return RequestConsequence{Prompt: &reasserted}, nil
 			}),
 		)
-		testassert.Require(t, len(ev.HookIDs) == 1 && ev.HookIDs[0].HookID == "req.pure.one",
-			"contributions = %+v, want the changed hook only: a reassertion changes nothing", ev.HookIDs)
+		testassert.Require(t, len(ev.HookIDs) == 2 && ev.HookIDs[0].HookID == "req.pure.one" && ev.HookIDs[1].HookID == "req.pure.reassert",
+			"contributions = %+v, want both accepted hooks in configured order", ev.HookIDs)
 		testassert.Require(t, promptOf(sent) == basePrompt+" one", "dispatch = %q, want the changed value", promptOf(sent))
 	})
-	t.Run("pure no-op before a changed hook is not a contributor", func(t *testing.T) {
+	t.Run("pure no-op before a changed hook is also a contributor", func(t *testing.T) {
 		ev, _ := drive(t,
 			hook("req.pure.noop", func(_ context.Context, in RequestHookInput) (RequestConsequence, error) {
 				same := in.Prompt
@@ -2018,10 +2021,10 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 				return RequestConsequence{Prompt: &changed}, nil
 			}),
 		)
-		testassert.Require(t, len(ev.HookIDs) == 1 && ev.HookIDs[0].HookID == "req.pure.change",
-			"contributions = %+v, want only the hook that changed the view", ev.HookIDs)
+		testassert.Require(t, len(ev.HookIDs) == 2 && ev.HookIDs[0].HookID == "req.pure.noop" && ev.HookIDs[1].HookID == "req.pure.change",
+			"contributions = %+v, want every accepted hook in configured order", ev.HookIDs)
 	})
-	t.Run("change then restore then later change keeps only the later contributor", func(t *testing.T) {
+	t.Run("change then restore then later change keeps every accepted contributor", func(t *testing.T) {
 		var original string
 		ev, sent := drive(t,
 			hook("req.pure.change", func(_ context.Context, in RequestHookInput) (RequestConsequence, error) {
@@ -2038,8 +2041,8 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 				return RequestConsequence{Prompt: &changed}, nil
 			}),
 		)
-		testassert.Require(t, len(ev.HookIDs) == 1 && ev.HookIDs[0].HookID == "req.pure.later",
-			"contributions = %+v, want only the post-restoration contributor", ev.HookIDs)
+		testassert.Require(t, len(ev.HookIDs) == 3 && ev.HookIDs[0].HookID == "req.pure.change" && ev.HookIDs[1].HookID == "req.pure.restore" && ev.HookIDs[2].HookID == "req.pure.later",
+			"contributions = %+v, want every accepted hook in configured order", ev.HookIDs)
 		testassert.Require(t, promptOf(sent) == original+" later", "dispatch = %q, want restoration then the later change", promptOf(sent))
 	})
 	t.Run("mixed prompt and tool changes keep intermediate contributors", func(t *testing.T) {
@@ -2063,7 +2066,7 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 		testassert.Require(t, ev.ToolNames == nil, "names delta = %v, want none: the final view is the full catalog", ev.ToolNames)
 		testassert.Require(t, len(sent.Tools) == len(capture.Tools), "dispatch advertises %d tools, want the restored full catalog", len(sent.Tools))
 	})
-	t.Run("hide-all then full baseline restoration clears pure provenance", func(t *testing.T) {
+	t.Run("hide-all then full baseline restoration keeps identities with no deltas", func(t *testing.T) {
 		ev, sent := drive(t,
 			hook("req.pure.hide", func(context.Context, RequestHookInput) (RequestConsequence, error) {
 				hidden := []string{}
@@ -2075,7 +2078,8 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 				return RequestConsequence{Prompt: &prompt, ToolNames: shown}, nil // the entire frozen baseline returns
 			}),
 		)
-		testassert.Require(t, len(ev.HookIDs) == 0, "contributions = %+v, want pure provenance cleared at whole-baseline restoration", ev.HookIDs)
+		testassert.Require(t, len(ev.HookIDs) == 2 && ev.HookIDs[0].HookID == "req.pure.hide" && ev.HookIDs[1].HookID == "req.pure.restore",
+			"contributions = %+v, want both accepted hooks kept in configured order", ev.HookIDs)
 		testassert.Require(t, ev.Prompt == nil && ev.ToolNames == nil, "deltas = prompt %v names %v, want no durable delta", ev.Prompt, ev.ToolNames)
 		testassert.Require(t, promptOf(sent) == basePrompt && len(sent.Tools) == len(capture.Tools), "dispatch = %q with %d tools, want the unchanged baseline view", promptOf(sent), len(sent.Tools))
 	})
@@ -2247,9 +2251,9 @@ func TestRequestHookInputFrozenDomainsCarryHiddenCatalogAndRestoresThroughCatalo
 		}
 		{
 			assistant := compositionAssistant(t, store, sessionID)
-			testassert.Require(t, assistant.Evidence != nil && len(assistant.Evidence.HookIDs) == 2 &&
-				assistant.Evidence.HookIDs[0].HookID == "req.first" && assistant.Evidence.HookIDs[1].HookID == "req.successor",
-				"assistant contributions = %+v, want the two changed pure hooks in order (the no-op barrier hook contributes nothing)", assistant.Evidence.HookIDs)
+			testassert.Require(t, assistant.Evidence != nil && len(assistant.Evidence.HookIDs) == 3 &&
+				assistant.Evidence.HookIDs[0].HookID == "req.first" && assistant.Evidence.HookIDs[1].HookID == "req.successor" && assistant.Evidence.HookIDs[2].HookID == "req.barrier",
+				"assistant contributions = %+v, want every accepted hook in configured order (the no-op barrier included)", assistant.Evidence.HookIDs)
 			testassert.Require(t, assistant.Evidence.ToolNames == nil, "names delta = %v, want none: the final view is the full catalog", assistant.Evidence.ToolNames)
 		}
 		testassert.Require(t, reflect.DeepEqual(parametersOf(capture.Tools), baseParameters), "the caller's capture must stand untouched") // the caller's capture stands untouched
@@ -2300,9 +2304,9 @@ func TestRequestHookInputFrozenDomainsCarryHiddenCatalogAndRestoresThroughCatalo
 			"committed consequence names = %v, want the codec-adopted restored full selection", committed[0].Consequence)
 		{
 			assistant := compositionAssistant(t, store, sessionID)
-			testassert.Require(t, assistant.Evidence != nil && len(assistant.Evidence.HookIDs) == 2 &&
-				assistant.Evidence.HookIDs[0].HookID == "req.first" && assistant.Evidence.HookIDs[1].HookID == "req.successor",
-				"assistant contributions = %+v, want the pure contributor and the effectful successor in order", assistant.Evidence.HookIDs)
+			testassert.Require(t, assistant.Evidence != nil && len(assistant.Evidence.HookIDs) == 3 &&
+				assistant.Evidence.HookIDs[0].HookID == "req.first" && assistant.Evidence.HookIDs[1].HookID == "req.successor" && assistant.Evidence.HookIDs[2].HookID == "req.barrier",
+				"assistant contributions = %+v, want the pure contributor, the effectful successor, and the accepted no-op barrier in configured order", assistant.Evidence.HookIDs)
 		}
 		testassert.Require(t, reflect.DeepEqual(parametersOf(capture.Tools), baseParameters), "the caller's capture must stand untouched")
 	})

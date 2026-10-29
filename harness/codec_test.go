@@ -3162,3 +3162,72 @@ func TestStrategyCaptureSettingsSurviveColdReadAndRecovery(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Require(t, string(rec.Admission.Execution.Strategy.Settings) == "1e999", "post-recovery settings = %s, want the admitted bytes", rec.Admission.Execution.Strategy.Settings)
 }
+
+// TestOperationStateUnreportedMaintenanceCodec proves the incomplete-maintenance
+// marker's durable wire: it round-trips on a running and on a terminal
+// Operation state, a false marker encodes as nothing, and a malformed member
+// value rejects the decode.
+func TestOperationStateUnreportedMaintenanceCodec(t *testing.T) {
+	roundTrip := func(t *testing.T, v OperationRecord) OperationCurrentState {
+		t.Helper()
+		raw, err := encodeOperationRegister(v)
+		testassert.NoError(t, err)
+		decoded, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: raw})
+		testassert.NoError(t, err)
+		testassert.Require(t, decoded.State.Status == v.State.Status && decoded.State.UnreportedMaintenance == v.State.UnreportedMaintenance &&
+			(decoded.State.Terminal == nil) == (v.State.Terminal == nil) && len(decoded.State.PendingToolCalls) == len(v.State.PendingToolCalls),
+			"round-tripped state = %+v, want %+v", decoded.State, v.State)
+		if v.State.SettledAt != nil {
+			testassert.Require(t, decoded.State.SettledAt != nil && decoded.State.SettledAt.Equal(*v.State.SettledAt), "round-tripped settled_at = %v, want %v", decoded.State.SettledAt, v.State.SettledAt)
+		}
+		if v.State.Terminal != nil {
+			testassert.Require(t, decoded.State.Terminal.Detail == v.State.Terminal.Detail && decoded.State.Terminal.SettlementEntry == v.State.Terminal.SettlementEntry, "round-tripped terminal = %+v, want %+v", decoded.State.Terminal, v.State.Terminal)
+		}
+		return decoded.State
+	}
+
+	running := validOperationRecord()
+	running.State.UnreportedMaintenance = true
+	raw, err := encodeOperationRegister(running)
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(string(raw), `"unreported_maintenance":true`), "running state with the marker %s, want the true member", raw)
+	roundTrip(t, running)
+
+	terminal := validOperationRecord()
+	settled := testTime
+	terminal.State.Status = OperationFailure
+	terminal.State.SettledAt = &settled
+	terminal.State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(5)}, Detail: "summary failure"}
+	terminal.State.UnreportedMaintenance = true
+	raw, err = encodeOperationRegister(terminal)
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(string(raw), `"unreported_maintenance":true`), "terminal state with the marker %s, want the true member", raw)
+	roundTrip(t, terminal)
+
+	plain := validOperationRecord()
+	raw, err = encodeOperationRegister(plain)
+	testassert.NoError(t, err)
+	testassert.Require(t, !strings.Contains(string(raw), "unreported_maintenance"), "false marker encoded as a member: %s", raw)
+	testassert.Require(t, !roundTrip(t, plain).UnreportedMaintenance, "round-tripped omitted marker = true, want the omitted/false equivalence")
+
+	for _, row := range []struct {
+		name  string
+		value string
+	}{
+		{"null marker", "null"},
+		{"number marker", "1"},
+		{"string marker", `"true"`},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			members, err := decodePayloadObject(raw)
+			testassert.NoError(t, err)
+			state := wireObject(t, members["state"])
+			state["unreported_maintenance"] = json.RawMessage(row.value)
+			members["state"] = mustRawJSON(state)
+			tampered, err := json.Marshal(members)
+			testassert.NoError(t, err)
+			_, err = decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: tampered})
+			testassert.Require(t, err != nil, "operation register with %s decoded, want rejection", row.name)
+		})
+	}
+}

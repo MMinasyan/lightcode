@@ -43,7 +43,7 @@ func TestExecutionCapturePricingCodec(t *testing.T) {
 	// Present pricing with a present zero rate and an absent rate.
 	v := testCapture()
 	v.Pricing = &ModelPricing{Input: fptr(0), Output: fptr(2.5)}
-	v.Compact.Pricing = &ModelPricing{CacheRead: fptr(0.25), CacheWrite: fptr(1e-9)}
+	v.Compact.Pricing = &ModelPricing{CacheRead: fptr(0.25)}
 	members := encode(t, v)
 	pricingObj, err := decodePayloadObject(members["pricing"])
 	testassert.NoError(t, err)
@@ -88,6 +88,11 @@ func TestExecutionCapturePricingCodec(t *testing.T) {
 			obj["discount"] = json.RawMessage(`1`)
 			m["pricing"] = mustRawJSON(obj)
 		}},
+		{"retired cache_write rate", func(m map[string]json.RawMessage) {
+			obj := wireObject(t, m["pricing"])
+			obj["cache_write"] = json.RawMessage(`0.25`)
+			m["pricing"] = mustRawJSON(obj)
+		}},
 		{"compact null pricing", func(m map[string]json.RawMessage) {
 			obj := wireObject(t, m["compact"])
 			obj["pricing"] = json.RawMessage("null")
@@ -97,6 +102,13 @@ func TestExecutionCapturePricingCodec(t *testing.T) {
 			obj := wireObject(t, m["compact"])
 			inner := wireObject(t, obj["pricing"])
 			inner["input_per_million"] = json.RawMessage(`1`)
+			obj["pricing"] = mustRawJSON(inner)
+			m["compact"] = mustRawJSON(obj)
+		}},
+		{"compact retired cache_write rate", func(m map[string]json.RawMessage) {
+			obj := wireObject(t, m["compact"])
+			inner := wireObject(t, obj["pricing"])
+			inner["cache_write"] = json.RawMessage(`0.25`)
 			obj["pricing"] = mustRawJSON(inner)
 			m["compact"] = mustRawJSON(obj)
 		}},

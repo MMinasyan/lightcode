@@ -166,6 +166,11 @@ func runEngineCall(execCtx context.Context, invocation agent.Invocation) (agent.
 		settle, err := modelEffect(ctx, req, assemble)
 		return settle, keep(err)
 	}
+	toolEffect := invocation.ToolEffect
+	invocation.ToolEffect = func(ctx context.Context, call model.ToolCall, names []string) (model.ToolResult, error) {
+		res, err := toolEffect(ctx, call, names)
+		return res, keep(err)
+	}
 	res, err := agent.Run(execCtx, invocation)
 	if retained != nil {
 		return agent.TerminalResult{}, retained
@@ -778,6 +783,13 @@ func (h *Harness) commitEffectResult(ctx context.Context, c *coordinator, operat
 		if (intent == nil || !intent.compaction) && len(next.State.PendingToolCalls) == 0 {
 			next.State.Request = nil // the conversation result closed its request with no batch to suspend
 		}
+		if intent != nil && intent.compaction {
+			// The completed maintenance model intent's empty running result leaves its
+			// maintenance facts process-local until a successful checkpoint or terminal
+			// publication records them: the marker carries the incomplete-maintenance
+			// knowledge across that gap.
+			next.State.UnreportedMaintenance = true
+		}
 		opPayload, err := encodeOperationRegister(next)
 		if err != nil {
 			return err
@@ -1145,6 +1157,12 @@ func commitTerminalSettlement(tx Transaction, sessionID, operationID string, cur
 	next.State.Status = terminal
 	next.State.PendingToolCalls = []PendingToolCall{}
 	next.State.SettledAt = &settled
+	if facts.hasInput() {
+		// This terminal publication records the maintenance facts exactly once and
+		// retires the incomplete-maintenance marker; a settlement that records none
+		// — a recovery retaining no process-local facts — preserves it on the terminal.
+		next.State.UnreportedMaintenance = false
+	}
 	next.State.Terminal = &OperationTerminal{
 		SettlementEntry: EntryRef{SessionID: sessionID, EntryID: settlementID},
 		Detail:          detail,
@@ -1649,10 +1667,12 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 			finalArguments:  selection.arguments,
 			contributionIDs: selection.hooks,
 		}); err != nil {
-			// An intent transaction aborted by cancellation settles the
-			// cancellation outcome: interrupted-before-execution, never a
-			// cancellation-shaped error out of an active effect.
-			if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() != nil {
+			// A marked publication failure propagates before any cancellation
+			// rule, regardless of a concurrent cancellation. Only an unmarked
+			// cancellation observed before the intent transaction was ever
+			// attempted settles the cancellation outcome: interrupted-before-
+			// execution, never a cancellation-shaped error out of an active effect.
+			if !isPublicationFailure(err) && isExecutionCancellation(err) && ctx.Err() != nil {
 				return h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: interruptedToolResult(call.ID)}, nil, false, selection, ExecutionNotStarted, false)
 			}
 			return model.ToolResult{}, err
@@ -1684,38 +1704,56 @@ func (h *Harness) toolEffect(c *coordinator, operationID string, exec Execution,
 // selection and provenance for a tool effect, or the hook identity, extension
 // identity, and consumed input bytes before I/O for a hook effect. Effects
 // never nest, so any committed intent of another effect rejects.
+// The intent owner follows beginModelEffect's origin rule: a cancellation
+// observed before the intent transaction is ever invoked returns unwrapped
+// and may use the caller's ordinary interruption settlement. Once the
+// transaction is invoked it runs on a cancellation-free copy of the execution
+// context — values only, like the result and terminal publications — so every
+// error from it is a real store failure and a publication-origin failure at
+// the intent boundary: it propagates marked with the durable state retained
+// for recovery and is never followed by a guessed compensating write.
 func (h *Harness) beginPendingCallEffect(ctx context.Context, c *coordinator, operationID, callID string, kind EffectKind, input pendingCallIntent) (string, error) {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
 		c.mu.Unlock()
-		return "", fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return "", wrapPublication(fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID))
 	}
 	if op.State.Status != OperationRunning {
 		c.mu.Unlock()
-		return "", invalidInput("operation %q is %s; a %s effect requires a running Operation", operationID, op.State.Status, kind)
+		return "", wrapPublication(invalidInput("operation %q is %s; a %s effect requires a running Operation", operationID, op.State.Status, kind))
 	}
 	if op.State.ActiveEffect != nil {
 		c.mu.Unlock()
-		return "", invalidInput("operation %q already carries an active effect; effects never nest", operationID)
+		return "", wrapPublication(invalidInput("operation %q already carries an active effect; effects never nest", operationID))
 	}
 	if len(op.State.PendingToolCalls) == 0 || op.State.PendingToolCalls[0].CallID != callID {
 		c.mu.Unlock()
-		return "", invalidInput("operation %q does not pending-start with call %q; a %s effect addresses the first pending call", operationID, callID, kind)
+		return "", wrapPublication(invalidInput("operation %q does not pending-start with call %q; a %s effect addresses the first pending call", operationID, callID, kind))
 	}
 	resultID := op.State.PendingToolCalls[0].ResultEntryID
 	if kind == EffectHook {
 		fresh, err := newHexID()
 		if err != nil {
 			c.mu.Unlock()
-			return "", fmt.Errorf("%w: %v", ErrStorage, err)
+			return "", wrapPublication(fmt.Errorf("%w: %v", ErrStorage, err))
 		}
 		resultID = fresh
 	}
+	if ctx.Err() != nil { // cancellation observed before the Transact is ever invoked is not a
+		// publication failure: it returns unwrapped and the caller's ordinary interruption settlement applies.
+		c.mu.Unlock()
+		return "", ctx.Err()
+	}
 	sessionID := op.Admission.SessionID
 	var updated OperationRecord
-	err := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
+	// Once the pre-Transact check admits the transition, the durable intent
+	// transaction runs without execution cancellation or deadline — values
+	// only, exactly like the result and terminal publications — so a shutdown
+	// that lands mid-transaction never aborts the admitted intent. The
+	// caller's execution-context gate settles the interruption afterwards.
+	err := h.deps.Storage.Transact(context.WithoutCancel(ctx), func(tx Transaction) error {
 		key := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID}
 		reg, err := tx.ReadRegister(key)
 		if err != nil {
@@ -1769,10 +1807,10 @@ func (h *Harness) beginPendingCallEffect(ctx context.Context, c *coordinator, op
 		c.mu.Unlock()
 		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
 			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-				return "", rerr
+				return "", wrapPublication(rerr)
 			}
 		}
-		return "", err
+		return "", wrapPublication(err)
 	}
 	c.graph.replaceOperation(operationID, updated)
 	c.mu.Unlock()
@@ -1785,31 +1823,42 @@ func (h *Harness) beginPendingCallEffect(ctx context.Context, c *coordinator, op
 // before any callback runs, and publishes the suspended conversation request
 // state inside this same existing effect transition when none is published
 // yet — the request state is never written by a pure-only transaction.
+// The intent owner follows beginModelEffect's origin rule: a cancellation
+// observed before the intent transaction is ever invoked returns unwrapped;
+// once the transaction is invoked it runs on a cancellation-free copy of the
+// execution context, so every error from it is a real store failure marked
+// publication-origin and propagates with the durable state retained for
+// recovery.
 func (h *Harness) beginRequestHookEffect(ctx context.Context, c *coordinator, operationID, requestID, hookID, extensionID string, consumed RequestEvidence) (string, error) {
 	c.mu.Lock()
 	op, ok := c.graph.Operation(operationID)
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
 		c.mu.Unlock()
-		return "", fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return "", wrapPublication(fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID))
 	}
 	if op.State.Status != OperationRunning {
 		c.mu.Unlock()
-		return "", invalidInput("operation %q is %s; a request hook effect requires a running Operation", operationID, op.State.Status)
+		return "", wrapPublication(invalidInput("operation %q is %s; a request hook effect requires a running Operation", operationID, op.State.Status))
 	}
 	if op.State.ActiveEffect != nil {
 		c.mu.Unlock()
-		return "", invalidInput("operation %q already carries an active effect; effects never nest", operationID)
+		return "", wrapPublication(invalidInput("operation %q already carries an active effect; effects never nest", operationID))
+	}
+	if ctx.Err() != nil { // cancellation observed before the Transact is ever invoked is not a
+		// publication failure: it returns unwrapped and the caller's ordinary interruption settlement applies.
+		c.mu.Unlock()
+		return "", ctx.Err()
 	}
 	resultID, err := newHexID()
 	if err != nil {
 		c.mu.Unlock()
-		return "", fmt.Errorf("%w: %v", ErrStorage, err)
+		return "", wrapPublication(fmt.Errorf("%w: %v", ErrStorage, err))
 	}
 	sessionID := op.Admission.SessionID
 	consumedCopy := consumed
 	var updated OperationRecord
-	err = h.deps.Storage.Transact(ctx, func(tx Transaction) error {
+	err = h.deps.Storage.Transact(context.WithoutCancel(ctx), func(tx Transaction) error {
 		key := RegisterKey{SessionID: sessionID, Kind: RegisterOperation, OperationID: operationID}
 		reg, err := tx.ReadRegister(key)
 		if err != nil {
@@ -1864,10 +1913,10 @@ func (h *Harness) beginRequestHookEffect(ctx context.Context, c *coordinator, op
 		c.mu.Unlock()
 		if errors.Is(err, errRevisionRace) {
 			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil {
-				return "", rerr
+				return "", wrapPublication(rerr)
 			}
 		}
-		return "", err
+		return "", wrapPublication(err)
 	}
 	c.graph.replaceOperation(operationID, updated)
 	c.mu.Unlock()
@@ -1940,7 +1989,7 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
 		c.mu.Unlock()
-		return model.ToolResult{}, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return model.ToolResult{}, wrapPublication(fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID))
 	}
 	sessionID := op.Admission.SessionID
 	viewSession := c.graph.Session
@@ -2068,10 +2117,10 @@ func (h *Harness) commitToolResult(ctx context.Context, c *coordinator, operatio
 		c.mu.Unlock()
 		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
 			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-				return model.ToolResult{}, rerr
+				return model.ToolResult{}, wrapPublication(rerr)
 			}
 		}
-		return model.ToolResult{}, err
+		return model.ToolResult{}, wrapPublication(err)
 	}
 	c.graph.Entries = append(c.graph.Entries, newEntries...)
 	c.graph.replaceOperation(operationID, updated)
@@ -2106,44 +2155,23 @@ func (h *Harness) runArgumentHooks(ctx, settleCtx context.Context, c *coordinato
 	}
 	current := raw
 	accepted := model.CloneRaw(record.NormalizedArguments)
-	type contribution struct {
-		identity HookIdentity
-		pure     bool
-	}
-	var contributions []contribution
+	acceptedFailure := record.NormalizationFailure
+	var contributions []HookIdentity
 	accept := func(value json.RawMessage, hook ToolArgumentsHook) {
-		if hook.Mode == HookModeEffectful || !bytes.Equal(value, accepted) {
-			contributions = append(contributions, contribution{
-				identity: HookIdentity{ExtensionID: hook.ExtensionID, HookID: hook.ID},
-				pure:     hook.Mode == HookModePure,
-			})
-		}
+		contributions = append(contributions, HookIdentity{ExtensionID: hook.ExtensionID, HookID: hook.ID})
 		current, accepted = value, value
-		if bytes.Equal(accepted, record.NormalizedArguments) {
-			kept := contributions[:0]
-			for _, c := range contributions {
-				if !c.pure {
-					kept = append(kept, c)
-				}
-			}
-			contributions = kept
-		}
+		acceptedFailure = ""
 	}
 	// chainSelection renders what the chain has accepted so far: a hook
-	// boundary settles carrying the last accepted value and provenance. Pure
-	// provenance survives only while the chain net-changed the argument view
-	// from the original bytes; effectful provenance always rides its
-	// boundaries, and a consumed pure intermediate stays retained in the
+	// boundary settles carrying the last accepted value and every accepted
+	// identity in configured order — pure or effectful, no-op, changed or
+	// restored alike. The consumed intermediate value stays retained in the
 	// effectful hook's own consumed input.
 	chainSelection := func() toolSelection {
-		selection := toolSelection{arguments: model.CloneRaw(accepted)}
-		netChanged := !bytes.Equal(accepted, record.NormalizedArguments)
-		for _, contribution := range contributions {
-			if !contribution.pure || netChanged {
-				selection.hooks = append(selection.hooks, contribution.identity)
-			}
+		return toolSelection{
+			arguments: model.CloneRaw(accepted),
+			hooks:     append([]HookIdentity(nil), contributions...),
 		}
-		return selection
 	}
 	for _, hook := range inv.ToolHooks {
 		if ctx.Err() != nil { // cancellation stops the next hook: the call settles interrupted carrying what the chain already accepted
@@ -2155,7 +2183,7 @@ func (h *Harness) runArgumentHooks(ctx, settleCtx context.Context, c *coordinato
 			return toolSelection{}, &settled, nil
 		}
 		if hook.Mode == HookModePure {
-			changed, failure, knowledge := evaluateArgumentHook(ctx, record, hook, inv.NormalizeTool, current)
+			changed, failure, knowledge := evaluateArgumentHook(ctx, record, hook, inv.NormalizeTool, current, accepted, acceptedFailure)
 			if failure != nil { // the refusal settles the call through the ordinary no-intent transition carrying the chain's accepted selection; a declared unknown hook outcome leaves the concrete call unstarted but uncertain
 				settled, cerr := h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: *failure}, nil, false, chainSelection(), ExecutionNotStarted, knowledge == ExecutionUnknown)
 				if cerr != nil {
@@ -2166,7 +2194,7 @@ func (h *Harness) runArgumentHooks(ctx, settleCtx context.Context, c *coordinato
 			accept(changed, hook)
 			continue
 		}
-		committed, settled, hookErr := h.runOneHook(ctx, settleCtx, c, operationID, pending, record, hook, inv.NormalizeTool, current, chainSelection())
+		committed, settled, hookErr := h.runOneHook(ctx, settleCtx, c, operationID, pending, record, hook, inv.NormalizeTool, current, accepted, acceptedFailure, chainSelection())
 		if hookErr != nil || settled != nil {
 			return toolSelection{}, settled, hookErr
 		}
@@ -2178,7 +2206,13 @@ func (h *Harness) runArgumentHooks(ctx, settleCtx context.Context, c *coordinato
 // evaluateArgumentHook owns and evaluates one callback's input and replacement.
 // Its caller retains the pure or effectful settlement boundary; normalization
 // failures are observed because the callback already produced its result.
-func evaluateArgumentHook(ctx context.Context, record toolCallRecord, hook ToolArgumentsHook, normalize func(model.ToolCall) (json.RawMessage, error), current json.RawMessage) (json.RawMessage, *model.ToolResult, ExecutionEvidence) {
+// Before parsing or normalizing a replacement it compares the returned bytes
+// with the input the hook received: an unchanged return consumes the chain's
+// current accepted normalization outcome (accepted, or its stored failure
+// diagnostic acceptedFailure when the predecessor normalization failed)
+// instead of re-running the normalizer. A changed replacement keeps the
+// existing shape validation and exactly one separate normalization.
+func evaluateArgumentHook(ctx context.Context, record toolCallRecord, hook ToolArgumentsHook, normalize func(model.ToolCall) (json.RawMessage, error), current, accepted json.RawMessage, acceptedFailure string) (json.RawMessage, *model.ToolResult, ExecutionEvidence) {
 	owned, err := model.NewToolCall(model.ToolCall{ID: record.ID, Name: record.Name, Arguments: current, Extra: record.Extra})
 	if err != nil { // the committed record's identity fields are validated; never reachable for a valid graph
 		failure := invalidToolResult(record.ID)
@@ -2195,6 +2229,15 @@ func evaluateArgumentHook(ctx context.Context, record toolCallRecord, hook ToolA
 			failure = interruptedToolResult(record.ID)
 		}
 		return nil, &failure, declaredExecutionKnowledge(runErr)
+	}
+	if bytes.Equal(replacement, current) && (acceptedFailure != "" || len(accepted) > 0) { // an unchanged return consumes the current accepted outcome: its normalized
+		// bytes, or — when the predecessor normalization failed — the stored failure diagnostic,
+		// never generic object-parse text and never another NormalizeTool invocation.
+		if acceptedFailure != "" {
+			failure := model.ToolResult{CallID: record.ID, Status: model.ResultError, Content: acceptedFailure}
+			return nil, &failure, ExecutionObserved
+		}
+		return accepted, nil, ExecutionObserved
 	}
 	if _, err := decodePayloadObject(replacement); err != nil { // an invalid returned value is the malformed-class validation failure
 		failure := invalidToolResult(record.ID)
@@ -2220,19 +2263,19 @@ func evaluateArgumentHook(ctx context.Context, record toolCallRecord, hook ToolA
 // cancellation arrives before its commit), a hook error, or an interruption
 // under the classification fixed for every hook. The continuation consumes
 // the codec-adopted committed consequence.
-func (h *Harness) runOneHook(ctx, settleCtx context.Context, c *coordinator, operationID string, pending PendingToolCall, record toolCallRecord, hook ToolArgumentsHook, normalize func(model.ToolCall) (json.RawMessage, error), current json.RawMessage, chain toolSelection) (hookResultEntry, *model.ToolResult, error) {
+func (h *Harness) runOneHook(ctx, settleCtx context.Context, c *coordinator, operationID string, pending PendingToolCall, record toolCallRecord, hook ToolArgumentsHook, normalize func(model.ToolCall) (json.RawMessage, error), current, accepted json.RawMessage, acceptedFailure string, chain toolSelection) (hookResultEntry, *model.ToolResult, error) {
 	resultID, err := h.beginPendingCallEffect(ctx, c, operationID, pending.CallID, EffectHook, pendingCallIntent{
 		hookID:               hook.ID,
 		extensionID:          hook.ExtensionID,
 		inputArgumentsBase64: base64.StdEncoding.EncodeToString(current),
 	})
 	if err != nil {
-		// An intent transaction aborted by cancellation committed no
-		// reservation, so no hook result exists: the call settles the existing
-		// interrupted-before-execution result through the ordinary no-intent
-		// transition, preserving the chain's accepted selection and preventing
-		// later starts.
-		if isExecutionCancellation(err) && ctx.Err() != nil {
+		// A marked publication failure propagates before any cancellation
+		// rule. Only an unmarked cancellation observed before the intent
+		// transaction was ever attempted applies the ordinary interrupted-
+		// before-execution settlement through the no-intent transition,
+		// preserving the chain's accepted selection and preventing later starts.
+		if !isPublicationFailure(err) && isExecutionCancellation(err) && ctx.Err() != nil {
 			outcome := ToolOutcome{Result: interruptedToolResult(pending.CallID)}
 			settled, terr := h.commitToolResult(settleCtx, c, operationID, pending, outcome, nil, false, chain, ExecutionNotStarted, false)
 			if terr != nil {
@@ -2246,7 +2289,7 @@ func (h *Harness) runOneHook(ctx, settleCtx context.Context, c *coordinator, ope
 		settled, serr := h.settleHookInterruption(settleCtx, c, operationID, pending, hook, resultID, ExecutionNotStarted, chain)
 		return hookResultEntry{}, settled, serr
 	}
-	normalized, failure, knowledge := evaluateArgumentHook(ctx, record, hook, normalize, current)
+	normalized, failure, knowledge := evaluateArgumentHook(ctx, record, hook, normalize, current, accepted, acceptedFailure)
 	if failure != nil {
 		if failure.Status == model.ResultInterrupted {
 			settled, serr := h.settleHookInterruption(settleCtx, c, operationID, pending, hook, resultID, knowledge, chain)
@@ -2353,7 +2396,7 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 	if !ok {
 		sessionID := c.graph.Session.Identity.SessionID
 		c.mu.Unlock()
-		return hookResultEntry{}, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID)
+		return hookResultEntry{}, wrapPublication(fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, sessionID))
 	}
 	sessionID := op.Admission.SessionID
 	viewSession := c.graph.Session
@@ -2468,10 +2511,10 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 		c.mu.Unlock()
 		if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the cached view
 			if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-				return hookResultEntry{}, rerr
+				return hookResultEntry{}, wrapPublication(rerr)
 			}
 		}
-		return hookResultEntry{}, err
+		return hookResultEntry{}, wrapPublication(err)
 	}
 	c.graph.Entries = append(c.graph.Entries, newEntries...)
 	c.graph.replaceOperation(operationID, updated)
@@ -2759,6 +2802,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		}
 		return &agent.TerminalResult{}, nil, exec.Close, err
 	}
+	ownOpenedInvocationDeclarations(&inv) // the accepted invocation owns its declarations before anything else consumes them
 	if err := validateOpenedInvocation(inv); err != nil {
 		if inv.Close != nil {
 			h.recordCleanupFailure(inv.Close())
@@ -2789,6 +2833,25 @@ func executionCancellationResult(execCtx context.Context, err error) *agent.Term
 		return &agent.TerminalResult{Status: agent.TerminalInterruption, Detail: executionInterruptedDetail}
 	}
 	return nil
+}
+
+// ownOpenedInvocationDeclarations copies an opened invocation's hook element
+// arrays into Harness-owned slices immediately after a successful
+// OpenInvocation boundary, before validation or retention: from the
+// acceptance onward, an opener-retained array or an earlier callback can
+// never replace, nil, or rewrite the accepted invocation's hook identities,
+// modes, callbacks, or their configured order. A shallow element copy is
+// sufficient — every hook entry is a value.
+func ownOpenedInvocationDeclarations(inv *InvocationExecution) {
+	if inv.ToolHooks != nil {
+		inv.ToolHooks = append(inv.ToolHooks[:0:0], inv.ToolHooks...)
+	}
+	if inv.RequestHooks != nil {
+		inv.RequestHooks = append(inv.RequestHooks[:0:0], inv.RequestHooks...)
+	}
+	if inv.ToolOutputHooks != nil {
+		inv.ToolOutputHooks = append(inv.ToolOutputHooks[:0:0], inv.ToolOutputHooks...)
+	}
 }
 
 // validateOpenedInvocation is the opened invocation's contract: a successful
