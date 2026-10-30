@@ -3741,8 +3741,8 @@ func decodeMessageToolCall(raw json.RawMessage) (model.ToolCall, error) {
 
 // decodeMessageValue reads one message value with exact keys and
 // reconstructs it through the shared message constructor, which re-enforces
-// the closed role set, per-role source rules, and deep ownership. An empty or
-// null name is rejected and absence is the unnamed zero value.
+// the closed role set, per-role source rules, and deep ownership. A null name
+// is rejected; an empty string or absence is the unnamed zero value.
 func decodeMessageValue(raw json.RawMessage) (model.Message, error) {
 	obj, err := decodePayloadObject(raw)
 	if err != nil {
