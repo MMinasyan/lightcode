@@ -2545,7 +2545,7 @@ func (h *Harness) runRequestHooks(ctx context.Context, c *coordinator, operation
 			if err != nil {
 				return err
 			}
-			view.recordPure(HookIdentity{ExtensionID: hook.ExtensionID, HookID: hook.ID}, consequence)
+			view.recordAccepted(HookIdentity{ExtensionID: hook.ExtensionID, HookID: hook.ID}, consequence)
 			continue
 		}
 		if err := h.runRequestHookEffect(ctx, c, operationID, hook, requestID, view); err != nil {
@@ -2654,7 +2654,7 @@ func (h *Harness) runRequestHookEffect(ctx context.Context, c *coordinator, oper
 		return cerr
 	}
 	applied := *entry.Consequence
-	view.recordEffectful(HookIdentity{ExtensionID: hook.ExtensionID, HookID: hook.ID}, applied)
+	view.recordAccepted(HookIdentity{ExtensionID: hook.ExtensionID, HookID: hook.ID}, applied)
 	return nil
 }
 

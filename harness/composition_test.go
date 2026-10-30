@@ -590,11 +590,11 @@ func TestAcceptedPureRequestIdentitiesRecordInOrder(t *testing.T) {
 	for _, restored := range []bool{false, true} {
 		view := newRequestView(capture, "", testEntryID, nil)
 		reasserted := capture.SystemPrompt
-		view.recordPure(HookIdentity{ExtensionID: "ext.test", HookID: "pure.noop"}, RequestConsequence{Prompt: &reasserted})
+		view.recordAccepted(HookIdentity{ExtensionID: "ext.test", HookID: "pure.noop"}, RequestConsequence{Prompt: &reasserted})
 		if restored {
 			changed, baseline := "changed", capture.SystemPrompt
-			view.recordPure(HookIdentity{ExtensionID: "ext.test", HookID: "pure.change"}, RequestConsequence{Prompt: &changed})
-			view.recordPure(HookIdentity{ExtensionID: "ext.test", HookID: "pure.restore"}, RequestConsequence{Prompt: &baseline})
+			view.recordAccepted(HookIdentity{ExtensionID: "ext.test", HookID: "pure.change"}, RequestConsequence{Prompt: &changed})
+			view.recordAccepted(HookIdentity{ExtensionID: "ext.test", HookID: "pure.restore"}, RequestConsequence{Prompt: &baseline})
 		}
 		evidence := view.evidenceFor()
 		want := []HookIdentity{{ExtensionID: "ext.test", HookID: "pure.noop"}}

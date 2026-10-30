@@ -152,19 +152,12 @@ func (v *requestView) applyConsequence(con RequestConsequence) {
 	}
 }
 
-// recordPure applies one accepted pure consequence and records its identity.
+// recordAccepted applies one accepted consequence and records its identity.
 // Every successfully accepted hook identity — pure or effectful, no-op,
 // changed or restored alike — enters the contributors once, in configured
-// order; a rejected or failed consequence never does.
-func (v *requestView) recordPure(identity HookIdentity, con RequestConsequence) {
-	v.applyConsequence(con)
-	v.contributors = append(v.contributors, identity)
-}
-
-// recordEffectful applies the codec-adopted committed consequence of one
-// settled effectful hook and records its identity unconditionally, including
-// for a reasserted no-op.
-func (v *requestView) recordEffectful(identity HookIdentity, con RequestConsequence) {
+// order; a rejected or failed consequence never does. Validation, effect
+// timing and codec adoption stay with the caller.
+func (v *requestView) recordAccepted(identity HookIdentity, con RequestConsequence) {
 	v.applyConsequence(con)
 	v.contributors = append(v.contributors, identity)
 }
