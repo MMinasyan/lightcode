@@ -36,7 +36,7 @@ func TestPreparedEditReplacesUniqueStringAndReportsLineRange(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "alpha\nbeta\ngamma")
 	root := filepath.Dir(path)
 
-	result, err := execEdit(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
+	result, err := execEdit(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 		"path":       path,
 		"old_string": "beta",
 		"new_string": "delta",
@@ -50,7 +50,7 @@ func TestPreparedEditReplaceAllReportsAllLineRanges(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "same\nother\nsame")
 	root := filepath.Dir(path)
 
-	result, err := execEdit(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
+	result, err := execEdit(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 		"path":        path,
 		"old_string":  "same",
 		"new_string":  "done",
@@ -65,7 +65,7 @@ func TestPreparedEditRejectsAmbiguousMatchWithoutReplaceAll(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "same\nsame")
 	root := filepath.Dir(path)
 
-	_, err := execEdit(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
+	_, err := execEdit(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 		"path":       path,
 		"old_string": "same",
 		"new_string": "done",
@@ -91,7 +91,7 @@ func TestPreparedEditValidatesOldString(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := execEdit(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
+			_, err := execEdit(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 				"path":       path,
 				"old_string": tt.oldString,
 				"new_string": tt.newString,
@@ -106,7 +106,7 @@ func TestPreparedEditMultilineReplacementLineRange(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "start\nold\nend")
 	root := filepath.Dir(path)
 
-	result, err := execEdit(t, root, "", "", CapabilityOptions{}, &applyPatchStore{turn: 1}, map[string]any{
+	result, err := execEdit(t, root, "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 		"path":       path,
 		"old_string": "old",
 		"new_string": "new\nline",
@@ -119,7 +119,7 @@ func TestPreparedEditMultilineReplacementLineRange(t *testing.T) {
 func TestPreparedEditWithSnapshotSnapshotsBeforeEdit(t *testing.T) {
 	path := readFileTestFile(t, "file.txt", "before")
 	root := filepath.Dir(path)
-	store := &recordingSnapshotStore{turn: 11, before: map[string]string{}}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))}
 
 	result, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":       path,
@@ -129,8 +129,8 @@ func TestPreparedEditWithSnapshotSnapshotsBeforeEdit(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Equal(t, result, "Edited "+path+" (1 replacement, lines 1-1).")
 	testassert.Equal(t, len(store.calls), 1)
-	testassert.Require(t, store.calls[0].turn == 11 && store.calls[0].path == path, "snapshot call = %+v, want turn=11 path=%q", store.calls[0], path)
-	testassert.Require(t, store.before[path] == "before", "snapshot saw %q, want pre-edit content", store.before[path])
+	testassert.Require(t, store.calls[0].path == path, "snapshot call = %+v, want path=%q", store.calls[0], path)
+	assertEntryPreimage(t, store, path, "before")
 	assertFileContent(t, path, "after")
 }
 
@@ -142,7 +142,7 @@ func TestPreparedEditWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testin
 	linkDir := filepath.Join(root, "linked")
 	testassert.NoError(t, os.Symlink(realDir, linkDir))
 	requested := filepath.Join(linkDir, "file.txt")
-	store := &recordingSnapshotStore{turn: 12, before: map[string]string{}}
+	store := &recordingCodeGroupStore{testCodeGroupStore: newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))}
 
 	result, err := execEdit(t, root, "", "", CapabilityOptions{}, store, map[string]any{
 		"path":       requested,
@@ -154,7 +154,7 @@ func TestPreparedEditWithSnapshotUsesCanonicalTargetAndRequestedResult(t *testin
 	testassert.Equal(t, result, "Edited "+requested+" (1 replacement, lines 1-1).")
 	testassert.Equal(t, len(store.calls), 1)
 	testassert.Require(t, store.calls[0].path == requested && store.calls[0].canonical == target, "snapshot call = %+v, want original=%q canonical=%q", store.calls[0], requested, target)
-	testassert.Require(t, store.before[target] == "before", "snapshot saw %q, want pre-edit content", store.before[target])
+	assertEntryPreimage(t, store, target, "before")
 	assertFileContent(t, target, "after")
 }
 

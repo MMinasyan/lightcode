@@ -26,13 +26,11 @@ type ToolConstraints struct {
 }
 
 // ToolDescription is one static tool description: the model-visible
-// definition, whether the tool is available under the hard constraints
-// (never a permission filter), and whether it stays hidden from the default
-// advertisement.
+// definition and whether the tool is available under the hard constraints
+// (never a permission filter).
 type ToolDescription struct {
-	Definition    model.ToolDefinition
-	Available     bool
-	DefaultHidden bool
+	Definition model.ToolDefinition
+	Available  bool
 }
 
 // BackgroundServices is the background-work surface a prepared call carries:

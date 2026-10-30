@@ -13,7 +13,7 @@ func TestApplyPatchPreviewMetadataEmitsEditPreviewFiles(t *testing.T) {
 	dir := t.TempDir()
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "x.txt"), []byte("alpha\nBEFORE\nbeta"), 0o644))
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("bye"), 0o644))
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 
 	input := applyPatchInput(t, "*** Add File: new.txt\n+hi\n*** Update File: x.txt\n@@\n alpha\n-BEFORE\n+AFTER\n beta\n*** Delete File: a.txt")
 	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -43,7 +43,7 @@ func TestApplyPatchPreviewMetadataEmitsEditPreviewFiles(t *testing.T) {
 func TestApplyPatchPreviewMetadataMoveTwoEntries(t *testing.T) {
 	dir := t.TempDir()
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "old.go"), []byte("a\nB\nc"), 0o644))
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 
 	input := applyPatchInput(t, "*** Update File: old.go\n*** Move to: new.go\n@@\n a\n-B\n+B2\n c")
 	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})
@@ -59,7 +59,7 @@ func TestApplyPatchPreviewMetadataMoveTwoEntries(t *testing.T) {
 
 func TestApplyPatchFailureEmitsNoPreviewMetadata(t *testing.T) {
 	dir := t.TempDir()
-	store := &applyPatchStore{turn: 1}
+	store := newTempCodeGroupStore(t)
 
 	input := applyPatchInput(t, "*** Delete File: ghost.txt")
 	res, err := execPatch(t, dir, "", "", CapabilityOptions{}, store, map[string]any{"input": input})

@@ -40,7 +40,7 @@ describe('RuntimeConnection.open', () => {
     vi.mocked(NextEvent).mockImplementation(() => new Promise<string>(() => {}));
     vi.mocked(Call).mockResolvedValue({
       status: 200,
-      body: '{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"6"}',
+      body: '{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"8"}',
       invalid: false,
     });
     const connection = new RuntimeConnection();

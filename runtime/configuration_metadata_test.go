@@ -109,7 +109,7 @@ func metadataBuiltinOverrideDocument() string {
 // subscribed service with its attached warning store.
 func metadataService(t *testing.T, h *serviceHarness) (*configurationService, *Subscription) {
 	t.Helper()
-	svc := h.service(context.Background(), servicePlugin("tools", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	svc.attachWarnings(newWarningStore())
 	{
 		_, err := svc.publish(context.Background())
@@ -1453,7 +1453,8 @@ func TestRuntimeModelMetadataMutationAffectsNextAdmissions(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"worker":{"model":"prov/m","system_prompt":"simple"}}`)
-		r, err := e.open(context.Background(), e.storagePlugin(store))
+		e.fixtureStore(store)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()

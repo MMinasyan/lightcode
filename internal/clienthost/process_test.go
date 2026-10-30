@@ -33,7 +33,6 @@ import (
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/plugins/sqlite"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -167,22 +166,35 @@ func runShapedChild(dataDir, configPath, version string, park bool) {
 	awaitStopAndClose(r)
 }
 
-// openRuntime opens the production sqlite plugin declaration through the
-// public Runtime constructor, wrapping its test-only factory callback with the
-// per-attempt marker. No controlled preparation or private constructor is
-// used.
-func openRuntime(dataDir, configPath string) (*runtime.Runtime, error) {
-	plugins := []runtime.Plugin{sqlite.Plugin()}
-	for index := range plugins {
-		plugin := plugins[index]
-		open := plugin.Open
-		plugin.Open = func(ctx context.Context, info runtime.ScopeInfo, bindings runtime.Bindings) (runtime.Instance, error) {
-			markFactory(plugin.ID)
-			return open(ctx, info, bindings)
-		}
-		plugins[index] = plugin
+// attemptMarkerPlugin is one inert Runtime-scoped plugin: its factory runs
+// only after the ownership lock and the initial publication are acquired, so a
+// losing attempt's zero factories stay provable per attempt. The store and the
+// standard tools are directly constructed by the owner and declare no factory.
+func attemptMarkerPlugin() runtime.Plugin {
+	return runtime.Plugin{
+		ID:       "attempt",
+		Scope:    runtime.ScopeRuntime,
+		Provides: []runtime.CapabilitySpec{runtime.Spec[attemptCloser]("attempt.closer")},
+		Open: func(context.Context, runtime.ScopeInfo, runtime.Bindings) (runtime.Instance, error) {
+			markFactory("attempt")
+			return runtime.Instance{Values: map[string]any{"attempt.closer": attemptCloser{}}}, nil
+		},
 	}
-	return runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: plugins})
+}
+
+// attemptCloser is the marker plugin's exported value type: a closer that
+// does nothing but keeps the declaration a real capability.
+type attemptCloser struct{}
+
+// openRuntime opens one real Runtime through the public constructor with the
+// per-attempt factory marker. No controlled preparation or private constructor
+// is used.
+func openRuntime(dataDir, configPath string) (*runtime.Runtime, error) {
+	return runtime.Open(context.Background(), runtime.Options{
+		DataDir:    dataDir,
+		ConfigPath: configPath,
+		Plugins:    []runtime.Plugin{attemptMarkerPlugin()},
+	})
 }
 
 // shapeHealth starts one test-only health server over the record's published
@@ -615,7 +627,7 @@ func TestClientHostConcurrentStartup(t *testing.T) {
 		t.Fatalf("client instance %q, record %q", clients[0].InstanceID(), record.InstanceID)
 	}
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N6, "authenticated health = %s/%s, want the record's instance and wire version", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N8, "authenticated health = %s/%s, want the record's instance and wire version", health.InstanceId, health.ProtocolVersion)
 
 	winners := 0
 	for _, l := range []*launched{first, second} {
@@ -670,7 +682,7 @@ func TestClientHostIncompatibleIncumbent(t *testing.T) {
 		testassert.Require(t, bytes.Equal(after, before), "the incompatible record changed across the probe")
 	}
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N6, "the incumbent's real health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N8, "the incumbent's real health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	incumbent.stopAndJoin(t)
 }
 
@@ -740,7 +752,7 @@ func TestClientHostCancellationDoesNotKillOwner(t *testing.T) {
 	record := readRecord(t, filepath.Join(s.dataDir, "runtime.json"))
 	testassert.Equal(t, record.Endpoint, endpoint)
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N6, "the surviving owner health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N8, "the surviving owner health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	pid := attemptPID(t, attempts[0])
 	testassert.Require(t, aliveProcessByPID(pid), "the canceled Connect killed owner process %d", pid)
 	{
@@ -773,7 +785,7 @@ func TestClientHostHealthTimeoutPreservesHolder(t *testing.T) {
 	testassert.Require(t, errors.Is(err, context.DeadlineExceeded), "Connect against a parked health holder = %v, want the caller deadline", err)
 
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N6, "the preserved holder health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N8, "the preserved holder health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	{
 		after := readFile(t, recordPath)
 		testassert.Require(t, bytes.Equal(after, before), "the parked record changed across the failed probes")

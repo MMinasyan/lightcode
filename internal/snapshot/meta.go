@@ -1,6 +1,6 @@
 // Package snapshot owns the deferred copy-based code capture per target code
-// group: snapshots/<turn>/<path-hash>/ holding each touched file's preimage
-// and metadata, with first-write-wins capture, last-write identity checks and
+// group: snapshots/1/<path-hash>/ holding each touched file's preimage and
+// metadata, with first-write-wins capture, last-write identity checks and
 // the shared restore traversal. It reads no conversation, claim or session
 // lifecycle state.
 //
@@ -8,15 +8,13 @@
 //
 //	<group-dir>/
 //	└── snapshots/
-//	    └── <turn>/
+//	    └── 1/
 //	        └── <path-hash>/
 //	            ├── original     # pre-edit bytes, absent if file didn't exist
 //	            └── meta.json    # {original_path, canonical_path, existed, last_write}
 //
-// Turn numbers are integers starting at 1. Retained pre-cutover session
-// directories keep their old meta.json/turns/claims files untouched; the
-// retained reader in runtime proves only the explicit old ID, project path
-// and project hash members and never interprets the rest.
+// Old pre-cutover session directories keep their meta.json/turns/claims files
+// inert and untouched; no snapshot reader interprets them.
 package snapshot
 
 import (
@@ -29,10 +27,10 @@ import (
 
 // SnapshotMeta is written alongside each snapshotted file. OriginalPath
 // is the user-facing path shown in history and affected-file output.
-// CanonicalPath is the hidden restore target for new snapshots. Old
-// metadata without CanonicalPath falls back to OriginalPath.
-// Existed is false when the snapshot represents a file that did not
-// exist before the turn — on revert, that file is deleted.
+// CanonicalPath is the capture-time canonical witness every restore is
+// proven against; an entry without it is refused, never reconstructed
+// from a path guess. Existed is false when the snapshot represents a file
+// that did not exist before the mutation — on revert, that file is deleted.
 type SnapshotMeta struct {
 	OriginalPath  string                   `json:"original_path"`
 	CanonicalPath string                   `json:"canonical_path,omitempty"`
@@ -40,8 +38,10 @@ type SnapshotMeta struct {
 	LastWrite     *SnapshotContentIdentity `json:"last_write,omitempty"`
 }
 
-// SnapshotContentIdentity identifies the state produced by the session's
-// latest successful mutation for a snapshot entry.
+// SnapshotContentIdentity identifies the state a completed producer mutation
+// left for a snapshot entry. The pre-mutation proof clear and any uncertain
+// mutation failure leave LastWrite nil, and a restore against a nil LastWrite
+// skips the entry instead of guessing.
 type SnapshotContentIdentity struct {
 	Hash   string `json:"hash,omitempty"`
 	Absent bool   `json:"absent,omitempty"`

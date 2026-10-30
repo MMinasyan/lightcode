@@ -393,8 +393,8 @@ func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 		seeded := seedStaleSession(t, store, filepath.Join(e.dataDir, "seeded"), 100*time.Hour)
 		hook := &recordHook{name: "hook.first", events: &traceLog{}}
 		var opOpens, agOpens atomic.Int64
+		e.fixtureStore(store)
 		r, err := e.open(context.Background(),
-			e.storagePlugin(store),
 			hookPlugin(hook),
 			shortScopeProbe("probe", ScopeOperation, &opOpens),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
@@ -428,7 +428,8 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 		wrapped := newSweepStore(store)
 		hook := &recordHook{name: "hook.first", events: &traceLog{}}
 		var opOpens, agOpens atomic.Int64
-		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped), hookPlugin(hook),
+		e.fixtureStore(wrapped)
+		r, ticks, err := e.openSwept(context.Background(), hookPlugin(hook),
 			shortScopeProbe("probe", ScopeOperation, &opOpens),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		testassert.NoError(t, err)
@@ -493,7 +494,8 @@ func TestMaintenanceFailedPassReportsAndWaitsForTheNextTick(t *testing.T) {
 				e := newOwnerEnv(t)
 				writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 				wrapped := newSweepStore(store)
-				r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
+				e.fixtureStore(wrapped)
+				r, ticks, err := e.openSwept(context.Background())
 				testassert.NoError(t, err)
 				created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
 				testassert.NoError(t, err)
@@ -529,7 +531,8 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			e := newOwnerEnv(t)
 			writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 			wrapped := newSweepStore(store)
-			r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
+			e.fixtureStore(wrapped)
+			r, ticks, err := e.openSwept(context.Background())
 			testassert.NoError(t, err)
 			created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
 			testassert.NoError(t, err)
@@ -582,7 +585,8 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 			wrapped := newSweepStore(store)
 			ctx := newDeadlineContext()
-			r, ticks, err := e.openSwept(ctx, e.storagePlugin(wrapped))
+			e.fixtureStore(wrapped)
+			r, ticks, err := e.openSwept(ctx)
 			testassert.NoError(t, err)
 			created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
 			testassert.NoError(t, err)
@@ -629,7 +633,8 @@ func TestMaintenanceUnrelatedFailureIsQuietOnceShutdownIsObserved(t *testing.T) 
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		wrapped := newSweepStore(store)
-		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
+		e.fixtureStore(wrapped)
+		r, ticks, err := e.openSwept(context.Background())
 		testassert.NoError(t, err)
 		created, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "sweep"), "solo")
 		testassert.NoError(t, err)
@@ -672,7 +677,8 @@ func TestMaintenanceGateRejectionIsQuiet(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		wrapped := newSweepStore(store)
-		r, err := e.open(context.Background(), e.storagePlugin(wrapped))
+		e.fixtureStore(wrapped)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		testassert.NoError(t, r.Close(context.Background()))
 		stderr := captureSweepStderr(t)
@@ -695,7 +701,8 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
 		wrapped := newSweepStore(store)
-		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
+		e.fixtureStore(wrapped)
+		r, ticks, err := e.openSwept(context.Background(), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
 		testassert.NoError(t, err)
 		busy, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "busy"), "solo")
 		testassert.NoError(t, err)
@@ -738,7 +745,8 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		wrapped := newSweepStore(store)
-		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
+		e.fixtureStore(wrapped)
+		r, ticks, err := e.openSwept(context.Background())
 		testassert.NoError(t, err)
 		corrupted, err := r.createSession(context.Background(), filepath.Join(e.dataDir, "bad"), "solo")
 		testassert.NoError(t, err)
@@ -798,7 +806,8 @@ func TestMaintenanceNonpositiveThresholdsDisableTheirTransitions(t *testing.T) {
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":0,"delete_after_archive_days":0}`))
 		seeded := seedStaleSession(t, store, filepath.Join(e.dataDir, "seeded"), 100*time.Hour)
 		wrapped := newSweepStore(store)
-		r, err := e.open(context.Background(), e.storagePlugin(wrapped))
+		e.fixtureStore(wrapped)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		testassert.Equal(t, wrapped.listCount(), 2)
 		var payload struct {
@@ -932,7 +941,8 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		ctx := context.Background()
-		r, err := e.open(ctx, e.storagePlugin(store))
+		e.fixtureStore(store)
+		r, err := e.open(ctx)
 		testassert.NoError(t, err)
 		archive := func(sessionID string) {
 			t.Helper()
@@ -1010,7 +1020,8 @@ func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
 		e := newOwnerEnv(t)
 		ctx := context.Background()
 		blocked := newTargetedBlockStore(store)
-		r, err := open(ctx, e.options(e.storagePlugin(blocked)))
+		e.fixtureStore(blocked)
+		r, err := e.open(ctx)
 		testassert.NoError(t, err)
 		archived, err := r.createSession(ctx, filepath.Join(e.dataDir, "ws"), "solo")
 		testassert.NoError(t, err)
@@ -1063,7 +1074,8 @@ func TestPrivateDeleteSessionReturnsCleanupErrors(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		ctx := context.Background()
-		r, err := e.open(ctx, e.storagePlugin(store))
+		e.fixtureStore(store)
+		r, err := e.open(ctx)
 		testassert.NoError(t, err)
 		archived, err := r.createSession(ctx, filepath.Join(e.dataDir, "ws"), "solo")
 		testassert.NoError(t, err)
@@ -1115,7 +1127,8 @@ func TestMaintenanceSweepCleansCommittedSessions(t *testing.T) {
 		wrapped := newSweepStore(store)
 		wrapped.armDeleteTarget(second)
 		stderr := captureSweepStderr(t)
-		r, err := open(context.Background(), e.options(e.storagePlugin(wrapped)))
+		e.fixtureStore(wrapped)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 
 		mustNotExist(t, firstCode, "the committed deletion's artifacts despite the stopping pass error")
@@ -1163,7 +1176,8 @@ func TestMaintenanceSweepJoinsPassAndCleanupErrorsInOneDiagnostic(t *testing.T) 
 		wrapped := newSweepStore(store)
 		wrapped.armDeleteTarget(second)
 		stderr := captureSweepStderr(t)
-		r, err := open(context.Background(), e.options(e.storagePlugin(wrapped)))
+		e.fixtureStore(wrapped)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 
 		out := stderr()
@@ -1196,7 +1210,8 @@ func TestMaintenanceSweepReportsCleanupErrorsAndAttemptsEveryID(t *testing.T) {
 		t.Cleanup(func() { os.Chmod(blocked, 0o755) })
 
 		stderr := captureSweepStderr(t)
-		r, err := open(context.Background(), e.options(e.storagePlugin(store)))
+		e.fixtureStore(store)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 
 		for _, id := range []string{a, b} { // committed deletions are never rolled back
@@ -1238,7 +1253,8 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 		plantSessionCode(t, e.dataDir, second)
 
 		blocked := newTargetedBlockStore(store)
-		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(blocked))
+		e.fixtureStore(blocked)
+		r, ticks, err := e.openSwept(context.Background())
 		testassert.NoError(t, err)
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		{
@@ -1296,7 +1312,8 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 		first, second, third := ids[0], ids[1], ids[2]
 
 		wrapped := newSweepStore(store)
-		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
+		e.fixtureStore(wrapped)
+		r, ticks, err := e.openSwept(context.Background())
 		testassert.NoError(t, err)
 		defer func() {
 			{
@@ -1405,7 +1422,8 @@ func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
 		thirdCode := plantSessionCode(t, e.dataDir, third)
 
 		wrapped := newSweepStore(store)
-		r, ticks, err := e.openSwept(context.Background(), e.storagePlugin(wrapped))
+		e.fixtureStore(wrapped)
+		r, ticks, err := e.openSwept(context.Background())
 		testassert.NoError(t, err)
 		defer func() {
 			{
@@ -1509,7 +1527,8 @@ func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
 		ctx := context.Background()
-		r, err := e.open(ctx, e.storagePlugin(store), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
+		e.fixtureStore(store)
+		r, err := e.open(ctx, hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
 		testassert.NoError(t, err)
 		heldWorkspace := filepath.Join(e.dataDir, "held-ws")
 		testassert.NoError(t, os.MkdirAll(heldWorkspace, 0o700))

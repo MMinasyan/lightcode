@@ -29,20 +29,19 @@ import (
 
 // compactObservationConfigDocument configures the conversation model with a
 // window whose trigger threshold the seed turn's reported usage overflows,
-// and the compact model as a distinct catalog identity, so the wire
-// distinguishes the transports by model ID.
+// and the top-level compaction model as a distinct catalog identity, so the
+// wire distinguishes the transports by model ID.
 func compactObservationConfigDocument(endpoint string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
 		`{"m":{"name":"M","context_window":8192,"max_output_tokens":4096},`+
-			`"k":{"name":"K","context_window":32768,"max_output_tokens":4096,"usage_in_stream":true}}`) + `}}`
+			`"k":{"name":"K","context_window":32768,"max_output_tokens":4096,"usage_in_stream":true}}`) + `},
+		"compaction":{"model":"prov/k"}}`
 }
 
 // compactObservationAgentsDocument selects the conversation model for the
-// working type and overlays the compact builtin onto the distinct compact
-// model, so the two transports are distinguishable on the wire.
+// working type.
 const compactObservationAgentsDocument = `{
-	"tight": {"model": "prov/m", "system_prompt": "simple"},
-	"compact": {"model": "prov/k"}
+	"tight": {"model": "prov/m", "system_prompt": "simple"}
 }`
 
 // TestCompactLifecycleNativeCompactionObservation keeps the Runtime observer
@@ -59,7 +58,8 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
-		r, err := e.open(context.Background(), e.storagePlugin(store))
+		e.fixtureStore(store)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		ctx := context.Background()
 
@@ -120,7 +120,7 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 			err := json.Unmarshal(summary.Messages[0].Content, &systemText)
 			testassert.Require(t, err == nil && systemText == op2.Admission.Execution.Compact.SystemPrompt, "compact summary system = %q (err %v), want the captured compact prompt %q", systemText, err, op2.Admission.Execution.Compact.SystemPrompt)
 		}
-		testassert.Require(t, op2.Admission.Execution.Compact.Model == (model.ModelRef{Provider: "prov", Model: "k"}), "captured compact model = %+v, want the overlaid prov/k", op2.Admission.Execution.Compact.Model)
+		testassert.Require(t, op2.Admission.Execution.Compact.Model == (model.ModelRef{Provider: "prov", Model: "k"}), "captured compact model = %+v, want the configured prov/k", op2.Admission.Execution.Compact.Model)
 		first := decodeWireChatBody(t, conversation[1])
 		{
 			roles := wireRoles(first)
@@ -200,7 +200,8 @@ func TestCompactLifecycleNativeCompactionAgentScopeCount(t *testing.T) {
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
 		var agOpens atomic.Int64
-		r, err := e.open(context.Background(), e.storagePlugin(store),
+		e.fixtureStore(store)
+		r, err := e.open(context.Background(),
 			shortScopeProbe("probe-agent", ScopeAgent, &agOpens))
 		testassert.NoError(t, err)
 		ctx := context.Background()

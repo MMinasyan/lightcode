@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"errors"
+	"os"
 	"path/filepath"
 
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/runtime"
 )
+
+//go:embed runtime_identity.md
+var runtimeIdentity string
 
 // runRuntime runs the shared managed Runtime owner in the foreground for the
 // lifetime of the signal context. It opens the owner over the normalized
@@ -24,10 +29,16 @@ func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 	if err != nil {
 		return err
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
 	owner, err := runtime.Open(ctx, runtime.Options{
-		DataDir:    absDataDir,
-		ConfigPath: absConfigPath,
-		Plugins:    builtin.Plugins(),
+		DataDir:        absDataDir,
+		ConfigPath:     absConfigPath,
+		Plugins:        builtin.Plugins(),
+		Identity:       runtimeIdentity,
+		GlobalRulesDir: filepath.Join(home, ".lightcode"),
 	})
 	if errors.Is(err, runtime.ErrOwned) {
 		// Another process owns the data directory; this contender

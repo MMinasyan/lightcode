@@ -10,7 +10,6 @@ package runtime
 // stores with isolated HOME.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,20 +28,18 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	modeladapt "github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/internal/agents"
-	"github.com/MMinasyan/lightcode/internal/pathutil"
-	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 )
 
 // chainAgentsDocument builds the combined scenario's agents document with the
 // chained agent's system prompt as the given text: the agent selects the
-// preparation hook, the argument hook, and the model adaptation, and declares
-// the write tool and the patch tool.
+// preparation hook and the argument hook, and declares the directly
+// constructed baseline write and patch tools.
 func chainAgentsDocument(body string) string {
 	return `{
-  "chained": {"model": "prov/gpt-5.5", "system_prompt": "simple", "prompt": "` + body + `", "tools": ["prod_write", "apply_patch"], "capabilities": ["hook.first", "arg.rewrite", "model_adaptation"]}
+  "chained": {"model": "prov/gpt-5.5", "system_prompt": "simple", "prompt": "` + body + `", "tools": ["write_file", "apply_patch"], "capabilities": ["hook.first", "arg.rewrite"]}
 }`
 }
 
@@ -77,7 +74,7 @@ func chainModelsConfigDocument(endpoint string) string {
 }
 
 // rewriteWriteHook is the combined scenario's ToolArgumentsHook: it replaces
-// every prod_write call's arguments with its fixed rewrite, passes every
+// every write_file call's arguments with its fixed rewrite, passes every
 // other call through unchanged, and records every received call's identity
 // and raw argument bytes.
 type rewriteWriteHook struct {
@@ -90,7 +87,7 @@ func (h *rewriteWriteHook) BeforeTool(_ context.Context, _ Invocation, call mode
 	h.mu.Lock()
 	h.seen = append(h.seen, call.Name+" "+string(call.Arguments))
 	h.mu.Unlock()
-	if call.Name == "prod_write" {
+	if call.Name == "write_file" {
 		return json.RawMessage(h.replace), nil
 	}
 	return call.Arguments, nil
@@ -140,18 +137,19 @@ func argumentHookPlugin(id string, hook ToolArgumentsHook) Plugin {
 // composed directly over the real bundled matcher).
 type bundledAdaptation struct{}
 
-func (bundledAdaptation) Resolve(ref model.ModelRef) (Adaptation, error) {
+func (bundledAdaptation) Resolve(ref model.ModelRef, mode prompt.Mode) (Adaptation, error) {
 	match := modeladapt.Match(ref.Model)
 	if match == nil {
 		return Adaptation{}, nil
 	}
-	return Adaptation{
+	out := Adaptation{
 		ExcludeTools:                match.ExcludeTools,
-		IncludeTools:                match.IncludeTools,
-		Blocks:                      match.Blocks,
-		Additions:                   match.Additions,
 		ToolDescriptionReplacements: match.ToolDescriptionReplacements,
-	}, nil
+	}
+	if mode == prompt.ModeFull {
+		out.Append = match.Append
+	}
+	return out, nil
 }
 
 // bundledAdaptationPlugin declares the bundled resolver as the composition's
@@ -163,344 +161,6 @@ func bundledAdaptationPlugin() Plugin {
 		Provides: []CapabilitySpec{Spec[ModelAdaptation]("model_adaptation")},
 		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"model_adaptation": bundledAdaptation{}}}, nil
-		},
-	}
-}
-
-// chainDecodeArguments strictly decodes one call's JSON arguments into an
-// owned map, rejecting malformed, non-object, null and trailing data.
-func chainDecodeArguments(raw json.RawMessage) (map[string]any, error) {
-	var args map[string]any
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	if err := dec.Decode(&args); err != nil || args == nil {
-		return nil, errors.New("arguments must be one JSON object")
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, errors.New("arguments must be one JSON object")
-	}
-	return args, nil
-}
-
-// chainImmediateError is the validation-class immediate outcome: status error
-// carrying the bounded diagnostic.
-func chainImmediateError(callID string, cause error) harness.PreparedTool {
-	msg := cause.Error()
-	if len(msg) > 512 {
-		msg = msg[:512]
-	}
-	return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-		Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: msg},
-	}}
-}
-
-// chainImmediateDenied is the failed-canonical-preparation immediate outcome:
-// the fixed denial.
-func chainImmediateDenied(callID string) harness.PreparedTool {
-	return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-		Result: model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: "Permission denied."},
-	}}
-}
-
-// chainCodeGroup adapts one per-call snapshot.CodeStore to the shared
-// SnapshotStore interface, mirroring the shipped plugin's group wrapper: the
-// transactional path preempts the plain methods; they are interface
-// compliance only.
-type chainCodeGroup struct{ *snapshot.CodeStore }
-
-func (chainCodeGroup) CurrentTurn() int { return 1 }
-
-func (s chainCodeGroup) Snapshot(turn int, absPath string) error {
-	_, _, err := s.SnapshotResolvedEntry(turn, absPath, absPath)
-	return err
-}
-
-// chainWriteTool is the combined scenario's prod_write capability: the
-// shared write preparation (the per-call code group opened fresh from the
-// admitted-input identity, the pre-write preimage capture, one file.write
-// pair) behind the production Tool contract, mirroring the shipped plugin's
-// write_file export.
-type chainWriteTool struct{ dataDir string }
-
-func (chainWriteTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
-	definition, err := model.NewToolDefinition(model.ToolDefinition{
-		Name:        "prod_write",
-		Description: "writes one file in the workspace",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`),
-	})
-	if err != nil {
-		return ToolDescription{}, err
-	}
-	return ToolDescription{Definition: definition, Available: !constraints.Readonly || constraints.WriteDir != ""}, nil
-}
-
-func (t chainWriteTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	args, err := chainDecodeArguments(call.Arguments)
-	if err != nil {
-		return nil, err
-	}
-	normalized, err := tool.NormalizeWriteArgs(args)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(normalized)
-}
-
-func (t chainWriteTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
-	args, err := chainDecodeArguments(call.Arguments)
-	if err != nil {
-		return chainImmediateError(call.ID, err)
-	}
-	resolved, err := pathutil.ResolveFilePathFrom("", tc.Workspace)
-	if err != nil {
-		return chainImmediateDenied(call.ID)
-	}
-	writeDirCanonical := ""
-	if tc.Constraints.WriteDir != "" {
-		resolvedWriteDir, err := pathutil.ResolveFilePathFrom(tc.Workspace, tc.Constraints.WriteDir)
-		if err != nil {
-			return chainImmediateDenied(call.ID)
-		}
-		writeDirCanonical = resolvedWriteDir.CanonicalPath
-	}
-	group, err := snapshot.OpenCodeStore(filepath.Join(t.dataDir, "code", tc.AdmittedEntry.SessionID, tc.AdmittedEntry.EntryID))
-	if err != nil {
-		return chainImmediateDenied(call.ID)
-	}
-	prepared, err := tool.PrepareWriteCall(tc.Workspace, resolved.CanonicalPath, writeDirCanonical, tool.CapabilityOptions{WriteDir: tc.Constraints.WriteDir}, chainCodeGroup{group}, args)
-	if err != nil {
-		return chainImmediateDenied(call.ID)
-	}
-	pairs := make([]harness.PermissionRequest, 0, len(prepared.Targets))
-	for _, target := range prepared.Targets {
-		pairs = append(pairs, harness.PermissionRequest{Permission: "file.write", Target: target.CanonicalPath})
-	}
-	return harness.PreparedTool{
-		Permissions:        pairs,
-		CanonicalWorkspace: resolved.CanonicalPath,
-		Execute: func(ctx context.Context) harness.ToolOutcome {
-			result, execErr := prepared.Execute(ctx)
-			if execErr != nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: execErr.Error()}}
-			}
-			return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: result}}
-		},
-	}
-}
-
-// chainPatchTool is the combined scenario's apply_patch capability: the
-// shared patch engine (one V4A parse, the per-call code group opened fresh
-// from the admitted-input identity, the same preview capture) behind the
-// production Tool contract, mirroring the shipped plugin's apply_patch
-// export.
-type chainPatchTool struct{ dataDir string }
-
-func (chainPatchTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
-	definition, err := model.NewToolDefinition(model.ToolDefinition{
-		Name:        "apply_patch",
-		Description: "edits, creates, deletes, or renames files using the V4A patch format",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`),
-	})
-	if err != nil {
-		return ToolDescription{}, err
-	}
-	return ToolDescription{Definition: definition, Available: !constraints.Readonly || constraints.WriteDir != "", DefaultHidden: true}, nil
-}
-
-func (t chainPatchTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	args, err := chainDecodeArguments(call.Arguments)
-	if err != nil {
-		return nil, err
-	}
-	normalized, err := tool.NormalizePatchArgs(args)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(normalized)
-}
-
-func (t chainPatchTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
-	args, err := chainDecodeArguments(call.Arguments)
-	if err != nil {
-		return chainImmediateError(call.ID, err)
-	}
-	resolved, err := pathutil.ResolveFilePathFrom("", tc.Workspace)
-	if err != nil {
-		return chainImmediateDenied(call.ID)
-	}
-	writeDirCanonical := ""
-	if tc.Constraints.WriteDir != "" {
-		resolvedWriteDir, err := pathutil.ResolveFilePathFrom(tc.Workspace, tc.Constraints.WriteDir)
-		if err != nil {
-			return chainImmediateDenied(call.ID)
-		}
-		writeDirCanonical = resolvedWriteDir.CanonicalPath
-	}
-	group, err := snapshot.OpenCodeStore(filepath.Join(t.dataDir, "code", tc.AdmittedEntry.SessionID, tc.AdmittedEntry.EntryID))
-	if err != nil {
-		return chainImmediateDenied(call.ID)
-	}
-	prepared, err := tool.PreparePatchCall(tc.Workspace, resolved.CanonicalPath, writeDirCanonical, tool.CapabilityOptions{WriteDir: tc.Constraints.WriteDir}, chainCodeGroup{group}, args)
-	if err != nil {
-		return chainImmediateDenied(call.ID)
-	}
-	pairs := make([]harness.PermissionRequest, 0, len(prepared.Targets))
-	for _, target := range prepared.Targets {
-		pairs = append(pairs, harness.PermissionRequest{Permission: "file.write", Target: target.CanonicalPath})
-	}
-	return harness.PreparedTool{
-		Permissions:        pairs,
-		CanonicalWorkspace: resolved.CanonicalPath,
-		Execute: func(ctx context.Context) harness.ToolOutcome {
-			result, execErr := prepared.Execute(ctx)
-			if execErr != nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: execErr.Error()}}
-			}
-			outcome := harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: result.Result}}
-			if m := tool.ApplyPatchPreviewMetadata(result.Previews); m != nil {
-				if raw, merr := json.Marshal(m); merr == nil {
-					outcome.Metadata = raw
-				}
-			}
-			return outcome
-		},
-	}
-}
-
-// chainCommandTool is the readonly-git row's run_command capability: the
-// read-only allowlist rewrite with its injected safety flags, one command.run
-// pair on the rewritten target, and real foreground execution in the
-// Workspace — mirroring the shipped plugin's readonly command path.
-type chainCommandTool struct{ dataDir string }
-
-func (chainCommandTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
-	definition, err := model.NewToolDefinition(model.ToolDefinition{
-		Name:        "run_command",
-		Description: "executes one command",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
-	})
-	if err != nil {
-		return ToolDescription{}, err
-	}
-	return ToolDescription{Definition: definition, Available: true}, nil
-}
-
-func (t chainCommandTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	args, err := chainDecodeArguments(call.Arguments)
-	if err != nil {
-		return nil, err
-	}
-	normalized, err := tool.NormalizeRunCommandArgs(args, 120)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(normalized)
-}
-
-func (t chainCommandTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
-	args, err := chainDecodeArguments(call.Arguments)
-	if err != nil {
-		return chainImmediateError(call.ID, err)
-	}
-	command, _ := args["command"].(string)
-	rewritten, err := tool.ReadOnlyCommand(command)
-	if err != nil {
-		return chainImmediateError(call.ID, errors.New(tool.ReadOnlyRunCommandRejected))
-	}
-	spillDir := filepath.Join(t.dataDir, "code", tc.AdmittedEntry.SessionID, "output")
-	return harness.PreparedTool{
-		Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: rewritten}},
-		Execute: func(ctx context.Context) harness.ToolOutcome {
-			result, execErr := tool.RunForegroundCommand(ctx, rewritten, tc.Workspace, 120, 15360, 5000, spillDir, os.Environ())
-			if execErr != nil {
-				status := model.ResultError
-				var exitErr *tool.ExitError
-				if errors.As(execErr, &exitErr) && exitErr.Cancelled {
-					status = model.ResultInterrupted
-				}
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: status, Content: execErr.Error()}}
-			}
-			return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: result}}
-		},
-	}
-}
-
-// chainCommandPlugin declares the readonly-git row's run_command export.
-func chainCommandPlugin() Plugin {
-	return Plugin{
-		ID:       "chaincommands",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("run_command", chainCommandTool{}.describe)},
-		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"run_command": chainCommandTool{dataDir: info.DataDir}}}, nil
-		},
-	}
-}
-
-// inertTool is the capability-ID row's tool value: it composes a real
-// description and advertisement and dispatches nothing (the row's model turns
-// carry no tool calls; a dispatch settles the call with an immediate error).
-type inertTool struct {
-	name     string
-	defThide bool
-}
-
-func (t inertTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
-	definition, err := model.NewToolDefinition(model.ToolDefinition{
-		Name:        t.name,
-		Description: "inert " + t.name,
-		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
-	})
-	if err != nil {
-		return ToolDescription{}, err
-	}
-	return ToolDescription{Definition: definition, Available: true, DefaultHidden: t.defThide}, nil
-}
-
-func (t inertTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	return runtimeNormalize(call)
-}
-
-func (t inertTool) Prepare(_ context.Context, _ ToolContext, call model.ToolCall) harness.PreparedTool {
-	return chainImmediateError(call.ID, errors.New("inert tool dispatch"))
-}
-
-// inertToolsPlugin declares the four native file-tool names as inert tools
-// for the capability-ID row's advertisement composition.
-func inertToolsPlugin() Plugin {
-	return Plugin{
-		ID:    "inerttools",
-		Scope: ScopeRuntime,
-		Provides: []CapabilitySpec{
-			ToolSpec("read_file", inertTool{name: "read_file"}.describe),
-			ToolSpec("write_file", inertTool{name: "write_file"}.describe),
-			ToolSpec("edit_file", inertTool{name: "edit_file"}.describe),
-			ToolSpec("apply_patch", inertTool{name: "apply_patch", defThide: true}.describe),
-		},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{
-				"read_file":   inertTool{name: "read_file"},
-				"write_file":  inertTool{name: "write_file"},
-				"edit_file":   inertTool{name: "edit_file"},
-				"apply_patch": inertTool{name: "apply_patch", defThide: true},
-			}}, nil
-		},
-	}
-}
-
-// chainToolsPlugin declares the combined scenario's two concrete tools: the
-// group-capturing write tool and the patch tool, both deriving their code
-// groups from the owner data root.
-func chainToolsPlugin() Plugin {
-	return Plugin{
-		ID:       "chaintools",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("prod_write", chainWriteTool{}.describe), ToolSpec("apply_patch", chainPatchTool{}.describe)},
-		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{
-				"prod_write":  chainWriteTool{dataDir: info.DataDir},
-				"apply_patch": chainPatchTool{dataDir: info.DataDir},
-			}}, nil
 		},
 	}
 }
@@ -683,13 +343,13 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		allowedPatch, err := json.Marshal(map[string]any{"input": "*** Begin Patch\n*** Update File: notes.txt\n*** Move to: renamed.txt\n@@\n-alpha\n+ALPHA\n*** End Patch"})
 		testassert.NoError(t, err)
 		writeTurn := func(id string) func(http.ResponseWriter) {
-			return func(w http.ResponseWriter) { writeToolCallTurn(w, id, "prod_write", modelWriteArgs) }
+			return func(w http.ResponseWriter) { writeToolCallTurn(w, id, "write_file", modelWriteArgs) }
 		}
 		release2 := make(chan struct{})
 		release3 := make(chan struct{})
 		parked := make(chan struct{}) // the canceled operation parks until the owner cancels
 		server := newChainServer(t,
-			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-1", "prod_write", modelWriteArgs) }},
+			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-1", "write_file", modelWriteArgs) }},
 			chainTurn{hold: release2, respond: writeTurn("call-2")},
 			chainTurn{hold: release3, respond: writeTurn("call-3")},
 			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-4", "apply_patch", string(deniedPatch)) }},
@@ -720,9 +380,10 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 			return c
 		}}
 		argHook := &rewriteWriteHook{replace: hookRewriteArgs}
+		useFixtureStore(t, e.store)
 		openChained := func(ctx context.Context, hook *recordHook, argHook *rewriteWriteHook) (*Runtime, error) {
 			return Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []Plugin{
-				coreStoragePlugin(e.store), chainToolsPlugin(), hookPlugin(hook),
+				hookPlugin(hook),
 				argumentHookPlugin("arg.rewrite", argHook), bundledAdaptationPlugin(),
 			}})
 		}
@@ -748,7 +409,7 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		}
 		{
 			seen := argHook.received()
-			testassert.Require(t, slices.Equal(seen, []string{"prod_write " + modelWriteArgs}), "argument hook observations = %v, want exactly the original call arguments", seen)
+			testassert.Require(t, slices.Equal(seen, []string{"write_file " + modelWriteArgs}), "argument hook observations = %v, want exactly the original call arguments", seen)
 		}
 		admitted := readOperation(t, r, sessionID, "op-1").Admission.AdmittedEntry.EntryID
 
@@ -862,7 +523,7 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		// call: three rewritten writes and two pass-through patch calls.
 		{
 			seen := argHook.received()
-			testassert.Require(t, len(seen) == 5 && seen[0] == "prod_write "+modelWriteArgs && seen[1] == "prod_write "+modelWriteArgs && seen[2] == "prod_write "+modelWriteArgs && seen[3] == "apply_patch "+string(deniedPatch) && seen[4] == "apply_patch "+string(allowedPatch), "argument hook observations = %v, want each call's original arguments exactly once", seen)
+			testassert.Require(t, len(seen) == 5 && seen[0] == "write_file "+modelWriteArgs && seen[1] == "write_file "+modelWriteArgs && seen[2] == "write_file "+modelWriteArgs && seen[3] == "apply_patch "+string(deniedPatch) && seen[4] == "apply_patch "+string(allowedPatch), "argument hook observations = %v, want each call's original arguments exactly once", seen)
 		}
 
 		// The predecessor's own requests carry its immutable old capture, and
@@ -964,7 +625,7 @@ func TestProductionReadonlyGitHookSeesOriginalArguments(t *testing.T) {
 			`{"rogit": {"model": "prov/m", "system_prompt": "simple", "tools": ["run_command"], "readonly": true, "capabilities": ["arg.noop"]}}`)
 
 		hook := &noopArgumentHook{}
-		r, err := e.openPlugins(ctx, coreStoragePlugin(e.store), chainCommandPlugin(), argumentHookPlugin("arg.noop", hook))
+		r, err := e.openPlugins(ctx, argumentHookPlugin("arg.noop", hook))
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
@@ -997,11 +658,19 @@ func TestProductionReadonlyGitHookSeesOriginalArguments(t *testing.T) {
 // two agents with identical configured capabilities but differently-adapted
 // models keep IDENTICAL capability ID lists in their captures while the
 // model-dependent adaptation changes their advertisements and prompts — the
-// adaptation never leaks into the capability list.
+// adaptation never leaks into the capability list. The GPT-adapted Agent then
+// attempts the two tools its adaptation excludes: each call settles the
+// ordinary exact unavailable error and leaves no file effect.
 func TestProductionCapabilityIDsModelIndependent(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		server := newChainServer(t,
+			chainTurn{respond: func(w http.ResponseWriter) {
+				writeToolCallTurn(w, "call-write", "write_file", `{"path":"gpt-write.txt","content":"must not land"}`)
+			}},
+			chainTurn{respond: func(w http.ResponseWriter) {
+				writeToolCallTurn(w, "call-edit", "edit_file", `{"path":"gpt-edit.txt","old_string":"keep me","new_string":"changed"}`)
+			}},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 		)
@@ -1011,11 +680,14 @@ func TestProductionCapabilityIDsModelIndependent(t *testing.T) {
   "vanillaagent": {"model": "prov/vanilla", "system_prompt": "full", "tools": ["read_file", "write_file", "edit_file", "apply_patch"], "capabilities": ["model_adaptation"]}
 }`)
 
-		r, err := e.openPlugins(ctx, coreStoragePlugin(e.store), inertToolsPlugin(), bundledAdaptationPlugin())
+		r, err := e.openPlugins(ctx, bundledAdaptationPlugin())
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
-		gpt, err := r.createSession(ctx, e.workspace("adapt-gpt"), "gptagent")
+		gptWorkspace := e.workspace("adapt-gpt")
+		testassert.NoError(t, os.MkdirAll(gptWorkspace, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(gptWorkspace, "gpt-edit.txt"), []byte("keep me\n"), 0o600))
+		gpt, err := r.createSession(ctx, gptWorkspace, "gptagent")
 		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, gpt.Identity.SessionID, "op-gpt", "hello")
 		gptRec := awaitOperation(t, r, gpt.Identity.SessionID, "op-gpt", harness.OperationSuccess)
@@ -1030,17 +702,38 @@ func TestProductionCapabilityIDsModelIndependent(t *testing.T) {
 		testassert.Require(t, slices.Equal(gptRec.Admission.Execution.Capabilities, vanRec.Admission.Execution.Capabilities) && slices.Equal(gptRec.Admission.Execution.Capabilities, []string{"model_adaptation"}), "capability IDs = %q vs %q, want identical lists across the model switch; capability IDs = %q, want exactly the agents' configured selection", gptRec.Admission.Execution.Capabilities, vanRec.Admission.Execution.Capabilities, gptRec.Admission.Execution.Capabilities)
 
 		// The advertisements differ exactly as the bundled adaptations
-		// resolve: the GPT-family match swaps write/edit for apply_patch,
-		// the unmatched model keeps the default-hidden patch tool out.
+		// resolve: the GPT-family match excludes write/edit and keeps the
+		// patch tool, the unmatched model selects all four tools.
 		gptTools := toolNames(gptRec.Admission.Execution.Tools)
 		vanTools := toolNames(vanRec.Admission.Execution.Tools)
 		testassert.Require(t, slices.Equal(gptTools, []string{"read_file", "apply_patch"}), "adapted advertisement = %v, want write/edit excluded and apply_patch included", gptTools)
-		testassert.Require(t, slices.Equal(vanTools, []string{"read_file", "write_file", "edit_file"}), "baseline advertisement = %v, want the untouched list with the hidden patch tool out", vanTools)
+		testassert.Require(t, slices.Equal(vanTools, []string{"read_file", "write_file", "edit_file", "apply_patch"}), "baseline advertisement = %v, want every selected tool", vanTools)
 
-		// The prompts differ too: the adapted model's task_execution
-		// addition renders in the full prompt.
-		testassert.Require(t, strings.Contains(gptRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "adapted prompt = %.200s, want the adaptation's task_execution addition", gptRec.Admission.Execution.SystemPrompt)
-		testassert.Require(t, !strings.Contains(vanRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "baseline prompt = %.200s, want no adaptation addition", vanRec.Admission.Execution.SystemPrompt)
+		// The excluded tools are refused by the ordinary unavailable path:
+		// each attempted call settles its exact error and no file effect
+		// happens, so the exclusion is an advertisement/dispatch rule rather
+		// than a rejected definition.
+		results := chainToolResults(t, e.store, gpt.Identity.SessionID)
+		for _, row := range []struct{ callID, name string }{
+			{"call-write", "write_file"},
+			{"call-edit", "edit_file"},
+		} {
+			res, ok := results[row.callID]
+			testassert.Require(t, ok && res.Status == model.ResultError && res.Content == `Tool "`+row.name+`" is not available.`, "%s result = %+v (ok %v), want the ordinary exact unavailable error", row.name, res, ok)
+		}
+		{
+			_, err := os.Stat(filepath.Join(gptWorkspace, "gpt-write.txt"))
+			testassert.Require(t, errors.Is(err, os.ErrNotExist), "gpt-write.txt = err %v, want absent: the excluded write tool ran", err)
+		}
+		{
+			data, err := os.ReadFile(filepath.Join(gptWorkspace, "gpt-edit.txt"))
+			testassert.Require(t, err == nil && string(data) == "keep me\n", "gpt-edit.txt = (%q, %v), want the unchanged bytes: the excluded edit tool ran", data, err)
+		}
+
+		// The prompts differ too: the adapted model's bundled guidance
+		// append renders in the full prompt.
+		testassert.Require(t, strings.Contains(gptRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "adapted prompt = %.200s, want the adaptation's append paragraph", gptRec.Admission.Execution.SystemPrompt)
+		testassert.Require(t, !strings.Contains(vanRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "baseline prompt = %.200s, want no automatic bundled guidance", vanRec.Admission.Execution.SystemPrompt)
 	})
 }
 

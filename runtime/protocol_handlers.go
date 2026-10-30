@@ -30,7 +30,7 @@ func (rt *protocolHandlers) GetHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N6}
+	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N8}
 	rt.writeQualifiedJSON(w, http.StatusOK, &health)
 }
 
@@ -468,18 +468,6 @@ func (rt *protocolHandlers) RevertSessionCode(w http.ResponseWriter, r *http.Req
 	rt.writeCodeRevertResponse(w, result, err)
 }
 
-// RevertRetainedCode serves the retained pre-cutover restore under the same
-// partial-result contract.
-func (rt *protocolHandlers) RevertRetainedCode(w http.ResponseWriter, r *http.Request) {
-	var body protocol.RetainedRevertRequest
-	if err := decodeRequestBody(r, &body); err != nil {
-		writeProtocolError(w, err)
-		return
-	}
-	result, err := rt.revertRetainedCode(r.Context(), body)
-	rt.writeCodeRevertResponse(w, result, err)
-}
-
 // writeCodeRevertResponse writes the one restore contract: success carries
 // the completed result; a traversal failure carries the accumulated result
 // with its error member and the mapped status; a pre-traversal refusal
@@ -522,15 +510,4 @@ func (rt *protocolHandlers) ReadWorkspaceFile(w http.ResponseWriter, r *http.Req
 		return
 	}
 	rt.writeQualifiedJSON(w, http.StatusOK, &result)
-}
-
-// GetRetainedCodeSnapshots serves the legacy turn listing of one proven
-// pre-cutover Session directory.
-func (rt *protocolHandlers) GetRetainedCodeSnapshots(w http.ResponseWriter, r *http.Request, params protocol.GetRetainedCodeSnapshotsParams) {
-	turns, err := rt.listRetainedCodeSnapshots(r.Context(), params.Workspace, params.SessionId)
-	if err != nil {
-		writeProtocolError(w, err)
-		return
-	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &turns)
 }

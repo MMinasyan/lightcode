@@ -5,7 +5,6 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"sort"
 )
 
 //go:embed data/bundled.json
@@ -15,32 +14,16 @@ var bundledFS embed.FS
 // schema: no model ids, no vendor names, no adaptation names. Adding a new
 // model adaptation is a data-only change to data/bundled.json; no Go edit.
 type bundledDoc struct {
-	Version  int             `json:"version"`
-	Defaults bundledDefaults `json:"defaults"`
-	Entries  []bundledEntry  `json:"entries"`
-}
-
-type bundledDefaults struct {
-	ToolDescriptionReplacements map[string]string `json:"tool_description_replacements,omitempty"`
+	Version int            `json:"version"`
+	Entries []bundledEntry `json:"entries"`
 }
 
 type bundledEntry struct {
 	Pattern                     string            `json:"pattern"`
 	Name                        string            `json:"name"`
 	ExcludeTools                []string          `json:"exclude_tools,omitempty"`
-	IncludeTools                []string          `json:"include_tools,omitempty"`
-	Additions                   map[string]string `json:"additions,omitempty"`
+	Append                      []string          `json:"append,omitempty"`
 	ToolDescriptionReplacements map[string]string `json:"tool_description_replacements,omitempty"`
-}
-
-// validSectionIDs lists the user-overridable section ids the prompt
-// assembler accepts. An additions key outside this set is rejected at
-// startup so a typo in the data file is caught immediately.
-var validSectionIDs = map[string]bool{
-	"safety":         true,
-	"tone":           true,
-	"task_execution": true,
-	"language":       true,
 }
 
 // loadBundledTable reads, decodes, and validates the bundled adaptation
@@ -63,14 +46,10 @@ func loadBundledTable() []entry {
 	if len(doc.Entries) == 0 {
 		panic("adaptation: bundled data has no entries")
 	}
-	if err := validateBundledDefaults(doc.Defaults); err != nil {
-		panic(fmt.Sprintf("adaptation: bundled data: %v", err))
-	}
-	defaultToolDescriptionReplacements = cloneStringMap(doc.Defaults.ToolDescriptionReplacements)
 	out := make([]entry, 0, len(doc.Entries))
 	seen := make(map[string]bool)
 	for i, e := range doc.Entries {
-		if err := validateBundledEntry(i, e, doc.Defaults); err != nil {
+		if err := validateBundledEntry(i, e); err != nil {
 			panic(fmt.Sprintf("adaptation: bundled data: %v", err))
 		}
 		key := e.Pattern + "\x00" + e.Name
@@ -80,27 +59,14 @@ func loadBundledTable() []entry {
 		seen[key] = true
 		out = append(out, entry{pattern: e.Pattern, adapt: Adaptation{
 			ExcludeTools:                append([]string(nil), e.ExcludeTools...),
-			IncludeTools:                append([]string(nil), e.IncludeTools...),
-			Additions:                   cloneStringMap(e.Additions),
+			Append:                      append([]string(nil), e.Append...),
 			ToolDescriptionReplacements: cloneStringMap(e.ToolDescriptionReplacements),
 		}})
 	}
 	return out
 }
 
-func validateBundledDefaults(d bundledDefaults) error {
-	for k, v := range d.ToolDescriptionReplacements {
-		if err := validatePlaceholderKey(k); err != nil {
-			return fmt.Errorf("defaults.tool_description_replacements: %w", err)
-		}
-		if v == "" {
-			return fmt.Errorf("defaults.tool_description_replacements[%q] is empty", k)
-		}
-	}
-	return nil
-}
-
-func validateBundledEntry(i int, e bundledEntry, defaults bundledDefaults) error {
+func validateBundledEntry(i int, e bundledEntry) error {
 	if e.Pattern == "" {
 		return fmt.Errorf("entry %d: pattern is empty", i)
 	}
@@ -115,46 +81,8 @@ func validateBundledEntry(i int, e bundledEntry, defaults bundledDefaults) error
 			return fmt.Errorf("entry %d (%q): exclude_tools[%d] is empty", i, e.Pattern, j)
 		}
 	}
-	for j, t := range e.IncludeTools {
-		if t == "" {
-			return fmt.Errorf("entry %d (%q): include_tools[%d] is empty", i, e.Pattern, j)
-		}
-	}
-	keys := make([]string, 0, len(e.Additions))
-	for k := range e.Additions {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		if !validSectionIDs[k] {
-			return fmt.Errorf("entry %d (%q): additions key %q is not a user-overridable section id (want safety/tone/task_execution/language)", i, e.Pattern, k)
-		}
-		if e.Additions[k] == "" {
-			return fmt.Errorf("entry %d (%q): additions[%q] is empty", i, e.Pattern, k)
-		}
-	}
-	keys = keys[:0]
-	for k := range e.ToolDescriptionReplacements {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		if err := validatePlaceholderKey(k); err != nil {
-			return fmt.Errorf("entry %d (%q): tool_description_replacements key %q is invalid: %w", i, e.Pattern, k, err)
-		}
-		if _, ok := defaults.ToolDescriptionReplacements[k]; !ok {
-			return fmt.Errorf("entry %d (%q): tool_description_replacements key %q has no default replacement", i, e.Pattern, k)
-		}
-	}
-	return nil
-}
-
-func validatePlaceholderKey(k string) error {
-	if k == "" {
-		return fmt.Errorf("placeholder key is empty")
-	}
-	if len(k) < 3 || k[0] != '<' || k[len(k)-1] != '>' {
-		return fmt.Errorf("placeholder must be wrapped in <...>")
+	if _, empty := e.ToolDescriptionReplacements[""]; empty {
+		return fmt.Errorf("entry %d (%q): tool_description_replacements key is empty", i, e.Pattern)
 	}
 	return nil
 }

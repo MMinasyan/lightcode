@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -321,13 +322,16 @@ func restoreOwningBytes(path string, prior []byte, existed bool) error {
 	return nil
 }
 
-// editSettings builds the settings edit: the whole sessions member and the
-// whole plugins member are written as the generated target shape — each
-// plugin ID's opaque document string becomes that plugin's owned raw
-// section, and an ID absent from the target removes any newer section,
-// exactly one object per document — and every other top-level root member is
-// unowned and kept untouched. Never merged per field. The selected
-// declaration's validator, not this edit, interprets each document.
+// editSettings builds the settings edit: the whole sessions member, the
+// top-level baseline tools, jobs and compaction sections, and the whole
+// plugins member are written as the generated target shape — each baseline
+// section as its exact JSON object bytes and each plugin ID's opaque document
+// string becomes that plugin's owned raw section, and an ID absent from the
+// target removes any newer section, exactly one object per document — and
+// every other top-level root member is unowned and kept untouched. Never
+// merged per field. The selected declaration's validator, not this edit,
+// interprets each plugin document; the candidate construction validates the
+// baseline sections with their owning services' validators.
 func editSettings(settings protocol.Settings) configurationEdit {
 	return configurationEdit{apply: func(roots rawRoots, _ configurationCapture) (editedFile, error) {
 		sessions, err := json.Marshal(settings.Sessions)
@@ -344,8 +348,21 @@ func editSettings(settings protocol.Settings) configurationEdit {
 		}
 		roots.config["sessions"] = sessions
 		roots.config["plugins"] = pluginsRaw
+		roots.config["tools"] = settingsSection(settings.Tools)
+		roots.config["jobs"] = settingsSection(settings.Jobs)
+		roots.config["compaction"] = settingsSection(settings.Compaction)
 		return editMainConfig, nil
 	}}
+}
+
+// settingsSection copies one top-level baseline settings object; an absent
+// member is the empty object the owning service defaults from, matching the
+// projection's absent-section value.
+func settingsSection(raw json.RawMessage) json.RawMessage {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return json.RawMessage("{}")
+	}
+	return append(json.RawMessage(nil), raw...)
 }
 
 // editAgentModel copies the retained owning model-field mutation onto the

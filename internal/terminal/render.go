@@ -561,14 +561,6 @@ func FormatToolArgs(name, args string) string {
 			return FormatHeaderArg(prompt, 80)
 		}
 		return FormatHeaderArg(args, 80)
-	case "diagnostics":
-		return ""
-	case "workspace_symbol":
-		q := extractJSONString(args, "query")
-		if q != "" {
-			return FormatHeaderArg(q, 80)
-		}
-		return FormatHeaderArg(args, 80)
 	default:
 		return FormatHeaderArg(args, 80)
 	}

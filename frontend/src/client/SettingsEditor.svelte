@@ -26,10 +26,22 @@
   export let stamp; // () => ReaderStamp
   const dispatch = createEventDispatcher();
 
-  // First-party numeric limit controls; every other plugin entry is raw inspect/edit/remove.
-  const PLUGIN_FIELDS = {
+  // Top-level baseline controls: exact JSON members of the tools, jobs and
+  // compaction objects. Every other plugin entry stays raw
+  // inspect/edit/remove; tasks remains an optional plugin control.
+  const BASELINE_FIELDS = {
     tools: ['max_output_bytes', 'read_max_lines', 'read_line_max_chars', 'command_timeout'],
     jobs: ['max_background_processes', 'max_output_bytes', 'read_line_max_chars'],
+    compaction: ['model', 'prompt'],
+  };
+  // Ordinary string controls inside the baseline objects: plain text is
+  // displayed and JSON.stringify restores the string value without requiring
+  // quotes or escape sequences from the user. Every other baseline member is
+  // a raw-JSON token control.
+  const BASELINE_STRING_FIELDS = {
+    compaction: ['model', 'prompt'],
+  };
+  const PLUGIN_FIELDS = {
     tasks: ['max_concurrent', 'max_output_bytes'],
   };
   const SESSION_FIELDS = ['archive_after_days', 'delete_after_archive_days'];
@@ -98,6 +110,41 @@
       const sessionsNow = parseSettingsObject(current).sessions || {};
       return replaceObjectMembers(current, composeMemberPatch('sessions', composeSessionsPatch(sessionsNow, member, valueText)));
     });
+  }
+
+  // A baseline edit patches one member inside its top-level object, then
+  // places that exact object back into the settings document.
+  function patchBaseline(section, member, valueText) {
+    applyEdit((current) => {
+      const value = parseSettingsObject(current)[section];
+      const object = value !== null && typeof value === 'object' && !Array.isArray(value) && !JSON.isRawJSON(value) ? value : {};
+      const next = replaceObjectMembers(JSON.stringify(object), composeMemberPatch(member, valueText));
+      return replaceObjectMembers(current, composeMemberPatch(section, next));
+    });
+  }
+
+  function isBaselineString(section, member) {
+    return Object.hasOwn(BASELINE_STRING_FIELDS, section) && BASELINE_STRING_FIELDS[section].includes(member);
+  }
+
+  function editBaseline(section, member, enteredText) {
+    patchBaseline(section, member, isBaselineString(section, member) ? JSON.stringify(enteredText) : enteredText);
+  }
+
+  // Replace only one top-level section with supplied raw value text through
+  // the exact member patch, validating the supplied value as one JSON object
+  // first. Raw-document editing and the reset action share this setter.
+  function replaceBaselineSection(section, valueText) {
+    applyEdit((current) => {
+      parseSettingsObject(valueText);
+      return replaceObjectMembers(current, composeMemberPatch(section, valueText));
+    });
+  }
+
+  // Reset one baseline section to its absent-member defaults: only that
+  // object becomes {}, never a per-member edit.
+  function resetBaseline(section) {
+    replaceBaselineSection(section, '{}');
   }
 
   // A plugin edit patches the member, then places the document back into `plugins`.
@@ -174,6 +221,26 @@
     return member in values ? JSON.stringify(values[member]) : '';
   }
 
+  function baselineValues(section) {
+    const value = parsed ? parsed[section] : null;
+    return value !== null && typeof value === 'object' && !Array.isArray(value) && !JSON.isRawJSON(value) ? value : {};
+  }
+
+  function baselineMemberValue(section, member) {
+    const values = baselineValues(section);
+    return member in values ? JSON.stringify(values[member]) : '';
+  }
+
+  function baselineMemberText(section, member) {
+    const values = baselineValues(section);
+    if (!(member in values)) return '';
+    return typeof values[member] === 'string' ? values[member] : JSON.stringify(values[member]);
+  }
+
+  function baselineDocumentText(section) {
+    return JSON.stringify(baselineValues(section));
+  }
+
   async function save() {
     if (disposed || pending !== 'idle') return;
     // Capture the text once; inputs are gated for the whole save unit.
@@ -245,6 +312,31 @@
             <input class="num" type="text" value={sessionValue(member)} aria-label={member} disabled={busy}
               on:change={(e) => editSession(member, e.target.value)} />
           </label>
+        {/each}
+
+        {#each Object.keys(BASELINE_FIELDS) as section (section)}
+          <div class="sec">{section}</div>
+          {#if Object.keys(baselineValues(section)).length === 0}
+            <div class="hint" aria-label={`${section} uses defaults`}>Uses defaults</div>
+          {/if}
+          {#each BASELINE_FIELDS[section] as member (member)}
+            <label class="row"><span class="label">{member}</span>
+              {#if member === 'prompt'}
+                <textarea class="doc" rows="4" value={isBaselineString(section, member) ? baselineMemberText(section, member) : baselineMemberValue(section, member)} aria-label={`${section} ${member}`} disabled={busy}
+                  on:change={(e) => editBaseline(section, member, e.target.value)}></textarea>
+              {:else}
+                <input class="num" type="text" value={isBaselineString(section, member) ? baselineMemberText(section, member) : baselineMemberValue(section, member)} aria-label={`${section} ${member}`} disabled={busy}
+                  on:change={(e) => editBaseline(section, member, e.target.value)} />
+              {/if}
+            </label>
+          {/each}
+          <label class="row raw"><span class="label">Raw document</span>
+            <textarea class="doc" rows="3" value={baselineDocumentText(section)} aria-label={`${section} raw document`} disabled={busy}
+              on:change={(e) => replaceBaselineSection(section, e.target.value)}></textarea>
+          </label>
+          <div class="row"><span class="label"></span>
+            <button class="ghost" disabled={busy} on:click={() => resetBaseline(section)} aria-label={`Reset ${section} to defaults`}>Reset {section} to defaults</button>
+          </div>
         {/each}
 
         {#each Object.keys(PLUGIN_FIELDS) as pluginID (pluginID)}

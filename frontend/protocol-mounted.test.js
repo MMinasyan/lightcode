@@ -42,7 +42,7 @@ mounted('generated SDK round-trips special identity query values over the mounte
   // 0600 mode; these are the record-shape checks it does not duplicate.
   expect(discovery.endpoint).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
   expect(discovery.instance_id).toMatch(/^[0-9a-f]{32}$/);
-  expect(discovery.protocol_version).toBe('6');
+  expect(discovery.protocol_version).toBe('8');
   // The credential is validated without an assertion diff: a mismatch must
   // never print the value this check exists to protect.
   if (typeof discovery.credential !== 'string' || !/^[0-9a-f]{64}$/.test(discovery.credential)) {
@@ -52,7 +52,7 @@ mounted('generated SDK round-trips special identity query values over the mounte
   const client = createClient({ baseUrl: discovery.endpoint, auth: discovery.credential });
   const health = await getHealth({ client });
   expect(health.error).toBeUndefined();
-  expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '6' });
+  expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '8' });
 
   // The open warning source crosses the generated TypeScript boundary: the
   // mounted owner's real Runtime-scoped reporter plugin attributes its report
@@ -67,31 +67,47 @@ mounted('generated SDK round-trips special identity query values over the mounte
     message: 'mounted plugin warning',
   });
 
-  // The settings round-trip carries each compiled plugin's own document as
-  // one opaque string: the int64 lexeme never passes through a JS number,
-  // the real tools validator accepts the document, and the read returns the
-  // same values. Whitespace is normalized because the owning writer keeps
-  // its existing pretty-printed raw-root bytes — value fidelity, not a new
-  // byte-formatting contract.
+  // The settings round-trip carries the top-level tools object with an
+  // UNKNOWN exact int64 lexeme never passing through a JS number; known
+  // members remain ordinary valid values. Raw HTTP result/re-read text is
+  // inspected for the exact lexeme because the generated SDK's JSON.parse
+  // necessarily rounds numbers beyond 2^53.
   const canonical = (text) => text.replace(/\s+/g, '');
-  const toolsDocument =
-    '{"command_timeout":60,"max_output_bytes":4096,"read_line_max_chars":3000,"read_max_lines":100,"opaque":9007199254740993}';
+  const toolsDocument = '{"command_timeout":60,"max_output_bytes":4096,"read_line_max_chars":3000,"read_max_lines":100,"opaque":9007199254740993}';
+  const toolsObject = JSON.parse(toolsDocument, (_key, value, context) =>
+    typeof value === 'number' && context !== undefined && typeof context.source === 'string'
+      ? JSON.rawJSON(context.source)
+      : value);
   const initial = await getConfiguration({ client });
   expect(initial.error).toBeUndefined();
-  const written = await updateConfigurationSettings({
-    client,
-    body: { settings: { sessions: initial.data.settings.sessions, plugins: { tools: toolsDocument } } },
-  });
+  const settingsBody = {
+    sessions: initial.data.settings.sessions,
+    tools: toolsObject,
+    jobs: {},
+    compaction: {},
+    plugins: {},
+  };
+  const written = await updateConfigurationSettings({ client, body: { settings: settingsBody } });
   expect(written.error).toBeUndefined();
-  const writtenDocument = written.data?.result.plugins.tools;
-  expect(writtenDocument).toBeTypeOf('string');
-  expect(canonical(writtenDocument)).toBe(canonical(toolsDocument));
-  const reread = await getConfiguration({ client });
-  expect(reread.error).toBeUndefined();
-  const rereadDocument = reread.data?.settings.plugins.tools;
-  expect(rereadDocument).toBeTypeOf('string');
-  expect(rereadDocument).toContain('9007199254740993');
-  expect(canonical(rereadDocument)).toBe(canonical(toolsDocument));
+  expect(written.data?.result.tools.max_output_bytes).toBe(4096);
+  expect(written.data?.result.tools.command_timeout).toBe(60);
+
+  // Raw result and re-read text keep the unknown lexeme exact.
+  const authHeaders = { Authorization: `Bearer ${discovery.credential}` };
+  const rawPut = await fetch(`${discovery.endpoint}/v1/configuration/settings`, {
+    method: 'PUT',
+    headers: { ...authHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ settings: settingsBody }),
+  });
+  expect(rawPut.status).toBe(200);
+  const rawResultText = await rawPut.text();
+  expect(canonical(rawResultText)).toContain('"opaque":9007199254740993');
+  expect(canonical(rawResultText)).toContain('"max_output_bytes":4096');
+  const rawRead = await fetch(`${discovery.endpoint}/v1/configuration`, { headers: authHeaders });
+  expect(rawRead.status).toBe(200);
+  const rawReadText = await rawRead.text();
+  expect(canonical(rawReadText)).toContain('"opaque":9007199254740993');
+  expect(canonical(rawReadText)).toContain('"max_output_bytes":4096');
 
   const window = 4096;
   for (const id of ['.', '..', '?', '#', '%']) {

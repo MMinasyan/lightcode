@@ -176,15 +176,11 @@ func TestCompositionRejectsInvalidDeclarations(t *testing.T) {
 		}},
 		{"export ID collision across plugins", []Plugin{declares("a", ScopeRuntime, "dup"), declares("b", ScopeRuntime, "dup")}},
 		{"export ID collision within one plugin", []Plugin{declares("a", ScopeRuntime, "dup", "dup")}},
-		{"ordinary export collides with Core storage export", []Plugin{
+		{"export ID collision across declaration types", []Plugin{
 			provides("a", ScopeRuntime, Spec[harness.Storage]("core")),
 			declares("b", ScopeRuntime, "core"),
 		}},
 		{"missing binding", []Plugin{requires("a", ScopeRuntime, Spec[greeter]("nobody"))}},
-		{"dependency on Core storage export by ID", []Plugin{
-			provides("a", ScopeRuntime, Spec[harness.Storage]("core")),
-			requires("b", ScopeRuntime, Spec[harness.Storage]("core")),
-		}},
 		{"provider type not assignable to requested type", []Plugin{
 			provides("a", ScopeRuntime, Spec[greeter]("g")),
 			requires("b", ScopeRuntime, Spec[loudGreeter]("g")),
@@ -244,7 +240,7 @@ func TestCompositionAcceptsLongLivedHookDeclarations(t *testing.T) {
 			testassert.Require(t, got == 1, "%s plan holds %d plugins, want 1", kind, got)
 		}
 	}
-	ids := append([]string(nil), c.capabilityIDs...)
+	ids := append([]string(nil), c.capabilityIDs[len(standardToolSpecs()):]...)
 	slices.Sort(ids)
 	{
 		want := []string{"ag.byvalue", "ag.g", "hook.iface", "hook.ptr", "hook.value", "op.g"}
@@ -451,41 +447,30 @@ func TestScopeConstructionFailuresRollBackWithoutPublishing(t *testing.T) {
 	}
 }
 
-func TestScopeAcceptsZeroTypedAndCoreSeamValues(t *testing.T) {
+// TestScopeAcceptsZeroTypedValues proves the uniform export rule: every
+// declared value, whatever its type, is an ordinary capability with an
+// ordinary binding and an ordinary selectable ID — the composition recognizes
+// no storage or job-stopper seam.
+func TestScopeAcceptsZeroTypedValues(t *testing.T) {
 	c := mustComposition(t,
 		Plugin{ID: "ok", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("ok.n"), Spec[counted]("ok.c"), Spec[harness.Storage]("ok.store"), Spec[harness.JobStopper]("ok.stop")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"ok.n": 0, "ok.c": (*counterService)(nil), "ok.store": stubCoreStorage{}, "ok.stop": (*stubStopper)(nil)}}, nil
 		}},
 	)
-	testassert.Require(t, len(c.capabilityIDs) == 2 && c.capabilityIDs[0] == "ok.n" && c.capabilityIDs[1] == "ok.c" && len(c.coreExports) == 1 && c.coreExports[0].id == "ok.store" && c.coreExports[0].plugin == "ok" && c.coreExports[0].scope == ScopeRuntime && len(c.jobStoppers) == 1 && c.jobStoppers[0].id == "ok.stop" && c.jobStoppers[0].plugin == "ok" && c.jobStoppers[0].scope == ScopeRuntime, "capability universe = %q, want the ordinary IDs without the Core seam exports; Core storage declarations = %+v, want the one Runtime export; job-stop declarations = %+v, want the one Runtime export", c.capabilityIDs, c.coreExports, c.jobStoppers)
+	ids := append([]string(nil), c.capabilityIDs[len(standardToolSpecs()):]...)
+	slices.Sort(ids)
+	testassert.Require(t, slices.Equal(ids, []string{"ok.c", "ok.n", "ok.stop", "ok.store"}), "capability universe past the standard-tool prefix = %q, want every declared export", ids)
 	sc := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
 	{
-		_, ok := sc.storages["ok.store"].(stubCoreStorage)
-		testassert.Require(t, ok, "Core storage resolution = %#v, want the supplied stub", sc.storages)
+		_, ok := sc.bindings.entries["ok.store"].value.(stubCoreStorage)
+		testassert.Require(t, ok, "storage export resolution = %#v, want the supplied value in the ordinary bindings", sc.bindings.entries)
 	}
 	{
-		_, ok := sc.jobStoppers["ok.stop"]
-		testassert.Require(t, ok, "job-stop resolution = %#v, want the supplied value", sc.jobStoppers)
+		testassert.Require(t, sc.bindings.entries["ok.stop"].value != nil, "job-stopper export resolution = %#v, want the supplied value in the ordinary bindings", sc.bindings.entries)
 	}
 	{
-		_, leaked := sc.bindings.entries["ok.store"]
-		testassert.Require(t, !leaked, "Core storage export leaked into ordinary bindings")
-	}
-	{
-		_, leaked := sc.bindings.entries["ok.stop"]
-		testassert.Require(t, !leaked, "job-stop export leaked into ordinary bindings")
-	}
-	{
-		_, err := selectCapabilities([]*scope{sc}, []string{"ok.store"})
-		testassert.Check(t, errors.Is(err, ErrComposition), "selecting the Core storage export: %v, want ErrComposition", err)
-	}
-	{
-		_, err := selectCapabilities([]*scope{sc}, []string{"ok.stop"})
-		testassert.Check(t, errors.Is(err, ErrComposition), "selecting the job-stop export: %v, want ErrComposition", err)
-	}
-	{
-		_, err := selectCapabilities([]*scope{sc}, []string{"ok.n", "ok.c"})
-		testassert.Check(t, err == nil, "selecting ordinary exports: %v", err)
+		_, err := selectCapabilities([]*scope{sc}, []string{"ok.n", "ok.c", "ok.store", "ok.stop"})
+		testassert.Check(t, err == nil, "selecting every export: %v", err)
 	}
 }
 
@@ -1097,8 +1082,8 @@ func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
 		name    string
 		plugins []Plugin
 	}{
-		{"Spec[Tool] provides", []Plugin{{ID: "tools", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[Tool]("tool.x")}, Open: noop}}},
-		{"ToolSpec with a nil function", []Plugin{{ID: "tools", Scope: ScopeRuntime, Provides: []CapabilitySpec{ToolSpec("tool.x", nil)}, Open: noop}}},
+		{"Spec[Tool] provides", []Plugin{{ID: "toolprov", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[Tool]("tool.x")}, Open: noop}}},
+		{"ToolSpec with a nil function", []Plugin{{ID: "toolprov", Scope: ScopeRuntime, Provides: []CapabilitySpec{ToolSpec("tool.x", nil)}, Open: noop}}},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			{
@@ -1118,7 +1103,7 @@ func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
 			}
 			return Instance{Values: map[string]any{"consumer.greet": loudGreeter{word: "hi"}}}, nil
 		}}
-	provider := Plugin{ID: "tools", Scope: ScopeRuntime,
+	provider := Plugin{ID: "toolprov", Scope: ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("tool.x", staticToolDescription("tool.x"))}, Open: noop}
 	{
 		_, err := newComposition([]Plugin{provider, consumer})
@@ -1127,8 +1112,8 @@ func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
 }
 
 // TestToolDeclarationsComposeAtAllScopes proves a tool provider may use any
-// of the four scopes and its declaration ID joins the tool universe in
-// registration order without running any factory.
+// of the four scopes and its declaration ID joins the tool universe after the
+// baseline standard tools, without running any factory.
 func TestToolDeclarationsComposeAtAllScopes(t *testing.T) {
 	describe := func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{}, nil
@@ -1156,10 +1141,15 @@ func TestToolDeclarationsComposeAtAllScopes(t *testing.T) {
 			testassert.Require(t, got == 1, "%s plan holds %d plugins, want 1", kind, got)
 		}
 	}
+	baselineIDs := make([]string, 0, len(standardToolSpecs()))
+	for _, spec := range standardToolSpecs() {
+		baselineIDs = append(baselineIDs, spec.id)
+	}
+	testassert.Require(t, slices.Equal(c.toolIDs[:len(baselineIDs)], baselineIDs), "tool universe prefix = %v, want the baseline standard tools first", c.toolIDs)
 	slices.Sort(wantIDs)
-	gotIDs := append([]string(nil), c.toolIDs...)
+	gotIDs := append([]string(nil), c.toolIDs[len(baselineIDs):]...)
 	slices.Sort(gotIDs)
-	testassert.Require(t, slices.Equal(gotIDs, wantIDs), "tool universe = %v, want every declared tool ID %v", gotIDs, wantIDs)
+	testassert.Require(t, slices.Equal(gotIDs, wantIDs), "declared tool universe = %v, want every declared tool ID %v", gotIDs, wantIDs)
 	testassert.Equal(t, opened, 0)
 }
 
@@ -1174,7 +1164,7 @@ func TestToolSpecDescribeValidatesAndCopies(t *testing.T) {
 	source := model.ToolDefinition{Name: "tool.x", Description: "reads", Parameters: json.RawMessage(`{"a":1}`)}
 	describe := func(invocation Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 		gotInvocation, gotConstraints = invocation, constraints
-		return ToolDescription{Definition: source, Available: true, DefaultHidden: true}, nil
+		return ToolDescription{Definition: source, Available: true}, nil
 	}
 	spec := ToolSpec("tool.x", describe)
 
@@ -1185,7 +1175,7 @@ func TestToolSpecDescribeValidatesAndCopies(t *testing.T) {
 	if gotInvocation.Revision() != wantInvocation.Revision() || gotConstraints != wantConstraints {
 		t.Fatalf("describe inputs = (%q, %+v), want the supplied invocation and constraints echoed", gotInvocation.Revision(), gotConstraints)
 	}
-	testassert.Require(t, description.Available && description.DefaultHidden && description.Definition.Description == "reads" && description.Definition.Name == "tool.x", "description = %+v, want the flags and validated definition passed through", description)
+	testassert.Require(t, description.Available && description.Definition.Description == "reads" && description.Definition.Name == "tool.x", "description = %+v, want the availability and validated definition passed through", description)
 	// The returned definition is an owned copy in both directions.
 	source.Parameters = json.RawMessage(`{"a":2}`)
 	testassert.Require(t, string(description.Definition.Parameters) == `{"a":1}`, "returned parameters = %s, want the copied bytes", description.Definition.Parameters)

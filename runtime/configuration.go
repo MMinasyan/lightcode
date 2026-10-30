@@ -16,6 +16,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -35,6 +36,10 @@ type configuration struct {
 	definitions          []agents.Resolved
 	agentWarnings        []agents.Warning
 	sessions             config.SessionConfig
+	tools                json.RawMessage
+	jobs                 json.RawMessage
+	compaction           json.RawMessage
+	compactionValues     compactionSettings
 	plugins              map[string]json.RawMessage
 	userProviders        map[string]any
 	permissions          json.RawMessage
@@ -42,21 +47,24 @@ type configuration struct {
 }
 
 // capturedConfigDocument is the private single-pass decode of one captured
-// main configuration document: only the catalog, sessions, and plugin
-// sections are consumed while the raw permissions member is captured
-// unchanged for policy resolution, numbers stay exact through the UseNumber
-// decoder, and no legacy whole-document shape or permission rule is
-// enforced.
+// main configuration document: the catalog, sessions, the top-level baseline
+// tools/jobs/compaction objects, and the plugin sections are consumed while
+// the raw permissions member is captured unchanged for policy resolution,
+// numbers stay exact through the UseNumber decoder, and no legacy
+// whole-document shape or permission rule is enforced.
 type capturedConfigDocument struct {
 	Providers   map[string]any             `json:"providers"`
 	Sessions    json.RawMessage            `json:"sessions"`
+	Tools       json.RawMessage            `json:"tools"`
+	Jobs        json.RawMessage            `json:"jobs"`
+	Compaction  json.RawMessage            `json:"compaction"`
 	Plugins     map[string]json.RawMessage `json:"plugins"`
 	Permissions json.RawMessage            `json:"permissions"`
 }
 
 // decodeCapturedConfig decodes one captured main configuration document in a
-// single pass: only the catalog, sessions, and plugin sections are consumed,
-// numbers stay exact through the UseNumber decoder, and no legacy
+// single pass: the catalog, sessions, baseline and plugin sections are
+// consumed, numbers stay exact through the UseNumber decoder, and no legacy
 // whole-document shape or permission rule is enforced.
 func decodeCapturedConfig(configData []byte) (capturedConfigDocument, error) {
 	var doc capturedConfigDocument
@@ -90,6 +98,16 @@ func newConfiguration(generation uint64, doc capturedConfigDocument, built catal
 	if err != nil {
 		return nil, fmt.Errorf("captured configuration sessions: %w", err)
 	}
+	if err := validateBaselineSection("tools", doc.Tools, validateToolsSettings); err != nil {
+		return nil, fmt.Errorf("captured configuration tools: %w", err)
+	}
+	if err := validateBaselineSection("jobs", doc.Jobs, jobs.ValidateSettings); err != nil {
+		return nil, fmt.Errorf("captured configuration jobs: %w", err)
+	}
+	compaction, err := parseCompactionSettings(doc.Compaction)
+	if err != nil {
+		return nil, fmt.Errorf("captured configuration compaction: %w", err)
+	}
 	definitions, err := agents.ParseWithCapabilities(agentsData, capabilityIDs, toolIDs, defaultCapabilityIDs)
 	if err != nil {
 		return nil, fmt.Errorf("decode captured agent definitions: %w", err)
@@ -101,6 +119,10 @@ func newConfiguration(generation uint64, doc capturedConfigDocument, built catal
 		definitions:          definitions.All(),
 		agentWarnings:        definitions.Warnings(),
 		sessions:             sessions,
+		tools:                doc.Tools,
+		jobs:                 doc.Jobs,
+		compaction:           doc.Compaction,
+		compactionValues:     compaction,
 		plugins:              doc.Plugins,
 		userProviders:        doc.Providers,
 		permissions:          doc.Permissions,
@@ -109,25 +131,41 @@ func newConfiguration(generation uint64, doc capturedConfigDocument, built catal
 }
 
 // projectSettings projects one captured revision's settings view: the parsed
-// session policy beside every owned raw plugin section as its opaque JSON
-// document string. This is a lossless transport projection, not an
-// interpreted settings authority — each document is returned as captured and
-// the selected declaration's validator owns interpretation. An owned empty
-// object is an empty document, absent sections are absent map members, and
-// unowned numbers survive as their exact lexemes inside the strings.
-func projectSettings(sessions config.SessionConfig, plugins map[string]json.RawMessage) protocol.Settings {
+// session policy beside the top-level baseline sections and every owned raw
+// plugin section. The baseline sections are copied as their exact captured
+// JSON objects, with an absent section projected as the empty object so its
+// owning service applies its defaults at consumption. Every plugin section is
+// an opaque JSON document string. This is a lossless transport projection, not
+// an interpreted settings authority — each section is returned as captured
+// and the owning declaration's validator owns interpretation. An owned empty
+// object is an empty document, absent plugin sections are absent map members,
+// and unowned numbers survive as their exact lexemes inside the copied bytes.
+func projectSettings(sessions config.SessionConfig, tools, jobs, compaction json.RawMessage, plugins map[string]json.RawMessage) protocol.Settings {
 	out := protocol.Settings{
 		Sessions: protocol.SessionsSettings{
 			AutoArchive:            sessions.AutoArchive,
 			ArchiveAfterDays:       sessions.ArchiveAfterDays,
 			DeleteAfterArchiveDays: sessions.DeleteAfterArchiveDays,
 		},
-		Plugins: make(protocol.PluginsSettings, len(plugins)),
+		Tools:      projectSettingsObject(tools),
+		Jobs:       projectSettingsObject(jobs),
+		Compaction: projectSettingsObject(compaction),
+		Plugins:    make(protocol.PluginsSettings, len(plugins)),
 	}
 	for id, raw := range plugins {
 		out.Plugins[id] = string(raw)
 	}
 	return out
+}
+
+// projectSettingsObject returns one owned copy of a top-level baseline
+// section; an absent section is the empty object its consuming service
+// defaults from.
+func projectSettingsObject(raw json.RawMessage) json.RawMessage {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return json.RawMessage("{}")
+	}
+	return append(json.RawMessage(nil), raw...)
 }
 
 // permissionPolicy resolves this revision's automatic policy for one

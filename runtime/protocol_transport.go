@@ -83,6 +83,11 @@ type enumValue interface {
 
 var contentPartType = reflect.TypeOf(protocol.ContentPart{})
 
+// rawMessageType is the one generated alias whose bytes are the opaque JSON
+// value itself: the schema still requires an object, but the transport must
+// never re-interpret or renumber its members.
+var rawMessageType = reflect.TypeOf(json.RawMessage(nil))
+
 // validateDecodedValue checks the decoded request value against its raw JSON
 // bytes: every required member (no omitempty tag) is present, every present
 // declared member is non-null (no request member is nullable), every
@@ -97,6 +102,8 @@ func validateDecodedValue(raw []byte, v reflect.Value, path string) error {
 	}
 	t := v.Type()
 	switch {
+	case t == rawMessageType:
+		return nil
 	case t == contentPartType:
 		return validateContentPart(raw, v.Interface().(protocol.ContentPart), path)
 	case t.Kind() == reflect.String:
@@ -158,6 +165,7 @@ func validateStructMembers(raw []byte, v reflect.Value, path string) error {
 		return invalidRequest("%s must be a JSON object: %v", path, err)
 	}
 	t := v.Type()
+	settingsType := reflect.TypeOf(protocol.Settings{})
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		if !field.IsExported() || field.Tag.Get("json") == "" || field.Tag.Get("json") == "-" {
@@ -175,6 +183,14 @@ func validateStructMembers(raw []byte, v reflect.Value, path string) error {
 		}
 		if isJSONNull(member) {
 			return invalidRequest("%s member %q must not be null", path, name)
+		}
+		// The three generated settings section aliases are raw messages, but
+		// their schema type is an object. The boundary enforces only that
+		// shape; every consumed member stays the candidate's validation.
+		if t == settingsType && field.Type == rawMessageType {
+			if err := requireSettingsObject(name, member); err != nil {
+				return invalidRequest("%s member %q: %v", path, name, err)
+			}
 		}
 		if err := validateDecodedValue(member, v.Field(i), path+"."+name); err != nil {
 			return err

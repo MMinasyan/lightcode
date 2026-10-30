@@ -137,15 +137,14 @@ func TestGeneratedScopeEventRoundTripsBothKinds(t *testing.T) {
 	}
 }
 
-// TestRevertDefaultsShareTheCodeRevertErrorContract keeps the two revert
-// default responses on one shared union contract: both wire cases (a plain
-// schema error and the partial result carrying its error) stay accepted,
-// and a body matching neither branch stays rejected.
+// TestRevertDefaultsShareTheCodeRevertErrorContract keeps the revert default
+// response on its shared union contract: both wire cases (a plain schema
+// error and the partial result carrying its error) stay accepted, and a body
+// matching neither branch stays rejected.
 func TestRevertDefaultsShareTheCodeRevertErrorContract(t *testing.T) {
 	doc := schema(t)
 	for _, row := range []struct{ path string }{
 		{"/v1/sessions/{id}/revert-code"},
-		{"/v1/retained-code-snapshots/revert"},
 	} {
 		item := doc.Paths.Find(row.path)
 		testassert.Require(t, item != nil && item.Post != nil, "%s has no POST operation", row.path)
@@ -308,4 +307,21 @@ func TestGeneratedJSONObjectPreservesNumbersThroughUnionConstructors(t *testing.
 	// value stays byte-exact: the fixture's opaque numbers survive untouched.
 	want := "{\"big\":" + string(members["big"]) + ",\"n\":" + string(members["n"]) + "}"
 	testassert.Require(t, decoded.ToolCalls[0].Metadata != nil && string(*decoded.ToolCalls[0].Metadata) == want, "decoded metadata = %v, want the raw value preserved", decoded.ToolCalls[0].Metadata)
+}
+
+// TestSettingsBaselineSectionsStayRawObjects keeps the top-level tools, jobs
+// and compaction members schema-defined JSON objects generated as the raw
+// message alias: an inline structured type would renumber or reinterpret
+// their members, while a plugin-document string would change the transport
+// shape.
+func TestSettingsBaselineSectionsStayRawObjects(t *testing.T) {
+	settings := componentSchema(t, "Settings")
+	for _, name := range []string{"tools", "jobs", "compaction"} {
+		property, ok := settings.Properties[name]
+		testassert.Require(t, ok && property.Ref == "#/components/schemas/"+strings.ToUpper(name[:1])+name[1:]+"Settings", "Settings.%s = %+v, want its named object component", name, property)
+		component := componentSchema(t, strings.ToUpper(name[:1])+name[1:]+"Settings")
+		testassert.Require(t, component.Type != nil && component.Type.Is("object"), "%sSettings type = %v, want object", name, component.Type)
+		testassert.Require(t, component.Extensions["x-go-type"] == "json.RawMessage", "%sSettings x-go-type = %v, want json.RawMessage", name, component.Extensions["x-go-type"])
+		testassert.Require(t, component.AdditionalProperties.Has != nil && *component.AdditionalProperties.Has, "%sSettings must accept raw members", name)
+	}
 }

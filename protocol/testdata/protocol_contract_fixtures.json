@@ -250,7 +250,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"settings\":{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}},\"agents\":[],\"providers\":[]}"
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"settings\":{\"tools\":{},\"jobs\":{},\"compaction\":{},\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}},\"agents\":[],\"providers\":[]}"
     }
    ],
    "reject": []
@@ -595,7 +595,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"6\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"8\"}"
     }
    ],
    "reject": [
@@ -605,16 +605,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"6\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"8\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"6\"}"
+     "json": "{\"protocol_version\":\"8\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"6\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"8\",\"extra\":true}"
     }
    ]
   },
@@ -1247,55 +1247,6 @@
    ]
   },
   {
-   "schema": "RetainedRevertRequest",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"workspace\":\"fixture\",\"session_id\":\"01234567\",\"after_turn\":0}"
-    },
-    {
-     "name": "after-zero",
-     "json": "{\"workspace\":\"/workspace\",\"session_id\":\"01234567\",\"after_turn\":0}"
-    },
-    {
-     "name": "after-negative",
-     "json": "{\"workspace\":\"/workspace\",\"session_id\":\"01234567\",\"after_turn\":-1}"
-    }
-   ],
-   "reject": [
-    {
-     "name": "missing-workspace",
-     "json": "{\"session_id\":\"01234567\",\"after_turn\":0}"
-    }
-   ]
-  },
-  {
-   "schema": "RetainedTurn",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"turn\":1,\"files\":[]}"
-    }
-   ],
-   "reject": [
-    {
-     "name": "zero-turn",
-     "json": "{\"turn\":0,\"files\":[]}",
-     "typescript": false
-    }
-   ]
-  },
-  {
-   "schema": "RetainedTurns",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"turns\":[]}"
-    }
-   ],
-   "reject": []
-  },
-  {
    "schema": "RevertCodeRequest",
    "accept": [
     {
@@ -1603,6 +1554,91 @@
    "reject": []
   },
   {
+   "schema": "ToolsSettings",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "raw-numbers",
+     "json": "{\"read_max_lines\":9007199254740993,\"unknown\":{\"deep\":[1,2]}}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "null-literal",
+     "json": "null"
+    },
+    {
+     "name": "array",
+     "json": "[]"
+    },
+    {
+     "name": "scalar",
+     "json": "7"
+    }
+   ]
+  },
+  {
+   "schema": "JobsSettings",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "raw-numbers",
+     "json": "{\"max_output_bytes\":9007199254740993}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "null-literal",
+     "json": "null"
+    },
+    {
+     "name": "array",
+     "json": "[]"
+    },
+    {
+     "name": "scalar",
+     "json": "7"
+    }
+   ]
+  },
+  {
+   "schema": "CompactionSettings",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{}"
+    },
+    {
+     "name": "configured",
+     "json": "{\"model\":\"prov/m\",\"prompt\":\"exact text\"}"
+    },
+    {
+     "name": "raw-unknown",
+     "json": "{\"custom\":9007199254740993}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "null-literal",
+     "json": "null"
+    },
+    {
+     "name": "array",
+     "json": "[]"
+    },
+    {
+     "name": "scalar",
+     "json": "7"
+    }
+   ]
+  },
+  {
    "schema": "SetAgentTypeModelRequest",
    "accept": [
     {
@@ -1632,17 +1668,34 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}}"
+     "json": "{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"tools\":{},\"jobs\":{},\"compaction\":{},\"plugins\":{}}"
+    },
+    {
+     "name": "baseline-raw",
+     "json": "{\"sessions\":{\"auto_archive\":true,\"archive_after_days\":7,\"delete_after_archive_days\":7},\"tools\":{\"read_max_lines\":9007199254740993},\"jobs\":{\"max_output_bytes\":1024},\"compaction\":{\"model\":\"prov/m\",\"prompt\":\"custom\"},\"plugins\":{\"tasks\":\"{}\"}}"
     }
    ],
-   "reject": []
+   "reject": [
+    {
+     "name": "missing-tools",
+     "json": "{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"jobs\":{},\"compaction\":{},\"plugins\":{}}"
+    },
+    {
+     "name": "tools-null",
+     "json": "{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"tools\":null,\"jobs\":{},\"compaction\":{},\"plugins\":{}}"
+    },
+    {
+     "name": "compaction-string",
+     "json": "{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"tools\":{},\"jobs\":{},\"compaction\":\"{}\",\"plugins\":{}}"
+    }
+   ]
   },
   {
    "schema": "SettingsMutation",
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}}}"
+     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"tools\":{},\"jobs\":{},\"compaction\":{},\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}}}"
     }
    ],
    "reject": []
@@ -1966,7 +2019,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"settings\":{\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}}}"
+     "json": "{\"settings\":{\"tools\":{},\"jobs\":{},\"compaction\":{},\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"plugins\":{}}}"
     }
    ],
    "reject": []
@@ -2271,16 +2324,6 @@
    }
   },
   {
-   "operation_id": "GetRetainedCodeSnapshots",
-   "method": "get",
-   "path": "/v1/retained-code-snapshots",
-   "request": null,
-   "responses": {
-    "200": "RetainedTurns",
-    "default": "Error"
-   }
-  },
-  {
    "operation_id": "GetSessionCodeSnapshots",
    "method": "get",
    "path": "/v1/sessions/{id}/code-snapshots",
@@ -2430,16 +2473,6 @@
    }
   },
   {
-   "operation_id": "RevertRetainedCode",
-   "method": "post",
-   "path": "/v1/retained-code-snapshots/revert",
-   "request": "RetainedRevertRequest",
-   "responses": {
-    "200": "CodeRevertResult",
-    "default": "CodeRevertError"
-   }
-  },
-  {
    "operation_id": "RevertSessionCode",
    "method": "post",
    "path": "/v1/sessions/{id}/revert-code",
@@ -2547,6 +2580,18 @@
   {
    "schema": "AssistantItem",
    "json": "{\"item_id\":\"assistant-item\",\"kind\":\"assistant\",\"committed_at\":\"2026-01-02T03:04:07Z\",\"operation_id\":\"op-1\",\"status\":\"completed\",\"source\":\"prov/m\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"},{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"},{\"kind\":\"opaque\",\"opaque_wire_type\":\"vendor/wire\"}],\"refusal\":\"declined\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"normalized_arguments\":{\"n\":9007199254740993,\"big\":1e1000},\"status\":\"success\",\"content\":\"ok\",\"metadata\":{\"n\":9007199254740993,\"big\":1e1000,\"list\":[null,false,0],\"text\":\"x\"},\"extra\":{\"origin\":\"provider\"}}],\"extra\":{\"reasoning\":\"completed\"}}"
+  },
+  {
+   "schema": "ToolsSettings",
+   "json": "{\"n\":9007199254740993,\"big\":1e1000}"
+  },
+  {
+   "schema": "JobsSettings",
+   "json": "{\"n\":9007199254740993,\"big\":1e1000}"
+  },
+  {
+   "schema": "CompactionSettings",
+   "json": "{\"n\":9007199254740993,\"big\":1e1000}"
   }
  ]
 }

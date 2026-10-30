@@ -34,7 +34,7 @@ func (r *Runtime) getConfiguration(ctx context.Context) (protocol.ConfigurationV
 	}
 	return protocol.ConfigurationView{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Settings:              projectSettings(captured.snapshot.sessions, captured.snapshot.plugins),
+		Settings:              projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.plugins),
 		Agents:                projectAgents(captured.snapshot),
 		Providers:             projectProviders(captured),
 	}, nil
@@ -173,7 +173,7 @@ func (r *Runtime) updateSettings(ctx context.Context, settings protocol.Settings
 	}
 	return protocol.SettingsMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                projectSettings(captured.snapshot.sessions, captured.snapshot.plugins),
+		Result:                projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.plugins),
 	}, nil
 }
 
@@ -540,7 +540,7 @@ func projectModelListEntry(prov *catalog.Provider, entry *catalog.Model) protoco
 // the existing agentTypes() projection — the one selected-model and
 // write-dir normalization producer admission already uses. Required array
 // members are owned non-nil lists even when the definition carries none, and
-// no private definition field (system prompt, LSP flag) is exposed.
+// no private definition field (system prompt, prompt body) is exposed.
 func projectAgents(captured *configuration) []protocol.Agent {
 	out := make([]protocol.Agent, 0, len(captured.definitions))
 	for _, at := range captured.agentTypes() {

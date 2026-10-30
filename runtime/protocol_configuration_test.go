@@ -50,7 +50,9 @@ const configurationProvidersDocument = `{
     "openrouter": {"transport": {"headers": {"x-title": "user-title", "X-Custom": "keep"}}, "models": {"m": {"context_window": 4096}}}
   },
   "sessions": {"auto_archive": false, "archive_after_days": 3},
-  "plugins": {"tools": {"max_output_bytes": 42}, "jobs": {"max_background_processes": 20}, "tasks": {}}
+  "tools": {"max_output_bytes": 42},
+  "jobs": {"max_background_processes": 20},
+  "plugins": {"tasks": {}}
 }`
 
 // configurationAgentsDocument configures the primary model and one
@@ -66,8 +68,8 @@ const configurationAgentsDocument = `{
 func settingsPlugins() []Plugin {
 	var opens atomic.Int64 // the fixture counters are unread here
 	return []Plugin{
-		servicePlugin("tools", &opens, func(json.RawMessage) error { return nil }),
-		servicePlugin("jobs", &opens, func(json.RawMessage) error { return nil }),
+		servicePlugin("capowner", &opens, func(json.RawMessage) error { return nil }),
+		servicePlugin("jobcap", &opens, func(json.RawMessage) error { return nil }),
 		servicePlugin("tasks", &opens, func(json.RawMessage) error { return nil }),
 		rosterToolPlugin(),
 	}
@@ -292,16 +294,17 @@ func openConfigurationRuntimeWithEnv(t *testing.T, store harness.Storage, e *own
 	t.Helper()
 	writeServiceFile(t, e.configPath, configDoc)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), agentsDoc)
-	r, err := e.open(context.Background(), append([]Plugin{e.storagePlugin(store)}, extra...)...)
+	e.fixtureStore(store)
+	r, err := e.open(context.Background(), extra...)
 	testassert.NoError(t, err)
 	return r, e
 }
 
 // TestConfigurationViewProjectsSettingsAndRoster pins the settings view: the
-// parsed session policy, each owned plugin section returned as its exact
-// opaque document string — no ID-chosen decoder, no injected defaults, an
-// owned empty object as `{}` — absent sections omitted, and the Agent
-// roster's public fields.
+// parsed session policy, the top-level baseline sections as exact objects,
+// each owned plugin section returned as its exact opaque document string —
+// no ID-chosen decoder, no injected defaults, an owned empty object as `{}` —
+// absent sections omitted, and the Agent roster's public fields.
 func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
@@ -311,9 +314,9 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 		testassert.NoError(t, err)
 		sessions := view.Settings.Sessions
 		testassert.Require(t, !sessions.AutoArchive && sessions.ArchiveAfterDays == 3 && sessions.DeleteAfterArchiveDays == 7, "sessions settings = %+v, want the supplied values with the 7-day delete default", sessions)
+		testassert.Require(t, compactJSON(t, view.Settings.Tools) == `{"max_output_bytes":42}`, "tools = %s, want the exact top-level object", view.Settings.Tools)
+		testassert.Require(t, compactJSON(t, view.Settings.Jobs) == `{"max_background_processes":20}`, "jobs = %s, want the exact top-level object", view.Settings.Jobs)
 		wantDocs := map[string]string{
-			"tools": `{"max_output_bytes":42}`,
-			"jobs":  `{"max_background_processes":20}`,
 			"tasks": `{}`,
 		}
 		testassert.Require(t, len(view.Settings.Plugins) == len(wantDocs), "plugins = %v, want exactly the owned sections %v", view.Settings.Plugins, wantDocs)
@@ -333,6 +336,7 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 		absentView, err := absent.getConfiguration(context.Background())
 		testassert.NoError(t, err)
 		testassert.Require(t, len(absentView.Settings.Plugins) == 0, "absent plugin sections projected = %+v, want none", absentView.Settings.Plugins)
+		testassert.Require(t, string(absentView.Settings.Tools) == `{}` && string(absentView.Settings.Jobs) == `{}` && string(absentView.Settings.Compaction) == `{}`, "absent baseline sections = %s/%s/%s, want empty objects", absentView.Settings.Tools, absentView.Settings.Jobs, absentView.Settings.Compaction)
 
 		// The Agent roster: the primary model selection and the worker's
 		// public fields with the trimmed write dir.
@@ -550,7 +554,10 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 		(*model.ExtraBody)["side"] = "mutated"
 		model.InputModalities[0] = "mutated"
 		baseline.Settings.Sessions.ArchiveAfterDays = 999
-		baseline.Settings.Plugins["tools"] = `{"mutated":true}`
+		baseline.Settings.Plugins["tasks"] = `{"mutated":true}`
+		if len(baseline.Settings.Tools) > 0 {
+			baseline.Settings.Tools[0] = 'x'
+		}
 		for i := range baseline.Agents {
 			if baseline.Agents[i].Name == "worker" && len(baseline.Agents[i].Tools) > 0 {
 				baseline.Agents[i].Tools[0] = "mutated"

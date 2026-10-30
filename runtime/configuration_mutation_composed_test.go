@@ -23,16 +23,34 @@ import (
 // in-package fake validators alone do not prove the real limits.
 
 // composedMutationSettings is one complete settings shape the real
-// validators accept: each compiled plugin's section as its opaque document
-// string.
+// validators accept: the top-level tools and jobs objects beside no optional
+// plugin documents.
 func composedMutationSettings() protocol.Settings {
 	return protocol.Settings{
-		Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 14, DeleteAfterArchiveDays: 3},
-		Plugins: protocol.PluginsSettings{
-			"tools": `{"command_timeout":90,"max_output_bytes":4096,"read_line_max_chars":4000,"read_max_lines":200}`,
-			"jobs":  `{"max_background_processes":5,"max_output_bytes":8192,"read_line_max_chars":4000}`,
-		},
+		Sessions:   protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 14, DeleteAfterArchiveDays: 3},
+		Tools:      json.RawMessage(`{"command_timeout":90,"max_output_bytes":4096,"read_line_max_chars":4000,"read_max_lines":200}`),
+		Jobs:       json.RawMessage(`{"max_background_processes":5,"max_output_bytes":8192,"read_line_max_chars":4000}`),
+		Compaction: json.RawMessage(`{}`),
+		Plugins:    protocol.PluginsSettings{},
 	}
+}
+
+// mutationEnv is this suite's own isolated composition environment: a
+// throwaway home and one config file over a dedicated data root. The
+// in-package suite keeps its copy because internal/plugins/* cannot be
+// imported from package runtime's own tests.
+type mutationEnv struct {
+	dataDir    string
+	configPath string
+}
+
+func newMutationEnv(t *testing.T) mutationEnv {
+	t.Helper()
+	home, dataDir, configDir := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	configPath := filepath.Join(configDir, "config.json")
+	testassert.NoError(t, os.WriteFile(configPath, []byte(`{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`), 0o600))
+	return mutationEnv{dataDir: dataDir, configPath: configPath}
 }
 
 // TestComposedSettingsMutationThroughRealValidators proves the settings PUT
@@ -42,7 +60,7 @@ func composedMutationSettings() protocol.Settings {
 // tools validator rejects changes no file, generation, warning, or event.
 func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	ctx := context.Background()
-	e := newComposeEnv(t)
+	e := newMutationEnv(t)
 	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
 	testassert.NoError(t, err)
 	sub, err := r.Subscribe(8)
@@ -56,19 +74,17 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	// The valid write: the real validators accept the marshaled sections.
 	mutation, err := runtime.UpdateSettingsForTest(r, composedMutationSettings())
 	testassert.NoError(t, err)
-	testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Sessions.ArchiveAfterDays == 14 && compactComposed(t, []byte(mutation.Result.Plugins["jobs"])) == compactComposed(t, []byte(composedMutationSettings().Plugins["jobs"])), "mutation revision = %+v, want generation 2; mutation result = %+v, want the written shape", mutation.ConfigurationRevision, mutation.Result)
+	testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Sessions.ArchiveAfterDays == 14 && compactComposed(t, mutation.Result.Tools) == compactComposed(t, composedMutationSettings().Tools) && compactComposed(t, mutation.Result.Jobs) == compactComposed(t, composedMutationSettings().Jobs), "mutation revision = %+v, want generation 2; mutation result = %+v, want the written shape", mutation.ConfigurationRevision, mutation.Result)
 	data, err := os.ReadFile(e.configPath)
 	testassert.NoError(t, err)
 	var root struct {
-		Plugins struct {
-			Tools json.RawMessage `json:"tools"`
-		} `json:"plugins"`
+		Tools    json.RawMessage `json:"tools"`
 		Sessions json.RawMessage `json:"sessions"`
 	}
 	testassert.NoError(t, json.Unmarshal(data, &root))
 	{
-		got := compactComposed(t, root.Plugins.Tools)
-		testassert.Require(t, strings.Contains(got, `"max_output_bytes":4096`), "plugins.tools member = %s, want the written section", got)
+		got := compactComposed(t, root.Tools)
+		testassert.Require(t, strings.Contains(got, `"max_output_bytes":4096`), "tools member = %s, want the written section", got)
 	}
 	if event, ok := nextComposedEvent(t, sub); !ok || composedEventKind(t, event) != "configuration_changed" || composedEventGeneration(t, event) != "2" {
 		t.Fatalf("event = %s (ok=%v), want the generation 2 configuration event", composedEventJSON(event), ok)
@@ -82,7 +98,7 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	warnings, err := runtime.GetWarningsForTest(r)
 	testassert.NoError(t, err)
 	rejected := composedMutationSettings()
-	rejected.Plugins["tools"] = `{"command_timeout":0,"max_output_bytes":0,"read_line_max_chars":0,"read_max_lines":0}`
+	rejected.Tools = json.RawMessage(`{"command_timeout":0,"max_output_bytes":0,"read_line_max_chars":0,"read_max_lines":0}`)
 	{
 		mutation, err := runtime.UpdateSettingsForTest(r, rejected)
 		testassert.Require(t, err != nil, "rejected mutation = %+v, want the real tools validator's failure", mutation)
@@ -108,7 +124,7 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 // while an unknown type fails invalid without creating a bare entry.
 func TestComposedAgentModelMutationThroughRealRoster(t *testing.T) {
 	ctx := context.Background()
-	e := newComposeEnv(t)
+	e := newMutationEnv(t)
 	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
 	testassert.NoError(t, err)
 	agentsPath := filepath.Join(filepath.Dir(e.configPath), "agents.json")

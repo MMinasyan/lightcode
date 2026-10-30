@@ -66,14 +66,27 @@ func agentsWithCompact(overlay string) string {
 	return strings.TrimSuffix(prepAgentsDocument, "}") + ",\n  \"compact\": " + overlay + "}"
 }
 
+// compactPrepConfigDocumentWith appends one top-level compaction section to
+// the compact fixture document.
+func compactPrepConfigDocumentWith(endpoint, compaction string) string {
+	return strings.TrimSuffix(compactPrepConfigDocument(endpoint), "}") + `,"compaction":` + compaction + `}`
+}
+
 // compactPrep wires one concrete preparation (nil controlled prepare) over
 // the compact fixture documents, publishes the configuration once, and
 // returns that publication's own snapshot+credential capture.
 func compactPrep(t *testing.T, agentsDoc, endpoint string) (configurationCapture, *preparation) {
 	t.Helper()
+	return compactPrepWith(t, agentsDoc, compactPrepConfigDocument(endpoint), endpoint)
+}
+
+// compactPrepWith publishes the exact config document together with the
+// agents document and returns that publication's own capture.
+func compactPrepWith(t *testing.T, agentsDoc, configDoc, endpoint string) (configurationCapture, *preparation) {
+	t.Helper()
 	sh := newServiceHarness(t)
 	t.Setenv("PREP_COMPACT_KEY", "compact-secret")
-	writeServiceFile(t, sh.configPath, compactPrepConfigDocument(endpoint))
+	writeServiceFile(t, sh.configPath, configDoc)
 	writeServiceFile(t, agents.PathForConfig(sh.configPath), agentsDoc)
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -84,12 +97,12 @@ func compactPrep(t *testing.T, agentsDoc, endpoint string) (configurationCapture
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs)
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, nil, nil, nil)
+	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, "", "", nil, nil, nil, nil)
 }
 
 func compactToolsPlugin() Plugin {
 	return Plugin{
-		ID:       "tools",
+		ID:       "compacttools",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("echo", staticToolDescription("echo")), ToolSpec("read", staticToolDescription("read"))},
 		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
@@ -139,9 +152,9 @@ func testToolDefinitionRuntime() model.ToolDefinition {
 
 // TestConcretePrepareCompactCapture pins every capture field the compaction
 // configuration must carry from one revision: the conversation window, the
-// output reserve with the 131072 fallback, the compact selection with the
-// conversation-model default, the compact prompt equal to the resolved
-// compact type's Prompt, and the captured pricing of the final effective
+// output reserve with the 131072 fallback, the compact selection from the
+// top-level compaction section with the conversation-model fallback, the
+// unchanged builtin prompt, and the captured pricing of the final effective
 // conversation and compact models — the conversation model's own rates
 // exactly when the fallback kept that model and its transport, and the
 // fallback candidate's rates never reaching a capture it did not select.
@@ -155,55 +168,65 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 	cases := []struct {
 		name               string
 		agentsDoc          string
+		compaction         string
 		agent              string
 		wantModel          model.ModelRef
 		wantWindow         int
 		wantReserve        int
 		wantCompactRef     model.ModelRef
+		wantCompactPrompt  string
 		wantPricing        *harness.ModelPricing
 		wantCompactPricing *harness.ModelPricing
 	}{
 		{
 			name:               "conversation model with the reserve fallback",
 			agentsDoc:          prepAgentsDocument,
+			compaction:         `{}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
 			wantWindow:         4096,
 			wantReserve:        131072,
 			wantCompactRef:     conversationRef,
+			wantCompactPrompt:  retainedSummarizerPrompt,
 			wantPricing:        mPricing,
 			wantCompactPricing: mPricing,
 		},
 		{
-			name:               "compact model override via the roster",
-			agentsDoc:          agentsWithCompact(`{"model": "prov/m2"}`),
+			name:               "compact model override via settings",
+			agentsDoc:          prepAgentsDocument,
+			compaction:         `{"model":"prov/m2"}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
 			wantWindow:         4096,
 			wantReserve:        131072,
 			wantCompactRef:     m2Ref,
+			wantCompactPrompt:  retainedSummarizerPrompt,
 			wantPricing:        mPricing,
 			wantCompactPricing: m2Pricing,
 		},
 		{
 			name:               "compact model that does not resolve falls back",
-			agentsDoc:          agentsWithCompact(`{"model": "prov/absent"}`),
+			agentsDoc:          prepAgentsDocument,
+			compaction:         `{"model":"prov/absent"}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
 			wantWindow:         4096,
 			wantReserve:        131072,
 			wantCompactRef:     conversationRef,
+			wantCompactPrompt:  retainedSummarizerPrompt,
 			wantPricing:        mPricing,
 			wantCompactPricing: mPricing,
 		},
 		{
 			name:               "compact key that does not resolve falls back",
-			agentsDoc:          agentsWithCompact(`{"model": "p2/m3"}`),
+			agentsDoc:          prepAgentsDocument,
+			compaction:         `{"model":"p2/m3"}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
 			wantWindow:         4096,
 			wantReserve:        131072,
 			wantCompactRef:     conversationRef,
+			wantCompactPrompt:  retainedSummarizerPrompt,
 			wantPricing:        mPricing,
 			wantCompactPricing: mPricing,
 		},
@@ -211,30 +234,34 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 			// catalog.Lookup rejects the zero-window model, so the
 			// conversation-model default applies.
 			name:               "compact entry with no positive window falls back",
-			agentsDoc:          agentsWithCompact(`{"model": "prov/mzero"}`),
+			agentsDoc:          prepAgentsDocument,
+			compaction:         `{"model":"prov/mzero"}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
 			wantWindow:         4096,
 			wantReserve:        131072,
 			wantCompactRef:     conversationRef,
+			wantCompactPrompt:  retainedSummarizerPrompt,
 			wantPricing:        mPricing,
 			wantCompactPricing: mPricing,
 		},
 		{
 			name:               "conversation reserve from the entry's max output tokens",
 			agentsDoc:          strings.TrimSuffix(prepAgentsDocument, "}") + ",\n  \"reservable\": {\"model\": \"prov/m2\", \"system_prompt\": \"simple\", \"tools\": [\"echo\"]}}",
+			compaction:         `{}`,
 			agent:              "reservable",
 			wantModel:          m2Ref,
 			wantWindow:         2048,
 			wantReserve:        1000,
 			wantCompactRef:     m2Ref,
+			wantCompactPrompt:  retainedSummarizerPrompt,
 			wantPricing:        m2Pricing,
 			wantCompactPricing: m2Pricing,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			captured, prep := compactPrep(t, tc.agentsDoc, "https://prov.test/v1")
+			captured, prep := compactPrepWith(t, tc.agentsDoc, compactPrepConfigDocumentWith("https://prov.test/v1", tc.compaction), "https://prov.test/v1")
 			sel := compactPrepSelection(t, captured, tc.agent)
 			capture, opener, err := prep.concretePrepare(context.Background(), compactPrepRequest(), sel)
 			testassert.NoError(t, err)
@@ -246,7 +273,7 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 			if capture.Compact.Model != tc.wantCompactRef {
 				t.Fatalf("capture Compact.Model = %s, want %s", capture.Compact.Model.String(), tc.wantCompactRef.String())
 			}
-			testassert.Equal(t, capture.Compact.SystemPrompt, retainedSummarizerPrompt)
+			testassert.Equal(t, capture.Compact.SystemPrompt, tc.wantCompactPrompt)
 			testassert.Require(t, capture.Pricing.Equal(tc.wantPricing), "capture pricing = %+v, want the conversation entry's catalog rates", capture.Pricing)
 			testassert.Require(t, capture.Compact.Pricing.Equal(tc.wantCompactPricing), "capture compact pricing = %+v, want the final effective compact model's catalog rates", capture.Compact.Pricing)
 		})
@@ -310,16 +337,16 @@ func TestConcreteOpenerCompactModel(t *testing.T) {
 	conversationRef := model.ModelRef{Provider: "prov", Model: "m"}
 	cases := []struct {
 		name          string
-		agentsDoc     string
+		compaction    string
 		wantCompactOn string
 	}{
-		{"compact model override", agentsWithCompact(`{"model": "prov/m2"}`), "m2"},
-		{"conversation model default", prepAgentsDocument, "m"},
+		{"compact model override", `{"model":"prov/m2"}`, "m2"},
+		{"conversation model default", `{}`, "m"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			server := newCompactRecordingServer(t)
-			captured, prep := compactPrep(t, tc.agentsDoc, server.URL)
+			captured, prep := compactPrepWith(t, prepAgentsDocument, compactPrepConfigDocumentWith(server.URL, tc.compaction), server.URL)
 			sel := compactPrepSelection(t, captured, "solo")
 			capture, opener, err := prep.concretePrepare(context.Background(), compactPrepRequest(), sel)
 			testassert.NoError(t, err)

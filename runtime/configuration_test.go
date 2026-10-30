@@ -13,6 +13,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 )
 
 const testConfigDocument = `{
@@ -36,7 +37,6 @@ const testAgentsDocument = `{
     "prompt": "plan prompt",
     "tools": ["plan_tool", "plan_tool", "read_file"],
     "capabilities": ["cap-b", "cap-a"],
-    "lsp": false,
     "readonly": true,
     "write_dir": "/tmp/plan",
     "description": "planner",
@@ -83,6 +83,9 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 		modelEntry := provider.Models["m"]
 		testassert.Require(t, modelEntry != nil && modelEntry.ContextWindow == 9007199254740993, "catalog model = %+v, want the exact integer preserved through the decode", modelEntry)
 	}
+	// The legacy compaction member is unowned now: unknown members are
+	// ignored and the absent model/prompt keep their defaults.
+	testassert.Require(t, snapshot.compactionValues.model.IsZero() && snapshot.compactionValues.prompt == prompt.DefaultSummarizerPrompt, "compaction values = %+v, want the absent-section defaults", snapshot.compactionValues)
 	plugin, ok := snapshot.plugins["alpha"]
 	testassert.Require(t, ok, "plugins = %+v, want the alpha entry", snapshot.plugins)
 	var pluginFields map[string]any
@@ -104,7 +107,7 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 		if def.Name != "plan" {
 			continue
 		}
-		testassert.Require(t, !def.LSP && def.Readonly && def.WriteDir == "/tmp/plan" && def.Description == "planner" && def.Subagent && !def.Builtin, "resolved plan lost its retained fields: %+v", def)
+		testassert.Require(t, def.Readonly && def.WriteDir == "/tmp/plan" && def.Description == "planner" && def.Subagent && !def.Builtin, "resolved plan lost its retained fields: %+v", def)
 	}
 	testassert.Require(t, len(snapshot.catalogWarnings) == 0 && len(snapshot.agentWarnings) == 0, "valid input produced warnings: catalog %+v agents %+v", snapshot.catalogWarnings, snapshot.agentWarnings)
 }

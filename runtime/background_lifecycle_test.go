@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -168,6 +170,23 @@ func (s *lifecycleStopper) addDelivery(sessionID, completionID, content string) 
 	defer s.mu.Unlock()
 	s.deliveries = append(s.deliveries, lifecycleDelivery{sessionID: sessionID, completionID: completionID, content: content})
 }
+
+// The remaining jobsService methods are inert for these rows: the stop seam is
+// what they drive.
+func (s *lifecycleStopper) Reserve() (string, error) { return "stubjob1", nil }
+func (s *lifecycleStopper) Abort(string)             {}
+func (s *lifecycleStopper) Start(jobs.StartRequest) error {
+	return errors.New("lifecycle jobs service starts no process")
+}
+func (s *lifecycleStopper) Read(string, string) (string, error) {
+	return "", errors.New("lifecycle jobs service reads nothing")
+}
+func (s *lifecycleStopper) Kill(string, string) error {
+	return errors.New("lifecycle jobs service kills nothing")
+}
+func (s *lifecycleStopper) List(string) string   { return "" }
+func (s *lifecycleStopper) Live(string) []string { return nil }
+func (s *lifecycleStopper) Close() error         { return nil }
 
 func (s *lifecycleStopper) StopJob(sessionID, jobID string) {
 	s.mu.Lock()
@@ -400,16 +419,16 @@ type bgRuntime struct {
 	tools *lifecycleTools
 }
 
-func openBackgroundRuntime(t *testing.T, store harness.Storage, stopper harness.JobStopper) *bgRuntime {
+func openBackgroundRuntime(t *testing.T, store harness.Storage, stopper jobsService) *bgRuntime {
 	t.Helper()
 	e := newOwnerEnv(t)
 	writeServiceFile(t, e.configPath, backgroundLifecycleConfigDocument(e.server.URL))
 	writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
 	hook := &recordHook{name: "hook.first", events: &traceLog{}}
 	tools := &lifecycleTools{}
+	e.fixtureStore(store)
+	e.fixtureJobs(stopper)
 	r, err := e.open(context.Background(),
-		e.storagePlugin(store),
-		jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper),
 		hookPlugin(hook),
 		lifecycleToolsPlugin(tools))
 	testassert.NoError(t, err)

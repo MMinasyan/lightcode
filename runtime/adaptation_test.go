@@ -7,14 +7,16 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 )
 
 // fakeAdaptation is a counting ModelAdaptation: it records every Resolve call
@@ -22,13 +24,15 @@ import (
 type fakeAdaptation struct {
 	calls int
 	ref   model.ModelRef
+	mode  prompt.Mode
 	value Adaptation
 	err   error
 }
 
-func (f *fakeAdaptation) Resolve(ref model.ModelRef) (Adaptation, error) {
+func (f *fakeAdaptation) Resolve(ref model.ModelRef, mode prompt.Mode) (Adaptation, error) {
 	f.calls++
 	f.ref = ref
+	f.mode = mode
 	return f.value, f.err
 }
 
@@ -81,7 +85,7 @@ func TestCompositionSelectsSingleModelAdaptationAndLeavesOtherExportsUnselected(
 		},
 	}})
 	testassert.NoError(t, err)
-	testassert.Require(t, mixed.modelAdaptation == "model_adaptation" && reflect.DeepEqual(mixed.capabilityIDs, []string{"model_adaptation", "extra"}), "got %v, want %v; capability universe = %q, want both exports selectable", mixed.modelAdaptation, "model_adaptation", mixed.capabilityIDs)
+	testassert.Require(t, mixed.modelAdaptation == "model_adaptation" && reflect.DeepEqual(mixed.capabilityIDs[len(standardToolSpecs()):], []string{"model_adaptation", "extra"}), "got %v, want %v; capability universe past the standard-tool prefix = %q, want both exports selectable", mixed.modelAdaptation, "model_adaptation", mixed.capabilityIDs[len(standardToolSpecs()):])
 	{
 		got := defaultCapabilityIDsFor(t, mixed)
 		testassert.Require(t, reflect.DeepEqual(got, []string{"model_adaptation"}), "default capability list for the mixed plugin = %q, want [model_adaptation] only", got)
@@ -136,17 +140,17 @@ func TestConfigurationServiceProjectsDefaultCapabilities(t *testing.T) {
 // Tool-spec fixtures for the composer: ToolSpec records the pure describe
 // function behind the same validation production declarations use.
 
-func staticToolSpec(id, description string, available, hidden bool) CapabilitySpec {
+func staticToolSpec(id, description string, available bool) CapabilitySpec {
 	return ToolSpec(id, func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
-		return toolDescriptionFor(id, description, available, hidden)
+		return toolDescriptionFor(id, description, available)
 	})
 }
 
 // mutationToolSpec mirrors the native mutation-tool descriptions: available
 // unless the hard constraints make it ineligible.
-func mutationToolSpec(id string, hidden bool) CapabilitySpec {
+func mutationToolSpec(id string) CapabilitySpec {
 	return ToolSpec(id, func(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
-		return toolDescriptionFor(id, id+" description", !constraints.Readonly || constraints.WriteDir != "", hidden)
+		return toolDescriptionFor(id, id+" description", !constraints.Readonly || constraints.WriteDir != "")
 	})
 }
 
@@ -161,11 +165,11 @@ func failingToolSpec(id string) CapabilitySpec {
 // availability on the parent lineage.
 func lineageToolSpec(id string) CapabilitySpec {
 	return ToolSpec(id, func(_ Invocation, _ ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
-		return toolDescriptionFor(id, id+" description", identity.ParentSessionID == "", false)
+		return toolDescriptionFor(id, id+" description", identity.ParentSessionID == "")
 	})
 }
 
-func toolDescriptionFor(id, description string, available, hidden bool) (ToolDescription, error) {
+func toolDescriptionFor(id, description string, available bool) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        id,
 		Description: description,
@@ -174,18 +178,19 @@ func toolDescriptionFor(id, description string, available, hidden bool) (ToolDes
 	if err != nil {
 		return ToolDescription{}, err
 	}
-	return ToolDescription{Definition: definition, Available: available, DefaultHidden: hidden}, nil
+	return ToolDescription{Definition: definition, Available: available}, nil
 }
 
 func baseSurfaceRequest(t *testing.T) surfaceRequest {
 	t.Helper()
 	return surfaceRequest{
-		home:       t.TempDir(),
-		workspace:  t.TempDir(),
-		promptSize: prompt.SizeFull,
+		hostIdentity:   "FIXTURE_IDENTITY",
+		globalRulesDir: t.TempDir(),
+		workspace:      t.TempDir(),
+		promptSize:     prompt.ModeFull,
 		toolSpecs: []CapabilitySpec{
-			staticToolSpec("read_file", "read_file description", true, false),
-			staticToolSpec("apply_patch", "apply_patch description", true, true),
+			staticToolSpec("read_file", "read_file description", true),
+			staticToolSpec("apply_patch", "apply_patch description", true),
 		},
 		modelRef: model.ModelRef{Provider: "prov", Model: "m"},
 	}
@@ -194,31 +199,42 @@ func baseSurfaceRequest(t *testing.T) surfaceRequest {
 func TestComposeSurfacePromptSizesSkipRulesUnderNone(t *testing.T) {
 	req := baseSurfaceRequest(t)
 	req.sessionStart = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	for _, size := range []string{prompt.SizeNone, prompt.SizeSimple, prompt.SizeFull} {
+	for _, mode := range []prompt.Mode{prompt.ModeNone, prompt.ModeSimple, prompt.ModeFull} {
 		r := req
-		r.promptSize = size
+		r.promptSize = mode
 		result, _, err := composeSurface(r)
-		testassert.Require(t, err == nil, "composeSurface(%s): %v", size, err)
-		direct := prompt.NewService(req.home).Assemble(req.workspace, req.sessionStart, prompt.Spec{Size: size})
-		testassert.Require(t, result.Prompt == direct.Prompt, "composeSurface(%s) prompt diverged from the direct assembly", size)
-		if size == prompt.SizeNone {
+		testassert.Require(t, err == nil, "composeSurface(%s): %v", mode, err)
+		rules, err := prompt.ReadRules(req.globalRulesDir, req.workspace, mode)
+		testassert.NoError(t, err)
+		direct, err := prompt.Assemble(prompt.AssemblyInput{
+			Identity:      req.hostIdentity,
+			Mode:          mode,
+			Rules:         rules,
+			Workspace:     req.workspace,
+			SessionStart:  req.sessionStart,
+			OS:            goruntime.GOOS,
+			Shell:         captureShell(),
+			OSDescription: captureOSDescription(),
+		})
+		testassert.NoError(t, err)
+		testassert.Require(t, result.Prompt == direct, "composeSurface(%s) prompt diverged from the direct assembly", mode)
+		if mode == prompt.ModeNone {
 			// None skips the rules reads: no warnings even though no rules
-			// file exists under the isolated home.
+			// file exists under the explicit directories.
 			testassert.Require(t, len(result.Warnings) == 0, "none-size warnings = %#v, want none", result.Warnings)
 		} else if len(result.Warnings) != 1 || result.Warnings[0].Kind != prompt.WarnRulesNotFound {
-			t.Fatalf("%s-size warnings = %#v, want the rules_not_found warning", size, result.Warnings)
+			t.Fatalf("%s-size warnings = %#v, want the rules_not_found warning", mode, result.Warnings)
 		}
 	}
 }
 
 func TestComposeSurfaceRulesPrecedenceAndOverrides(t *testing.T) {
-	home := t.TempDir()
-	testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700))
-	testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", "AGENTS.md"), []byte("GLOBAL CONTENT"), 0o600))
+	globalDir := t.TempDir()
+	testassert.NoError(t, os.WriteFile(filepath.Join(globalDir, "AGENTS.md"), []byte("GLOBAL CONTENT"), 0o600))
 	workspace := t.TempDir()
 	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("PROJECT CONTENT"), 0o600))
 	req := baseSurfaceRequest(t)
-	req.home, req.workspace = home, workspace
+	req.globalRulesDir, req.workspace = globalDir, workspace
 	result, _, err := composeSurface(req)
 	testassert.NoError(t, err)
 	testassert.Require(t, strings.Contains(result.Prompt, "GLOBAL CONTENT") && strings.Contains(result.Prompt, "PROJECT CONTENT"), "the composed prompt lost a rules layer")
@@ -232,91 +248,188 @@ func TestComposeSurfaceRulesPrecedenceAndOverrides(t *testing.T) {
 	testassert.Require(t, strings.Contains(result.Prompt, "Project tone rule."), "the overriding project tone rule is missing")
 }
 
-func TestComposeSurfaceBlocksAndAdditionsRender(t *testing.T) {
+func TestComposeSurfaceAppendsParagraphAfterAssembly(t *testing.T) {
+	workspace := t.TempDir()
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("USER_RULES_MARKER"), 0o600))
 	req := baseSurfaceRequest(t)
-	req.promptBody = "Do the task."
-	req.adaptation = &fakeAdaptation{value: Adaptation{
-		Blocks:    []string{"COACHING BLOCK"},
-		Additions: map[string]string{"safety": "ADDITION SAFETY"},
-	}}
+	req.workspace = workspace
+	baseline, _, err := composeSurface(req)
+	testassert.NoError(t, err)
+	req.adaptation = &fakeAdaptation{value: Adaptation{Append: []string{"  APPENDED PARAGRAPH  "}}}
 	result, _, err := composeSurface(req)
 	testassert.NoError(t, err)
-	testassert.Require(t, strings.Contains(result.Prompt, "COACHING BLOCK") && strings.Contains(result.Prompt, "ADDITION SAFETY"), "the adaptation blocks or additions did not render")
-	testassert.Require(t, strings.Index(result.Prompt, "COACHING BLOCK") < strings.Index(result.Prompt, "## Your Role and Instructions"), "coaching blocks did not render before the agent body and rules")
+	testassert.Equal(t, result.Prompt, baseline.Prompt+"\n\n  APPENDED PARAGRAPH  ")
+	for _, retained := range []string{"FIXTURE_IDENTITY", "## Core Rules", "USER_RULES_MARKER", "## Environment"} {
+		testassert.Require(t, strings.Contains(result.Prompt, retained), "the append lost the assembled %q", retained)
+	}
+}
+
+func TestComposeSurfaceCustomPromptAppendAppliesInEveryMode(t *testing.T) {
+	for _, mode := range []prompt.Mode{prompt.ModeFull, prompt.ModeSimple, prompt.ModeNone} {
+		t.Run(string(mode), func(t *testing.T) {
+			req := baseSurfaceRequest(t)
+			req.promptSize = mode
+			req.promptBody = "DEFAULT_INSTRUCTIONS"
+			baseline, _, err := composeSurface(req)
+			testassert.NoError(t, err)
+			req.adaptation = &fakeAdaptation{value: Adaptation{Append: []string{"  CUSTOM_APPEND\n"}}}
+			result, _, err := composeSurface(req)
+			testassert.NoError(t, err)
+			testassert.Equal(t, result.Prompt, baseline.Prompt+"\n\n  CUSTOM_APPEND\n")
+		})
+	}
+}
+
+func TestComposeSurfaceZeroValueAdaptationIsNoOp(t *testing.T) {
+	req := baseSurfaceRequest(t)
+	req.sessionStart = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	baseline, _, err := composeSurface(req)
+	testassert.NoError(t, err)
+	req.adaptation = &fakeAdaptation{value: Adaptation{}}
+	got, _, err := composeSurface(req)
+	testassert.NoError(t, err)
+	testassert.Equal(t, got.Prompt, baseline.Prompt)
+}
+
+func TestComposeSurfaceInvalidModeFailsBeforeRulesRead(t *testing.T) {
+	req := baseSurfaceRequest(t)
+	globalDir := t.TempDir()
+	testassert.NoError(t, os.Mkdir(filepath.Join(globalDir, "AGENTS.md"), 0o700))
+	req.globalRulesDir = globalDir
+	req.promptSize = "bogus"
+	result, advertised, err := composeSurface(req)
+	testassert.Require(t, errors.Is(err, prompt.ErrInvalidInput), "composeSurface invalid mode error = %v, want ErrInvalidInput", err)
+	testassert.Require(t, result.Prompt == "" && len(result.Warnings) == 0 && advertised == nil, "invalid mode produced a surface: %+v", result)
 }
 
 func TestComposeSurfaceDescriptionReplacements(t *testing.T) {
-	const description = "Edit <EDIT FILE OR WRITE FILE> via one call."
+	const description = "Edit edit_file or write_file via one call."
 	req := baseSurfaceRequest(t)
-	req.toolSpecs = []CapabilitySpec{staticToolSpec("read_file", description, true, false)}
+	req.toolSpecs = []CapabilitySpec{staticToolSpec("read_file", description, true)}
 
-	// No adaptation: the bundled default replacement applies.
+	// No adaptation: the literal description is advertised unchanged.
 	_, advertised, err := composeSurface(req)
 	testassert.NoError(t, err)
 	testassert.Equal(t, advertised[0].Description, "Edit edit_file or write_file via one call.")
 
-	// The shipped GPT row's entry override applies instead.
+	// The shipped GPT row's literal override applies instead.
 	req.adaptation = &fakeAdaptation{value: Adaptation{
-		ToolDescriptionReplacements: map[string]string{"<EDIT FILE OR WRITE FILE>": "apply_patch"},
+		ToolDescriptionReplacements: map[string]string{"edit_file or write_file": "apply_patch"},
 	}}
 	_, advertised, err = composeSurface(req)
 	testassert.NoError(t, err)
 	testassert.Equal(t, advertised[0].Description, "Edit apply_patch via one call.")
 }
 
+// bundledGPTGuidanceLine and bundledGPTGuidanceReplacement are the complete
+// literal standard run_command guidance line the bundled GPT rows replace and
+// its GPT form: the data names the whole line, so no other prose carrying the
+// phrase can be rewritten.
+const bundledGPTGuidanceLine = "- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use edit_file or write_file."
+const bundledGPTGuidanceReplacement = "- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use apply_patch."
+
+// TestComposeSurfaceBundledGPTDescriptionReplacementIsLiteral proves the
+// shipped GPT replacement is a literal whole-line rule over the REAL standard
+// run_command description composed with the REAL bundled matcher: the final
+// text is exactly the standard description with that one line rewritten (the
+// same text the previous broad phrase key produced), while an unrelated
+// optional tool whose text merely names the same phrase is untouched. Nil,
+// unselected and readonly behavior stay as before.
+func TestComposeSurfaceBundledGPTDescriptionReplacementIsLiteral(t *testing.T) {
+	const unrelated = "Edit edit_file or write_file via one call."
+	descriptions := func(advertised []model.ToolDefinition) map[string]string {
+		out := make(map[string]string, len(advertised))
+		for _, definition := range advertised {
+			out[definition.Name] = definition.Description
+		}
+		return out
+	}
+	req := baseSurfaceRequest(t)
+	req.toolSpecs = []CapabilitySpec{
+		ToolSpec("run_command", runCommandTool{}.describe),
+		staticToolSpec("note_editor", unrelated, true),
+	}
+
+	// Unselected: with no active adaptation each tool advertises its own text.
+	_, advertised, err := composeSurface(req)
+	testassert.NoError(t, err)
+	{
+		got := descriptions(advertised)
+		testassert.Require(t, len(got) == 2 && got["run_command"] == runCommandDescription && got["note_editor"] == unrelated, "baseline descriptions = %q, want each tool's own text", got)
+	}
+
+	want := strings.Replace(runCommandDescription, bundledGPTGuidanceLine, bundledGPTGuidanceReplacement, 1)
+	testassert.Require(t, strings.ReplaceAll(runCommandDescription, "edit_file or write_file", "apply_patch") == want, "the literal expectation is not the text the previous broad phrase key composed")
+	req.modelRef = model.ModelRef{Provider: "prov", Model: "gpt-5.5"}
+	req.adaptation = &bundledAdaptation{}
+	_, advertised, err = composeSurface(req)
+	testassert.NoError(t, err)
+	{
+		got := descriptions(advertised)
+		testassert.Require(t, got["run_command"] == want, "GPT run_command description = %q, want the standard text with only its guidance line rewritten", got["run_command"])
+		testassert.Require(t, got["note_editor"] == unrelated, "GPT unrelated description = %q, want the bundled whole-line rule to leave it unchanged", got["note_editor"])
+	}
+
+	// Readonly swaps run_command to its retained read-only text and toggles
+	// availability only: the bundled whole-line rule names the standard
+	// guidance line, so the read-only text stays exactly as the tool declares
+	// it and both tools remain advertised.
+	req.constraints = ToolConstraints{Readonly: true}
+	_, advertised, err = composeSurface(req)
+	testassert.NoError(t, err)
+	{
+		got := descriptions(advertised)
+		testassert.Require(t, got["run_command"] == tool.ReadOnlyRunCommandDescription && got["note_editor"] == unrelated, "readonly GPT descriptions = %q, want the read-only text and the untouched unrelated text", got)
+	}
+}
+
 func TestComposeSurfaceAdvertisement(t *testing.T) {
 	req := baseSurfaceRequest(t)
 
-	// Unselected: only the available, non-hidden tool is advertised.
+	// Unselected: every eligible tool is advertised in declaration order.
 	_, advertised, err := composeSurface(req)
 	testassert.NoError(t, err)
 	{
 		names := advertisedNames(advertised)
-		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file"}), "baseline advertisement = %q, want [read_file]", names)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "apply_patch"}), "baseline advertisement = %q, want the declaration order", names)
 	}
 
-	// The hidden tool appears only through the include list.
-	req.adaptation = &fakeAdaptation{value: Adaptation{IncludeTools: []string{"apply_patch"}}}
+	// The adaptation only subtracts: the exclusion removes one selected tool.
+	req.adaptation = &fakeAdaptation{value: Adaptation{ExcludeTools: []string{"read_file"}}}
 	_, advertised, err = composeSurface(req)
 	testassert.NoError(t, err)
 	{
 		names := advertisedNames(advertised)
-		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "apply_patch"}), "included advertisement = %q, want the declaration order", names)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"apply_patch"}), "excluded advertisement = %q, want [apply_patch]", names)
 	}
 
-	// Exclusion always wins over inclusion.
-	req.adaptation = &fakeAdaptation{value: Adaptation{
-		ExcludeTools: []string{"read_file"},
-		IncludeTools: []string{"read_file", "apply_patch"},
-	}}
+	// The nearest forbidden sibling: an exclusion naming nothing selects no
+	// tool removal, and an unknown name removes none either.
+	req.adaptation = &fakeAdaptation{value: Adaptation{ExcludeTools: []string{"absent_tool"}}}
 	_, advertised, err = composeSurface(req)
 	testassert.NoError(t, err)
 	{
 		names := advertisedNames(advertised)
-		testassert.Require(t, reflect.DeepEqual(names, []string{"apply_patch"}), "exclusion-wins advertisement = %q, want [apply_patch]", names)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "apply_patch"}), "unknown-name advertisement = %q, want the untouched surface", names)
 	}
 }
 
 func TestComposeSurfaceReadonlyCannotRegainMutationTools(t *testing.T) {
 	req := baseSurfaceRequest(t)
 	req.toolSpecs = []CapabilitySpec{
-		staticToolSpec("read_file", "read_file description", true, false),
-		mutationToolSpec("write_file", false),
-		mutationToolSpec("edit_file", false),
-		mutationToolSpec("apply_patch", true),
+		staticToolSpec("read_file", "read_file description", true),
+		mutationToolSpec("write_file"),
+		mutationToolSpec("edit_file"),
+		mutationToolSpec("apply_patch"),
 	}
 	req.constraints = ToolConstraints{Readonly: true}
-	req.adaptation = &fakeAdaptation{value: Adaptation{
-		IncludeTools: []string{"write_file", "edit_file", "apply_patch"},
-	}}
 	_, advertised, err := composeSurface(req)
 	testassert.NoError(t, err)
 	{
 		names := advertisedNames(advertised)
 		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file"}), "readonly advertisement = %q, want only the eligible read_file", names)
 	}
-	// The nearest sibling: with a write dir the tools are eligible and the
-	// include surfaces the hidden one.
+	// The nearest sibling: with a write dir the tools are eligible.
 	req.constraints = ToolConstraints{Readonly: true, WriteDir: "/tmp/plan"}
 	_, advertised, err = composeSurface(req)
 	testassert.NoError(t, err)
@@ -343,8 +456,8 @@ func TestComposeSurfaceResolvesExactlyOnce(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, fake.calls, 1)
-	if fake.ref != req.modelRef {
-		t.Fatalf("Resolve received %s, want %s", fake.ref.String(), req.modelRef.String())
+	if fake.ref != req.modelRef || fake.mode != req.promptSize {
+		t.Fatalf("Resolve received %s/%q, want %s/%q", fake.ref.String(), fake.mode, req.modelRef.String(), req.promptSize)
 	}
 }
 
@@ -362,11 +475,23 @@ func TestComposeSurfaceUnselectedAdaptationKeepsBaselinePrompt(t *testing.T) {
 	req.sessionStart = start
 	result, advertised, err := composeSurface(req)
 	testassert.NoError(t, err)
-	direct := prompt.NewService(req.home).Assemble(req.workspace, start, prompt.Spec{Size: prompt.SizeFull})
-	testassert.Require(t, result.Prompt == direct.Prompt, "the unselected adaptation changed the baseline prompt")
+	rules, err := prompt.ReadRules(req.globalRulesDir, req.workspace, prompt.ModeFull)
+	testassert.NoError(t, err)
+	direct, err := prompt.Assemble(prompt.AssemblyInput{
+		Identity:      req.hostIdentity,
+		Mode:          prompt.ModeFull,
+		Rules:         rules,
+		Workspace:     req.workspace,
+		SessionStart:  start,
+		OS:            goruntime.GOOS,
+		Shell:         captureShell(),
+		OSDescription: captureOSDescription(),
+	})
+	testassert.NoError(t, err)
+	testassert.Require(t, result.Prompt == direct, "the unselected adaptation changed the baseline prompt")
 	{
 		names := advertisedNames(advertised)
-		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file"}), "baseline advertisement = %q, want the full eligible surface", names)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "apply_patch"}), "baseline advertisement = %q, want the full eligible surface", names)
 	}
 }
 
@@ -407,7 +532,7 @@ func TestComposeSurfaceExcludesLineageUnavailableTools(t *testing.T) {
 	testassert.NoError(t, err)
 	{
 		names := advertisedNames(root)
-		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "task"}), "root advertisement = %q, want the lineage-gated tool present alongside its sibling", names)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "apply_patch", "task"}), "root advertisement = %q, want the lineage-gated tool present alongside its siblings", names)
 	}
 
 	childReq := req
@@ -416,7 +541,7 @@ func TestComposeSurfaceExcludesLineageUnavailableTools(t *testing.T) {
 	testassert.NoError(t, err)
 	{
 		names := advertisedNames(child)
-		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file"}), "child advertisement = %q, want the lineage-gated tool excluded", names)
+		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "apply_patch"}), "child advertisement = %q, want the lineage-gated tool excluded", names)
 	}
 }
 

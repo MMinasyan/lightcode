@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -55,7 +54,8 @@ func openProtocolServer(t *testing.T, r *Runtime) *ProtocolServer {
 func openProtocolOwner(t *testing.T, store harness.Storage) (*Runtime, *ownerEnv) {
 	t.Helper()
 	e := newOwnerEnv(t)
-	r, err := e.open(context.Background(), e.storagePlugin(store))
+	e.fixtureStore(store)
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	return r, e
 }
@@ -281,7 +281,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		health, err := client.GetHealthWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, health.JSON200 != nil && health.HTTPResponse.StatusCode == http.StatusOK, "health = (%d, %v), want the 200 typed body", health.HTTPResponse.StatusCode, health.JSON200)
-		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N6, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N6)
+		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N8, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N8)
 
 		workspace := filepath.Join(e.home, "mounted")
 		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "solo"})
@@ -687,7 +687,8 @@ func TestProtocolServerCredentialFlowRawWireSecretFree(t *testing.T) {
 		// One malformed line makes the startup LoadDotEnv diagnostic run, so
 		// the captured stderr sink is genuinely exercised before the scan.
 		writeDotEnv(t, e.home, "MALFORMED LINE\n")
-		r, err := e.open(context.Background(), e.storagePlugin(store))
+		e.fixtureStore(store)
+		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
 		ps := openProtocolServer(t, r)
@@ -1060,7 +1061,10 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 				ArchiveAfterDays:       archiveDays,
 				DeleteAfterArchiveDays: archiveDays,
 			},
-			Plugins: protocol.PluginsSettings{},
+			Tools:      json.RawMessage("{}"),
+			Jobs:       json.RawMessage("{}"),
+			Compaction: json.RawMessage("{}"),
+			Plugins:    protocol.PluginsSettings{},
 		}})
 		testassert.NoError(t, err)
 		if settings.JSON200 == nil || !settings.JSON200.Result.Sessions.AutoArchive || settings.JSON200.Result.Sessions.ArchiveAfterDays != archiveDays {
@@ -1090,8 +1094,11 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			{"non-object document", protocol.PluginsSettings{"core": `1`}},
 		} {
 			response, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: protocol.Settings{
-				Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: archiveDays, DeleteAfterArchiveDays: archiveDays},
-				Plugins:  row.plugins,
+				Sessions:   protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: archiveDays, DeleteAfterArchiveDays: archiveDays},
+				Tools:      json.RawMessage("{}"),
+				Jobs:       json.RawMessage("{}"),
+				Compaction: json.RawMessage("{}"),
+				Plugins:    row.plugins,
 			}})
 			testassert.Require(t, err == nil, "%s: UpdateConfigurationSettings: %v", row.name, err)
 			if response.HTTPResponse.StatusCode != http.StatusUnprocessableEntity || response.JSONDefault == nil || response.JSONDefault.Code != protocol.Configuration {
@@ -1307,7 +1314,8 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 func TestProtocolServerAgentModelEdit(t *testing.T) {
 	e := newOwnerEnv(t)
 	writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo": {"model": "prov/m", "system_prompt": "simple"}, "..": {"model": "prov/m", "system_prompt": "simple"}}`)
-	r, err := e.open(context.Background(), e.storagePlugin(storage.NewMemory()))
+	e.fixtureStore(storage.NewMemory())
+	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
 	defer closeProjectionRuntime(r)
 	ps := openProtocolServer(t, r)
@@ -1324,62 +1332,6 @@ func TestProtocolServerAgentModelEdit(t *testing.T) {
 	unknown, err := client.SetAgentTypeModelWithResponse(ctx, &protocol.SetAgentTypeModelParams{AgentType: "ghost"}, protocol.SetAgentTypeModelRequest{Model: "prov/m"})
 	testassert.NoError(t, err)
 	testassert.Require(t, unknown.JSONDefault != nil && unknown.JSONDefault.Code == protocol.Invalid, "unknown agent type edit = %+v, want the typed invalid refusal", unknown.JSONDefault)
-}
-
-// TestProtocolServerRetainedFamily drives the retained pre-cutover snapshot
-// operation family through the mounted server: the turn listing under the
-// exact 8-hex legacy identity and its workspace proof, the code-only restore
-// to the recorded preimage, and the identity boundary that refuses a target
-// 32-hex Session ID on the retained route.
-func TestProtocolServerRetainedFamily(t *testing.T) {
-	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
-		r, e := openProjectionRuntime(t, store)
-		defer closeProjectionRuntime(r)
-		ps := openProtocolServer(t, r)
-		client := protocolClient(t, ps)
-		ctx := context.Background()
-
-		workspace := filepath.Join(e.home, "legacy-ws")
-		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
-		legacyID := "feedface"
-		sessionDir := seedRetainedSession(t, r.config.loader.Home(), workspace, legacyID)
-		file := filepath.Join(workspace, "partial.txt")
-		testassert.NoError(t, os.WriteFile(file, []byte("p0"), 0o600))
-		recordRetainedMutation(t, sessionDir, 1, file, file, []byte("p1"))
-
-		turns, err := client.GetRetainedCodeSnapshotsWithResponse(ctx, &protocol.GetRetainedCodeSnapshotsParams{Workspace: workspace, SessionId: legacyID})
-		testassert.NoError(t, err)
-		if turns.JSON200 == nil || len(turns.JSON200.Turns) != 1 {
-			body, _ := json.Marshal(turns.JSON200)
-			t.Fatalf("retained turns = %s (status %d, %v), want one recorded turn", body, turns.HTTPResponse.StatusCode, turns.JSONDefault)
-		}
-		turn := turns.JSON200.Turns[0]
-		if turn.Turn != 1 || len(turn.Files) != 1 || turn.Files[0].Path != file || !turn.Files[0].Existed {
-			body, _ := json.Marshal(turn)
-			t.Fatalf("retained turn = %s, want the recorded file identity", body)
-		}
-
-		revert, err := client.RevertRetainedCodeWithResponse(ctx, protocol.RetainedRevertRequest{Workspace: workspace, SessionId: legacyID, AfterTurn: 0})
-		testassert.NoError(t, err)
-		if revert.JSON200 == nil || !slices.Contains(revert.JSON200.Restored, file) || revert.JSON200.Error != nil {
-			body, _ := json.Marshal(revert.JSON200)
-			t.Fatalf("retained revert = %s (status %d), want the completed restore", body, revert.HTTPResponse.StatusCode)
-		}
-		{
-			restored, err := os.ReadFile(file)
-			testassert.Require(t, err == nil && string(restored) == "p0", "restored retained file = (%q, %v), want its recorded preimage", restored, err)
-		}
-
-		// The identity boundary is one rule: a target 32-hex Session ID is
-		// refused on the retained route before any snapshot read.
-		target := strings.Repeat("a", 32)
-		wrong, err := client.GetRetainedCodeSnapshotsWithResponse(ctx, &protocol.GetRetainedCodeSnapshotsParams{Workspace: workspace, SessionId: target})
-		testassert.NoError(t, err)
-		if wrong.JSONDefault == nil || wrong.JSONDefault.Code != protocol.Invalid {
-			body, _ := json.Marshal(wrong.JSONDefault)
-			t.Fatalf("target identity on the retained route = %s, want the typed invalid refusal", body)
-		}
-	})
 }
 
 // TestProtocolServerIdentityQueryRoundTrips pins the identity rule: every

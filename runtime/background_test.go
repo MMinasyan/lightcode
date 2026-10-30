@@ -24,7 +24,9 @@ func TestBackgroundBridgeMethodsForward(t *testing.T) {
 	e := newOwnerEnv(t)
 	store := storage.NewMemory()
 	stopper := &stubStopper{events: e.events}
-	r, err := e.open(ctx, e.storagePlugin(store), jobStopperPlugin(e, "jobs", "job-stopper", ScopeRuntime, stopper))
+	e.fixtureStore(store)
+	e.fixtureJobs(stopper)
+	r, err := e.open(ctx)
 	testassert.NoError(t, err)
 	bridge := &backgroundBridge{h: r.harness}
 
@@ -134,8 +136,9 @@ func TestBackgroundBridgeArmingAcrossPublication(t *testing.T) {
 	testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 
 	probe := &backgroundProbe{}
+	useFixtureStore(t, store)
 	r, err := Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []Plugin{
-		coreStoragePlugin(store), backgroundProbePlugin(probe),
+		backgroundProbePlugin(probe),
 	}})
 	testassert.NoError(t, err)
 	// The unarmed-to-armed window ends before publication: construction

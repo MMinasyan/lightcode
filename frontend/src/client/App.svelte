@@ -1160,7 +1160,7 @@
       on:close={() => closeModal('viewer')} />
   {/if}
   {#if $modal === 'snapshots'}
-    <SnapshotsDialog getClient={clientNow} stamp={() => stampFor('', 'root')()} {workspace} sessionID={rootID}
+    <SnapshotsDialog getClient={clientNow} stamp={() => stampFor('', 'root')()} sessionID={rootID}
       on:note={(e) => { outcomeNote = e.detail; }}
       on:close={() => closeModal('snapshots')} />
   {/if}

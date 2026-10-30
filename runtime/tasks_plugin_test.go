@@ -51,7 +51,7 @@ func openTask(t *testing.T) runtime.Tool {
 // admitted-input identity, the given Invocation, and the scripted bridge.
 func taskContext(t *testing.T, sections map[string]string, background runtime.BackgroundServices) runtime.ToolContext {
 	t.Helper()
-	invocation, err := runtime.ConfiguredInvocationForTest(sections)
+	invocation, err := runtime.ConfiguredInvocationForTest("", "", "", sections)
 	testassert.NoError(t, err)
 	return runtime.ToolContext{
 		AdmittedEntry: harness.EntryRef{SessionID: testSessionID, EntryID: testEntryID},
@@ -87,7 +87,7 @@ func (*taskBackground) DeliverCompletion(context.Context, string, string, string
 // definition.
 func TestTaskDescriptionComposesFromRoster(t *testing.T) {
 	spec := tasks.Plugin().Provides[0]
-	invocation, err := runtime.ConfiguredInvocationForTest(nil)
+	invocation, err := runtime.ConfiguredInvocationForTest("", "", "", nil)
 	testassert.NoError(t, err)
 
 	root, err := runtime.DescribeToolForTest(spec, invocation, runtime.ToolConstraints{}, harness.SessionIdentity{SessionID: testSessionID})
@@ -251,7 +251,7 @@ func TestComposedTaskPermissionDenialSettlesOnlyTheCall(t *testing.T) {
 	policy := harness.ResolvePermissionPolicy(json.RawMessage(`{"rules":[
 		{"permission":"child.launch","target":"secondary","access":"deny"}
 	]}`), nil)
-	invocation, err := runtime.ConfiguredInvocationForTest(nil)
+	invocation, err := runtime.ConfiguredInvocationForTest("", "", "", nil)
 	testassert.NoError(t, err)
 	background := &taskBackground{result: harness.LaunchChildResult{ChildSessionID: taskChildID}}
 	attempt := 0
@@ -270,14 +270,7 @@ func TestComposedTaskPermissionDenialSettlesOnlyTheCall(t *testing.T) {
 			return stopStream("done"), nil
 		}
 	}
-	th := newToolsHarnessWith(t, modelFn, toolsHarnessOpts{
-		advertise:   []string{"task"},
-		permissions: policy,
-		invocation:  invocation,
-		background:  background,
-		extraPlugin: tasks.Plugin(),
-		extraToolID: "task",
-	})
+	th := newTaskHarness(t, modelFn, policy, invocation, background)
 	session := th.createSession()
 	th.submit(session, "op-1", "exercise the denied and allowed launches")
 	rec := th.awaitSettled(session, "op-1")

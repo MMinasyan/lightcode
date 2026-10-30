@@ -14,7 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
+func TestSnapshotResolvedEntryRejectsNonRegularExistingTargets(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		target func(t *testing.T) string
@@ -55,16 +55,15 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newTestCodeGroup(t)
 			target := tc.target(t)
-			const turn = 1
 
 			err := runSnapshotShapeWithTimeout(func() error {
-				_, _, err := store.SnapshotResolvedEntry(turn, target, target)
+				_, _, err := store.SnapshotResolvedEntry(target, target)
 				return err
 			})
-			testassert.Require(t, err != nil, "SnapshotResolved(%s) succeeded, want non-regular target refusal", tc.name)
+			testassert.Require(t, err != nil, "SnapshotResolvedEntry(%s) succeeded, want non-regular target refusal", tc.name)
 			msg := strings.ToLower(err.Error())
-			testassert.Require(t, !strings.Contains(msg, "did not fail closed before blocking"), "SnapshotResolved(%s) error = %v, want refusal before blocking on target I/O", tc.name, err)
-			testassert.Require(t, strings.Contains(msg, "non-regular"), "SnapshotResolved(%s) error = %v, want explicit non-regular target refusal", tc.name, err)
+			testassert.Require(t, !strings.Contains(msg, "did not fail closed before blocking"), "SnapshotResolvedEntry(%s) error = %v, want refusal before blocking on target I/O", tc.name, err)
+			testassert.Require(t, strings.Contains(msg, "non-regular"), "SnapshotResolvedEntry(%s) error = %v, want explicit non-regular target refusal", tc.name, err)
 
 			entries, readErr := os.ReadDir(filepath.Join(store.snapshotsDir, "1"))
 			testassert.Require(t, readErr == nil || errors.Is(readErr, os.ErrNotExist), "%v", readErr)
@@ -78,20 +77,19 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 	}
 }
 
-func TestSnapshotResolvedStillAllowsMissingAndRegularTargets(t *testing.T) {
+func TestSnapshotResolvedEntryStillAllowsMissingAndRegularTargets(t *testing.T) {
 	store := newTestCodeGroup(t)
-	const turn = 1
 
 	missing := filepath.Join(t.TempDir(), "new-file.txt")
 	{
-		_, _, err := store.SnapshotResolvedEntry(turn, missing, missing)
+		_, _, err := store.SnapshotResolvedEntry(missing, missing)
 		testassert.NoError(t, err)
 	}
 
 	regular := filepath.Join(t.TempDir(), "regular.txt")
 	testassert.NoError(t, os.WriteFile(regular, []byte("before"), 0o644))
 	{
-		_, _, err := store.SnapshotResolvedEntry(turn, regular, regular)
+		_, _, err := store.SnapshotResolvedEntry(regular, regular)
 		testassert.NoError(t, err)
 	}
 }

@@ -87,7 +87,7 @@ func newFrameFixture(t *testing.T, instance string, parkHydration bool) *frameFi
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"6"}`, f.instance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"8"}`, f.instance)
 	})
 	mux.HandleFunc("/v1/events", f.serveEvents)
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
@@ -267,7 +267,7 @@ func (f *frameFixture) marker(open int) chan string {
 // writeRecord publishes this fixture's live discovery record.
 func (f *frameFixture) writeRecord(t *testing.T, dataDir string) {
 	t.Helper()
-	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"6","credential":%q}`,
+	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"8","credential":%q}`,
 		f.server.URL, f.instance, frameCredential)
 	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600))
 }

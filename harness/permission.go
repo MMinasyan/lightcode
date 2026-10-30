@@ -10,22 +10,21 @@ import (
 )
 
 // PermissionFileRead, PermissionFileWrite, PermissionCommandRun,
-// PermissionWorkspaceInspect, PermissionSleep, PermissionChildLaunch and
-// PermissionProcessOwn are the published semantic permission names of the
-// fixed automatic policy. They are exact strings; plugins may define new
-// namespaced names but cannot contribute rules to the built-in policy, and
-// these built-in names are not a closed plugin namespace.
+// PermissionSleep, PermissionChildLaunch and PermissionProcessOwn are the
+// published semantic permission names of the fixed automatic policy. They are
+// exact strings; plugins may define new namespaced names but cannot contribute
+// rules to the built-in policy, and these built-in names are not a closed
+// plugin namespace.
 //
 // The access values stay private: access strings and policy parsing are the
 // Harness's own.
 const (
-	PermissionFileRead         = "file.read"
-	PermissionFileWrite        = "file.write"
-	PermissionCommandRun       = "command.run"
-	PermissionWorkspaceInspect = "workspace.inspect"
-	PermissionSleep            = "sleep"
-	PermissionChildLaunch      = "child.launch"
-	PermissionProcessOwn       = "process.own"
+	PermissionFileRead    = "file.read"
+	PermissionFileWrite   = "file.write"
+	PermissionCommandRun  = "command.run"
+	PermissionSleep       = "sleep"
+	PermissionChildLaunch = "child.launch"
+	PermissionProcessOwn  = "process.own"
 
 	permissionAccessAllow = "allow"
 	permissionAccessDeny  = "deny"
@@ -113,8 +112,8 @@ func ResolvePermissionPolicy(global, workspace json.RawMessage) PermissionPolicy
 // default if present, then the last matching global rule, then the global
 // default if present, then the built-in rules in their fixed order, then the
 // built-in default deny. canonicalRoot is the call's prepared canonical
-// Workspace root: evaluation input for the built-in file and inspect rules,
-// never policy state.
+// Workspace root: evaluation input for the built-in file rules, never policy
+// state.
 func (p PermissionPolicy) evaluate(canonicalRoot string, req PermissionRequest) bool {
 	if allow, decided := p.workspace.decide(req); decided {
 		return allow
@@ -204,7 +203,6 @@ func buildBuiltinRules() []builtinRule {
 	}
 	return append(rules,
 		builtinRule{permission: PermissionCommandRun, matches: anyTarget, allow: true},
-		builtinRule{permission: PermissionWorkspaceInspect, matches: equalsWorkspaceRoot, allow: true},
 		builtinRule{permission: PermissionSleep, matches: equalsFixedTarget, allow: true},
 		builtinRule{permission: PermissionChildLaunch, matches: anyTarget, allow: true},
 		builtinRule{permission: PermissionProcessOwn, matches: anyTarget, allow: true},
@@ -218,10 +216,6 @@ func denySensitiveBasename(pattern string) func(canonicalRoot, target string) bo
 
 func insideWorkspace(canonicalRoot, target string) bool {
 	return containsPath(canonicalRoot, target)
-}
-
-func equalsWorkspaceRoot(canonicalRoot, target string) bool {
-	return target == canonicalRoot
 }
 
 func anyTarget(_, _ string) bool { return true }
