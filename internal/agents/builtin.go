@@ -1,6 +1,6 @@
 package agents
 
-import "github.com/MMinasyan/lightcode/internal/prompt"
+import "github.com/MMinasyan/lightcode/prompt"
 
 var builtinOrder = []string{"primary", "secondary", "explore", "review", "compact"}
 

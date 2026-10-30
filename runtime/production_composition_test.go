@@ -30,6 +30,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 )
 
 // chainAgentsDocument builds the combined scenario's agents document with the
@@ -136,17 +137,19 @@ func argumentHookPlugin(id string, hook ToolArgumentsHook) Plugin {
 // composed directly over the real bundled matcher).
 type bundledAdaptation struct{}
 
-func (bundledAdaptation) Resolve(ref model.ModelRef) (Adaptation, error) {
+func (bundledAdaptation) Resolve(ref model.ModelRef, mode prompt.Mode) (Adaptation, error) {
 	match := modeladapt.Match(ref.Model)
 	if match == nil {
 		return Adaptation{}, nil
 	}
-	return Adaptation{
+	out := Adaptation{
 		ExcludeTools:                match.ExcludeTools,
-		Blocks:                      match.Blocks,
-		Additions:                   match.Additions,
 		ToolDescriptionReplacements: match.ToolDescriptionReplacements,
-	}, nil
+	}
+	if mode == prompt.ModeFull {
+		out.Append = match.Append
+	}
+	return out, nil
 }
 
 // bundledAdaptationPlugin declares the bundled resolver as the composition's
@@ -727,10 +730,10 @@ func TestProductionCapabilityIDsModelIndependent(t *testing.T) {
 			testassert.Require(t, err == nil && string(data) == "keep me\n", "gpt-edit.txt = (%q, %v), want the unchanged bytes: the excluded edit tool ran", data, err)
 		}
 
-		// The prompts differ too: the adapted model's task_execution
-		// addition renders in the full prompt.
-		testassert.Require(t, strings.Contains(gptRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "adapted prompt = %.200s, want the adaptation's task_execution addition", gptRec.Admission.Execution.SystemPrompt)
-		testassert.Require(t, !strings.Contains(vanRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "baseline prompt = %.200s, want no adaptation addition", vanRec.Admission.Execution.SystemPrompt)
+		// The prompts differ too: the adapted model's bundled guidance
+		// append renders in the full prompt.
+		testassert.Require(t, strings.Contains(gptRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "adapted prompt = %.200s, want the adaptation's append paragraph", gptRec.Admission.Execution.SystemPrompt)
+		testassert.Require(t, !strings.Contains(vanRec.Admission.Execution.SystemPrompt, "Use more tool calls when they can improve the response"), "baseline prompt = %.200s, want no automatic bundled guidance", vanRec.Admission.Execution.SystemPrompt)
 	})
 }
 

@@ -97,7 +97,7 @@ func compactPrepWith(t *testing.T, agentsDoc, configDoc, endpoint string) (confi
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs)
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, nil, nil, nil, nil)
+	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, "", "", nil, nil, nil, nil)
 }
 
 func compactToolsPlugin() Plugin {

@@ -31,6 +31,12 @@ type Options struct {
 	DataDir    string
 	ConfigPath string
 	Plugins    []Plugin
+
+	// Identity is the application-supplied prompt persona text. GlobalRulesDir
+	// is the explicit directory holding the global AGENTS.md. Zero values
+	// supply no identity and no global rules, never an implicit fallback.
+	Identity       string
+	GlobalRulesDir string
 }
 
 // Open constructs the complete managed Runtime with concrete production
@@ -40,9 +46,11 @@ type Options struct {
 // one admitted-call gate, and the joined shutdown.
 func Open(ctx context.Context, opts Options) (*Runtime, error) {
 	return open(ctx, options{
-		DataDir:    opts.DataDir,
-		ConfigPath: opts.ConfigPath,
-		Plugins:    opts.Plugins,
+		DataDir:        opts.DataDir,
+		ConfigPath:     opts.ConfigPath,
+		Plugins:        opts.Plugins,
+		Identity:       opts.Identity,
+		GlobalRulesDir: opts.GlobalRulesDir,
 	})
 }
 
@@ -57,6 +65,8 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 type options struct {
 	DataDir, ConfigPath string
 	Plugins             []Plugin
+	Identity            string
+	GlobalRulesDir      string
 	sweepTicks          <-chan time.Time
 }
 
@@ -263,7 +273,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: store,
 		Jobs:    jobsService,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, background, adapter, artifacts, subprocessEnv).bind(),
+		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, options.Identity, options.GlobalRulesDir, background, adapter, artifacts, subprocessEnv).bind(),
 		Observe: adapter.observe,
 	})
 	if err != nil {

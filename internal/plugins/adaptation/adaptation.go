@@ -11,6 +11,7 @@ import (
 
 	modeladapt "github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
@@ -32,20 +33,24 @@ func Plugin() runtime.Plugin {
 
 // resolver adapts the bundled binding table to the public contract. Match
 // receives the model component of the ref alone and returns an independent
-// copy; nil is the baseline.
+// copy; nil is the baseline. The bundled guidance append paragraphs apply only
+// to full-mode prompts; tool exclusions and description replacements apply in
+// every mode.
 type resolver struct{}
 
-func (resolver) Resolve(ref model.ModelRef) (runtime.Adaptation, error) {
+func (resolver) Resolve(ref model.ModelRef, mode prompt.Mode) (runtime.Adaptation, error) {
 	match := modeladapt.Match(ref.Model)
 	if match == nil {
 		return runtime.Adaptation{}, nil
 	}
-	return runtime.Adaptation{
+	out := runtime.Adaptation{
 		ExcludeTools:                match.ExcludeTools,
-		Blocks:                      match.Blocks,
-		Additions:                   match.Additions,
 		ToolDescriptionReplacements: match.ToolDescriptionReplacements,
-	}, nil
+	}
+	if mode == prompt.ModeFull {
+		out.Append = match.Append
+	}
+	return out, nil
 }
 
 func open(ctx context.Context, _ runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {

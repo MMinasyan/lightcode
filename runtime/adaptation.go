@@ -4,24 +4,27 @@ import (
 	"reflect"
 
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 )
 
 // Adaptation is the public per-model treatment value a ModelAdaptation
-// resolves: which registered tools the model is hidden from, which coaching
-// blocks join its system prompt, and which per-section additions and
-// tool-description replacements apply. The zero value is a valid no-op
-// baseline.
+// resolves: which registered tools the model is hidden from, an optional
+// complete prompt replacement, ordered prompt append paragraphs, and
+// tool-description replacements. The zero value is a valid no-op baseline.
 type Adaptation struct {
-	ExcludeTools, Blocks                   []string
-	Additions, ToolDescriptionReplacements map[string]string
+	ExcludeTools                []string
+	Prompt                      *string
+	Append                      []string
+	ToolDescriptionReplacements map[string]string
 }
 
 // ModelAdaptation is the consumed public capability: one Resolve per
-// preparation converts the active model ref into the treatment applied to the
-// captured prompt and tool surface. Resolve returns only the value above and
-// cannot add capability IDs, hooks, or plugin implementations.
+// preparation converts the active model ref and the preparation's prompt mode
+// into the treatment applied to the captured prompt and tool surface. Resolve
+// returns only the value above and cannot add capability IDs, hooks, or plugin
+// implementations.
 type ModelAdaptation interface {
-	Resolve(model.ModelRef) (Adaptation, error)
+	Resolve(model.ModelRef, prompt.Mode) (Adaptation, error)
 }
 
 // modelAdaptationType is the declared-type identity of the public

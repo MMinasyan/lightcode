@@ -24,6 +24,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -229,14 +230,15 @@ func productionToolsPlugin() Plugin {
 }
 
 // testAdaptation is the custom test plugin's ModelAdaptation value: one
-// coaching block, one section addition, and one excluded tool.
+// appended paragraph, one complete prompt replacement, and one excluded tool.
 type testAdaptation struct{}
 
-func (testAdaptation) Resolve(model.ModelRef) (Adaptation, error) {
+func (testAdaptation) Resolve(model.ModelRef, prompt.Mode) (Adaptation, error) {
+	replacement := "PROD-ADAPTATION-PROMPT"
 	return Adaptation{
 		ExcludeTools: []string{"prod_read"},
-		Blocks:       []string{"PROD-ADAPTATION-BLOCK"},
-		Additions:    map[string]string{"safety": "ADDITION-SAFETY-TEXT"}, // the one section the simple prompt renders
+		Prompt:       &replacement,
+		Append:       []string{"  PROD-ADAPTATION-BLOCK\n"},
 	}, nil
 }
 
@@ -264,12 +266,14 @@ func eachProductionStore(t *testing.T, run func(t *testing.T, e *productionEnv))
 }
 
 type productionEnv struct {
-	t          *testing.T
-	home       string
-	dataDir    string
-	configPath string
-	server     *productionModelServer
-	store      harness.Storage
+	t              *testing.T
+	home           string
+	dataDir        string
+	configPath     string
+	server         *productionModelServer
+	store          harness.Storage
+	identity       string
+	globalRulesDir string
 }
 
 // newProductionEnv isolates HOME and both data roots, points the configured
@@ -298,7 +302,7 @@ func (e *productionEnv) open(ctx context.Context, hook *recordHook, park *parkin
 func (e *productionEnv) openPlugins(ctx context.Context, plugins ...Plugin) (*Runtime, error) {
 	e.t.Helper()
 	useFixtureStore(e.t, e.store)
-	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins})
+	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
 }
 
 // openWithPlugins composes the suite's base plugin set plus extras — the
@@ -1096,7 +1100,7 @@ func TestProductionTransportConversion(t *testing.T) {
 	svc := newConfigurationService(owner, c, sh.loader, sh.configPath, obs)
 	snapshot, err := svc.publish(owner)
 	testassert.NoError(t, err)
-	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, nil, nil, nil, nil)
+	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, "", "", nil, nil, nil, nil)
 	ref := model.ModelRef{Provider: "prov", Model: "m"}
 	provider, entry, err := snapshot.snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
 	testassert.NoError(t, err)
@@ -1420,11 +1424,53 @@ func TestProductionBaselineCapabilitySelection(t *testing.T) {
 	})
 }
 
+// TestProductionSuppliesExplicitPromptInputs proves public Open forwards the
+// caller's identity and global rules directory to preparation: an ambient
+// home .lightcode rule never enters the prompt, and neither does an embedded
+// persona. The zero-value sibling supplies no identity or global directory
+// while the same ambient home rule exists.
+func TestProductionSuppliesExplicitPromptInputs(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		workspace := e.workspace("explicit-ws")
+		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("WORKSPACE_RULES_MARKER"), 0o600))
+		testassert.NoError(t, os.MkdirAll(filepath.Join(e.home, ".lightcode"), 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, ".lightcode", "AGENTS.md"), []byte("AMBIENT_HOME_RULES"), 0o600))
+		globalDir := filepath.Join(e.home, "explicit-rules")
+		testassert.NoError(t, os.MkdirAll(globalDir, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(globalDir, "AGENTS.md"), []byte("EXPLICIT_GLOBAL_RULES"), 0o600))
+
+		capture := func(t *testing.T, operationID, identity, rulesDir string) string {
+			t.Helper()
+			e.identity = identity
+			e.globalRulesDir = rulesDir
+			r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
+			testassert.NoError(t, err)
+			defer func() { testassert.NoError(t, r.Close(ctx)) }()
+			session, err := r.createSession(ctx, workspace, "worker")
+			testassert.NoError(t, err)
+			submitThroughRuntime(t, r, session.Identity.SessionID, operationID, "hello")
+			rec := awaitOperation(t, r, session.Identity.SessionID, operationID, harness.OperationSuccess)
+			return rec.Admission.Execution.SystemPrompt
+		}
+
+		explicit := capture(t, "op-explicit", "PRODUCTION_HOST_IDENTITY", globalDir)
+		testassert.Require(t, strings.Contains(explicit, "PRODUCTION_HOST_IDENTITY") && strings.Contains(explicit, "EXPLICIT_GLOBAL_RULES") && strings.Contains(explicit, "WORKSPACE_RULES_MARKER"), "captured prompt misses the explicit host inputs or Workspace rules: %.300s", explicit)
+		testassert.Require(t, !strings.Contains(explicit, "AMBIENT_HOME_RULES") && !strings.Contains(explicit, "Lightcode, an agentic coding assistant"), "captured prompt carries an implicit home rule or embedded persona: %.300s", explicit)
+
+		zero := capture(t, "op-zero", "", "")
+		testassert.Require(t, strings.Contains(zero, "WORKSPACE_RULES_MARKER"), "zero-value prompt misses the Workspace rules: %.300s", zero)
+		testassert.Require(t, !strings.Contains(zero, "PRODUCTION_HOST_IDENTITY") && !strings.Contains(zero, "EXPLICIT_GLOBAL_RULES"), "zero-value prompt carries an explicit host input: %.300s", zero)
+		testassert.Require(t, !strings.Contains(zero, "AMBIENT_HOME_RULES") && !strings.Contains(zero, "Lightcode, an agentic coding assistant"), "zero-value prompt carries an implicit home rule or embedded persona: %.300s", zero)
+	})
+}
+
 // TestProductionAdaptationComposes composes the suite's custom
 // ModelAdaptation export through public Open and proves through one real
 // admitted operation that the selected adaptation reached the composed
-// surface: the coaching block and section addition appear in the captured
-// prompt and the excluded tool is absent from the advertisement.
+// surface: the complete prompt replacement and its append paragraph appear in
+// the captured prompt and the excluded tool is absent from the advertisement.
 func TestProductionAdaptationComposes(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
@@ -1437,7 +1483,7 @@ func TestProductionAdaptationComposes(t *testing.T) {
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 
 		prompt := rec.Admission.Execution.SystemPrompt
-		testassert.Require(t, strings.Contains(prompt, "PROD-ADAPTATION-BLOCK") && strings.Contains(prompt, "ADDITION-SAFETY-TEXT"), "captured prompt misses the adaptation's coaching block: %.200s; captured prompt misses the adaptation's section addition: %.200s", prompt, prompt)
+		testassert.Require(t, strings.HasPrefix(prompt, "PROD-ADAPTATION-PROMPT\n\n  PROD-ADAPTATION-BLOCK\n"), "captured prompt misses the adaptation's replacement or append whitespace: %.200s", prompt)
 		{
 			got := toolNames(rec.Admission.Execution.Tools)
 			testassert.Require(t, slices.Equal(got, []string{"prod_write"}), "advertisement = %v, want the adaptation's excluded tool absent", got)

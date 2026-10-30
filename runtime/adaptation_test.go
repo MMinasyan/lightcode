@@ -7,15 +7,16 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 )
 
 // fakeAdaptation is a counting ModelAdaptation: it records every Resolve call
@@ -23,13 +24,15 @@ import (
 type fakeAdaptation struct {
 	calls int
 	ref   model.ModelRef
+	mode  prompt.Mode
 	value Adaptation
 	err   error
 }
 
-func (f *fakeAdaptation) Resolve(ref model.ModelRef) (Adaptation, error) {
+func (f *fakeAdaptation) Resolve(ref model.ModelRef, mode prompt.Mode) (Adaptation, error) {
 	f.calls++
 	f.ref = ref
+	f.mode = mode
 	return f.value, f.err
 }
 
@@ -181,9 +184,10 @@ func toolDescriptionFor(id, description string, available bool) (ToolDescription
 func baseSurfaceRequest(t *testing.T) surfaceRequest {
 	t.Helper()
 	return surfaceRequest{
-		home:       t.TempDir(),
-		workspace:  t.TempDir(),
-		promptSize: prompt.SizeFull,
+		hostIdentity:   "FIXTURE_IDENTITY",
+		globalRulesDir: t.TempDir(),
+		workspace:      t.TempDir(),
+		promptSize:     prompt.ModeFull,
 		toolSpecs: []CapabilitySpec{
 			staticToolSpec("read_file", "read_file description", true),
 			staticToolSpec("apply_patch", "apply_patch description", true),
@@ -195,31 +199,42 @@ func baseSurfaceRequest(t *testing.T) surfaceRequest {
 func TestComposeSurfacePromptSizesSkipRulesUnderNone(t *testing.T) {
 	req := baseSurfaceRequest(t)
 	req.sessionStart = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	for _, size := range []string{prompt.SizeNone, prompt.SizeSimple, prompt.SizeFull} {
+	for _, mode := range []prompt.Mode{prompt.ModeNone, prompt.ModeSimple, prompt.ModeFull} {
 		r := req
-		r.promptSize = size
+		r.promptSize = mode
 		result, _, err := composeSurface(r)
-		testassert.Require(t, err == nil, "composeSurface(%s): %v", size, err)
-		direct := prompt.NewService(req.home).Assemble(req.workspace, req.sessionStart, prompt.Spec{Size: size})
-		testassert.Require(t, result.Prompt == direct.Prompt, "composeSurface(%s) prompt diverged from the direct assembly", size)
-		if size == prompt.SizeNone {
+		testassert.Require(t, err == nil, "composeSurface(%s): %v", mode, err)
+		rules, err := prompt.ReadRules(req.globalRulesDir, req.workspace, mode)
+		testassert.NoError(t, err)
+		direct, err := prompt.Assemble(prompt.AssemblyInput{
+			Identity:      req.hostIdentity,
+			Mode:          mode,
+			Rules:         rules,
+			Workspace:     req.workspace,
+			SessionStart:  req.sessionStart,
+			OS:            goruntime.GOOS,
+			Shell:         captureShell(),
+			OSDescription: captureOSDescription(),
+		})
+		testassert.NoError(t, err)
+		testassert.Require(t, result.Prompt == direct, "composeSurface(%s) prompt diverged from the direct assembly", mode)
+		if mode == prompt.ModeNone {
 			// None skips the rules reads: no warnings even though no rules
-			// file exists under the isolated home.
+			// file exists under the explicit directories.
 			testassert.Require(t, len(result.Warnings) == 0, "none-size warnings = %#v, want none", result.Warnings)
 		} else if len(result.Warnings) != 1 || result.Warnings[0].Kind != prompt.WarnRulesNotFound {
-			t.Fatalf("%s-size warnings = %#v, want the rules_not_found warning", size, result.Warnings)
+			t.Fatalf("%s-size warnings = %#v, want the rules_not_found warning", mode, result.Warnings)
 		}
 	}
 }
 
 func TestComposeSurfaceRulesPrecedenceAndOverrides(t *testing.T) {
-	home := t.TempDir()
-	testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700))
-	testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", "AGENTS.md"), []byte("GLOBAL CONTENT"), 0o600))
+	globalDir := t.TempDir()
+	testassert.NoError(t, os.WriteFile(filepath.Join(globalDir, "AGENTS.md"), []byte("GLOBAL CONTENT"), 0o600))
 	workspace := t.TempDir()
 	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("PROJECT CONTENT"), 0o600))
 	req := baseSurfaceRequest(t)
-	req.home, req.workspace = home, workspace
+	req.globalRulesDir, req.workspace = globalDir, workspace
 	result, _, err := composeSurface(req)
 	testassert.NoError(t, err)
 	testassert.Require(t, strings.Contains(result.Prompt, "GLOBAL CONTENT") && strings.Contains(result.Prompt, "PROJECT CONTENT"), "the composed prompt lost a rules layer")
@@ -233,17 +248,76 @@ func TestComposeSurfaceRulesPrecedenceAndOverrides(t *testing.T) {
 	testassert.Require(t, strings.Contains(result.Prompt, "Project tone rule."), "the overriding project tone rule is missing")
 }
 
-func TestComposeSurfaceBlocksAndAdditionsRender(t *testing.T) {
+func TestComposeSurfaceAppliesCompletePromptReplacementAfterAssembly(t *testing.T) {
+	workspace := t.TempDir()
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("USER_RULES_MARKER"), 0o600))
 	req := baseSurfaceRequest(t)
-	req.promptBody = "Do the task."
-	req.adaptation = &fakeAdaptation{value: Adaptation{
-		Blocks:    []string{"COACHING BLOCK"},
-		Additions: map[string]string{"safety": "ADDITION SAFETY"},
-	}}
+	req.workspace = workspace
+	replacement := "REPLACED PROMPT"
+	req.adaptation = &fakeAdaptation{value: Adaptation{Prompt: &replacement, Append: []string{"  APPENDED PARAGRAPH  "}}}
 	result, _, err := composeSurface(req)
 	testassert.NoError(t, err)
-	testassert.Require(t, strings.Contains(result.Prompt, "COACHING BLOCK") && strings.Contains(result.Prompt, "ADDITION SAFETY"), "the adaptation blocks or additions did not render")
-	testassert.Require(t, strings.Index(result.Prompt, "COACHING BLOCK") < strings.Index(result.Prompt, "## Your Role and Instructions"), "coaching blocks did not render before the agent body and rules")
+	testassert.Equal(t, result.Prompt, "REPLACED PROMPT\n\n  APPENDED PARAGRAPH  ")
+	for _, forbidden := range []string{"FIXTURE_IDENTITY", "## Core Rules", "USER_RULES_MARKER", "## Environment"} {
+		testassert.Require(t, !strings.Contains(result.Prompt, forbidden), "the replacement retained %q", forbidden)
+	}
+}
+
+func TestComposeSurfaceCustomPromptTransformAppliesInEveryMode(t *testing.T) {
+	for _, mode := range []prompt.Mode{prompt.ModeFull, prompt.ModeSimple, prompt.ModeNone} {
+		t.Run(string(mode), func(t *testing.T) {
+			req := baseSurfaceRequest(t)
+			req.promptSize = mode
+			req.promptBody = "DEFAULT_INSTRUCTIONS"
+			req.adaptation = &fakeAdaptation{value: Adaptation{Prompt: stringPtr("CUSTOM_PROMPT"), Append: []string{"  CUSTOM_APPEND\n"}}}
+			result, _, err := composeSurface(req)
+			testassert.NoError(t, err)
+			testassert.Equal(t, result.Prompt, "CUSTOM_PROMPT\n\n  CUSTOM_APPEND\n")
+		})
+	}
+}
+
+func TestComposeSurfaceEmptyReplacementRemovesNonePrompt(t *testing.T) {
+	req := baseSurfaceRequest(t)
+	req.promptSize = prompt.ModeNone
+	req.promptBody = "INSTRUCTIONS"
+	empty := ""
+	req.adaptation = &fakeAdaptation{value: Adaptation{Prompt: &empty}}
+	result, _, err := composeSurface(req)
+	testassert.NoError(t, err)
+	testassert.Equal(t, result.Prompt, "")
+}
+
+func TestComposeSurfaceZeroValueAdaptationIsNoOp(t *testing.T) {
+	req := baseSurfaceRequest(t)
+	req.sessionStart = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	baseline, _, err := composeSurface(req)
+	testassert.NoError(t, err)
+	req.adaptation = &fakeAdaptation{value: Adaptation{}}
+	got, _, err := composeSurface(req)
+	testassert.NoError(t, err)
+	testassert.Equal(t, got.Prompt, baseline.Prompt)
+}
+
+func TestComposeSurfaceInvalidModeFailsBeforeRulesRead(t *testing.T) {
+	req := baseSurfaceRequest(t)
+	globalDir := t.TempDir()
+	testassert.NoError(t, os.Mkdir(filepath.Join(globalDir, "AGENTS.md"), 0o700))
+	req.globalRulesDir = globalDir
+	req.promptSize = "bogus"
+	result, advertised, err := composeSurface(req)
+	testassert.Require(t, errors.Is(err, prompt.ErrInvalidInput), "composeSurface invalid mode error = %v, want ErrInvalidInput", err)
+	testassert.Require(t, result.Prompt == "" && len(result.Warnings) == 0 && advertised == nil, "invalid mode produced a surface: %+v", result)
+}
+
+func stringPtr(value string) *string { return &value }
+
+func TestComposeSurfacePromptReplacementEmptyRemovesEverything(t *testing.T) {
+	req := baseSurfaceRequest(t)
+	req.adaptation = &fakeAdaptation{value: Adaptation{Prompt: new(string)}}
+	result, _, err := composeSurface(req)
+	testassert.NoError(t, err)
+	testassert.Equal(t, result.Prompt, "")
 }
 
 func TestComposeSurfaceDescriptionReplacements(t *testing.T) {
@@ -400,8 +474,8 @@ func TestComposeSurfaceResolvesExactlyOnce(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, fake.calls, 1)
-	if fake.ref != req.modelRef {
-		t.Fatalf("Resolve received %s, want %s", fake.ref.String(), req.modelRef.String())
+	if fake.ref != req.modelRef || fake.mode != req.promptSize {
+		t.Fatalf("Resolve received %s/%q, want %s/%q", fake.ref.String(), fake.mode, req.modelRef.String(), req.promptSize)
 	}
 }
 
@@ -419,8 +493,20 @@ func TestComposeSurfaceUnselectedAdaptationKeepsBaselinePrompt(t *testing.T) {
 	req.sessionStart = start
 	result, advertised, err := composeSurface(req)
 	testassert.NoError(t, err)
-	direct := prompt.NewService(req.home).Assemble(req.workspace, start, prompt.Spec{Size: prompt.SizeFull})
-	testassert.Require(t, result.Prompt == direct.Prompt, "the unselected adaptation changed the baseline prompt")
+	rules, err := prompt.ReadRules(req.globalRulesDir, req.workspace, prompt.ModeFull)
+	testassert.NoError(t, err)
+	direct, err := prompt.Assemble(prompt.AssemblyInput{
+		Identity:      req.hostIdentity,
+		Mode:          prompt.ModeFull,
+		Rules:         rules,
+		Workspace:     req.workspace,
+		SessionStart:  start,
+		OS:            goruntime.GOOS,
+		Shell:         captureShell(),
+		OSDescription: captureOSDescription(),
+	})
+	testassert.NoError(t, err)
+	testassert.Require(t, result.Prompt == direct, "the unselected adaptation changed the baseline prompt")
 	{
 		names := advertisedNames(advertised)
 		testassert.Require(t, reflect.DeepEqual(names, []string{"read_file", "apply_patch"}), "baseline advertisement = %q, want the full eligible surface", names)

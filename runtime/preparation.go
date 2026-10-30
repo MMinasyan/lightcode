@@ -15,8 +15,8 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/prompt"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -144,8 +144,15 @@ type preparation struct {
 	runtime     *scope
 	workspaces  *workspaceScopes
 	home        string
-	background  BackgroundServices
-	passive     *observationAdapter
+
+	// identity and globalRulesDir are the host-supplied prompt inputs: the
+	// application persona text and the explicit global rules directory. Their
+	// zero values supply no identity and no global rules, never an implicit
+	// fallback.
+	identity       string
+	globalRulesDir string
+	background     BackgroundServices
+	passive        *observationAdapter
 
 	// artifacts is the Runtime's private per-Session artifact interval
 	// registry. Every committed opener acquires its Session's token here
@@ -165,23 +172,26 @@ type preparation struct {
 
 // newPreparation wires the binder to the published configuration, the
 // composition with its constructed Runtime scope and Workspace registry, the
-// once-resolved home, the background services bridge armed after harness.New
+// once-resolved home, the host-supplied prompt identity and global rules
+// directory, the background services bridge armed after harness.New
 // returns, the Runtime's passive publication adapter (nil in isolated
 // preparation tests, dropping only passive presentation), the Runtime's
 // private artifact interval registry (nil without a Runtime), and the
 // Runtime's live managed-environment producer (nil without a retained
 // manager). One concrete preparation path serves every admission.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home string, background BackgroundServices, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
+func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home, identity, globalRulesDir string, background BackgroundServices, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
 	return &preparation{
-		config:        config,
-		composition:   c,
-		runtime:       runtime,
-		workspaces:    workspaces,
-		home:          home,
-		background:    background,
-		passive:       passive,
-		artifacts:     artifacts,
-		subprocessEnv: subprocessEnv,
+		config:         config,
+		composition:    c,
+		runtime:        runtime,
+		workspaces:     workspaces,
+		home:           home,
+		identity:       identity,
+		globalRulesDir: globalRulesDir,
+		background:     background,
+		passive:        passive,
+		artifacts:      artifacts,
+		subprocessEnv:  subprocessEnv,
 	}
 }
 
@@ -476,17 +486,18 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 		return harness.ExecutionCapture{}, nil, err
 	}
 	result, tools, err := composeSurface(surfaceRequest{
-		home:         p.home,
-		workspace:    req.Session.Identity.Workspace,
-		sessionStart: req.Session.Identity.CreatedAt, // a Fork's zero start samples the compose time once
-		promptSize:   sel.agent.SystemPrompt,
-		promptBody:   sel.agent.Prompt,
-		invocation:   sel.invocation,
-		constraints:  ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
-		identity:     req.Session.Identity,
-		toolSpecs:    specs,
-		adaptation:   adaptation,
-		modelRef:     sel.agent.Model,
+		hostIdentity:   p.identity,
+		globalRulesDir: p.globalRulesDir,
+		workspace:      req.Session.Identity.Workspace,
+		sessionStart:   req.Session.Identity.CreatedAt, // a Fork's zero start samples the compose time once
+		promptSize:     prompt.Mode(sel.agent.SystemPrompt),
+		promptBody:     sel.agent.Prompt,
+		invocation:     sel.invocation,
+		constraints:    ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
+		identity:       req.Session.Identity,
+		toolSpecs:      specs,
+		adaptation:     adaptation,
+		modelRef:       sel.agent.Model,
 	})
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err

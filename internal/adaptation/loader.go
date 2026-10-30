@@ -5,7 +5,6 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"sort"
 )
 
 //go:embed data/bundled.json
@@ -23,18 +22,8 @@ type bundledEntry struct {
 	Pattern                     string            `json:"pattern"`
 	Name                        string            `json:"name"`
 	ExcludeTools                []string          `json:"exclude_tools,omitempty"`
-	Additions                   map[string]string `json:"additions,omitempty"`
+	Append                      []string          `json:"append,omitempty"`
 	ToolDescriptionReplacements map[string]string `json:"tool_description_replacements,omitempty"`
-}
-
-// validSectionIDs lists the user-overridable section ids the prompt
-// assembler accepts. An additions key outside this set is rejected at
-// startup so a typo in the data file is caught immediately.
-var validSectionIDs = map[string]bool{
-	"safety":         true,
-	"tone":           true,
-	"task_execution": true,
-	"language":       true,
 }
 
 // loadBundledTable reads, decodes, and validates the bundled adaptation
@@ -70,7 +59,7 @@ func loadBundledTable() []entry {
 		seen[key] = true
 		out = append(out, entry{pattern: e.Pattern, adapt: Adaptation{
 			ExcludeTools:                append([]string(nil), e.ExcludeTools...),
-			Additions:                   cloneStringMap(e.Additions),
+			Append:                      append([]string(nil), e.Append...),
 			ToolDescriptionReplacements: cloneStringMap(e.ToolDescriptionReplacements),
 		}})
 	}
@@ -90,19 +79,6 @@ func validateBundledEntry(i int, e bundledEntry) error {
 	for j, t := range e.ExcludeTools {
 		if t == "" {
 			return fmt.Errorf("entry %d (%q): exclude_tools[%d] is empty", i, e.Pattern, j)
-		}
-	}
-	keys := make([]string, 0, len(e.Additions))
-	for k := range e.Additions {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		if !validSectionIDs[k] {
-			return fmt.Errorf("entry %d (%q): additions key %q is not a user-overridable section id (want safety/tone/task_execution/language)", i, e.Pattern, k)
-		}
-		if e.Additions[k] == "" {
-			return fmt.Errorf("entry %d (%q): additions[%q] is empty", i, e.Pattern, k)
 		}
 	}
 	if _, empty := e.ToolDescriptionReplacements[""]; empty {

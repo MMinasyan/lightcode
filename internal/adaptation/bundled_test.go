@@ -51,7 +51,7 @@ func TestProductionBundledDataIsValid(t *testing.T) {
 	for i, e := range doc.Entries {
 		testassert.Check(t, e.Name != "", "row %d (%q): fixture row has no authoring name", i, e.Pattern)
 		testassert.Check(t, tbl[i].pattern == e.Pattern, "row %d: loader pattern %q != fixture %q", i, tbl[i].pattern, e.Pattern)
-		testassert.Check(t, maps.Equal(tbl[i].adapt.Additions, e.Additions) &&
+		testassert.Check(t, slices.Equal(tbl[i].adapt.Append, e.Append) &&
 			slices.Equal(tbl[i].adapt.ExcludeTools, e.ExcludeTools) &&
 			maps.Equal(tbl[i].adapt.ToolDescriptionReplacements, e.ToolDescriptionReplacements), "row %d (%q): loaded adaptation outputs %+v != fixture row %+v", i, e.Pattern, tbl[i].adapt, e)
 	}
@@ -85,14 +85,13 @@ func TestProductionBundledDataHasNoDuplicateRow(t *testing.T) {
 	}
 }
 
-// TestProductionBundledDataAdditionsUseValidSectionIDs walks every
-// addition in the production data and confirms the key is one of the
-// four user-overridable section ids.
-func TestProductionBundledDataAdditionsUseValidSectionIDs(t *testing.T) {
+// TestProductionBundledDataAppendParagraphsAreNonEmpty walks every append
+// paragraph in the production data and confirms it carries text.
+func TestProductionBundledDataAppendParagraphsAreNonEmpty(t *testing.T) {
 	doc := loadFixture(t)
 	for _, e := range doc.Entries {
-		for k := range e.Additions {
-			testassert.Check(t, validSectionIDs[k], "entry %q has additions key %q outside {safety, tone, task_execution, language}", e.Pattern, k)
+		for i, paragraph := range e.Append {
+			testassert.Check(t, strings.TrimSpace(paragraph) != "", "entry %q has an empty append[%d]", e.Pattern, i)
 		}
 	}
 }

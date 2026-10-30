@@ -51,17 +51,6 @@ func RenderToolDescription(description string, adapt *Adaptation) string {
 	return strings.Join(lines, "\n")
 }
 
-// SectionAddition returns the nonempty addition for section from the active
-// adaptation, or "" when the adaptation or the entry is absent. section is one
-// of the four user-overridable section ids: "safety", "tone", "task_execution",
-// "language".
-func SectionAddition(adapt *Adaptation, section string) string {
-	if adapt == nil {
-		return ""
-	}
-	return adapt.Additions[section]
-}
-
 // matchIn returns an independent copy of the first entry in t whose pattern
 // matches modelID, or nil. Matching is case-insensitive and walks t in order, so
 // the table's most-specific-first ordering decides ties (first match wins). The
@@ -73,8 +62,7 @@ func matchIn(t []entry, modelID string) *Adaptation {
 		if globMatch(strings.ToLower(t[i].pattern), id) {
 			a := t[i].adapt
 			a.ExcludeTools = slices.Clone(a.ExcludeTools)
-			a.Blocks = slices.Clone(a.Blocks)
-			a.Additions = maps.Clone(a.Additions)
+			a.Append = slices.Clone(a.Append)
 			a.ToolDescriptionReplacements = maps.Clone(a.ToolDescriptionReplacements)
 			return &a
 		}
