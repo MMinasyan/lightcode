@@ -9,8 +9,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
-func stringPtr(value string) *string { return &value }
-
 func TestMatchInOrderingMostSpecificFirst(t *testing.T) {
 	// gpt-oss* is listed before gpt-* so the more specific family wins on overlap.
 	tbl := []entry{
@@ -102,15 +100,6 @@ func TestTransformPromptNoOpReturnsIncomingBytes(t *testing.T) {
 	}
 }
 
-func TestTransformPromptCompleteReplacementIsExact(t *testing.T) {
-	incoming := "## Identity\n\nbaseline text\n\n## Rules\n\nuser rules\n"
-	replacement := "  replaced prompt bytes\n\nwith exact spacing  "
-	adapt := &Adaptation{Prompt: stringPtr(replacement)}
-	testassert.Equal(t, TransformPrompt(incoming, adapt), replacement)
-	empty := ""
-	testassert.Equal(t, TransformPrompt(incoming, &Adaptation{Prompt: &empty}), "")
-}
-
 func TestTransformPromptOrderedAppend(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -142,28 +131,12 @@ func TestTransformPromptOrderedAppend(t *testing.T) {
 			adapt:    &Adaptation{Append: []string{"", "after"}},
 			want:     "\n\nafter",
 		},
-		{
-			name:     "empty replacement followed by appends",
-			incoming: "BASE",
-			adapt:    &Adaptation{Prompt: stringPtr(""), Append: []string{"first", "", "second"}},
-			want:     "first\n\n\n\nsecond",
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			testassert.Equal(t, TransformPrompt(tc.incoming, tc.adapt), tc.want)
 		})
 	}
-}
-
-func TestTransformPromptReplacementThenOrderedAppend(t *testing.T) {
-	adapt := &Adaptation{
-		Prompt: stringPtr("ONLY_REPLACEMENT"),
-		Append: []string{"FIRST_APPEND", "  ", "SECOND_APPEND"},
-	}
-	got := TransformPrompt("## Identity\n\nBASELINE\n\nuser rules", adapt)
-	testassert.Equal(t, got, "ONLY_REPLACEMENT\n\nFIRST_APPEND\n\n  \n\nSECOND_APPEND")
-	testassert.Require(t, !strings.Contains(got, "BASELINE") && !strings.Contains(got, "user rules"), "replacement retained earlier text: %q", got)
 }
 
 func TestTransformPromptEqualTextAndTransformProduceEqualOutput(t *testing.T) {

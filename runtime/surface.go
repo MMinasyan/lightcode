@@ -47,11 +47,10 @@ type surfaceResult struct {
 // adaptation resolves exactly once for the model ref and prompt mode; its
 // error aborts preparation. The prompt reads the explicitly supplied global
 // and Workspace rules, assembles the baseline through the public pure
-// assembler, then applies the resolved adaptation's plain text transformation
-// last: the default assembly never reinserts text after a replacement. The
-// advertised surface walks the tool specs in the agent's selection order after
-// first-occurrence dedupe: every selected eligible tool is advertised minus
-// the excluded names — an exclusion can never revive a tool the hard
+// assembler, then appends the resolved adaptation's ordered paragraphs last.
+// The advertised surface walks the tool specs in the agent's selection order
+// after first-occurrence dedupe: every selected eligible tool is advertised
+// minus the excluded names — an exclusion can never revive a tool the hard
 // constraints made ineligible. Every advertised description renders through
 // the existing adaptation rendering helper. A zero session start samples the
 // compose time once, so the resulting prompt is captured once.
@@ -66,7 +65,6 @@ func composeSurface(req surfaceRequest) (surfaceResult, []model.ToolDefinition, 
 		resolved = value
 		conv = &adaptation.Adaptation{
 			ExcludeTools:                slices.Clone(resolved.ExcludeTools),
-			Prompt:                      cloneString(resolved.Prompt),
 			Append:                      slices.Clone(resolved.Append),
 			ToolDescriptionReplacements: maps.Clone(resolved.ToolDescriptionReplacements),
 		}
@@ -142,12 +140,4 @@ func captureOSDescription() string {
 		}
 	}
 	return goruntime.GOOS + "/" + goruntime.GOARCH
-}
-
-func cloneString(value *string) *string {
-	if value == nil {
-		return nil
-	}
-	copied := *value
-	return &copied
 }

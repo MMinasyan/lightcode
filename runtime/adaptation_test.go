@@ -248,44 +248,36 @@ func TestComposeSurfaceRulesPrecedenceAndOverrides(t *testing.T) {
 	testassert.Require(t, strings.Contains(result.Prompt, "Project tone rule."), "the overriding project tone rule is missing")
 }
 
-func TestComposeSurfaceAppliesCompletePromptReplacementAfterAssembly(t *testing.T) {
+func TestComposeSurfaceAppendsParagraphAfterAssembly(t *testing.T) {
 	workspace := t.TempDir()
 	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("USER_RULES_MARKER"), 0o600))
 	req := baseSurfaceRequest(t)
 	req.workspace = workspace
-	replacement := "REPLACED PROMPT"
-	req.adaptation = &fakeAdaptation{value: Adaptation{Prompt: &replacement, Append: []string{"  APPENDED PARAGRAPH  "}}}
+	baseline, _, err := composeSurface(req)
+	testassert.NoError(t, err)
+	req.adaptation = &fakeAdaptation{value: Adaptation{Append: []string{"  APPENDED PARAGRAPH  "}}}
 	result, _, err := composeSurface(req)
 	testassert.NoError(t, err)
-	testassert.Equal(t, result.Prompt, "REPLACED PROMPT\n\n  APPENDED PARAGRAPH  ")
-	for _, forbidden := range []string{"FIXTURE_IDENTITY", "## Core Rules", "USER_RULES_MARKER", "## Environment"} {
-		testassert.Require(t, !strings.Contains(result.Prompt, forbidden), "the replacement retained %q", forbidden)
+	testassert.Equal(t, result.Prompt, baseline.Prompt+"\n\n  APPENDED PARAGRAPH  ")
+	for _, retained := range []string{"FIXTURE_IDENTITY", "## Core Rules", "USER_RULES_MARKER", "## Environment"} {
+		testassert.Require(t, strings.Contains(result.Prompt, retained), "the append lost the assembled %q", retained)
 	}
 }
 
-func TestComposeSurfaceCustomPromptTransformAppliesInEveryMode(t *testing.T) {
+func TestComposeSurfaceCustomPromptAppendAppliesInEveryMode(t *testing.T) {
 	for _, mode := range []prompt.Mode{prompt.ModeFull, prompt.ModeSimple, prompt.ModeNone} {
 		t.Run(string(mode), func(t *testing.T) {
 			req := baseSurfaceRequest(t)
 			req.promptSize = mode
 			req.promptBody = "DEFAULT_INSTRUCTIONS"
-			req.adaptation = &fakeAdaptation{value: Adaptation{Prompt: stringPtr("CUSTOM_PROMPT"), Append: []string{"  CUSTOM_APPEND\n"}}}
+			baseline, _, err := composeSurface(req)
+			testassert.NoError(t, err)
+			req.adaptation = &fakeAdaptation{value: Adaptation{Append: []string{"  CUSTOM_APPEND\n"}}}
 			result, _, err := composeSurface(req)
 			testassert.NoError(t, err)
-			testassert.Equal(t, result.Prompt, "CUSTOM_PROMPT\n\n  CUSTOM_APPEND\n")
+			testassert.Equal(t, result.Prompt, baseline.Prompt+"\n\n  CUSTOM_APPEND\n")
 		})
 	}
-}
-
-func TestComposeSurfaceEmptyReplacementRemovesNonePrompt(t *testing.T) {
-	req := baseSurfaceRequest(t)
-	req.promptSize = prompt.ModeNone
-	req.promptBody = "INSTRUCTIONS"
-	empty := ""
-	req.adaptation = &fakeAdaptation{value: Adaptation{Prompt: &empty}}
-	result, _, err := composeSurface(req)
-	testassert.NoError(t, err)
-	testassert.Equal(t, result.Prompt, "")
 }
 
 func TestComposeSurfaceZeroValueAdaptationIsNoOp(t *testing.T) {
@@ -308,16 +300,6 @@ func TestComposeSurfaceInvalidModeFailsBeforeRulesRead(t *testing.T) {
 	result, advertised, err := composeSurface(req)
 	testassert.Require(t, errors.Is(err, prompt.ErrInvalidInput), "composeSurface invalid mode error = %v, want ErrInvalidInput", err)
 	testassert.Require(t, result.Prompt == "" && len(result.Warnings) == 0 && advertised == nil, "invalid mode produced a surface: %+v", result)
-}
-
-func stringPtr(value string) *string { return &value }
-
-func TestComposeSurfacePromptReplacementEmptyRemovesEverything(t *testing.T) {
-	req := baseSurfaceRequest(t)
-	req.adaptation = &fakeAdaptation{value: Adaptation{Prompt: new(string)}}
-	result, _, err := composeSurface(req)
-	testassert.NoError(t, err)
-	testassert.Equal(t, result.Prompt, "")
 }
 
 func TestComposeSurfaceDescriptionReplacements(t *testing.T) {

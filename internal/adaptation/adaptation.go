@@ -1,7 +1,7 @@
 // Package adaptation defines per-model treatment. A single binding table maps
 // a model id to an Adaptation that selects which tools the model is shown,
-// replaces or extends its complete prompt text, and overrides model-facing
-// tool description text.
+// appends ordered parts to its prompt text, and overrides model-facing tool
+// description text.
 //
 // The binding table in this package is the only place in the codebase that
 // inspects the model-id string. Consumers stay model-blind: they receive a
@@ -17,13 +17,9 @@ type Adaptation struct {
 	// ExcludeTools lists registered tool names hidden from this model.
 	ExcludeTools []string
 
-	// Prompt, when non-nil, replaces the complete incoming prompt text. A
-	// pointer to the empty string removes that incoming text before appends.
-	Prompt *string
-
-	// Append lists prompt parts appended to the incoming or replaced prompt in
-	// declared order, joined verbatim by one blank line. Empty and whitespace
-	// parts are preserved.
+	// Append lists prompt parts appended to the incoming prompt in declared
+	// order, joined verbatim by one blank line. Empty and whitespace parts are
+	// preserved.
 	Append []string
 
 	// ToolDescriptionReplacements rewrites the model-facing tool description
@@ -34,16 +30,12 @@ type Adaptation struct {
 	ToolDescriptionReplacements map[string]string
 }
 
-// TransformPrompt applies adapt's plain prompt-text transformation: an
-// optional complete replacement followed by every ordered append part, joined
-// verbatim by one blank line. The replacement text is exact, and a nil or
-// zero-value adaptation returns text unchanged.
+// TransformPrompt appends every ordered part to text, joined verbatim by one
+// blank line. The incoming text is exact, and a nil or zero-value adaptation
+// returns it unchanged.
 func TransformPrompt(text string, adapt *Adaptation) string {
 	if adapt == nil {
 		return text
-	}
-	if adapt.Prompt != nil {
-		text = *adapt.Prompt
 	}
 	parts := make([]string, 0, len(adapt.Append)+1)
 	if text != "" {

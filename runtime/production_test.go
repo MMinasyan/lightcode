@@ -230,14 +230,12 @@ func productionToolsPlugin() Plugin {
 }
 
 // testAdaptation is the custom test plugin's ModelAdaptation value: one
-// appended paragraph, one complete prompt replacement, and one excluded tool.
+// appended paragraph and one excluded tool.
 type testAdaptation struct{}
 
 func (testAdaptation) Resolve(model.ModelRef, prompt.Mode) (Adaptation, error) {
-	replacement := "PROD-ADAPTATION-PROMPT"
 	return Adaptation{
 		ExcludeTools: []string{"prod_read"},
-		Prompt:       &replacement,
 		Append:       []string{"  PROD-ADAPTATION-BLOCK\n"},
 	}, nil
 }
@@ -1469,8 +1467,8 @@ func TestProductionSuppliesExplicitPromptInputs(t *testing.T) {
 // TestProductionAdaptationComposes composes the suite's custom
 // ModelAdaptation export through public Open and proves through one real
 // admitted operation that the selected adaptation reached the composed
-// surface: the complete prompt replacement and its append paragraph appear in
-// the captured prompt and the excluded tool is absent from the advertisement.
+// surface: the append paragraph lands after the assembled baseline and the
+// excluded tool is absent from the advertisement.
 func TestProductionAdaptationComposes(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
@@ -1483,7 +1481,8 @@ func TestProductionAdaptationComposes(t *testing.T) {
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 
 		prompt := rec.Admission.Execution.SystemPrompt
-		testassert.Require(t, strings.HasPrefix(prompt, "PROD-ADAPTATION-PROMPT\n\n  PROD-ADAPTATION-BLOCK\n"), "captured prompt misses the adaptation's replacement or append whitespace: %.200s", prompt)
+		testassert.Require(t, strings.HasSuffix(prompt, "  PROD-ADAPTATION-BLOCK\n"), "captured prompt misses the adaptation's append paragraph and whitespace: %.200s", prompt)
+		testassert.Require(t, strings.Contains(prompt, "## Core Rules"), "captured prompt lost the assembled baseline: %.200s", prompt)
 		{
 			got := toolNames(rec.Admission.Execution.Tools)
 			testassert.Require(t, slices.Equal(got, []string{"prod_write"}), "advertisement = %v, want the adaptation's excluded tool absent", got)
@@ -1492,6 +1491,83 @@ func TestProductionAdaptationComposes(t *testing.T) {
 		// The exclusion is the adaptation's work, not the hard constraints:
 		// the capture's readonly/write-dir fields stay the definition's.
 		testassert.Require(t, !rec.Admission.Execution.Readonly && rec.Admission.Execution.WriteDir == "", "capture constraints = (%v, %q), want the definition's untouched values", rec.Admission.Execution.Readonly, rec.Admission.Execution.WriteDir)
+	})
+}
+
+// TestProductionPreparationHookReplacesAndRemovesPromptAfterAssembly proves
+// the existing PreparationHook callback owns complete replacement and empty
+// removal AFTER prompt assembly: full, simple and none each assemble their
+// baseline (identity, rules, instructions), the hook replaces it with one
+// exact text (or removes it), the admitted capture is exactly that text with
+// no baseline, rule or identity reinsertion, and the model request carries
+// the exact system message (or none at all).
+func TestProductionPreparationHookReplacesAndRemovesPromptAfterAssembly(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		writeServiceFile(t, agents.PathForConfig(e.configPath), `{
+  "fullagent": {"model": "prov/m", "system_prompt": "full", "prompt": "FULL_INSTRUCTIONS", "capabilities": ["hook.first"]},
+  "simpleagent": {"model": "prov/m", "system_prompt": "simple", "prompt": "SIMPLE_INSTRUCTIONS", "capabilities": ["hook.first"]},
+  "noneagent": {"model": "prov/m", "system_prompt": "none", "prompt": "NONE_INSTRUCTIONS", "capabilities": ["hook.first"]}
+}`)
+		globalDir := e.workspace("global-rules")
+		testassert.NoError(t, os.MkdirAll(globalDir, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(globalDir, "AGENTS.md"), []byte("EXPLICIT_GLOBAL_RULES"), 0o600))
+		e.identity = "PRODUCTION_HOST_IDENTITY"
+		e.globalRulesDir = globalDir
+		workspace := e.workspace("hook-prompt-ws")
+		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("WORKSPACE_RULES_MARKER"), 0o600))
+
+		const replaced = "HOOK-REPLACED-PROMPT"
+		cases := []struct {
+			name, agent, want string
+			assembled         []string
+		}{
+			{"full", "fullagent", replaced, []string{"PRODUCTION_HOST_IDENTITY", "EXPLICIT_GLOBAL_RULES", "WORKSPACE_RULES_MARKER", "FULL_INSTRUCTIONS"}},
+			{"simple", "simpleagent", replaced, []string{"PRODUCTION_HOST_IDENTITY", "EXPLICIT_GLOBAL_RULES", "WORKSPACE_RULES_MARKER", "SIMPLE_INSTRUCTIONS"}},
+			{"none", "noneagent", "", []string{"NONE_INSTRUCTIONS"}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var mu sync.Mutex
+				var preHook string
+				hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
+					mu.Lock()
+					preHook = c.SystemPrompt
+					mu.Unlock()
+					c.SystemPrompt = tc.want
+					return c
+				}}
+				r, err := e.openPlugins(ctx, hookPlugin(hook))
+				testassert.NoError(t, err)
+				defer r.Close(ctx)
+				session, err := r.createSession(ctx, workspace, tc.agent)
+				testassert.NoError(t, err)
+				before := e.server.requests()
+				submitThroughRuntime(t, r, session.Identity.SessionID, "op-"+tc.name, "hello")
+				rec := awaitOperation(t, r, session.Identity.SessionID, "op-"+tc.name, harness.OperationSuccess)
+
+				mu.Lock()
+				assembled := preHook
+				mu.Unlock()
+				for _, marker := range tc.assembled {
+					testassert.Require(t, strings.Contains(assembled, marker), "pre-hook prompt misses the assembled %q: %.300s", marker, assembled)
+				}
+				testassert.Equal(t, rec.Admission.Execution.SystemPrompt, tc.want)
+				for _, marker := range tc.assembled {
+					testassert.Require(t, !strings.Contains(rec.Admission.Execution.SystemPrompt, marker), "admitted prompt reinserted %q", marker)
+				}
+
+				testassert.Require(t, e.server.requests() > before, "no model request was recorded")
+				wire := decodeWireChatBody(t, e.server.bodyAt(before))
+				if tc.want == "" {
+					testassert.Require(t, len(wire.Messages) != 0 && wire.Messages[0].Role != "system", "wire messages = %+v, want no system message for the removed prompt", wire.Messages)
+					return
+				}
+				want, err := json.Marshal(tc.want)
+				testassert.Require(t, err == nil && len(wire.Messages) != 0 && wire.Messages[0].Role == "system" && string(wire.Messages[0].Content) == string(want), "wire messages = %+v, want the exact replacement system message %s", wire.Messages, want)
+			})
+		}
 	})
 }
 

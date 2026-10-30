@@ -79,7 +79,7 @@ func TestResolveBundledGuidanceOnlyInFullMode(t *testing.T) {
 func TestResolveUnmatchedModelIsBaseline(t *testing.T) {
 	got, err := resolvePlugin(t, context.Background(), model.ModelRef{Provider: "anthropic", Model: "claude-x"}, prompt.ModeFull)
 	testassert.NoError(t, err)
-	testassert.Require(t, got.ExcludeTools == nil && got.Prompt == nil && len(got.Append) == 0 && got.ToolDescriptionReplacements == nil, "unmatched model adaptation = %+v, want the zero baseline", got)
+	testassert.Require(t, got.ExcludeTools == nil && len(got.Append) == 0 && got.ToolDescriptionReplacements == nil, "unmatched model adaptation = %+v, want the zero baseline", got)
 }
 
 func TestResolveMatchesTheModelComponentOnly(t *testing.T) {

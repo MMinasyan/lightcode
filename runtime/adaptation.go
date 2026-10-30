@@ -8,12 +8,11 @@ import (
 )
 
 // Adaptation is the public per-model treatment value a ModelAdaptation
-// resolves: which registered tools the model is hidden from, an optional
-// complete prompt replacement, ordered prompt append paragraphs, and
-// tool-description replacements. The zero value is a valid no-op baseline.
+// resolves: which registered tools the model is hidden from, ordered prompt
+// append paragraphs, and tool-description replacements. The zero value is a
+// valid no-op baseline.
 type Adaptation struct {
 	ExcludeTools                []string
-	Prompt                      *string
 	Append                      []string
 	ToolDescriptionReplacements map[string]string
 }
