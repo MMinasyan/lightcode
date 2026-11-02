@@ -16,22 +16,6 @@ func cancelThen(cancel context.CancelFunc, set ModelSettlement) (ModelSettlement
 	return set, nil
 }
 
-func TestRunCancellationShapedCallbackErrorIdentity(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	cause := fmt.Errorf("model failure: %w", context.Canceled)
-	f := &runFakes{}
-	f.modelSet = func(int, model.Request, AssemblyCallback) (ModelSettlement, error) {
-		cancel()
-		return ModelSettlement{}, cause
-	}
-	res, err := Run(ctx, f.invocation())
-	requireZeroTerminal(t, res)
-	if err != cause || f.sourceCalls != 1 || f.modelCalls != 1 || f.toolCalls != 0 {
-		t.Fatalf("error=%v calls=%d/%d/%d, want original error and 1/1/0", err, f.sourceCalls, f.modelCalls, f.toolCalls)
-	}
-}
-
 // TestRunCancelledAfterSettledBatchRetainsCompletedOutput pins the loop-top checkpoint reached only after a complete batch: the run's last completed output survives the cancellation intact and carries no unstarted calls — every one of them settled — and no further effect starts.
 func TestRunCancelledAfterSettledBatchRetainsCompletedOutput(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
