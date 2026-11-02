@@ -61,41 +61,157 @@ func TestRunCancelledDuringSnapshot(t *testing.T) {
 	testassert.Require(t, f.sourceCalls == 1 && f.modelCalls == 0 && f.toolCalls == 0, "source=%d model=%d tool=%d, want 1/0/0", f.sourceCalls, f.modelCalls, f.toolCalls)
 }
 
-// TestRunRequestSourceCancellationRouting pins both halves of the source rule: a cancellation report under a genuinely done run context maps to Agent interruption, while the same-shaped report under a live context is an ordinary infrastructure error returned verbatim with no terminal.
-func TestRunRequestSourceCancellationRouting(t *testing.T) {
-	wrapped := func() error { return fmt.Errorf("snapshot read: %w", context.Canceled) }
-
-	t.Run("done-context-interruption", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		f := &runFakes{}
-		f.snapshot = func(int) ([]model.Message, error) { cancel(); return nil, wrapped() }
-
-		res, err := Run(ctx, f.invocation())
-		requireRunInterrupted(t, res, err, "agent interrupted")
-		testassert.Equal(t, f.modelCalls, 0)
-	})
-
-	t.Run("live-context-infrastructure-error", func(t *testing.T) {
-		f := &runFakes{}
-		f.snapshot = func(int) ([]model.Message, error) { return nil, wrapped() }
-
-		res, err := Run(context.Background(), f.invocation())
-		requireZeroTerminal(t, res)
-		testassert.Require(t, errors.Is(err, context.Canceled), "error = %v, want the verbatim cancellation-shaped infrastructure failure", err)
-		testassert.Require(t, f.modelCalls == 0 && f.toolCalls == 0, "later effects started: model=%d tool=%d", f.modelCalls, f.toolCalls)
-	})
-
-	t.Run("deadline-under-done-context-interruption", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		f := &runFakes{}
-		f.snapshot = func(int) ([]model.Message, error) {
-			cancel()
-			return nil, fmt.Errorf("snapshot read: %w", context.DeadlineExceeded)
+func TestRunCallbackErrorIdentity(t *testing.T) {
+	for _, boundary := range []string{"source", "model", "tool"} {
+		for _, done := range []bool{false, true} {
+			for _, cause := range []error{context.Canceled, context.DeadlineExceeded, fmt.Errorf("wrapped: %w", context.Canceled), fmt.Errorf("wrapped: %w", context.DeadlineExceeded), errInfra} {
+				t.Run(fmt.Sprintf("%s/done=%t/%s", boundary, done, cause), func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					f := &runFakes{modelSet: readyOutputs(mkCallsTerminalOutput())}
+					fail := func() {
+						if done {
+							cancel()
+						}
+					}
+					switch boundary {
+					case "source":
+						f.snapshot = func(int) ([]model.Message, error) { fail(); return nil, cause }
+					case "model":
+						f.modelSet = func(int, model.Request, AssemblyCallback) (ModelSettlement, error) {
+							fail()
+							return ModelSettlement{}, cause
+						}
+					case "tool":
+						f.toolRes = func(int, model.ToolCall) (model.ToolResult, error) { fail(); return model.ToolResult{}, cause }
+					}
+					res, err := Run(ctx, f.invocation())
+					requireZeroTerminal(t, res)
+					wantModel, wantTool := 0, 0
+					if boundary != "source" {
+						wantModel = 1
+					}
+					if boundary == "tool" {
+						wantTool = 1
+					}
+					if err != cause || f.sourceCalls != 1 || f.modelCalls != wantModel || f.toolCalls != wantTool {
+						t.Fatalf("error=%v calls=%d/%d/%d, want original error and 1/%d/%d", err, f.sourceCalls, f.modelCalls, f.toolCalls, wantModel, wantTool)
+					}
+				})
+			}
 		}
+	}
+}
 
-		res, err := Run(ctx, f.invocation())
-		requireRunInterrupted(t, res, err, "agent interrupted")
+func TestRunRequestSourceOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		result     RequestResult
+		err        error
+		wantError  error
+		wantStatus TerminalStatus
+	}{
+		{"populated", RequestResult{Request: &model.Request{Messages: userSnapshot("go")}}, nil, nil, TerminalSuccess},
+		{"empty", RequestResult{Request: &model.Request{}}, nil, nil, TerminalSuccess},
+		{"interrupted", RequestResult{Interrupted: true}, nil, nil, TerminalInterruption},
+		{"neither", RequestResult{}, nil, ErrBoundaryProtocol, ""},
+		{"both", RequestResult{Request: &model.Request{}, Interrupted: true}, nil, ErrBoundaryProtocol, ""},
+		{"error wins invalid", RequestResult{Request: &model.Request{}, Interrupted: true}, errInfra, errInfra, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &runFakes{modelSet: readyOutputs(mkOutput(model.OutputCompleted, "", nil))}
+			inv := f.invocation()
+			inv.Request = func(context.Context) (RequestResult, error) { f.sourceCalls++; return tc.result, tc.err }
+			res, err := Run(context.Background(), inv)
+			if tc.wantError != nil {
+				requireZeroTerminal(t, res)
+				if !errors.Is(err, tc.wantError) || f.modelCalls != 0 || f.toolCalls != 0 {
+					t.Fatalf("result=%+v error=%v calls=%d/%d", res, err, f.modelCalls, f.toolCalls)
+				}
+				if tc.err != nil && err != tc.err {
+					t.Fatalf("error identity = %v", err)
+				}
+				return
+			}
+			if err != nil || res.Status != tc.wantStatus || f.sourceCalls != 1 || f.toolCalls != 0 {
+				t.Fatalf("result=%+v error=%v calls=%d/%d/%d", res, err, f.sourceCalls, f.modelCalls, f.toolCalls)
+			}
+			wantModel := 1
+			if tc.wantStatus == TerminalInterruption {
+				wantModel = 0
+			}
+			if f.modelCalls != wantModel {
+				t.Fatalf("model calls=%d want %d", f.modelCalls, wantModel)
+			}
+		})
+	}
+	t.Run("invalid ready before cancellation checkpoint", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f := &runFakes{}
+		inv := f.invocation()
+		inv.Request = func(context.Context) (RequestResult, error) {
+			cancel()
+			return RequestResult{Request: &model.Request{Messages: []model.Message{{Role: "invalid"}}}}, nil
+		}
+		res, err := Run(ctx, inv)
+		requireZeroTerminal(t, res)
+		if !errors.Is(err, ErrBoundaryProtocol) || f.modelCalls != 0 {
+			t.Fatalf("result=%+v error=%v", res, err)
+		}
 	})
+}
+
+func TestRunLaterRequestSourceOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result RequestResult
+		err    error
+		status TerminalStatus
+	}{
+		{"populated", RequestResult{Request: &model.Request{Messages: userSnapshot("later")}}, nil, TerminalSuccess},
+		{"empty", RequestResult{Request: &model.Request{}}, nil, TerminalSuccess},
+		{"interrupted", RequestResult{Interrupted: true}, nil, TerminalInterruption},
+		{"both", RequestResult{Request: &model.Request{}, Interrupted: true}, nil, ""},
+		{"neither", RequestResult{}, nil, ""},
+		{"error wins invalid", RequestResult{Interrupted: true, Request: &model.Request{}}, errInfra, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first := mkCallsTerminalOutput()
+			f := &runFakes{modelSet: readyOutputs(first, mkOutput(model.OutputCompleted, "", nil))}
+			inv := f.invocation()
+			source := inv.Request
+			inv.Request = func(ctx context.Context) (RequestResult, error) {
+				if f.sourceCalls == 0 {
+					return source(ctx)
+				}
+				f.sourceCalls++
+				return tc.result, tc.err
+			}
+			res, err := Run(context.Background(), inv)
+			if tc.status == "" {
+				requireZeroTerminal(t, res)
+				if tc.err != nil && err != tc.err {
+					t.Fatalf("error=%v want %v", err, tc.err)
+				}
+				if tc.err == nil && !errors.Is(err, ErrBoundaryProtocol) {
+					t.Fatalf("error=%v want protocol error", err)
+				}
+			} else if err != nil || res.Status != tc.status {
+				t.Fatalf("result=%+v error=%v", res, err)
+			}
+			if tc.status == TerminalInterruption && (res.LastOutput != first || len(res.UnstartedCalls) != 0) {
+				t.Fatalf("interruption=%+v", res)
+			}
+			wantModels := 1
+			if tc.status == TerminalSuccess {
+				wantModels = 2
+			}
+			if f.sourceCalls != 2 || f.modelCalls != wantModels || f.toolCalls != 3 {
+				t.Fatalf("calls=%d/%d/%d", f.sourceCalls, f.modelCalls, f.toolCalls)
+			}
+		})
+	}
 }
 
 // TestRunCancelledBeforeToolDispatch pins cancellation observed after a completed model output: the interruption carries that output and every one of its not-yet-dispatched calls, in message order.
@@ -172,60 +288,6 @@ func TestRunInterruptedToolResultStopsBatch(t *testing.T) {
 		testassert.Equal(t, got, "[b c]")
 	}
 	testassert.Equal(t, f.toolCalls, 1)
-}
-
-// TestRunEffectCancellationErrorsAreProtocolViolations pins that active-effect cancellation must come back as a settlement, never as a Go error: a cancellation-shaped error out of either effect is one typed boundary-protocol error naming that effect's boundary even while the run context is done.
-func TestRunEffectCancellationErrorsAreProtocolViolations(t *testing.T) {
-	t.Run("model-effect", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		f := &runFakes{}
-		f.modelSet = func(int, model.Request, AssemblyCallback) (ModelSettlement, error) {
-			cancel()
-			return ModelSettlement{}, fmt.Errorf("attempt died: %w", context.Canceled)
-		}
-
-		res, err := Run(ctx, f.invocation())
-		requireBoundaryViolation(t, err, "model")
-		requireZeroTerminal(t, res)
-		testassert.Equal(t, f.toolCalls, 0)
-	})
-
-	t.Run("model-effect-live-context", func(t *testing.T) {
-		f := &runFakes{}
-		f.modelSet = func(int, model.Request, AssemblyCallback) (ModelSettlement, error) {
-			return ModelSettlement{}, fmt.Errorf("attempt died: %w", context.DeadlineExceeded)
-		}
-
-		res, err := Run(context.Background(), f.invocation())
-		requireBoundaryViolation(t, err, "model")
-		requireZeroTerminal(t, res)
-	})
-
-	t.Run("tool-effect", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		f := &runFakes{}
-		f.modelSet = readyOutputs(mkCallsTerminalOutput())
-		f.toolRes = func(int, model.ToolCall) (model.ToolResult, error) {
-			cancel()
-			return model.ToolResult{}, fmt.Errorf("killed: %w", context.DeadlineExceeded)
-		}
-
-		res, err := Run(ctx, f.invocation())
-		requireBoundaryViolation(t, err, "tool")
-		requireZeroTerminal(t, res)
-	})
-
-	t.Run("tool-effect-live-context", func(t *testing.T) {
-		f := &runFakes{}
-		f.modelSet = readyOutputs(mkCallsTerminalOutput())
-		f.toolRes = func(int, model.ToolCall) (model.ToolResult, error) {
-			return model.ToolResult{}, fmt.Errorf("killed: %w", context.Canceled)
-		}
-
-		res, err := Run(context.Background(), f.invocation())
-		requireBoundaryViolation(t, err, "tool")
-		requireZeroTerminal(t, res)
-	})
 }
 
 // TestRunInfraErrorsWinOverCancellation pins that a non-nil caller error is never reclassified by concurrent cancellation: the original error comes back verbatim with no terminal, from either effect, even when the same invocation just cancelled the run context.

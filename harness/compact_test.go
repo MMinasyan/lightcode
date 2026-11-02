@@ -467,7 +467,7 @@ func TestRunCompactionCanceledBeforeRunSettlesInterruption(t *testing.T) {
 	cancel()
 	summary, usage, _, _, closeInvocation, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), compactSnapshotMessages(), nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
-	testassert.Require(t, err != nil && err.Error() == executionInterruptedDetail, "error %v, want the run's interruption detail", err)
+	testassert.Require(t, err == errExecutionInterrupted, "error %v, want the private interruption token", err)
 	testassert.Require(t, summary == "" && usage == nil, "summary %q usage %+v, want no summary and no usage", summary, usage)
 	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
@@ -503,7 +503,7 @@ func TestRunCompactionCanceledAfterSummarySettlesInterruption(t *testing.T) {
 	exec := compactionExecution(t, compact, nil)
 	summary, usage, _, _, closeInvocation, err := h.runCompaction(ctx, c, testOpID, exec, testCapture(), snapshot, nil, nil)
 	defer closeInvocation() // the fixture joins the opened maintenance stage
-	testassert.Require(t, err != nil && err.Error() == executionInterruptedDetail, "error %v, want the run's interruption detail", err)
+	testassert.Require(t, err == errExecutionInterrupted, "error %v, want the private interruption token", err)
 	testassert.Equal(t, summary, "")
 	testassert.Require(t, usage != nil && *usage == (UsageCount{InputTokens: 4, OutputTokens: 2}), "usage = %+v, want the summary's reported counts", usage)
 	testassert.Equal(t, requests, 1)

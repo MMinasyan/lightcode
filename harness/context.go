@@ -318,7 +318,7 @@ func cloneMessageValue(m model.Message) model.Message {
 // to the model effect of the same execution.
 func (h *Harness) requestSource(c *coordinator, operationID string, capture ExecutionCapture, exec Execution, inv InvocationExecution, round *conversationRound) agent.RequestSource {
 	firstRequest := true
-	return func(ctx context.Context) (model.Request, error) {
+	build := func(ctx context.Context) (model.Request, error) {
 		if !firstRequest {
 			c.mu.Lock()
 			waiting := len(c.steering) > 0
@@ -329,7 +329,7 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 		}
 		firstRequest = false
 		if err := ctx.Err(); err != nil { // the source never starts work under a canceled execution
-			return model.Request{}, err
+			return model.Request{}, errExecutionInterrupted
 		}
 		canonical, checkpointID, boundaryID, err := h.projectCanonical(c, operationID)
 		if err != nil {
@@ -391,6 +391,16 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 			net:       evidence,
 		}
 		return req, nil
+	}
+	return func(ctx context.Context) (agent.RequestResult, error) {
+		req, err := build(ctx)
+		if err == errExecutionInterrupted {
+			return agent.RequestResult{Interrupted: true}, nil
+		}
+		if err != nil {
+			return agent.RequestResult{}, err
+		}
+		return agent.RequestResult{Request: &req}, nil
 	}
 }
 

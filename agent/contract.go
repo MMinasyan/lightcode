@@ -21,9 +21,9 @@ import (
 )
 
 type (
-	// RequestSource supplies one complete logical request per Engine round;
-	// the Engine validates it and owns the validated copy from that point on.
-	RequestSource func(context.Context) (model.Request, error)
+	// RequestSource supplies a ready request or an explicit interruption. A
+	// non-nil error returns unchanged, regardless of the accompanying result.
+	RequestSource func(context.Context) (RequestResult, error)
 
 	AssemblyCallback func(model.ModelRef, model.Stream) (model.Output, error)
 
@@ -34,6 +34,12 @@ type (
 	// independent of the mutable request handed to the model effect.
 	ToolEffect func(context.Context, model.ToolCall, []string) (model.ToolResult, error)
 )
+
+// RequestResult carries exactly one of a ready request or interruption.
+type RequestResult struct {
+	Request     *model.Request
+	Interrupted bool
+}
 
 type ModelDisposition string
 
@@ -73,7 +79,7 @@ func newBoundaryViolation(boundary, detail string) *ProtocolError {
 
 type Invocation struct {
 	ExpectedModel model.ModelRef // complete identity every callback-produced source must equal for the whole run.
-	Request       RequestSource  // supplies one complete request per round; nil is a protocol violation at invocation entry — never normalized to any other request.
+	Request       RequestSource  // supplies one request or interruption per round; nil is a protocol violation.
 	ModelEffect   ModelEffect    // exactly one per invocation; its settlements are validated against the closed disposition table before anything proceeds from them.
 	ToolEffect    ToolEffect     // invoked once per started call in assembled order, carrying an owned per-call copy of the producing request's advertised names; nil is likewise rejected at entry.
 }

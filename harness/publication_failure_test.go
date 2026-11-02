@@ -287,6 +287,50 @@ func TestRequestHookPublicationFailuresAtIntentAndResult(t *testing.T) {
 	})
 }
 
+func TestRequestHookPublicationFailureThroughExecuteAndWait(t *testing.T) {
+	for _, tc := range []struct {
+		ordinal     int
+		interrupted bool
+	}{{1, false}, {2, false}, {2, true}} {
+		t.Run(fmt.Sprintf("replace-%d/interrupted=%t", tc.ordinal, tc.interrupted), func(t *testing.T) {
+			ctx, cancelRun := context.WithCancel(context.Background())
+			defer cancelRun()
+			cause := fmt.Errorf("request hook publication: %w", context.Canceled)
+			hookCalls, modelCalls := 0, 0
+			h, store, c, sessionID, prepared, stop := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
+				hook := RequestHook{ID: "req.effectful", ExtensionID: "req-ext", Mode: HookModeEffectful, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
+					hookCalls++
+					if tc.interrupted {
+						return RequestConsequence{}, &EffectError{Evidence: ExecutionObserved, Err: context.Canceled, Interrupted: true}
+					}
+					return RequestConsequence{}, nil
+				}}
+				return requestHookFixtureExecution(func(context.Context, model.Request) (model.Stream, error) {
+					modelCalls++
+					return completedTurnStream(), nil
+				}, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, hook), nil
+			})
+			defer stop()
+			injectAtNthReplace(store, tc.ordinal, cause, cancelRun)
+			err := executeDirect(h, c, ctx, testOpID, prepared)
+			store.txHook = nil
+			if !errors.Is(err, cause) || !isPublicationFailure(err) || hookCalls != tc.ordinal-1 || modelCalls != 0 {
+				t.Fatalf("execute=%v hook=%d model=%d", err, hookCalls, modelCalls)
+			}
+			assertRetainsRunningState(t, h, store, sessionID, func(ae *ActiveEffect) bool {
+				if tc.ordinal == 1 {
+					return ae == nil
+				}
+				return ae != nil && ae.Kind == EffectHook && ae.HookID == "req.effectful"
+			})
+			stop()
+			if err := h.Wait(context.Background()); !errors.Is(err, cause) {
+				t.Fatalf("Wait=%v, want publication cause", err)
+			}
+		})
+	}
+}
+
 // TestCommitResultNotFoundBoundariesAreMarked proves the ErrNotFound guards of
 // the result publications carry the publication-origin classification with
 // the original identity.

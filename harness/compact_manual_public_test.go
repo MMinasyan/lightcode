@@ -12,6 +12,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -772,6 +774,90 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 type publicReplacementStrategy struct {
 	none bool
 	seen *[]*harness.UsageCount
+}
+
+type publicFailingStrategy struct {
+	stage string
+	fail  func() error
+}
+
+func (s publicFailingStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
+	if s.stage == "plan" {
+		return harness.PlanOutput{}, s.fail()
+	}
+	return (publicReplacementStrategy{}).Plan(in)
+}
+
+func (s publicFailingStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
+	return harness.PlanOutput{}, s.fail()
+}
+
+func TestPublicManualStrategyExplicitOutcomes(t *testing.T) {
+	for _, stage := range []string{"plan", "consume"} {
+		for _, interrupted := range []bool{false, true} {
+			for _, cancelDuring := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/interrupted=%t/canceled=%t", stage, interrupted, cancelDuring), func(t *testing.T) {
+					eachStore(t, func(t *testing.T, store harness.Storage) {
+						conversation := newScriptModel(publicTurn())
+						compact := newScriptModel(summaryAttempt("first"), summaryAttempt("second"), summaryAttempt("third"))
+						f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+						replacementStrategyPrep(f, false)
+						defer f.close()
+						session := createSession(t, f.h)
+						idleHistory(t, f, session)
+						compactWhenIdle(t, f.h, session, "prior")
+						prior := awaitTerminal(t, f.h, session, "prior")
+						testassert.Require(t, prior.State.Status == harness.OperationSuccess, "prior=%+v", prior.State)
+						ids := compactionEntryIDs(t, store, session)
+						testassert.Require(t, len(ids) == 2, "initial checkpoints=%v", ids)
+						beforeCompact, beforeConversation := len(compact.seen()), len(conversation.seen())
+						cause := &harness.EffectError{Err: context.Canceled, Interrupted: interrupted}
+						prepared := f.defaultPrep
+						open := prepared.Open
+						prepared.Open = func(ctx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+							exec, err := open(ctx, admission)
+							if err == nil {
+								exec.Strategy = &harness.StrategyBinding{ID: "test.strategy/v1", Strategy: publicFailingStrategy{stage: stage, fail: func() error {
+									if cancelDuring {
+										if err := f.h.Interrupt(context.Background(), session); err != nil {
+											t.Errorf("interrupt: %v", err)
+										}
+									}
+									return cause
+								}}}
+							}
+							return exec, err
+						}
+						f.prepMu.Lock()
+						f.prepareHook = func(int, harness.PreparationRequest) (harness.PreparedExecution, error) { return prepared, nil }
+						f.prepMu.Unlock()
+						compactWhenIdle(t, f.h, session, "failed")
+						rec := awaitTerminal(t, f.h, session, "failed")
+						want := harness.OperationFailure
+						if interrupted {
+							want = harness.OperationInterruption
+						}
+						testassert.Require(t, rec.State.Status == want, "state=%+v want %s", rec.State, want)
+						after := compactionEntryIDs(t, store, session)
+						testassert.Require(t, reflect.DeepEqual(after, ids), "checkpoints=%v want prior %v", after, ids)
+						wantModels := 0
+						if stage == "consume" {
+							wantModels = 1
+						}
+						testassert.Require(t, len(compact.seen()) == beforeCompact+wantModels && len(conversation.seen()) == beforeConversation, "model calls compact=%d conversation=%d", len(compact.seen()), len(conversation.seen()))
+						usage := harness.UsageByModelForTest(rec.State.Usage, compactModelRef)
+						if stage == "consume" {
+							testassert.Require(t, len(usage.ByModel) == 1 && usage.ByModel[0].Usage == (harness.UsageCount{InputTokens: 10, CachedInputTokens: 2, OutputTokens: 5}), "usage=%+v", usage)
+							payload := settlementPayloadOf(t, store, session, "failed")
+							testassert.Require(t, strings.Count(payload, "maintenance pass") == 1, "settlement facts=%s", payload)
+						} else {
+							testassert.Require(t, len(usage.ByModel) == 0, "usage=%+v", usage)
+						}
+					})
+				})
+			}
+		}
+	}
 }
 
 func (s publicReplacementStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {

@@ -201,19 +201,19 @@ func TestToolArgumentHookChainSettlement(t *testing.T) {
 }
 
 // TestToolArgumentHookInterruptionRules proves the interruption rows fixed
-// for every hook: a cancellation-shaped error with a done execution context is
-// interruption (during Run and between the committed intent and Run), while a
+// for every hook: an explicitly interrupted callback and cancellation between
+// the committed intent and Run interrupt, while a
 // successful normalized output is a real result even when cancellation
 // arrives before its commit — interruption then appears at the next boundary.
 func TestToolArgumentHookInterruptionRules(t *testing.T) {
-	t.Run("cancellation-shaped error during run interrupts", func(t *testing.T) {
+	t.Run("explicit interruption during run interrupts", func(t *testing.T) {
 		exec := hookFixtureExecution(func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, objectNormalize)
 		h, store, c, sessionID := newHookHarness(t, exec)
 		publishHookCalls(t, h, c, exec, testToolCall("call-1"))
 		ctx, cancel := context.WithCancel(context.Background())
 		hook := ToolArgumentsHook{ID: "cap.hook.one", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(ctx context.Context, _ model.ToolCall) (json.RawMessage, error) {
 			cancel() // the execution context dies during Run
-			return nil, ctx.Err()
+			return nil, &EffectError{Evidence: ExecutionObserved, Err: ctx.Err(), Interrupted: true}
 		}}
 		exec = hookFixtureExecution(func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, objectNormalize, hook)
 		got, err := h.toolEffect(c, testOpID, exec, openedConversation(t, exec), testCapture())(ctx, testToolCall("call-1"), []string{"echo"})
@@ -353,6 +353,16 @@ func TestToolArgumentHookFailureRules(t *testing.T) {
 			want:       model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: "hook broke"},
 			wantStatus: hookFailed,
 			wantError:  "hook broke",
+		},
+		{
+			name: "cancellation-shaped failure leaves later sibling eligible",
+			run: func(model.ToolCall) (json.RawMessage, error) {
+				return nil, &EffectError{Evidence: ExecutionObserved, Err: context.Canceled}
+			},
+			normalize:  objectNormalize,
+			want:       model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: "context canceled"},
+			wantStatus: hookFailed,
+			wantError:  "context canceled",
 		},
 		{
 			name:       "an empty-text error keeps valid evidence and settles the call",
@@ -750,8 +760,8 @@ func runRequestHookPipeline(t *testing.T, h *Harness, c *coordinator, exec Execu
 	if err != nil {
 		return agent.ModelSettlement{}, model.Request{}, err
 	}
-	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, inv, capture, round), req, nil)
-	return set, req, err
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, inv, capture, round), *req.Request, nil)
+	return set, *req.Request, err
 }
 
 // hookGraphHookResultsByStatus returns the committed hook_result payloads in
@@ -1457,20 +1467,102 @@ func TestRequestHookEmptyErrorTextSettlesWithGenericDetail(t *testing.T) {
 		"hook results = %+v, want the hook's own failure settled with the same standard detail", committed)
 }
 
-// TestArgumentHookCancellationKnowledgeRows proves the argument family's
-// cancellation classification through the real tool effect: a typed
-// EffectError whose wrapped cause is the cancellation itself keeps its
-// declared knowledge unchanged on the durable interrupted hook_result, an
-// ordinary cooperative cancellation settles as observed, and a cancellation
-// that lands between the committed intent and the callback settles the
-// effect not_started — the hook provably never ran.
+func TestRequestHookFailureAfterCancellationExecutesAsFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cause := fmt.Errorf("hook failure: %w", context.Canceled)
+	hook := RequestHook{ID: "req.effectful", ExtensionID: "req-ext", Mode: HookModeEffectful, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
+		cancel()
+		return RequestConsequence{}, cause
+	}}
+	h, store, c, sessionID, prepared, cleanup := newExecutionHarness(t, func(context.Context, model.Request) (model.Stream, error) {
+		t.Fatal("failed hook dispatched model")
+		return nil, nil
+	}, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} })
+	defer cleanup()
+	prepared.Open = func(context.Context, OperationAdmission) (Execution, error) {
+		return requestHookFixtureExecution(func(context.Context, model.Request) (model.Stream, error) {
+			t.Fatal("failed hook dispatched model")
+			return nil, nil
+		}, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, hook), nil
+	}
+	err := executeDirect(h, c, ctx, testOpID, prepared)
+	if err != cause {
+		t.Fatalf("execute error = %v, want original %v", err, cause)
+	}
+	settlement := graphSettlementOf(t, store, sessionID)
+	if settlement.Status != OperationFailure || settlement.Detail != cause.Error() {
+		t.Fatalf("settlement = %+v, want failure with original cause", settlement)
+	}
+	committed := hookGraphHookResults(t, store, sessionID)
+	if len(committed) != 1 || committed[0].Status != hookFailed {
+		t.Fatalf("hook results = %+v, want failure", committed)
+	}
+}
+
+func TestRequestHookOutcomesThroughExecute(t *testing.T) {
+	for _, mode := range []HookMode{HookModePure, HookModeEffectful} {
+		for _, interrupted := range []bool{false, true} {
+			for _, cancelDuring := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/interrupted=%t/canceled=%t", mode, interrupted, cancelDuring), func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					cause := &EffectError{Evidence: ExecutionUnknown, Err: context.Canceled, Interrupted: interrupted}
+					calls, models := 0, 0
+					h, store, c, sessionID, prepared, stop := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
+						hook := RequestHook{ID: "req.hook", ExtensionID: "req-ext", Mode: mode, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
+							calls++
+							if cancelDuring {
+								cancel()
+							}
+							return RequestConsequence{}, cause
+						}}
+						return requestHookFixtureExecution(func(context.Context, model.Request) (model.Stream, error) {
+							models++
+							return completedTurnStream(), nil
+						}, func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }, hook), nil
+					})
+					defer stop()
+					err := executeDirect(h, c, ctx, testOpID, prepared)
+					want := OperationFailure
+					if interrupted {
+						want = OperationInterruption
+					}
+					if (!interrupted && err != cause) || (interrupted && err != nil) || calls != 1 || models != 0 {
+						t.Fatalf("execute=%v calls=%d model=%d", err, calls, models)
+					}
+					settlement := graphSettlementOf(t, store, sessionID)
+					if settlement.Status != want {
+						t.Fatalf("settlement=%+v want %s", settlement, want)
+					}
+					hooks := hookGraphHookResults(t, store, sessionID)
+					if mode == HookModePure {
+						if len(hooks) != 0 {
+							t.Fatalf("pure hook recorded effect: %+v", hooks)
+						}
+					} else {
+						wantHook := hookFailed
+						if interrupted {
+							wantHook = hookInterrupted
+						}
+						if len(hooks) != 1 || hooks[0].Status != wantHook || hooks[0].Evidence != ExecutionUnknown {
+							t.Fatalf("hooks=%+v", hooks)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestArgumentHookCancellationKnowledgeRows keeps status independent of evidence.
 func TestArgumentHookCancellationKnowledgeRows(t *testing.T) {
-	runCancellation := func(t *testing.T, knowledge ExecutionEvidence, cause error, typed bool) {
+	runCancellation := func(t *testing.T, knowledge ExecutionEvidence, cause error, typed, interrupted bool) {
 		var cancel context.CancelFunc
 		hook := ToolArgumentsHook{ID: "cap.hook.one", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
 			cancel() // the callback was already entered: the execution ends cooperatively
 			if typed {
-				return nil, &EffectError{Evidence: knowledge, Err: cause}
+				return nil, &EffectError{Evidence: knowledge, Err: cause, Interrupted: interrupted}
 			}
 			return nil, cause
 		}}
@@ -1484,26 +1576,33 @@ func TestArgumentHookCancellationKnowledgeRows(t *testing.T) {
 		{
 			res, err := h.toolEffect(c, testOpID, exec, openedConversation(t, exec), testCapture())(ctx, testToolCall("call-1"), []string{"echo"})
 			testassert.NoError(t, err)
-			testassert.Require(t, res.Status == model.ResultInterrupted, "tool result = %+v, want the settled interruption", res)
+			want := model.ResultError
+			if interrupted {
+				want = model.ResultInterrupted
+			}
+			testassert.Require(t, res.Status == want, "tool result = %+v, want %s", res, want)
 		}
 		committed := hookGraphHookResults(t, store, sessionID)
-		testassert.Require(t, len(committed) == 1 && committed[0].Status == hookInterrupted && committed[0].Evidence == knowledge,
-			"hook results = %+v, want the interrupted effect with declared knowledge %s", committed, knowledge)
+		want := hookFailed
+		if interrupted {
+			want = hookInterrupted
+		}
+		testassert.Require(t, len(committed) == 1 && committed[0].Status == want && committed[0].Evidence == knowledge,
+			"hook results = %+v, want %s with declared knowledge %s", committed, want, knowledge)
 		{
 			if _, err := validateFixture(t, store, sessionID); err != nil {
 				t.Fatalf("graph validation: %v", err)
 			}
 		}
 	}
-	t.Run("declared not_started through a canceled callback stays not_started", func(t *testing.T) {
-		runCancellation(t, ExecutionNotStarted, context.Canceled, true)
-	})
-	t.Run("declared unknown through a deadline callback stays unknown", func(t *testing.T) {
-		runCancellation(t, ExecutionUnknown, context.DeadlineExceeded, true)
-	})
-	t.Run("bare cooperative cancellation settles observed", func(t *testing.T) {
-		runCancellation(t, ExecutionObserved, context.Canceled, false)
-	})
+	for _, knowledge := range []ExecutionEvidence{ExecutionNotStarted, ExecutionUnknown, ExecutionObserved} {
+		for _, interrupted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/interrupted=%t", knowledge, interrupted), func(t *testing.T) {
+				runCancellation(t, knowledge, context.Canceled, true, interrupted)
+			})
+		}
+	}
+	t.Run("bare cancellation is failure", func(t *testing.T) { runCancellation(t, ExecutionObserved, context.Canceled, false, false) })
 	t.Run("cancellation between the intent and the callback settles not_started", func(t *testing.T) {
 		ran := 0
 		hook := ToolArgumentsHook{ID: "cap.hook.one", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(context.Context, model.ToolCall) (json.RawMessage, error) {
@@ -1538,22 +1637,47 @@ func TestArgumentHookCancellationKnowledgeRows(t *testing.T) {
 	})
 }
 
-// TestRequestHookCancellationKnowledgeRows proves the same classification on
-// the request family through the real request source: a typed EffectError
-// carrying the cancellation keeps its declared knowledge on the durable
-// interrupted hook_result, a bare cooperative cancellation settles as
-// observed, and a cancellation between the committed intent and the callback
-// settles the effect not_started without ever running it.
+func TestPureArgumentHookFailureDoesNotCreateUncertainty(t *testing.T) {
+	for _, interrupted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("interrupted=%t", interrupted), func(t *testing.T) {
+			hook := ToolArgumentsHook{ID: "pure", ExtensionID: "ext", Mode: HookModePure, Run: func(context.Context, model.ToolCall) (json.RawMessage, error) {
+				return nil, &EffectError{Evidence: ExecutionUnknown, Err: context.Canceled, Interrupted: interrupted}
+			}}
+			spy := &hookToolSpy{}
+			exec := hookFixtureExecution(spy.tool, objectNormalize, hook)
+			h, store, c, sessionID := newHookHarness(t, exec)
+			publishHookCalls(t, h, c, exec, testToolCall("call-1"))
+			res, err := h.toolEffect(c, testOpID, exec, openedConversation(t, exec), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+			want := model.ResultError
+			if interrupted {
+				want = model.ResultInterrupted
+			}
+			if err != nil || res.Status != want || strings.Contains(res.Content, unknownHookToolResultPrefix) {
+				t.Fatalf("result=%+v error=%v", res, err)
+			}
+			if hooks := hookGraphHookResults(t, store, sessionID); len(hooks) != 0 {
+				t.Fatalf("pure hook published evidence: %+v", hooks)
+			}
+		})
+	}
+}
+
+// TestRequestHookCancellationKnowledgeRows keeps request status and knowledge independent.
 func TestRequestHookCancellationKnowledgeRows(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		knowledge ExecutionEvidence
-		cause     error
-		typed     bool
+		name        string
+		knowledge   ExecutionEvidence
+		cause       error
+		typed       bool
+		interrupted bool
 	}{
-		{"declared not_started through a canceled callback stays not_started", ExecutionNotStarted, context.Canceled, true},
-		{"declared unknown through a deadline callback stays unknown", ExecutionUnknown, context.DeadlineExceeded, true},
-		{"bare cooperative cancellation settles observed", ExecutionObserved, context.Canceled, false},
+		{"not started failure", ExecutionNotStarted, context.Canceled, true, false},
+		{"not started interrupted", ExecutionNotStarted, context.Canceled, true, true},
+		{"unknown failure", ExecutionUnknown, context.Canceled, true, false},
+		{"unknown interrupted", ExecutionUnknown, context.Canceled, true, true},
+		{"observed failure", ExecutionObserved, context.Canceled, true, false},
+		{"observed interrupted", ExecutionObserved, context.Canceled, true, true},
+		{"bare cancellation is failure", ExecutionObserved, context.Canceled, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -1561,7 +1685,7 @@ func TestRequestHookCancellationKnowledgeRows(t *testing.T) {
 			hook := RequestHook{ID: "req.effectful", ExtensionID: "req-ext", Mode: HookModeEffectful, Run: func(_ context.Context, in RequestHookInput) (RequestConsequence, error) {
 				cancel() // the callback was already entered: the execution ends cooperatively
 				if tc.typed {
-					return RequestConsequence{}, &EffectError{Evidence: tc.knowledge, Err: tc.cause}
+					return RequestConsequence{}, &EffectError{Evidence: tc.knowledge, Err: tc.cause, Interrupted: tc.interrupted}
 				}
 				return RequestConsequence{}, tc.cause
 			}}
@@ -1574,12 +1698,20 @@ func TestRequestHookCancellationKnowledgeRows(t *testing.T) {
 			round := &conversationRound{}
 			source := h.requestSource(c, testOpID, testCapture(), exec, inv, round)
 			{
-				_, err := source(ctx)
-				testassert.Require(t, errors.Is(err, tc.cause), "source = %v, want the cancellation cause", err)
+				result, err := source(ctx)
+				if tc.interrupted {
+					testassert.Require(t, err == nil && result.Interrupted, "source = %+v/%v, want interruption", result, err)
+				} else {
+					testassert.Require(t, errors.Is(err, tc.cause), "source = %v, want the original cause", err)
+				}
 			}
 			committed := hookGraphHookResults(t, store, sessionID)
-			testassert.Require(t, len(committed) == 1 && committed[0].Status == hookInterrupted && committed[0].Evidence == tc.knowledge,
-				"hook results = %+v, want the interrupted effect carrying the declared knowledge %s", committed, tc.knowledge)
+			want := hookFailed
+			if tc.interrupted {
+				want = hookInterrupted
+			}
+			testassert.Require(t, len(committed) == 1 && committed[0].Status == want && committed[0].Evidence == tc.knowledge,
+				"hook results = %+v, want %s carrying knowledge %s", committed, want, tc.knowledge)
 			{
 				if _, err := validateFixture(t, store, sessionID); err != nil {
 					t.Fatalf("graph validation: %v", err)
@@ -1614,8 +1746,8 @@ func TestRequestHookCancellationKnowledgeRows(t *testing.T) {
 		}
 		source := h.requestSource(c, testOpID, testCapture(), exec, inv, round)
 		{
-			_, err := source(ctx)
-			testassert.Require(t, errors.Is(err, context.Canceled), "source = %v, want the cancellation cause", err)
+			result, err := source(ctx)
+			testassert.Require(t, err == nil && result.Interrupted, "source = %+v/%v, want interruption", result, err)
 		}
 		testassert.Equal(t, ran, 0)
 		committed := hookGraphHookResults(t, store, sessionID)
