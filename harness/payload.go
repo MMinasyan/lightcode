@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -245,7 +246,24 @@ func encodeToolCallRecord(c toolCallRecord) (json.RawMessage, error) {
 	if err := validateToolCallRecord(c); err != nil {
 		return nil, invalidInput("tool call: %v", err)
 	}
-	return json.Marshal(c)
+	obj := map[string]json.RawMessage{
+		"id": mustMarshal(c.ID), "ordinal": mustMarshal(c.Ordinal), "name": mustMarshal(c.Name),
+		"arguments_base64": mustMarshal(c.ArgumentsBase64), "result_entry_id": mustMarshal(c.ResultEntryID),
+	}
+	if len(c.Extra) > 0 {
+		raw, err := marshalExtra(c.Extra)
+		if err != nil {
+			return nil, err
+		}
+		obj["extra"] = raw
+	}
+	if len(c.NormalizedArguments) > 0 {
+		obj["normalized_arguments_base64"] = frame(c.NormalizedArguments)
+	}
+	if c.NormalizationFailure != "" {
+		obj["normalization_failure"] = mustMarshal(c.NormalizationFailure)
+	}
+	return json.Marshal(obj)
 }
 
 // decodeToolCallRecord reads one assistant tool-call record with exact keys.
@@ -254,7 +272,7 @@ func decodeToolCallRecord(raw json.RawMessage) (toolCallRecord, error) {
 	if err != nil {
 		return toolCallRecord{}, fmt.Errorf("tool call: %w", err)
 	}
-	if err := rejectUnknownMembers(obj, "id", "ordinal", "name", "arguments_base64", "extra", "normalized_arguments", "normalization_failure", "result_entry_id"); err != nil {
+	if err := rejectUnknownMembers(obj, "id", "ordinal", "name", "arguments_base64", "extra", "normalized_arguments_base64", "normalization_failure", "result_entry_id"); err != nil {
 		return toolCallRecord{}, err
 	}
 	var c toolCallRecord
@@ -273,7 +291,7 @@ func decodeToolCallRecord(raw json.RawMessage) (toolCallRecord, error) {
 	if c.Extra, err = extraMember(obj, "extra", false); err != nil {
 		return toolCallRecord{}, err
 	}
-	if c.NormalizedArguments, err = rawJSONMember(obj, "normalized_arguments", false); err != nil {
+	if c.NormalizedArguments, err = framedMember(obj, "normalized_arguments_base64", false); err != nil {
 		return toolCallRecord{}, err
 	}
 	if c.NormalizationFailure, err = optionalNonEmptyString(obj, "normalization_failure"); err != nil {
@@ -605,6 +623,14 @@ func validateAssistantEntry(v assistantEntry) error {
 	if err := validateRequestEvidence(*v.Evidence); err != nil {
 		return err
 	}
+	if len(v.Evidence.ToolNames) != len(v.AdvertisedNames) {
+		return errors.New("assistant evidence does not match advertised names")
+	}
+	for i, name := range v.AdvertisedNames {
+		if v.Evidence.ToolNames[i] != name {
+			return errors.New("assistant evidence does not match advertised names")
+		}
+	}
 	if !assistantPayloadEligible(v) {
 		return errors.New("assistant entry carries no eligible model-visible payload (finalized content part, refusal, finalized extra, or, for completed output only, tool calls)")
 	}
@@ -635,23 +661,16 @@ func assistantPayloadEligible(v assistantEntry) bool {
 // plugin-owned semantics of the value.
 const maxToolMetadataBytes = 1 << 20 // 1 MiB
 
-// ownedToolMetadata is the one shared metadata mechanism: it returns the
-// owned bytes json.Marshal produces for one candidate tool_result metadata
-// member — one complete well-formed non-null JSON value whose durable
-// encoding (the compacted, HTML-escaped bytes json.Marshal produces for a
-// json.RawMessage) stays within the bound. Empty, malformed, null, or
-// oversized input returns nil. The bound applies to the persisted
-// representation, not to the caller's raw input, and the returned buffer
-// never aliases the caller.
+// ownedToolMetadata clones one complete non-null JSON value within the raw
+// byte bound. Empty, malformed, null, or oversized candidates are omitted.
 func ownedToolMetadata(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return nil
 	}
-	encoded, err := json.Marshal(raw)
-	if err != nil || string(encoded) == "null" || len(encoded) > maxToolMetadataBytes {
+	if len(raw) > maxToolMetadataBytes || !json.Valid(raw) || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return nil
 	}
-	return encoded
+	return model.CloneRaw(raw)
 }
 
 // encodeToolResultEntry renders one tool-result entry payload.
@@ -667,9 +686,12 @@ func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	var normalized json.RawMessage
+	var normalized, metadata json.RawMessage
 	if len(v.NormalizedArguments) > 0 {
-		normalized = model.CloneRaw(v.NormalizedArguments)
+		normalized = frame(v.NormalizedArguments)
+	}
+	if len(v.Metadata) > 0 {
+		metadata = frame(v.Metadata)
 	}
 	wire, err := json.Marshal(struct {
 		SessionID           string          `json:"session_id"`
@@ -682,8 +704,8 @@ func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 		OriginalContent     string          `json:"original_content"`
 		ShapingFailure      string          `json:"shaping_failure,omitempty"`
 		Evidence            string          `json:"evidence"`
-		Metadata            json.RawMessage `json:"metadata,omitempty"`
-		NormalizedArguments json.RawMessage `json:"normalized_arguments,omitempty"`
+		Metadata            json.RawMessage `json:"metadata_base64,omitempty"`
+		NormalizedArguments json.RawMessage `json:"normalized_arguments_base64,omitempty"`
 		HookIDs             json.RawMessage `json:"hook_ids,omitempty"`
 	}{
 		SessionID:           v.SessionID,
@@ -696,7 +718,7 @@ func encodeToolResultEntry(v toolResultEntry) (json.RawMessage, error) {
 		OriginalContent:     v.OriginalContent,
 		ShapingFailure:      v.ShapingFailure,
 		Evidence:            string(v.Evidence),
-		Metadata:            v.Metadata,
+		Metadata:            metadata,
 		NormalizedArguments: normalized,
 		HookIDs:             hookIDs,
 	})
@@ -716,7 +738,7 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 	if err != nil {
 		return toolResultEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "assistant_entry", "tool_call_id", "status", "content", "original_content", "shaping_failure", "evidence", "metadata", "normalized_arguments", "hook_ids"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "assistant_entry", "tool_call_id", "status", "content", "original_content", "shaping_failure", "evidence", "metadata_base64", "normalized_arguments_base64", "hook_ids"); err != nil {
 		return toolResultEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -731,7 +753,7 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 	if err != nil {
 		return toolResultEntry{}, err
 	}
-	metadata, err := rawJSONMember(obj, "metadata", false)
+	metadata, err := framedMember(obj, "metadata_base64", false)
 	if err != nil {
 		return toolResultEntry{}, err
 	}
@@ -767,7 +789,7 @@ func decodeToolResultEntry(env Entry) (toolResultEntry, error) {
 	if err != nil {
 		return toolResultEntry{}, err
 	}
-	normalizedArguments, err := rawJSONMember(obj, "normalized_arguments", false)
+	normalizedArguments, err := framedMember(obj, "normalized_arguments_base64", false)
 	if err != nil {
 		return toolResultEntry{}, err
 	}
@@ -878,7 +900,7 @@ func encodeHookResultEntry(v hookResultEntry) (json.RawMessage, error) {
 		// A successful effectful execution always carries its binding-owned
 		// consequence record.
 		if v.ToolCallID != "" {
-			obj["arguments"] = model.CloneRaw(v.Arguments)
+			obj["arguments_base64"] = frame(v.Arguments)
 		} else {
 			raw, err := encodeRequestConsequence(*v.Consequence)
 			if err != nil {
@@ -913,7 +935,7 @@ func decodeHookResultEntry(env Entry) (hookResultEntry, error) {
 	if err != nil {
 		return hookResultEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "hook_id", "extension_id", "tool_call_id", "request_id", "status", "evidence", "arguments", "error", "input_arguments_base64", "input_evidence", "consequence"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "hook_id", "extension_id", "tool_call_id", "request_id", "status", "evidence", "arguments_base64", "error", "input_arguments_base64", "input_evidence", "consequence"); err != nil {
 		return hookResultEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -952,7 +974,7 @@ func decodeHookResultEntry(env Entry) (hookResultEntry, error) {
 	if err != nil {
 		return hookResultEntry{}, err
 	}
-	arguments, err := rawJSONMember(obj, "arguments", false)
+	arguments, err := framedMember(obj, "arguments_base64", false)
 	if err != nil {
 		return hookResultEntry{}, err
 	}
@@ -2729,18 +2751,22 @@ func encodeStrategyCapture(v StrategyCapture) (json.RawMessage, error) {
 	if err := validateStrategyCapture(v); err != nil {
 		return nil, invalidInput("strategy capture: %v", err)
 	}
+	var settings json.RawMessage
+	if len(v.Settings) > 0 {
+		settings = frame(v.Settings)
+	}
 	return json.Marshal(struct {
 		ID                    string          `json:"id"`
-		Settings              json.RawMessage `json:"settings,omitempty"`
+		Settings              json.RawMessage `json:"settings_base64,omitempty"`
 		RequiresContextWindow bool            `json:"requires_context_window"`
-	}{ID: v.ID, Settings: v.Settings, RequiresContextWindow: v.RequiresContextWindow})
+	}{ID: v.ID, Settings: settings, RequiresContextWindow: v.RequiresContextWindow})
 }
 
 // decodeStrategyCapture reads the resolved selected strategy input with
 // exact keys. Its closed relation to the captured window is checked by the
 // enclosing capture validation without loading any strategy code.
 func decodeStrategyCapture(obj map[string]json.RawMessage) (StrategyCapture, error) {
-	if err := rejectUnknownMembers(obj, "id", "settings", "requires_context_window"); err != nil {
+	if err := rejectUnknownMembers(obj, "id", "settings_base64", "requires_context_window"); err != nil {
 		return StrategyCapture{}, err
 	}
 	id, err := stringMember(obj, "id", true)
@@ -2756,7 +2782,11 @@ func decodeStrategyCapture(obj map[string]json.RawMessage) (StrategyCapture, err
 	// syntax-only acceptance as the validating side: an accepted value —
 	// including null and large numbers — keeps its original bytes, and
 	// absence stays absent.
-	if settings, present := obj["settings"]; present {
+	if _, present := obj["settings_base64"]; present {
+		settings, err := framedMember(obj, "settings_base64", true)
+		if err != nil {
+			return StrategyCapture{}, err
+		}
 		if !json.Valid(settings) {
 			return StrategyCapture{}, errors.New("settings must be valid JSON")
 		}
@@ -3136,7 +3166,7 @@ func encodeActiveEffect(v ActiveEffect) (json.RawMessage, error) {
 		obj["input_arguments_base64"] = mustMarshal("")
 	}
 	if len(v.FinalArguments) > 0 {
-		obj["final_arguments"] = model.CloneRaw(v.FinalArguments)
+		obj["final_arguments_base64"] = frame(v.FinalArguments)
 	}
 	if len(v.ContributionIDs) > 0 {
 		raw, err := encodeHookIdentities(v.ContributionIDs)
@@ -3150,7 +3180,7 @@ func encodeActiveEffect(v ActiveEffect) (json.RawMessage, error) {
 
 // decodeActiveEffect reads one active effect with exact keys.
 func decodeActiveEffect(obj map[string]json.RawMessage) (ActiveEffect, error) {
-	if err := rejectUnknownMembers(obj, "kind", "result_entry_id", "tool_call_id", "hook_id", "request_id", "model", "purpose", "evidence", "hook_extension_id", "input_arguments_base64", "final_arguments", "hook_ids"); err != nil {
+	if err := rejectUnknownMembers(obj, "kind", "result_entry_id", "tool_call_id", "hook_id", "request_id", "model", "purpose", "evidence", "hook_extension_id", "input_arguments_base64", "final_arguments_base64", "hook_ids"); err != nil {
 		return ActiveEffect{}, err
 	}
 	kind, err := stringMember(obj, "kind", true)
@@ -3219,7 +3249,7 @@ func decodeActiveEffect(obj map[string]json.RawMessage) (ActiveEffect, error) {
 			return ActiveEffect{}, errors.New(`tool-bound hook active effect requires the "input_arguments_base64" member`)
 		}
 	}
-	finalArguments, err := rawJSONMember(obj, "final_arguments", false)
+	finalArguments, err := framedMember(obj, "final_arguments_base64", false)
 	if err != nil {
 		return ActiveEffect{}, err
 	}
@@ -3922,12 +3952,10 @@ func encodeRequestEvidence(v RequestEvidence) (json.RawMessage, error) {
 	}
 	obj := map[string]json.RawMessage{
 		"boundary_entry_id": mustMarshal(v.BoundaryEntryID),
+		"prompt":            mustMarshal(v.Prompt),
 	}
 	if v.CheckpointEntryID != "" {
 		obj["checkpoint_entry_id"] = mustMarshal(v.CheckpointEntryID)
-	}
-	if v.Prompt != nil {
-		obj["prompt"] = mustMarshal(*v.Prompt)
 	}
 	if len(v.Messages) > 0 {
 		messages := make([]json.RawMessage, 0, len(v.Messages))
@@ -3940,9 +3968,11 @@ func encodeRequestEvidence(v RequestEvidence) (json.RawMessage, error) {
 		}
 		obj["messages"] = mustMarshal(messages)
 	}
-	if v.ToolNames != nil {
-		obj["tool_names"] = mustMarshal(v.ToolNames)
+	names := v.ToolNames
+	if names == nil {
+		names = []string{}
 	}
+	obj["tool_names"] = mustMarshal(names)
 	if len(v.HookIDs) > 0 {
 		raw, err := encodeHookIdentities(v.HookIDs)
 		if err != nil {
@@ -3954,8 +3984,7 @@ func encodeRequestEvidence(v RequestEvidence) (json.RawMessage, error) {
 }
 
 // decodeRequestEvidence reads one closed request-evidence record with exact
-// keys and re-validates it. Present-empty tool_names survive as the recorded
-// selection; empty messages and hook_ids arrays decode to absence.
+// keys and re-validates it. Empty messages and hook_ids decode to absence.
 func decodeRequestEvidence(raw json.RawMessage) (RequestEvidence, error) {
 	obj, err := decodePayloadObject(raw)
 	if err != nil {
@@ -3972,7 +4001,7 @@ func decodeRequestEvidence(raw json.RawMessage) (RequestEvidence, error) {
 	if err != nil {
 		return RequestEvidence{}, err
 	}
-	prompt, err := optionalStringMember(obj, "prompt")
+	prompt, err := stringMember(obj, "prompt", true)
 	if err != nil {
 		return RequestEvidence{}, err
 	}
@@ -3990,6 +4019,9 @@ func decodeRequestEvidence(raw json.RawMessage) (RequestEvidence, error) {
 			return RequestEvidence{}, fmt.Errorf("messages[%d]: %w", i, err)
 		}
 		v.Messages = append(v.Messages, m)
+	}
+	if _, err := member(obj, "tool_names", true); err != nil {
+		return RequestEvidence{}, err
 	}
 	toolNames, err := optionalStringMemberList(obj, "tool_names")
 	if err != nil {

@@ -1493,8 +1493,8 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 			switch entry.Kind {
 			case harness.EntryAssistant:
 				var calls []struct {
-					ID                  string          `json:"id"`
-					NormalizedArguments json.RawMessage `json:"normalized_arguments"`
+					ID                  string `json:"id"`
+					NormalizedArguments []byte `json:"normalized_arguments_base64"`
 				}
 				testassert.NoError(t, json.Unmarshal(obj["tool_calls"], &calls))
 				if len(calls) == 0 {
@@ -1506,7 +1506,7 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 			case harness.EntryToolResult:
 				testassert.Require(t, string(obj["status"]) == `"denied"` && string(obj["content"]) == `"Permission denied."`, "tool result = %s, want the fixed denial", entry.Payload)
 				{
-					_, present := obj["metadata"]
+					_, present := obj["metadata_base64"]
 					testassert.Require(t, !present, "denied result carries a metadata member")
 				}
 				denial = true
@@ -1564,11 +1564,11 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 		entries, err := store.ReadEntries(context.Background(), session, 0)
 		testassert.NoError(t, err)
 		type hookWire struct {
-			HookID      string          `json:"hook_id"`
-			ExtensionID string          `json:"extension_id"`
-			ToolCallID  string          `json:"tool_call_id"`
-			Status      string          `json:"status"`
-			Arguments   json.RawMessage `json:"arguments"`
+			HookID      string `json:"hook_id"`
+			ExtensionID string `json:"extension_id"`
+			ToolCallID  string `json:"tool_call_id"`
+			Status      string `json:"status"`
+			Arguments   []byte `json:"arguments_base64"`
 		}
 		var hookResults []hookWire
 		for _, entry := range entries {

@@ -109,16 +109,15 @@ type HookIdentity struct {
 
 // RequestEvidence is the one closed request-evidence value: the canonical
 // boundary/checkpoint references of the projection actually consumed at that
-// boundary, the effective prompt/context/tool-view deltas against the frozen
-// capture (absent members mean unchanged), and the contributing hook
-// identities in contribution order. It records changes plus canonical input
-// references, never a copy of unchanged conversation history.
+// boundary, concrete effective prompt and tool names, request-only additions,
+// and contributing hook identities in order. Unchanged history is referenced,
+// never copied.
 type RequestEvidence struct {
 	CheckpointEntryID string          `json:"checkpoint_entry_id,omitempty"`
 	BoundaryEntryID   string          `json:"boundary_entry_id"`
-	Prompt            *string         `json:"prompt,omitempty"`
+	Prompt            string          `json:"prompt"`
 	Messages          []model.Message `json:"messages,omitempty"`
-	ToolNames         []string        `json:"tool_names,omitempty"`
+	ToolNames         []string        `json:"tool_names"`
 	HookIDs           []HookIdentity  `json:"hook_ids,omitempty"`
 }
 

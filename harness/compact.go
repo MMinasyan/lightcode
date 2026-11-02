@@ -570,8 +570,8 @@ func (h *Harness) runContextMaintenance(execCtx context.Context, c *coordinator,
 	}
 	// The consumed evidence names the frozen input references — never the
 	// proposed cut — and the frozen contribution view replaces it with the
-	// same references plus their effective deltas.
-	facts.consumed = RequestEvidence{CheckpointEntryID: input.CheckpointEntryID, BoundaryEntryID: input.BoundaryEntryID}
+	// same references plus the effective contribution view.
+	facts.consumed = newRequestView(capture, input.CheckpointEntryID, input.BoundaryEntryID, nil).evidenceFor()
 	if input.Contributions != nil {
 		facts.consumed = *input.Contributions
 	}
@@ -708,6 +708,17 @@ func (h *Harness) runMaintenanceModel(execCtx context.Context, c *coordinator, o
 	res, runErr := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: capture.Compact.Model,
 		Request: func(context.Context) (agent.RequestResult, error) {
+			if err := model.ValidateRequest(request); err == nil {
+				raw, err := encodeMaintenanceInput(request.Messages)
+				if err != nil {
+					return agent.RequestResult{}, err
+				}
+				messages, err := decodeMaintenanceInput(raw)
+				if err != nil {
+					return agent.RequestResult{}, err
+				}
+				request.Messages = messages
+			}
 			return agent.RequestResult{Request: &request}, nil
 		},
 		ModelEffect: effect,
@@ -1054,7 +1065,7 @@ func (h *Harness) commitCheckpoint(execCtx context.Context, c *coordinator, oper
 			}
 			// The consumed evidence names the frozen input references —
 			// never the proposed cut.
-			consumed := RequestEvidence{CheckpointEntryID: input.CheckpointEntryID, BoundaryEntryID: input.BoundaryEntryID}
+			consumed := newRequestView(capture, input.CheckpointEntryID, input.BoundaryEntryID, nil).evidenceFor()
 			// The merged carrier holds this checkpoint's facts exactly once,
 			// the accumulated uncommitted facts already in incurred order
 			// before the committing procedure's own.

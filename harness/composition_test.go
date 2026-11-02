@@ -35,10 +35,11 @@ func compositionFixtureRequest(t *testing.T, h *Harness, c *coordinator, exec Ex
 		return completedTurnStream(), nil
 	}
 	source := h.requestSource(c, testOpID, capture, exec, inv, round)
-	if _, err := source(context.Background()); err != nil {
+	request, err := source(context.Background())
+	if err != nil {
 		return agent.ModelSettlement{}, model.Request{}, err
 	}
-	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, inv, capture, round), defaultModelRequest(t), nil)
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, inv, capture, round), *request.Request, nil)
 	if err != nil {
 		return agent.ModelSettlement{}, model.Request{}, err
 	}
@@ -77,7 +78,7 @@ func TestRequestHookPurePromptRemoval(t *testing.T) {
 	testassert.Require(t, len(sent.Messages) > 0 && sent.Messages[0].Role != model.RoleSystem, "dispatch request = %+v, want no system prompt message after a present-empty prompt", sent.Messages)
 
 	assistant := compositionAssistant(t, store, sessionID)
-	testassert.Require(t, assistant.Evidence != nil && assistant.Evidence.Prompt != nil && *assistant.Evidence.Prompt == "", "assistant evidence = %+v, want the recorded empty-prompt contribution", assistant.Evidence)
+	testassert.Require(t, assistant.Evidence != nil && assistant.Evidence.Prompt == "", "assistant evidence = %+v, want the recorded empty-prompt contribution", assistant.Evidence)
 	testassert.Require(t, len(assistant.Evidence.HookIDs) == 1 && assistant.Evidence.HookIDs[0].HookID == "req.prompt.remove" && assistant.Evidence.HookIDs[0].ExtensionID == "req-ext", "assistant evidence hook identities = %+v, want the pure contributor recorded", assistant.Evidence.HookIDs)
 
 	graph, err := validateFixture(t, store, sessionID)
@@ -135,7 +136,7 @@ func TestRequestHookPureToolView(t *testing.T) {
 		testassert.NoError(t, err)
 		testassert.Require(t, len(sent.Tools) == 1 && sent.Tools[0].Name == "echo", "dispatch tools = %+v, want the restored full catalog", sent.Tools)
 		assistant := compositionAssistant(t, store, sessionID)
-		testassert.Require(t, assistant.Evidence != nil && assistant.Evidence.ToolNames == nil, "assistant evidence = %+v, want no net tool-view delta", assistant.Evidence)
+		testassert.Require(t, assistant.Evidence != nil && reflect.DeepEqual(assistant.Evidence.ToolNames, []string{"echo"}), "assistant evidence = %+v, want restored tool view", assistant.Evidence)
 		testassert.Require(t, len(assistant.Evidence.HookIDs) == 2 && assistant.Evidence.HookIDs[0].HookID == "req.tools.narrow" && assistant.Evidence.HookIDs[1].HookID == "req.tools.restore", "assistant evidence hook identities = %+v, want both accepted hooks in configured order", assistant.Evidence.HookIDs)
 	})
 }
@@ -167,7 +168,7 @@ func TestRequestHookFrozenInputOwnership(t *testing.T) {
 	testassert.Require(t, len(sent.Tools) == 1 && sent.Tools[0].Name == "echo", "dispatch tools = %+v, want the captured catalog unchanged by hook mutation", sent.Tools)
 	testassert.Require(t, strings.Contains(sent.Messages[0].TextContent(), "system") && !strings.Contains(sent.Messages[0].TextContent(), "mutated"), "dispatch prompt = %q, want the captured prompt unchanged", sent.Messages[0].TextContent())
 	assistant := compositionAssistant(t, store, sessionID)
-	testassert.Require(t, len(assistant.Evidence.HookIDs) == 1 && assistant.Evidence.HookIDs[0].HookID == "req.observe" && assistant.Evidence.Prompt == nil && assistant.Evidence.Messages == nil, "assistant evidence = %+v, want the accepted observer identity with no contribution from an empty consequence", assistant.Evidence)
+	testassert.Require(t, len(assistant.Evidence.HookIDs) == 1 && assistant.Evidence.HookIDs[0].HookID == "req.observe" && assistant.Evidence.Prompt == testCapture().SystemPrompt && assistant.Evidence.Messages == nil, "assistant evidence = %+v, want the accepted observer identity and captured prompt", assistant.Evidence)
 }
 
 // TestHookFamiliesDisjointForSameIdentity proves the binding-isolation rows:
@@ -216,7 +217,7 @@ func TestHookFamiliesDisjointForSameIdentity(t *testing.T) {
 
 	assistant := compositionAssistant(t, store, sessionID)
 	testassert.Require(t, assistant.Evidence != nil && len(assistant.Evidence.HookIDs) == 1 && assistant.Evidence.HookIDs[0].HookID == sharedID && assistant.Evidence.HookIDs[0].ExtensionID == sharedExt, "assistant evidence hook identities = %+v, want only the request-bound family record", assistant.Evidence.HookIDs)
-	testassert.Require(t, assistant.Evidence.Prompt != nil && *assistant.Evidence.Prompt == "shared request prompt", "assistant evidence = %+v, want the request family's consumed prompt contribution", assistant.Evidence)
+	testassert.Require(t, assistant.Evidence.Prompt == "shared request prompt", "assistant evidence = %+v, want the request family's consumed prompt contribution", assistant.Evidence)
 
 	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
@@ -509,16 +510,20 @@ func TestModelAttemptDeepOwnedRequestCopies(t *testing.T) {
 	exec := effectExecution(modelFn, nil)
 	exec.Retry = (&retrySpy{limit: 1}).retry
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	inv := InvocationExecution{Model: modelFn, NormalizeTool: objectNormalize}
+	inv := InvocationExecution{Model: modelFn, NormalizeTool: objectNormalize, RequestHooks: []RequestHook{{ID: "req.copy", ExtensionID: "req-ext", Mode: HookModePure, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
+		return RequestConsequence{Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "extra", Extra: model.Extra{"raw": json.RawMessage(` { "x" : "<" } `)}}}}}}, nil
+	}}}}
 	round := &conversationRound{}
 	source := h.requestSource(c, testOpID, testCapture(), exec, inv, round)
 	req, err := source(context.Background())
 	testassert.NoError(t, err)
 	// Record a fingerprint and mutate the callback-owned view at attempt one.
 	inv.Model = func(_ context.Context, r model.Request) (model.Stream, error) {
-		fingerprint := fmt.Sprintf("%d/%d/%s", len(r.Messages), len(r.Tools), r.Messages[len(r.Messages)-1].TextContent())
+		fingerprint := fmt.Sprintf("%d/%d/%s/%s/%s", len(r.Messages), len(r.Tools), r.Messages[len(r.Messages)-1].TextContent(), r.Messages[len(r.Messages)-1].Content[0].Extra["raw"], r.Tools[0].Parameters)
 		seen = append(seen, fingerprint)
 		r.Messages[len(r.Messages)-1].Content[0].Text = "mutated"
+		r.Messages[len(r.Messages)-1].Content[0].Extra["raw"][0] = 'X'
+		r.Tools[0].Parameters[0] = 'X'
 		r.Tools = append(r.Tools, model.ToolDefinition{Name: "extra", Parameters: json.RawMessage(`{"type":"object"}`)})
 		return modelFn(context.TODO(), r)
 	}
@@ -529,10 +534,76 @@ func TestModelAttemptDeepOwnedRequestCopies(t *testing.T) {
 	testassert.Require(t, len(seen) == 2 && seen[0] == seen[1], "attempt views differ after mutation: %v", seen)
 	assistant := compositionAssistant(t, store, sessionID)
 	testassert.Require(t, assistant.Evidence != nil && assistant.Evidence.BoundaryEntryID != "", "assistant evidence = %+v, want the untouched logical request evidence", assistant.Evidence)
+	testassert.Require(t, string(assistant.Evidence.Messages[0].Content[0].Extra["raw"]) == ` { "x" : "<" } ` && reflect.DeepEqual(assistant.AdvertisedNames, []string{"echo"}), "mutation reached evidence or advertisement")
 	{
 		if _, err := validateFixture(t, store, sessionID); err != nil {
 			t.Fatalf("graph validation: %v", err)
 		}
+	}
+}
+
+func TestPhysicalDispatchMatchesSourceRequest(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	contribution := model.Message{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "added", Extra: model.Extra{"raw": json.RawMessage(` { "value" : "<raw>" } `)}}}}
+	hook := RequestHook{ID: "req.extra", ExtensionID: "req-ext", Mode: HookModePure, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
+		return RequestConsequence{Messages: []model.Message{contribution}}, nil
+	}}
+	var sent model.Request
+	var intentEvidence RequestEvidence
+	modelFn := func(_ context.Context, r model.Request) (model.Stream, error) {
+		sent = r
+		c.mu.Lock()
+		op, ok := c.graph.Operation(testOpID)
+		if !ok || op.State.ActiveEffect == nil || op.State.ActiveEffect.Evidence == nil {
+			c.mu.Unlock()
+			t.Fatal("model callback has no committed intent")
+		}
+		intentEvidence = copyRequestEvidence(*op.State.ActiveEffect.Evidence)
+		c.mu.Unlock()
+		return completedTurnStream(), nil
+	}
+	exec := effectExecution(modelFn, nil)
+	inv := InvocationExecution{Model: modelFn, NormalizeTool: objectNormalize, RequestHooks: []RequestHook{hook}}
+	round := &conversationRound{}
+	source := h.requestSource(c, testOpID, testCapture(), exec, inv, round)
+	var sourceRequest model.Request
+	_, err := agent.Run(context.Background(), agent.Invocation{
+		ExpectedModel: testCapture().Model,
+		Request: func(ctx context.Context) (agent.RequestResult, error) {
+			result, err := source(ctx)
+			if result.Request != nil {
+				sourceRequest = *result.Request
+			}
+			return result, err
+		},
+		ModelEffect: h.modelEffect(c, testOpID, exec, inv, testCapture(), round),
+		ToolEffect: func(context.Context, model.ToolCall, []string) (model.ToolResult, error) {
+			return model.ToolResult{}, errors.New("unexpected tool call")
+		},
+	})
+	testassert.NoError(t, err)
+	if !reflect.DeepEqual(sourceRequest, sent) {
+		t.Fatalf("physical request differs from source: source=%+v sent=%+v", sourceRequest, sent)
+	}
+	want := model.Request{
+		Messages: []model.Message{
+			{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: "system"}}},
+			{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "hello"}}},
+			contribution,
+		},
+		Tools: []model.ToolDefinition{testToolDefinition()},
+	}
+	if !reflect.DeepEqual(sent, want) {
+		t.Fatalf("physical request = %+v, want independently authored %+v", sent, want)
+	}
+	assistant := compositionAssistant(t, store, sessionID)
+	if !reflect.DeepEqual(intentEvidence, *assistant.Evidence) {
+		t.Fatalf("intent evidence %+v differs from cold assistant evidence %+v", intentEvidence, *assistant.Evidence)
+	}
+	graph, err := validateFixture(t, store, sessionID)
+	testassert.NoError(t, err)
+	if assistant.Evidence.BoundaryEntryID != graph.Entries[0].Envelope.ID || assistant.Evidence.Prompt != "system" || !reflect.DeepEqual(assistant.Evidence.ToolNames, []string{"echo"}) || !reflect.DeepEqual(assistant.Evidence.Messages, []model.Message{contribution}) || !reflect.DeepEqual(graph.Operations[0].Admission.Execution.Tools, want.Tools) {
+		t.Fatalf("cold evidence differs from accepted request: %+v", assistant.Evidence)
 	}
 }
 
@@ -581,8 +652,8 @@ func TestRequestMessageCopyOwnsHistoricalToolCalls(t *testing.T) {
 func TestMaterializedEmptyToolSelectionStaysEmpty(t *testing.T) {
 	capture := testCapture()
 	testassert.Require(t, len(capture.Tools) > 0, "the captured catalog must be nonempty")
-	view := materializeRequestView(capture, nil, RequestEvidence{BoundaryEntryID: testEntryID, ToolNames: []string{}})
-	testassert.Require(t, view.names != nil && len(view.effectiveTools()) == 0, "present-empty selection became the full catalog")
+	req := buildDispatchRequest(capture, nil, RequestEvidence{BoundaryEntryID: testEntryID, ToolNames: []string{}})
+	testassert.Require(t, len(req.Tools) == 0, "present-empty selection became the full catalog")
 }
 
 func TestAcceptedPureRequestIdentitiesRecordInOrder(t *testing.T) {
@@ -602,7 +673,7 @@ func TestAcceptedPureRequestIdentitiesRecordInOrder(t *testing.T) {
 			want = append(want, HookIdentity{ExtensionID: "ext.test", HookID: "pure.change"}, HookIdentity{ExtensionID: "ext.test", HookID: "pure.restore"})
 		}
 		testassert.Check(t, reflect.DeepEqual(evidence.HookIDs, want), "restored=%v contributions = %+v, want every accepted identity in order", restored, evidence.HookIDs)
-		testassert.Check(t, evidence.Prompt == nil && evidence.Messages == nil && evidence.ToolNames == nil, "restored=%v deltas = %+v, want none", restored, evidence)
+		testassert.Check(t, evidence.Prompt == capture.SystemPrompt && evidence.Messages == nil && reflect.DeepEqual(evidence.ToolNames, []string{capture.Tools[0].Name}), "restored=%v evidence = %+v, want full captured view", restored, evidence)
 	}
 }
 
@@ -1028,7 +1099,7 @@ func TestRequestHooksRunBeforeCanonicalOnlyMaintenance(t *testing.T) {
 	committed := hookGraphHookResults(t, store, sessionID)
 	testassert.Require(t, len(committed) == 1 && committed[0].HookID == "req.effectful.noop" && committed[0].Status == hookSucceeded,
 		"hook results = %+v, want only the effectful no-op's durable effect", committed)
-	testassert.Require(t, committed[0].InputEvidence != nil && committed[0].InputEvidence.Prompt != nil && *committed[0].InputEvidence.Prompt == consumedPrompt &&
+	testassert.Require(t, committed[0].InputEvidence != nil && committed[0].InputEvidence.Prompt == consumedPrompt &&
 		len(committed[0].InputEvidence.HookIDs) == 1 && committed[0].InputEvidence.HookIDs[0].HookID == "req.pure",
 		"consumed evidence = %+v, want the pure intermediate prompt and identity retained at the effect boundary", committed[0].InputEvidence)
 	adopted = *committed[0].Consequence.Prompt

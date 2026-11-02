@@ -108,8 +108,8 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 		seen := append([]string{}, hookSeen...)
 		toolInput := append([]string{}, prepared...)
 		mu.Unlock()
-		testassert.Require(t, len(seen) == 2 && seen[0] == `{"x":1}` && seen[1] == `{"x":"\u003c"}`, "hook chain received %q, want the producer's committed normalization then the first hook's committed replacement", seen)
-		testassert.Require(t, len(toolInput) == 1 && toolInput[0] == `{"y":"\u0026\u003e"}`, "concrete tool received %q, want the final committed replacement bytes", toolInput)
+		testassert.Require(t, len(seen) == 2 && seen[0] == `{"x":1}` && seen[1] == `{ "x": "<" }`, "hook chain received %q, want the producer's committed normalization then the first hook's committed replacement", seen)
+		testassert.Require(t, len(toolInput) == 1 && toolInput[0] == `{"y":"&>"}`, "concrete tool received %q, want the final committed replacement bytes", toolInput)
 
 		rec, err := f.h.ReadOperation(ctx, session, "op-1")
 		testassert.Require(t, err == nil && rec.State.Status == harness.OperationSuccess && rec.State.ActiveEffect == nil && len(rec.State.PendingToolCalls) == 0, "hook turn = %+v err %v, want terminal success with every effect settled", rec, err)
@@ -119,11 +119,11 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 		entries, err := store.ReadEntries(ctx, session, 0)
 		testassert.NoError(t, err)
 		type hookWire struct {
-			HookID     string          `json:"hook_id"`
-			ToolCallID string          `json:"tool_call_id"`
-			Status     string          `json:"status"`
-			Arguments  json.RawMessage `json:"arguments"`
-			Error      string          `json:"error"`
+			HookID     string `json:"hook_id"`
+			ToolCallID string `json:"tool_call_id"`
+			Status     string `json:"status"`
+			Arguments  []byte `json:"arguments_base64"`
+			Error      string `json:"error"`
 		}
 		var hookResults []hookWire
 		for _, entry := range entries {
@@ -137,7 +137,7 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 			}
 			hookResults = append(hookResults, wire)
 		}
-		testassert.Require(t, len(hookResults) == 2 && hookResults[0].HookID == "cap.hook.one" && hookResults[0].Status == "success" && string(hookResults[0].Arguments) == `{"x":"\u003c"}` && hookResults[1].HookID == "cap.hook.two" && hookResults[1].Status == "success" && string(hookResults[1].Arguments) == `{"y":"\u0026\u003e"}`, "committed hook results = %+v, want one success per hook with the durable bytes", hookResults)
+		testassert.Require(t, len(hookResults) == 2 && hookResults[0].HookID == "cap.hook.one" && hookResults[0].Status == "success" && string(hookResults[0].Arguments) == `{ "x": "<" }` && hookResults[1].HookID == "cap.hook.two" && hookResults[1].Status == "success" && string(hookResults[1].Arguments) == `{"y":"&>"}`, "committed hook results = %+v, want one success per hook with the durable bytes", hookResults)
 
 		// The evidence never projects as conversation: the completing turn's
 		// projection carries the call result, not the hook replacements.
@@ -199,14 +199,14 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 				continue
 			}
 			var wire struct {
-				NormalizedArguments json.RawMessage `json:"normalized_arguments"`
+				NormalizedArguments []byte `json:"normalized_arguments_base64"`
 				HookIDs             []struct {
 					ExtensionID string `json:"extension_id"`
 					HookID      string `json:"hook_id"`
 				} `json:"hook_ids"`
 			}
 			testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
-			testassert.Require(t, string(wire.NormalizedArguments) == `{"y":"\u0026\u003e"}` && len(wire.HookIDs) == 2 &&
+			testassert.Require(t, string(wire.NormalizedArguments) == `{"y":"&>"}` && len(wire.HookIDs) == 2 &&
 				wire.HookIDs[0].HookID == "cap.hook.one" && wire.HookIDs[1].HookID == "cap.hook.two",
 				"copied tool result %s lost its accepted selection: %s", entry.ID, entry.Payload)
 			acceptedSelections++

@@ -1175,6 +1175,9 @@ func (v *graphValidation) collectRequestDomain(opID string) error {
 			if err := v.validateActiveEvidenceRefs(effect.Evidence); err != nil {
 				return err
 			}
+			if err := v.validateEvidenceNames(effect.Evidence, op.Admission.Execution); err != nil {
+				return err
+			}
 			if err := v.validateEvidenceHookOrder(effect.Evidence.HookIDs, req.orderedResults(), graphEntry{}); err != nil {
 				return v.corrupt("active effect evidence of operation %q: %v", opID, err)
 			}
@@ -1201,6 +1204,13 @@ func (v *graphValidation) validateActiveEvidenceRefs(evidence *RequestEvidence) 
 func (v *graphValidation) validateEvidenceRefs(what string, evidence *RequestEvidence, owner graphEntry) error {
 	if evidence == nil {
 		return v.corrupt("%s carries no evidence", what)
+	}
+	if owner.Envelope.OperationID != "" {
+		if op, ok := v.opsByID[owner.Envelope.OperationID]; ok {
+			if err := v.validateEvidenceNames(evidence, op.Admission.Execution); err != nil {
+				return err
+			}
+		}
 	}
 	if evidence.BoundaryEntryID == "" {
 		return v.corrupt("%s carries no canonical boundary reference", what)
@@ -1240,6 +1250,20 @@ func (v *graphValidation) validateEvidenceRefs(what string, evidence *RequestEvi
 		if owner.Envelope.Sequence != 0 && checkpoint.Envelope.Sequence >= owner.Envelope.Sequence {
 			return v.corrupt("%s references checkpoint entry %s at or after its own sequence", what, checkpoint.Envelope.ID)
 		}
+	}
+	return nil
+}
+
+func (v *graphValidation) validateEvidenceNames(evidence *RequestEvidence, capture ExecutionCapture) error {
+	next := 0
+	for _, name := range evidence.ToolNames {
+		for next < len(capture.Tools) && capture.Tools[next].Name != name {
+			next++
+		}
+		if next == len(capture.Tools) {
+			return v.corrupt("evidence tool names are outside captured catalog or out of order")
+		}
+		next++
 	}
 	return nil
 }

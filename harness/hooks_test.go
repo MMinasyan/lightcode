@@ -160,16 +160,16 @@ func TestToolArgumentHookChainSettlement(t *testing.T) {
 	count, chain := normalizations, append([]string{}, received...)
 	mu.Unlock()
 	testassert.Equal(t, count, 3)
-	testassert.Require(t, len(chain) == 2 && chain[0] == ` {"x": 1} ` && chain[1] == `{"x":"\u003c"}`, "hook chain received %q, want the raw arguments then the committed replacement bytes", chain)
+	testassert.Require(t, len(chain) == 2 && chain[0] == ` {"x": 1} ` && chain[1] == `{ "x": "<" }`, "hook chain received %q, want the raw arguments then the committed replacement bytes", chain)
 	prepared := spy.received()
-	testassert.Require(t, len(prepared) == 1 && prepared[0].ID == "call-1" && prepared[0].Name == "echo" && string(prepared[0].Arguments) == `{"y":"\u0026\u003e"}`, "preparer received %+v, want the final committed replacement bytes under the bound identity", prepared)
+	testassert.Require(t, len(prepared) == 1 && prepared[0].ID == "call-1" && prepared[0].Name == "echo" && string(prepared[0].Arguments) == `{"y":"&>"}`, "preparer received %+v, want the final committed replacement bytes under the bound identity", prepared)
 
 	// The committed evidence: one success hook_result per hook, whose stored
 	// arguments are exactly the bytes the continuation consumed.
 	committed := hookGraphHookResults(t, store, sessionID)
 	testassert.Equal(t, len(committed), 2)
-	testassert.Require(t, committed[0].HookID == "cap.hook.one" && committed[0].Status == hookSucceeded && string(committed[0].Arguments) == `{"x":"\u003c"}` && committed[0].Error == "", "first hook result = %+v, want the committed compacted replacement", committed[0])
-	testassert.Require(t, committed[1].HookID == "cap.hook.two" && committed[1].Status == hookSucceeded && string(committed[1].Arguments) == `{"y":"\u0026\u003e"}`, "second hook result = %+v, want the committed escaped replacement", committed[1])
+	testassert.Require(t, committed[0].HookID == "cap.hook.one" && committed[0].Status == hookSucceeded && string(committed[0].Arguments) == `{ "x": "<" }` && committed[0].Error == "", "first hook result = %+v, want the committed replacement", committed[0])
+	testassert.Require(t, committed[1].HookID == "cap.hook.two" && committed[1].Status == hookSucceeded && string(committed[1].Arguments) == `{"y":"&>"}`, "second hook result = %+v, want the committed replacement", committed[1])
 
 	// The assistant entry never mutated: original raw bytes retained, the
 	// producer's own committed normalization untouched.
@@ -184,7 +184,7 @@ func TestToolArgumentHookChainSettlement(t *testing.T) {
 			raw, derr := base64.StdEncoding.DecodeString(record.ArgumentsBase64)
 			testassert.Require(t, derr == nil && string(raw) == ` {"x": 1} `, "assistant raw arguments = %q err %v, want the original bytes retained", raw, derr)
 		}
-		testassert.Require(t, string(record.NormalizedArguments) == `{"x":1}`, "assistant normalized_arguments = %q, want the producer's committed value unchanged", record.NormalizedArguments)
+		testassert.Require(t, string(record.NormalizedArguments) == ` {"x": 1} `, "assistant normalized_arguments = %q, want the producer's committed value unchanged", record.NormalizedArguments)
 	}
 
 	// Hook results are execution evidence, not conversation messages.
@@ -833,13 +833,13 @@ func TestRequestHookEffectfulChainSettlement(t *testing.T) {
 	// only the net prompt setter.
 	testassert.Require(t, len(committed[0].InputEvidence.HookIDs) == 1 &&
 		committed[0].InputEvidence.HookIDs[0].HookID == "req.pure" &&
-		committed[0].InputEvidence.Prompt != nil && *committed[0].InputEvidence.Prompt == "pure prompt system",
+		committed[0].InputEvidence.Prompt == "pure prompt system",
 		"consumed input evidence = %+v, want the retained pure intermediate and its prompt delta at the effect boundary", committed[0].InputEvidence)
 	assistant := compositionAssistant(t, store, sessionID)
 	testassert.Require(t, assistant.Evidence != nil && len(assistant.Evidence.HookIDs) == 2 &&
 		assistant.Evidence.HookIDs[0].HookID == "req.pure" && assistant.Evidence.HookIDs[1].HookID == "req.effectful",
 		"assistant evidence hook identities = %+v, want the changed pure contributor and the effectful setter in hook order", assistant.Evidence.HookIDs)
-	testassert.Require(t, assistant.Evidence.Prompt != nil && *assistant.Evidence.Prompt == "effectful prompt" && len(assistant.Evidence.Messages) == 1,
+	testassert.Require(t, assistant.Evidence.Prompt == "effectful prompt" && len(assistant.Evidence.Messages) == 1,
 		"assistant evidence = %+v, want the final effective prompt and contribution", assistant.Evidence)
 	{
 		if _, err := validateFixture(t, store, sessionID); err != nil {
@@ -2011,11 +2011,11 @@ func TestRequestHookCodecAdoptedValueContinuesTheLiveView(t *testing.T) {
 	}
 	committed := hookGraphHookResults(t, store, sessionID)
 	testassert.Require(t, len(committed) == 1 && committed[0].Status == hookSucceeded &&
-		committed[0].InputEvidence != nil && committed[0].InputEvidence.Prompt != nil && *committed[0].InputEvidence.Prompt == effectfulSaw &&
+		committed[0].InputEvidence != nil && committed[0].InputEvidence.Prompt == effectfulSaw &&
 		committed[0].Consequence != nil && committed[0].Consequence.Prompt != nil && *committed[0].Consequence.Prompt == effectfulSaw,
 		"hook results = %+v, want the durable rows carrying the adopted text", committed)
 	assistant := compositionAssistant(t, store, sessionID)
-	testassert.Require(t, assistant.Evidence != nil && assistant.Evidence.Prompt != nil && *assistant.Evidence.Prompt == effectfulSaw,
+	testassert.Require(t, assistant.Evidence != nil && assistant.Evidence.Prompt == effectfulSaw,
 		"assistant evidence prompt = %v, want the adopted final effective value", assistant.Evidence.Prompt)
 	{
 		if _, err := validateFixture(t, store, sessionID); err != nil {
@@ -2124,7 +2124,7 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 		)
 		testassert.Require(t, len(ev.HookIDs) == 2 && ev.HookIDs[0].HookID == "req.pure.one" && ev.HookIDs[1].HookID == "req.pure.two",
 			"contributions = %+v, want both appenders in hook order", ev.HookIDs)
-		testassert.Require(t, ev.Prompt != nil && *ev.Prompt == basePrompt+" one two" && promptOf(sent) == basePrompt+" one two",
+		testassert.Require(t, ev.Prompt == basePrompt+" one two" && promptOf(sent) == basePrompt+" one two",
 			"prompt delta = %v dispatch = %q, want the whole accumulated replacement", ev.Prompt, promptOf(sent))
 	})
 	t.Run("reassertion after a change is also a contributor", func(t *testing.T) {
@@ -2195,7 +2195,7 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 		testassert.Require(t, len(ev.HookIDs) == 3 && ev.HookIDs[0].HookID == "req.pure.prompt" &&
 			ev.HookIDs[1].HookID == "req.pure.hide" && ev.HookIDs[2].HookID == "req.pure.show",
 			"contributions = %+v, want every hook that actually changed the live view, in hook order", ev.HookIDs)
-		testassert.Require(t, ev.ToolNames == nil, "names delta = %v, want none: the final view is the full catalog", ev.ToolNames)
+		testassert.Require(t, reflect.DeepEqual(ev.ToolNames, fullNames), "names = %v, want the full catalog", ev.ToolNames)
 		testassert.Require(t, len(sent.Tools) == len(capture.Tools), "dispatch advertises %d tools, want the restored full catalog", len(sent.Tools))
 	})
 	t.Run("hide-all then full baseline restoration keeps identities with no deltas", func(t *testing.T) {
@@ -2212,7 +2212,7 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 		)
 		testassert.Require(t, len(ev.HookIDs) == 2 && ev.HookIDs[0].HookID == "req.pure.hide" && ev.HookIDs[1].HookID == "req.pure.restore",
 			"contributions = %+v, want both accepted hooks kept in configured order", ev.HookIDs)
-		testassert.Require(t, ev.Prompt == nil && ev.ToolNames == nil, "deltas = prompt %v names %v, want no durable delta", ev.Prompt, ev.ToolNames)
+		testassert.Require(t, ev.Prompt == basePrompt && reflect.DeepEqual(ev.ToolNames, fullNames), "evidence = prompt %v names %v, want full captured view", ev.Prompt, ev.ToolNames)
 		testassert.Require(t, promptOf(sent) == basePrompt && len(sent.Tools) == len(capture.Tools), "dispatch = %q with %d tools, want the unchanged baseline view", promptOf(sent), len(sent.Tools))
 	})
 	t.Run("effectful no-op keeps the pure intermediate and its own fact", func(t *testing.T) {
@@ -2238,8 +2238,8 @@ func TestRequestHookPureContributorsFollowEffectiveChange(t *testing.T) {
 		testassert.Require(t, len(committed) == 1 && committed[0].HookID == "req.effectful.noop" && committed[0].Status == hookSucceeded &&
 			committed[0].Consequence != nil && committed[0].Consequence.Prompt != nil && *committed[0].Consequence.Prompt == basePrompt+" one",
 			"hook results = %+v, want the no-op's own committed fact", committed)
-		testassert.Require(t, committed[0].InputEvidence != nil && committed[0].InputEvidence.Prompt != nil &&
-			*committed[0].InputEvidence.Prompt == basePrompt+" one" &&
+		testassert.Require(t, committed[0].InputEvidence != nil &&
+			committed[0].InputEvidence.Prompt == basePrompt+" one" &&
 			len(committed[0].InputEvidence.HookIDs) == 1 && committed[0].InputEvidence.HookIDs[0].HookID == "req.pure.one",
 			"consumed evidence = %+v, want the pure intermediate provenance at the effect boundary", committed[0].InputEvidence)
 		assistant := compositionAssistant(t, store, sessionID)
@@ -2386,7 +2386,7 @@ func TestRequestHookInputFrozenDomainsCarryHiddenCatalogAndRestoresThroughCatalo
 			testassert.Require(t, assistant.Evidence != nil && len(assistant.Evidence.HookIDs) == 3 &&
 				assistant.Evidence.HookIDs[0].HookID == "req.first" && assistant.Evidence.HookIDs[1].HookID == "req.successor" && assistant.Evidence.HookIDs[2].HookID == "req.barrier",
 				"assistant contributions = %+v, want every accepted hook in configured order (the no-op barrier included)", assistant.Evidence.HookIDs)
-			testassert.Require(t, assistant.Evidence.ToolNames == nil, "names delta = %v, want none: the final view is the full catalog", assistant.Evidence.ToolNames)
+			testassert.Require(t, reflect.DeepEqual(assistant.Evidence.ToolNames, fullNames), "names = %v, want the full catalog", assistant.Evidence.ToolNames)
 		}
 		testassert.Require(t, reflect.DeepEqual(parametersOf(capture.Tools), baseParameters), "the caller's capture must stand untouched") // the caller's capture stands untouched
 	})
@@ -2426,7 +2426,7 @@ func TestRequestHookInputFrozenDomainsCarryHiddenCatalogAndRestoresThroughCatalo
 			"hook results = %+v, want exactly the effectful successor's own transaction", committed)
 		{
 			input := committed[0].InputEvidence
-			testassert.Require(t, input != nil && input.Prompt != nil && *input.Prompt == basePrompt+" modified" &&
+			testassert.Require(t, input != nil && input.Prompt == basePrompt+" modified" &&
 				input.ToolNames != nil && len(input.ToolNames) == 0 && len(input.Messages) == 1,
 				"consumed input evidence = %+v, want the hidden-view prompt, names, and addition the effect actually received", input)
 			testassert.Require(t, len(input.HookIDs) == 1 && input.HookIDs[0].HookID == "req.first",

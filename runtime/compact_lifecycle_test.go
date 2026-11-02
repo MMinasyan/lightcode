@@ -307,7 +307,7 @@ func compactRawMessageAdmission(sessionID, operationID, entryID string) string {
 		model:         usageWireRef{Provider: "prov", Model: "m"},
 		outputReserve: 1024,
 		systemPrompt:  "compact-sys",
-		tools:         `[{"name":"noop","description":"tool noop","parameters":{"type":"object"}}]`,
+		tools:         `[{"name":"noop","description":"tool noop","parameters_base64":"eyJ0eXBlIjoib2JqZWN0In0="}]`,
 		compactModel:  usageWireRef{Provider: "prov", Model: "m"},
 		compactPrompt: "summarize",
 	})
@@ -320,7 +320,7 @@ func compactRawOperationRegister(admission, state string) string {
 func compactRawRunningModelState(now, reserved, boundary string) string {
 	return fmt.Sprintf(
 		`{"status":"running","started_at":%q,`+
-			`"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"request-live-%s","model":{"provider":"prov","model":"m"},"purpose":"conversation","evidence":{"boundary_entry_id":%q}},`+
+			`"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"request-live-%s","model":{"provider":"prov","model":"m"},"purpose":"conversation","evidence":{"boundary_entry_id":%q,"prompt":"compact-sys","tool_names":[]}},`+
 			`"running_request":{"request_id":"request-live-%s","boundary_entry_id":%q,"hook_results":[]},`+
 			`"pending_tool_calls":[],"usage":{"by_model":[]}}`,
 		now, reserved, reserved, boundary, reserved, boundary)
@@ -341,7 +341,7 @@ func compactRawInputEntry(sessionID, entryID, operationID, origin, text string) 
 func compactRawAssistantEntry(sessionID, entryID, operationID, boundaryID, text string) string {
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+			`"source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q,"prompt":"compact-sys","tool_names":[]}}`,
 		sessionID, entryID, operationID, text, "request-a-"+entryID, boundaryID)
 }
 
@@ -357,7 +357,7 @@ func compactRawCompactionEntry(sessionID, entryID, operationID, summary, boundar
 			`"messages":[{"role":"assistant","source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}]}],`+
 			`"boundary_entry_id":%q,"configuration_revision":"rev-1",`+
 			`"facts":[{"request_id":%q,"model":{"provider":"prov","model":"m"},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}],`+
-			`"consumed_request_id":%q,"evidence":{"boundary_entry_id":%q}}`,
+			`"consumed_request_id":%q,"evidence":{"boundary_entry_id":%q,"prompt":"compact-sys","tool_names":[]}}`,
 		sessionID, entryID, operationID, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]", boundaryID, "maintainer-"+entryID, "request-"+operationID, boundaryID)
 }
 

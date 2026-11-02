@@ -422,7 +422,7 @@ func usageSeedMessageOperation(t *testing.T, store harness.Storage, sessionID, o
 		Content:   json.RawMessage(`[{"kind":"text","text":"answer ` + operationID + `"}]`),
 		ToolCalls: []harness.ToolCallRecord{},
 		Usage:     assistantUsage,
-		RequestID: "request-a-" + assistantID, Advertised: []string{}, Evidence: json.RawMessage(`{"boundary_entry_id":"` + inputID + `"}`),
+		RequestID: "request-a-" + assistantID, Advertised: []string{}, Evidence: json.RawMessage(`{"boundary_entry_id":"` + inputID + `","prompt":"compact-sys","tool_names":[]}`),
 	})
 	testassert.NoError(t, err)
 	settlementExtra := ""

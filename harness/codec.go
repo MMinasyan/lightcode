@@ -2,6 +2,7 @@ package harness
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -138,8 +139,7 @@ func arrayMember(obj map[string]json.RawMessage, key string, required bool) ([]j
 	return items, nil
 }
 
-// extraMember decodes one opaque model.Extra member. Extra contents stay raw
-// JSON preserved verbatim: no Harness key rules apply inside them.
+// extraMember decodes framed opaque keys and JSON values.
 func extraMember(obj map[string]json.RawMessage, key string, required bool) (model.Extra, error) {
 	raw, err := member(obj, key, required)
 	if err != nil || raw == nil {
@@ -150,26 +150,50 @@ func extraMember(obj map[string]json.RawMessage, key string, required bool) (mod
 		return nil, fmt.Errorf("member %q: %w", key, err)
 	}
 	extra := make(model.Extra, len(inner))
-	for k, v := range inner {
-		if !json.Valid(v) {
-			return nil, fmt.Errorf("member %q: extra field %q is not valid JSON", key, k)
+	for k := range inner {
+		decodedKey, err := decodeFrame(k)
+		if err != nil {
+			return nil, fmt.Errorf("member %q: invalid extra key: %w", key, err)
 		}
-		extra[k] = model.CloneRaw(v)
+		v, err := framedMember(inner, k, true)
+		if err != nil || !json.Valid(v) {
+			return nil, fmt.Errorf("member %q: invalid extra value for %q", key, k)
+		}
+		extra[string(decodedKey)] = v
 	}
 	return extra, nil
 }
 
-// rawJSONMember decodes one opaque raw-JSON member, returning an owned copy
-// of the exact stored bytes.
-func rawJSONMember(obj map[string]json.RawMessage, key string, required bool) (json.RawMessage, error) {
+// decodeFrame accepts only canonical standard base64.
+func decodeFrame(s string) ([]byte, error) {
+	b, err := base64.StdEncoding.Strict().DecodeString(s)
+	if err != nil || base64.StdEncoding.EncodeToString(b) != s {
+		return nil, fmt.Errorf("noncanonical base64")
+	}
+	return b, nil
+}
+
+func framedMember(obj map[string]json.RawMessage, key string, required bool) (json.RawMessage, error) {
 	raw, err := member(obj, key, required)
 	if err != nil || raw == nil {
 		return nil, err
 	}
-	if !json.Valid(raw) {
-		return nil, fmt.Errorf("member %q is not valid JSON", key)
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, fmt.Errorf("member %q must be a base64 string: %w", key, err)
 	}
-	return model.CloneRaw(raw), nil
+	b, err := decodeFrame(s)
+	if err != nil {
+		return nil, fmt.Errorf("member %q: %w", key, err)
+	}
+	if len(b) == 0 {
+		return nil, fmt.Errorf("member %q contains empty bytes", key)
+	}
+	return json.RawMessage(b), nil
+}
+
+func frame(raw []byte) json.RawMessage {
+	return mustMarshal(base64.StdEncoding.EncodeToString(raw))
 }
 
 // encodeTime renders one durable timestamp: nonzero, normalized to UTC in the
@@ -387,13 +411,16 @@ func decodeContentPart(raw json.RawMessage) (model.ContentPart, error) {
 	return model.NewContentPart(part)
 }
 
-// marshalExtra renders one Extra as a JSON object after checking every value
-// is complete valid JSON, so the raw value bytes pass through verbatim.
+// marshalExtra frames each opaque key and value after validating JSON syntax.
 func marshalExtra(e model.Extra) (json.RawMessage, error) {
 	if !validExtraValues(e) {
 		return nil, invalidInput("extra values must be complete valid JSON")
 	}
-	wire, err := json.Marshal(e)
+	framed := make(map[string]string, len(e))
+	for k, v := range e {
+		framed[base64.StdEncoding.EncodeToString([]byte(k))] = base64.StdEncoding.EncodeToString(v)
+	}
+	wire, err := json.Marshal(framed)
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +441,7 @@ func encodeToolDefinition(d model.ToolDefinition) (json.RawMessage, error) {
 	if obj["description"], err = json.Marshal(d.Description); err != nil {
 		return nil, err
 	}
-	obj["parameters"] = model.CloneRaw(d.Parameters)
+	obj["parameters_base64"] = frame(d.Parameters)
 	return json.Marshal(obj)
 }
 
@@ -425,7 +452,7 @@ func decodeToolDefinition(raw json.RawMessage) (model.ToolDefinition, error) {
 	if err != nil {
 		return model.ToolDefinition{}, fmt.Errorf("tool definition: %w", err)
 	}
-	if err := rejectUnknownMembers(obj, "name", "description", "parameters"); err != nil {
+	if err := rejectUnknownMembers(obj, "name", "description", "parameters_base64"); err != nil {
 		return model.ToolDefinition{}, err
 	}
 	var d model.ToolDefinition
@@ -435,7 +462,7 @@ func decodeToolDefinition(raw json.RawMessage) (model.ToolDefinition, error) {
 	if d.Description, err = stringMember(obj, "description", true); err != nil {
 		return model.ToolDefinition{}, err
 	}
-	params, err := member(obj, "parameters", true)
+	params, err := framedMember(obj, "parameters_base64", true)
 	if err != nil {
 		return model.ToolDefinition{}, err
 	}

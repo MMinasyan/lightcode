@@ -77,6 +77,7 @@ func factFixtureGraph() *testGraph {
 	assistant1 := validAssistantEntry(testOpID)
 	assistant1.EntryID = hexID(2)
 	assistant1.AdvertisedNames = []string{"echo"}
+	assistant1.Evidence.ToolNames = []string{"echo"}
 	assistant1.Extra = model.Extra{"reasoning": json.RawMessage(`{"deep":[1]}`)}
 	call := validToolCallRecord()
 	call.ResultEntryID = testResultID

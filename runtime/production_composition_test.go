@@ -276,7 +276,7 @@ func chainToolResults(t *testing.T, store harness.Storage, sessionID string) map
 			ToolCallID string                 `json:"tool_call_id"`
 			Status     model.ToolResultStatus `json:"status"`
 			Content    string                 `json:"content"`
-			Metadata   json.RawMessage        `json:"metadata"`
+			Metadata   []byte                 `json:"metadata_base64"`
 		}
 		testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
 		results[wire.ToolCallID] = struct {

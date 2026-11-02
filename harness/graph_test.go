@@ -422,6 +422,131 @@ func validateFixture(t *testing.T, store *graphStorage, sessionID string) (*sess
 	return validateSessionGraph(context.Background(), store, sessionID)
 }
 
+func TestEvidenceCatalogOwnershipAndCopiedPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		names []string
+		valid bool
+	}{
+		{"empty", []string{}, true},
+		{"ordered subset", []string{"echo", "other"}, true},
+		{"foreign", []string{"foreign"}, false},
+		{"reordered", []string{"other", "echo"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := validTestGraph()
+			tool := testToolDefinition()
+			tool.Name = "other"
+			fixture.ops[0].Admission.Execution.Tools = append(fixture.ops[0].Admission.Execution.Tools, tool)
+			fixture.entries[1].assistant.AdvertisedNames = tc.names
+			fixture.entries[1].assistant.Evidence.ToolNames = tc.names
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			if (err == nil) != tc.valid {
+				t.Fatalf("validate = %v, want valid %v", err, tc.valid)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name  string
+		names []string
+		valid bool
+	}{
+		{"active allowed", []string{"echo"}, true}, {"active foreign", []string{"foreign"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := validTestGraph()
+			fixture.entries = fixture.entries[:1]
+			effect, request := conversationModelEffect(hexID(9))
+			effect.Evidence.ToolNames = tc.names
+			fixture.ops[0].State.ActiveEffect, fixture.ops[0].State.Request = effect, request
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			if (err == nil) != tc.valid {
+				t.Fatalf("validate = %v, want valid %v", err, tc.valid)
+			}
+		})
+	}
+	fixture := validTestGraph()
+	fixture.session.Identity.SourceSessionID = hexID(10)
+	fixture.session.Identity.SourceBoundaryEntryID = hexID(11)
+	fixture.entries[0].env.OperationID = ""
+	fixture.entries[0].input.OperationID = ""
+	fixture.entries[1].env.OperationID = ""
+	assistant := fixture.entries[1].assistant
+	assistant.OperationID = ""
+	assistant.AdvertisedNames = []string{"foreign"}
+	assistant.Evidence.ToolNames = []string{"foreign"}
+	input := validInputEntry(testOpID)
+	input.EntryID = hexID(3)
+	fixture.entries = append(fixture.entries, testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryInput, Sequence: 3, CommittedAt: testTime}, input: &input})
+	fixture.ops[0].Admission.AdmittedEntry.EntryID = hexID(3)
+	_, err := validateFixture(t, fixture.storage(t), testSessionID)
+	if err != nil {
+		t.Fatalf("copied prefix with foreign historical catalog: %v", err)
+	}
+	stored, err := encodeAssistantEntry(*assistant)
+	testassert.NoError(t, err)
+	obj := wireObject(t, stored)
+	evidence := wireObject(t, obj["evidence"])
+	evidence["tool_names"] = mustMarshal([]string{"echo"})
+	obj["evidence"] = mustMarshal(evidence)
+	fixture.entries[1].rawOverride = mustMarshal(obj)
+	if _, err := validateFixture(t, fixture.storage(t), testSessionID); err == nil {
+		t.Fatal("stored copied advertisement mismatch accepted")
+	}
+	assistant.Evidence.ToolNames = []string{"echo"}
+	if _, err := encodeAssistantEntry(*assistant); err == nil {
+		t.Fatal("copied advertisement mismatch accepted")
+	}
+}
+
+func TestEvidenceCatalogForCommittedOwners(t *testing.T) {
+	for _, owner := range []string{"hook", "checkpoint", "settlement"} {
+		for _, foreign := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/foreign=%v", owner, foreign), func(t *testing.T) {
+				fixture := validTestGraph()
+				names := []string{"echo"}
+				if foreign {
+					names = []string{"foreign"}
+				}
+				switch owner {
+				case "hook":
+					hook := validRequestBoundHookResult(hookSucceeded)
+					hook.EntryID, hook.RequestID = hexID(3), "request-one"
+					hook.InputEvidence.ToolNames = names
+					assistant := fixture.entries[1]
+					assistant.env.Sequence = 3
+					assistant.assistant.RequestID = "request-one"
+					assistant.assistant.Evidence.HookIDs = []HookIdentity{{ExtensionID: hook.ExtensionID, HookID: hook.HookID}}
+					fixture.entries = []testEntry{fixture.entries[0], {env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryHookResult, Sequence: 2, CommittedAt: testTime}, hookResult: &hook}, assistant}
+				case "checkpoint":
+					comp := validCompactionEntry(testOpID)
+					comp.EntryID = hexID(5)
+					comp.Evidence.ToolNames = names
+					fixture.entries = append(fixture.entries, testEntry{env: Entry{SessionID: testSessionID, ID: hexID(5), OperationID: testOpID, Kind: EntryCompaction, Sequence: 3, CommittedAt: testTime}, compaction: &comp})
+					fixture.session.State.CheckpointEntryID = hexID(5)
+				case "settlement":
+					settlement := validSettlementEntry()
+					settlement.EntryID = hexID(3)
+					settlement.RequestID = "settled-request"
+					settlement.Evidence = &RequestEvidence{BoundaryEntryID: hexID(1), ToolNames: names}
+					fixture.entries = append(fixture.entries, testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryOperationSettlement, Sequence: 3, CommittedAt: testTime}, settlement: &settlement})
+					stamp := testTime
+					fixture.ops[0].State.Status, fixture.ops[0].State.SettledAt = OperationSuccess, &stamp
+					fixture.ops[0].State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(3)}}
+					fixture.session.State.CurrentOperationID = ""
+				}
+				_, err := validateFixture(t, fixture.storage(t), testSessionID)
+				if foreign && (err == nil || !strings.Contains(err.Error(), "evidence tool names")) {
+					t.Fatalf("foreign names: %v", err)
+				}
+				if !foreign && err != nil {
+					t.Fatalf("valid names: %v", err)
+				}
+			})
+		}
+	}
+}
+
 // mustState extracts the state member raw bytes of an encoded session
 // register payload.
 func mustState(t *testing.T, raw json.RawMessage) json.RawMessage {
