@@ -168,11 +168,11 @@ func TestRunToolEffectNamesArePerCallOwned(t *testing.T) {
 
 	res, err := agent.Run(context.Background(), agent.Invocation{
 		ExpectedModel: ref,
-		Request: func(context.Context) (model.Request, error) {
-			return model.Request{Messages: []model.Message{mustMessage(t, model.Message{
+		Request: func(context.Context) (agent.RequestResult, error) {
+			return agent.RequestResult{Request: &model.Request{Messages: []model.Message{mustMessage(t, model.Message{
 				Role:    model.RoleUser,
 				Content: []model.ContentPart{{Kind: model.PartText, Text: "run the tools"}},
-			})}, Tools: []model.ToolDefinition{{Name: "echo", Description: "echo", Parameters: json.RawMessage(`{"type":"object"}`)}}}, nil
+			})}, Tools: []model.ToolDefinition{{Name: "echo", Description: "echo", Parameters: json.RawMessage(`{"type":"object"}`)}}}}, nil
 		},
 		ModelEffect: agent.AdaptModelEffect(ref, transport),
 		ToolEffect:  toolEffect,
@@ -199,11 +199,11 @@ func TestAdaptToolsEmptyMapZeroToolRun(t *testing.T) {
 	transport, err := model.NewTransport(model.ResolvedTransport{Model: ref, BaseURL: srv.URL})
 	testassert.NoError(t, err)
 
-	requestSource := func(context.Context) (model.Request, error) {
-		return model.Request{Messages: []model.Message{mustMessage(t, model.Message{
+	requestSource := func(context.Context) (agent.RequestResult, error) {
+		return agent.RequestResult{Request: &model.Request{Messages: []model.Message{mustMessage(t, model.Message{
 			Role:    model.RoleUser,
 			Content: []model.ContentPart{{Kind: model.PartText, Text: "no tools here"}},
-		})}}, nil
+		})}}}, nil
 	}
 
 	res, err := agent.Run(context.Background(), agent.Invocation{

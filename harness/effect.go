@@ -139,43 +139,11 @@ func isPublicationFailure(err error) bool {
 	return errors.As(err, &failure)
 }
 
-// runEngineCall runs one Engine invocation at the one shared Harness
-// composition boundary: each supplied callback's publication-origin error is
-// retained before the Engine handles it, and after the run the retained
-// original propagates to the owning Harness orchestration or settler in place
-// of the Engine's substituted error or terminal. Every other outcome —
-// including a genuine pre-intent cancellation interruption and a
-// semantic or provider error of a similar sentinel shape — returns verbatim.
-// The Engine invokes the wrapped callbacks synchronously and sequentially, so
-// one captured variable holds the first retained error.
-func runEngineCall(execCtx context.Context, invocation agent.Invocation) (agent.TerminalResult, error) {
-	var retained error
-	keep := func(err error) error {
-		if err != nil && retained == nil && isPublicationFailure(err) {
-			retained = err
-		}
-		return err
-	}
-	request := invocation.Request
-	invocation.Request = func(ctx context.Context) (model.Request, error) {
-		req, err := request(ctx)
-		return req, keep(err)
-	}
-	modelEffect := invocation.ModelEffect
-	invocation.ModelEffect = func(ctx context.Context, req model.Request, assemble agent.AssemblyCallback) (agent.ModelSettlement, error) {
-		settle, err := modelEffect(ctx, req, assemble)
-		return settle, keep(err)
-	}
-	toolEffect := invocation.ToolEffect
-	invocation.ToolEffect = func(ctx context.Context, call model.ToolCall, names []string) (model.ToolResult, error) {
-		res, err := toolEffect(ctx, call, names)
-		return res, keep(err)
-	}
-	res, err := agent.Run(execCtx, invocation)
-	if retained != nil {
-		return agent.TerminalResult{}, retained
-	}
-	return res, err
+var errExecutionInterrupted = errors.New("execution interrupted")
+
+func effectInterrupted(err error) bool {
+	var effect *EffectError
+	return errors.As(err, &effect) && effect.Interrupted
 }
 
 // modelEffectIntent is the committed intent of one logical model effect: the
@@ -1848,7 +1816,7 @@ func (h *Harness) beginRequestHookEffect(ctx context.Context, c *coordinator, op
 	if ctx.Err() != nil { // cancellation observed before the Transact is ever invoked is not a
 		// publication failure: it returns unwrapped and the caller's ordinary interruption settlement applies.
 		c.mu.Unlock()
-		return "", ctx.Err()
+		return "", errExecutionInterrupted
 	}
 	resultID, err := newHexID()
 	if err != nil {
@@ -2183,9 +2151,9 @@ func (h *Harness) runArgumentHooks(ctx, settleCtx context.Context, c *coordinato
 			return toolSelection{}, &settled, nil
 		}
 		if hook.Mode == HookModePure {
-			changed, failure, knowledge := evaluateArgumentHook(ctx, record, hook, inv.NormalizeTool, current, accepted, acceptedFailure)
-			if failure != nil { // the refusal settles the call through the ordinary no-intent transition carrying the chain's accepted selection; a declared unknown hook outcome leaves the concrete call unstarted but uncertain
-				settled, cerr := h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: *failure}, nil, false, chainSelection(), ExecutionNotStarted, knowledge == ExecutionUnknown)
+			changed, failure, _ := evaluateArgumentHook(ctx, record, hook, inv.NormalizeTool, current, accepted, acceptedFailure)
+			if failure != nil { // a pure callback cannot create external-effect uncertainty
+				settled, cerr := h.commitToolResult(settleCtx, c, operationID, pending, ToolOutcome{Result: *failure}, nil, false, chainSelection(), ExecutionNotStarted, false)
 				if cerr != nil {
 					return toolSelection{}, nil, cerr
 				}
@@ -2225,7 +2193,7 @@ func evaluateArgumentHook(ctx context.Context, record toolCallRecord, hook ToolA
 	replacement, runErr := hook.Run(ctx, owned)
 	if runErr != nil {
 		failure := validationToolResult(record.ID, runErr)
-		if isExecutionCancellation(runErr) && ctx.Err() != nil {
+		if effectInterrupted(runErr) {
 			failure = interruptedToolResult(record.ID)
 		}
 		return nil, &failure, declaredExecutionKnowledge(runErr)
@@ -2321,10 +2289,8 @@ func declaredExecutionKnowledge(runErr error) ExecutionEvidence {
 	return ExecutionObserved
 }
 
-// isExecutionCancellation reports the cancellation-shaped classification gate
-// shared by every hook boundary: only a cooperative terminal interruption
-// under a genuinely canceled execution context converts a returned error into
-// an interruption.
+// isExecutionCancellation classifies pre-Engine opening errors and the
+// existing pre-publication cancellation gates.
 func isExecutionCancellation(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
@@ -2538,7 +2504,7 @@ func (h *Harness) commitHookResult(ctx context.Context, c *coordinator, operatio
 func (h *Harness) runRequestHooks(ctx context.Context, c *coordinator, operationID string, inv InvocationExecution, requestID string, view *requestView) error {
 	for _, hook := range inv.RequestHooks {
 		if ctx.Err() != nil { // cancellation stops the next hook before anything commits
-			return ctx.Err()
+			return errExecutionInterrupted
 		}
 		if hook.Mode == HookModePure {
 			consequence, err := h.runOneRequestHookPure(ctx, requestID, view, hook)
@@ -2573,6 +2539,9 @@ func (h *Harness) runOneRequestHookPure(ctx context.Context, requestID string, v
 	}
 	consequence, err := hook.Run(ctx, input)
 	if err != nil {
+		if effectInterrupted(err) {
+			return RequestConsequence{}, errExecutionInterrupted
+		}
 		return RequestConsequence{}, err
 	}
 	return validateRequestConsequence(view.capture, consequence)
@@ -2595,7 +2564,7 @@ func (h *Harness) runRequestHookEffect(ctx context.Context, c *coordinator, oper
 			}); cerr != nil {
 			return cerr
 		}
-		return ctx.Err() // the Engine's own cancellation checkpoints convert this into the typed interruption
+		return errExecutionInterrupted
 	}
 	// The callback consumes the adopted evidence the committed intent owns,
 	// materialized over the round's frozen canonical context — never a reread
@@ -2622,7 +2591,7 @@ func (h *Harness) runRequestHookEffect(ctx context.Context, c *coordinator, oper
 	if runErr != nil {
 		knowledge := declaredExecutionKnowledge(runErr)
 		status := hookFailed
-		if isExecutionCancellation(runErr) && ctx.Err() != nil { // a cooperative terminal interruption
+		if effectInterrupted(runErr) {
 			status = hookInterrupted
 		}
 		if _, cerr := h.commitHookResult(settleCtx, c, operationID,
@@ -2630,6 +2599,9 @@ func (h *Harness) runRequestHookEffect(ctx context.Context, c *coordinator, oper
 				Status: status, Evidence: knowledge, Error: failureDetail(runErr),
 			}); cerr != nil {
 			return cerr
+		}
+		if status == hookInterrupted {
+			return errExecutionInterrupted
 		}
 		return runErr
 	}
@@ -2810,7 +2782,7 @@ func (h *Harness) execute(c *coordinator, operationID string, prepared PreparedE
 		return &agent.TerminalResult{}, nil, exec.Close, err
 	}
 	round := &conversationRound{}
-	res, runErr := runEngineCall(execCtx, agent.Invocation{
+	res, runErr := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: agentCapture.Model,
 		Request:       h.requestSource(c, operationID, agentCapture, exec, inv, round),
 		ModelEffect:   h.modelEffect(c, operationID, exec, inv, agentCapture, round),
@@ -2909,6 +2881,8 @@ func (h *Harness) finishExecution(c *coordinator, run *activeExecution, operatio
 	err := runErr
 	if res != nil {
 		err = h.settleAgentTerminal(c, operationID, *res, runErr, run.execCtx)
+	} else if err == errExecutionInterrupted {
+		err = nil
 	}
 	h.recordStorageFailure(err) // the sole storage-class recorder, including nil-terminal outcomes
 	if closeInvocation != nil {

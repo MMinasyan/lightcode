@@ -604,7 +604,11 @@ func (h *Harness) runContextMaintenance(execCtx context.Context, c *coordinator,
 	}
 	plan, err := binding.Strategy.Plan(clonePlanInput(input))
 	if err != nil {
-		return nil, facts, closeInvocation, h.settleCompactionFailure(c, operationID, OperationFailure, err, capture, facts)
+		terminal := OperationFailure
+		if effectInterrupted(err) {
+			terminal = OperationInterruption
+		}
+		return nil, facts, closeInvocation, h.settleCompactionFailure(c, operationID, terminal, err, capture, facts)
 	}
 	plan.Model, plan.Checkpoint = ownModelPlan(plan.Model), ownCheckpointPlan(plan.Checkpoint)
 	for {
@@ -645,7 +649,11 @@ func (h *Harness) runContextMaintenance(execCtx context.Context, c *coordinator,
 		}
 		next, err := binding.Strategy.Consume(ConsumeInput{Input: clonePlanInput(input), State: plan.Model.State, Output: output})
 		if err != nil {
-			return nil, facts, closeInvocation, h.settleCompactionFailure(c, operationID, OperationFailure, err, capture, facts)
+			terminal := OperationFailure
+			if effectInterrupted(err) {
+				terminal = OperationInterruption
+			}
+			return nil, facts, closeInvocation, h.settleCompactionFailure(c, operationID, terminal, err, capture, facts)
 		}
 		next.Model, next.Checkpoint = ownModelPlan(next.Model), ownCheckpointPlan(next.Checkpoint)
 		plan = next
@@ -697,10 +705,10 @@ func (h *Harness) runMaintenanceModel(execCtx context.Context, c *coordinator, o
 	}
 	effect := h.compactModelEffect(c, operationID, inv, exec.Retry, capture, maintenanceID, facts, suspended)
 	request := plan.Request
-	res, runErr := runEngineCall(execCtx, agent.Invocation{
+	res, runErr := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: capture.Compact.Model,
-		Request: func(context.Context) (model.Request, error) {
-			return request, nil
+		Request: func(context.Context) (agent.RequestResult, error) {
+			return agent.RequestResult{Request: &request}, nil
 		},
 		ModelEffect: effect,
 		ToolEffect: func(context.Context, model.ToolCall, []string) (model.ToolResult, error) {
@@ -765,6 +773,9 @@ func (h *Harness) settleCompactionFailure(c *coordinator, operationID string, te
 	quiet := op.State.ActiveEffect == nil
 	c.mu.Unlock()
 	if settled || !quiet {
+		if settled && terminal == OperationInterruption && op.State.Status == OperationInterruption {
+			return errExecutionInterrupted
+		}
 		return cause
 	}
 	if _, err := h.commitEffectResult(context.WithoutCancel(h.ctx), c, operationID, nil, modelResult{
@@ -775,6 +786,9 @@ func (h *Harness) settleCompactionFailure(c *coordinator, operationID string, te
 		maintenanceID: facts.producer(),
 	}); err != nil {
 		return err
+	}
+	if terminal == OperationInterruption {
+		return errExecutionInterrupted
 	}
 	return cause
 }
@@ -1187,7 +1201,7 @@ func (h *Harness) commitCheckpoint(execCtx context.Context, c *coordinator, oper
 		// The interruption settlement already published: the waiting
 		// conversation never dispatches and no later interruption rewrites
 		// the committed terminal.
-		return errors.New(executionInterruptedDetail)
+		return errExecutionInterrupted
 	}
 	return nil
 }

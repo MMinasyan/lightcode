@@ -76,14 +76,14 @@ func TestFoundationCompositionOverRealTransport(t *testing.T) {
 
 	sourceCalls := 0
 	var reqs []model.Request
-	requestSource := func(context.Context) (model.Request, error) {
+	requestSource := func(context.Context) (agent.RequestResult, error) {
 		sourceCalls++
 		if sourceCalls > len(requests) {
-			return model.Request{}, fmt.Errorf("request source ran out of snapshots after %d calls", sourceCalls)
+			return agent.RequestResult{}, fmt.Errorf("request source ran out of snapshots after %d calls", sourceCalls)
 		}
 		req := model.Request{Messages: requests[sourceCalls-1], Tools: advertised}
 		reqs = append(reqs, req) // each round's fresh snapshot as the Engine receives it.
-		return req, nil
+		return agent.RequestResult{Request: &req}, nil
 	}
 
 	modelEffect := agent.AdaptModelEffect(ref, transport) // the shipped standalone adapter: one physical Stream attempt per round, assembled with the supplied source.
@@ -182,12 +182,12 @@ func TestFoundationCompositionUnadvertisedToolCall(t *testing.T) {
 	advertised := []model.ToolDefinition{{Name: "echo", Description: "echo its argument", Parameters: json.RawMessage(`{"type":"object"}`)}}
 
 	sourceCalls := 0
-	requestSource := func(context.Context) (model.Request, error) {
+	requestSource := func(context.Context) (agent.RequestResult, error) {
 		sourceCalls++
 		if sourceCalls > len(requests) {
-			return model.Request{}, fmt.Errorf("request source ran out of snapshots after %d calls", sourceCalls)
+			return agent.RequestResult{}, fmt.Errorf("request source ran out of snapshots after %d calls", sourceCalls)
 		}
-		return model.Request{Messages: requests[sourceCalls-1], Tools: advertised}, nil
+		return agent.RequestResult{Request: &model.Request{Messages: requests[sourceCalls-1], Tools: advertised}}, nil
 	}
 
 	var ran []string

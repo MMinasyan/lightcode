@@ -522,7 +522,7 @@ func TestModelAttemptDeepOwnedRequestCopies(t *testing.T) {
 		r.Tools = append(r.Tools, model.ToolDefinition{Name: "extra", Parameters: json.RawMessage(`{"type":"object"}`)})
 		return modelFn(context.TODO(), r)
 	}
-	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, inv, testCapture(), round), req, nil)
+	set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, inv, testCapture(), round), *req.Request, nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, set.Disposition, agent.DispoReady)
 	testassert.Equal(t, calls, 2)
@@ -1112,7 +1112,7 @@ func maintenanceHookedRound(t *testing.T, summaryErr, openerErr error) (*Harness
 		return h, store, sessionID, conversationCalls
 	}
 	{
-		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, inv, capture, round), req, nil)
+		set, err := invokeModelEffect(t, h.modelEffect(c, testOpID, exec, inv, capture, round), *req.Request, nil)
 		testassert.NoError(t, err)
 		testassert.Equal(t, set.Disposition, agent.DispoReady)
 	}

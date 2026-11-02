@@ -101,13 +101,13 @@ func validExecutionEvidence(evidence ExecutionEvidence) bool {
 	return false
 }
 
-// EffectError carries one hook's declared execution knowledge through a
-// binding-infrastructure failure to the Harness: the declared Evidence reaches
-// the shared accepting validator unchanged. Unwrap exposes the underlying
-// cause for classification.
+// EffectError declares callback interruption independently of its cause.
+// Effectful hooks also declare execution knowledge, validated at publication;
+// pure callbacks use only Interrupted and Err. Unwrap exposes the cause.
 type EffectError struct {
-	Evidence ExecutionEvidence
-	Err      error
+	Evidence    ExecutionEvidence
+	Err         error
+	Interrupted bool
 }
 
 func (e *EffectError) Error() string { return e.Err.Error() }

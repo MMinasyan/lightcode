@@ -85,7 +85,7 @@ func fixtureProjection(h *Harness, c *coordinator) func(context.Context) ([]mode
 		if err != nil {
 			return nil, err
 		}
-		return req.Messages, nil
+		return req.Request.Messages, nil
 	}
 }
 
@@ -1121,6 +1121,43 @@ func TestExecuteOpenerErrorSettlesOrdinaryTerminals(t *testing.T) {
 		testassert.NoError(t, err)
 		testassert.Equal(t, session.CurrentOperationID, testOpID)
 	})
+}
+
+func TestExecuteCancellationShapedOpeningErrors(t *testing.T) {
+	for _, opening := range []string{"execution", "invocation"} {
+		for _, canceled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/canceled=%t", opening, canceled), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				cause := fmt.Errorf("opening failed: %w", context.Canceled)
+				fail := func() error {
+					if canceled {
+						cancel()
+					}
+					return cause
+				}
+				h, _, c, session, prepared, stop := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
+					if opening == "execution" {
+						return Execution{}, fail()
+					}
+					return Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
+						return InvocationExecution{}, fail()
+					}}, nil
+				})
+				defer stop()
+				err := executeDirect(h, c, ctx, testOpID, prepared)
+				rec, readErr := h.ReadOperation(context.Background(), session, testOpID)
+				testassert.NoError(t, readErr)
+				want := OperationFailure
+				if canceled {
+					want = OperationInterruption
+				}
+				if rec.State.Status != want || (!canceled && err != cause) || (canceled && err != nil) {
+					t.Fatalf("state=%+v error=%v", rec.State, err)
+				}
+			})
+		}
+	}
 }
 
 // TestExecuteInvalidOpenedExecutionClosesBeforeRejection proves the
@@ -2723,6 +2760,20 @@ func TestToolOutputShaping(t *testing.T) {
 		testassert.Require(t, stored.Content == "raw output" && stored.OriginalContent == "raw output" && stored.ShapingFailure == "shaper broke" &&
 			stored.Status == model.ResultSuccess && stored.Evidence == ExecutionObserved && string(stored.Metadata) == `{"n":1}`,
 			"stored result = %+v, want the rendered original with the bounded failure and untouched status/evidence/metadata", stored)
+	})
+
+	t.Run("interrupted shaper cannot relabel the observed outcome", func(t *testing.T) {
+		h, store, c, sessionID := newShapingFixture(t)
+		inv := InvocationExecution{
+			Tool: shapingExecutor(model.ResultSuccess, "raw output", nil), NormalizeTool: objectNormalize,
+			ToolOutputHooks: []ToolOutputHook{shapingHook("shaper.interrupted", func(context.Context, ToolOutputInput) (string, error) {
+				return "", &EffectError{Evidence: ExecutionUnknown, Err: context.Canceled, Interrupted: true}
+			})},
+		}
+		got, err := h.toolEffect(c, testOpID, Execution{}, inv, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
+		testassert.NoError(t, err)
+		stored := storedShapingResult(t, store, sessionID)
+		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "raw output" && stored.Status == model.ResultSuccess && stored.Evidence == ExecutionObserved && stored.ShapingFailure == context.Canceled.Error(), "result=%+v stored=%+v", got, stored)
 	})
 
 	t.Run("invalid shaped output aborts with the rule diagnostic", func(t *testing.T) {

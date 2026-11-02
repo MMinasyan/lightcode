@@ -34,10 +34,19 @@ type fixtureStrategy struct {
 	seenInputs []PlanInput
 	seenStates []json.RawMessage
 	seenOutput int
+	planErr    error
+	consumeErr error
+	onFailure  func()
 }
 
 func (s *fixtureStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	s.seenInputs = append(s.seenInputs, in)
+	if s.planErr != nil {
+		if s.onFailure != nil {
+			s.onFailure()
+		}
+		return PlanOutput{}, s.planErr
+	}
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("strategy pass " + strconv.Itoa(len(s.seenInputs)))}}},
 		State:   json.RawMessage(`{"step":` + strconv.Itoa(len(s.seenInputs)) + `}`),
@@ -47,6 +56,12 @@ func (s *fixtureStrategy) Plan(in PlanInput) (PlanOutput, error) {
 func (s *fixtureStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
 	s.seenStates = append(s.seenStates, in.State)
 	s.seenOutput++
+	if s.consumeErr != nil {
+		if s.onFailure != nil {
+			s.onFailure()
+		}
+		return PlanOutput{}, s.consumeErr
+	}
 	if s.seenOutput == 1 {
 		return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
 			Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("strategy pass 2")}}},
@@ -90,6 +105,59 @@ func twoPassExecution(t *testing.T, first model.Usage, strategy *StrategyBinding
 	exec := compactionExecution(t, compact, nil)
 	exec.Strategy = strategy
 	return exec, &calls
+}
+
+func TestStrategyOutcomesThroughConversationEngine(t *testing.T) {
+	for _, stage := range []string{"plan", "consume"} {
+		for _, interrupted := range []bool{false, true} {
+			for _, cancelDuring := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/interrupted=%t/canceled=%t", stage, interrupted, cancelDuring), func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					var cause error = context.Canceled
+					if interrupted {
+						cause = &EffectError{Err: context.Canceled, Interrupted: true}
+					}
+					strategy := &fixtureStrategy{}
+					if stage == "plan" {
+						strategy.planErr = cause
+					} else {
+						strategy.consumeErr = cause
+					}
+					if cancelDuring {
+						strategy.onFailure = cancel
+					}
+					exec, calls := twoPassExecution(t, model.Usage{InputTokens: 3}, fixtureStrategyBinding(strategy))
+					prepared := modelPrepared(nil)
+					prepared.Capture = captureForHandoff()
+					prepared.Open = func(context.Context, OperationAdmission) (Execution, error) { return exec, nil }
+					h, store, c, sessionID := newAdmittedHarness(t, context.Background(), prepared)
+					err := executeDirect(h, c, ctx, testOpID, prepared)
+					want := OperationFailure
+					if interrupted {
+						want = OperationInterruption
+					}
+					if (!interrupted && err != cause) || (interrupted && err != nil) {
+						t.Fatalf("execute=%v", err)
+					}
+					settlement := graphSettlementOf(t, store, sessionID)
+					if settlement.Status != want {
+						t.Fatalf("settlement=%+v want %s", settlement, want)
+					}
+					wantCalls := 0
+					if stage == "consume" {
+						wantCalls = 1
+					}
+					if *calls != wantCalls || len(settlement.Facts) != wantCalls {
+						t.Fatalf("calls=%d facts=%+v", *calls, settlement.Facts)
+					}
+					if wantCalls == 1 && (settlement.Facts[0].Usage == nil || settlement.Facts[0].Usage.InputTokens != 3) {
+						t.Fatalf("facts=%+v", settlement.Facts)
+					}
+				})
+			}
+		}
+	}
 }
 
 // TestStrategyContractTwoFactCheckpoint proves the replacement policy's

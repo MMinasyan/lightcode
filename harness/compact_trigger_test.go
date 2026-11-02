@@ -59,8 +59,8 @@ func runTriggerRound(t *testing.T, h *Harness, c *coordinator, operationID strin
 	if err != nil {
 		return agent.ModelSettlement{}, model.Request{}, err
 	}
-	set, err := invokeModelEffect(t, h.modelEffect(c, operationID, exec, inv, capture, round), req, nil)
-	return set, req, err
+	set, err := invokeModelEffect(t, h.modelEffect(c, operationID, exec, inv, capture, round), *req.Request, nil)
+	return set, *req.Request, err
 }
 
 // triggerUsageCapture returns the fixture capture whose conversation

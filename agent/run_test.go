@@ -33,21 +33,22 @@ type runFakes struct {
 }
 
 func (f *runFakes) request() RequestSource {
-	return func(context.Context) (model.Request, error) {
+	return func(context.Context) (RequestResult, error) {
 		f.sourceCalls++
 		msgs, tools := userSnapshot("go"), advTools()
 		var err error
 		if f.snapshot != nil {
 			if msgs, err = f.snapshot(f.sourceCalls); err != nil {
-				return model.Request{}, err
+				return RequestResult{}, err
 			}
 		}
 		if f.tools != nil {
 			if tools, err = f.tools(f.sourceCalls); err != nil {
-				return model.Request{}, err
+				return RequestResult{}, err
 			}
 		}
-		return model.Request{Messages: msgs, Tools: tools}, nil
+		req := model.Request{Messages: msgs, Tools: tools}
+		return RequestResult{Request: &req}, nil
 	}
 }
 
