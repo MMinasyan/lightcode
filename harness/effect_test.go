@@ -2105,7 +2105,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 		}
 		{
 			got := string(committedAssistant(t, store, sessionID).Extra["form"])
-			testassert.Equal(t, got, `{"n":[1,1.0,9007199254740993]}`)
+			testassert.Equal(t, got, `{ "n" : [1, 1.0, 9007199254740993] }`)
 		}
 		for i := range producer { // ownership oracle: clobber the producer's buffer after the commit
 			producer[i] = ' '
@@ -2117,7 +2117,7 @@ func TestToolEffectConsumesCommittedNormalization(t *testing.T) {
 		got, err := h.toolEffect(c, testOpID, Execution{}, InvocationExecution{Tool: plan, NormalizeTool: normalize}, testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
 		testassert.NoError(t, err)
 		testassert.Require(t, got.Status == model.ResultSuccess, "result = %+v, want the valid original to run", got)
-		testassert.Equal(t, seenAtBoundary, `{"n":[1,1.0,9007199254740993]}`)
+		testassert.Equal(t, seenAtBoundary, `{ "n" : [1, 1.0, 9007199254740993] }`)
 	})
 
 	t.Run("oversized diagnostic is bounded and stored once", func(t *testing.T) {
@@ -2182,13 +2182,11 @@ func TestToolOutcomeMetadataRules(t *testing.T) {
 	}{
 		{name: "object metadata commits", metadata: json.RawMessage(`{"kind":"editpreview","files":["a.go"]}`), stored: `{"kind":"editpreview","files":["a.go"]}`},
 		{name: "scalar metadata commits", metadata: json.RawMessage(`42`), stored: `42`},
-		{name: "HTML characters persist in the escaped durable encoding", metadata: json.RawMessage(`"<"`), stored: `"\u003c"`},
+		{name: "HTML characters persist verbatim", metadata: json.RawMessage(`"<"`), stored: `"<"`},
 		{name: "metadata exactly at the durable bound commits", metadata: json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes-2) + `"`), stored: `"` + strings.Repeat("x", maxToolMetadataBytes-2) + `"`},
 		{name: "durable encoding one byte over the bound is dropped and the result commits", metadata: json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes-1) + `"`), stored: ""},
-		// The two-representation regression: the raw value is exactly at the
-		// bound, but HTML-escaping expands its durable encoding far past it,
-		// so the metadata drops while the result still commits.
-		{name: "raw at the bound but durable-oversized after escaping is dropped and the result commits", metadata: json.RawMessage(`"` + strings.Repeat("<", maxToolMetadataBytes-2) + `"`), stored: ""},
+		// Framing overhead does not count toward the raw metadata bound.
+		{name: "HTML bytes exactly at the bound commit", metadata: json.RawMessage(`"` + strings.Repeat("<", maxToolMetadataBytes-2) + `"`), stored: `"` + strings.Repeat("<", maxToolMetadataBytes-2) + `"`},
 		{name: "malformed metadata is dropped and the result commits", metadata: json.RawMessage(`{broken`), stored: ""},
 		{name: "null metadata is absent", metadata: json.RawMessage(`null`), stored: ""},
 		{name: "empty metadata is absent", metadata: json.RawMessage{}, stored: ""},
@@ -2690,7 +2688,11 @@ func captureNextModelRequest(t *testing.T, h *Harness, c *coordinator) model.Req
 		return completedTurnStream(), nil
 	}
 	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
+		exec, inv := effectExecution(modelFn, nil), invocationExecution(modelFn, nil)
+		round := &conversationRound{}
+		request, err := h.requestSource(c, testOpID, testCapture(), exec, inv, round)(context.Background())
+		testassert.NoError(t, err)
+		_, err = invokeModelEffect(t, h.modelEffect(c, testOpID, exec, inv, testCapture(), round), *request.Request, nil)
 		testassert.NoError(t, err)
 	}
 	return captured

@@ -204,8 +204,7 @@ func TestPublicSnapshotSessionReadsAndOwns(t *testing.T) {
 		assistant := pristineFacts[1].Assistant
 		testassert.Require(t, assistant != nil && len(assistant.ToolCalls) == 1 && assistant.ToolCalls[0].ID == "call-1" && assistant.ToolCalls[0].ResultEntryID != "", "assistant fact = %+v", assistant)
 		result := pristineFacts[2].ToolResult
-		// the durable codec's JSON encoding escapes the raw metadata's markup
-		testassert.Require(t, result != nil && result.ToolCallID == "call-1" && string(result.Metadata) == `{"n":[1,1.0],"s":"\u003c\u003e\u0026"}`, "tool result fact = %+v", result)
+		testassert.Require(t, result != nil && result.ToolCallID == "call-1" && string(result.Metadata) == `{"n":[1,1.0],"s":"<>&"}`, "tool result fact = %+v", result)
 		for i, seq := range []int64{1, 2, 3, 4, 5, 6, 7, 8} {
 			testassert.Require(t, pristineFacts[i].Sequence == seq, "fact[%d].Sequence = %d, want ascending %d", i, pristineFacts[i].Sequence, seq)
 		}

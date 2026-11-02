@@ -118,16 +118,15 @@ func validToolCallRecord() toolCallRecord {
 
 func validAssistantEntry(operationID string) assistantEntry {
 	return assistantEntry{
-		SessionID:       testSessionID,
-		EntryID:         testEntryID,
-		OperationID:     operationID,
-		Status:          model.OutputCompleted,
-		Source:          testModelRef(),
-		Content:         []model.ContentPart{model.ContentPart{Kind: model.PartText, Text: "hi"}},
-		ToolCalls:       []toolCallRecord{},
-		RequestID:       "request-one",
-		AdvertisedNames: []string{},
-		Evidence:        &RequestEvidence{BoundaryEntryID: hexID(1)},
+		SessionID:   testSessionID,
+		EntryID:     testEntryID,
+		OperationID: operationID,
+		Status:      model.OutputCompleted,
+		Source:      testModelRef(),
+		Content:     []model.ContentPart{model.ContentPart{Kind: model.PartText, Text: "hi"}},
+		ToolCalls:   []toolCallRecord{},
+		RequestID:   "request-one",
+		Evidence:    &RequestEvidence{BoundaryEntryID: hexID(1)},
 	}
 }
 
@@ -627,7 +626,7 @@ func TestHookResultStatusRules(t *testing.T) {
 				failed := validHookResultEntry(hookFailed)
 				failedRaw, err := encodeHookResultEntry(failed)
 				testassert.NoError(t, err)
-				return setKey(failedRaw, "arguments", json.RawMessage(`{}`))
+				return setKey(failedRaw, "arguments_base64", frame([]byte(`{}`)))
 			}()},
 		} {
 			t.Run(mutation.name, func(t *testing.T) {
@@ -1001,7 +1000,7 @@ func TestUsageAccounting(t *testing.T) {
 // while a non-null JSON value round-trips verbatim.
 func TestToolCallNormalizedArgumentsNullRejected(t *testing.T) {
 	entry := validAssistantEntry(testOpID)
-	entry.AdvertisedNames = []string{"echo"}
+	entry.Evidence.ToolNames = []string{"echo"}
 	call := validToolCallRecord()
 	call.NormalizedArguments = json.RawMessage("null")
 	entry.ToolCalls = []toolCallRecord{call}
@@ -1031,7 +1030,7 @@ func TestToolCallNormalizedArgumentsNullRejected(t *testing.T) {
 func TestToolCallNormalizedArgumentsObjectOnly(t *testing.T) {
 	const wrong = `[1,2]`
 	entry := validAssistantEntry(testOpID)
-	entry.AdvertisedNames = []string{"echo"}
+	entry.Evidence.ToolNames = []string{"echo"}
 	call := validToolCallRecord()
 	call.NormalizedArguments = json.RawMessage(wrong)
 	entry.ToolCalls = []toolCallRecord{call}
@@ -1043,7 +1042,7 @@ func TestToolCallNormalizedArgumentsObjectOnly(t *testing.T) {
 	// decode side: rewrite one valid encoded payload's member to the wrong
 	// kind and prove decode rejects it.
 	valid := validAssistantEntry(testOpID)
-	valid.AdvertisedNames = []string{"echo"}
+	valid.Evidence.ToolNames = []string{"echo"}
 	vcall := validToolCallRecord()
 	vcall.NormalizedArguments = json.RawMessage(`{"x":1}`)
 	valid.ToolCalls = []toolCallRecord{vcall}
@@ -1059,7 +1058,7 @@ func TestToolCallNormalizedArgumentsObjectOnly(t *testing.T) {
 		err := json.Unmarshal(obj["tool_calls"], &items)
 		testassert.Require(t, err == nil && len(items) == 1, "encoded tool_calls = %s (%v)", obj["tool_calls"], err)
 	}
-	items[0]["normalized_arguments"] = json.RawMessage(wrong)
+	items[0]["normalized_arguments_base64"] = frame([]byte(wrong))
 	edited, err := json.Marshal(items)
 	testassert.NoError(t, err)
 	obj["tool_calls"] = edited
@@ -1244,7 +1243,7 @@ func TestToolCallNormalizationFailureRules(t *testing.T) {
 	// One bounded diagnostic round-trips verbatim and encodes by omission
 	// when absent.
 	advertised := validAssistantEntry(testOpID)
-	advertised.AdvertisedNames = []string{"echo"}
+	advertised.Evidence.ToolNames = []string{"echo"}
 	failed := validToolCallRecord()
 	failed.NormalizationFailure = diag
 	advertised.ToolCalls = []toolCallRecord{failed}
@@ -1252,7 +1251,7 @@ func TestToolCallNormalizationFailureRules(t *testing.T) {
 	{
 		_, present := member["normalization_failure"]
 		testassert.Require(t, present, "encoded call %s carries no normalization_failure member", member)
-		_, present = member["normalized_arguments"]
+		_, present = member["normalized_arguments_base64"]
 		testassert.Require(t, !present, "encoded call %s carries both normalization members", member)
 	}
 	env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: raw}
@@ -1287,7 +1286,7 @@ func TestToolCallNormalizationFailureRules(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := validAssistantEntry(testOpID)
-			v.AdvertisedNames = tc.advertised
+			v.Evidence.ToolNames = tc.advertised
 			v.ToolCalls = []toolCallRecord{tc.call}
 			{
 				_, err := encodeAssistantEntry(v)
@@ -1300,7 +1299,7 @@ func TestToolCallNormalizationFailureRules(t *testing.T) {
 	// rejected by both codec sides; the exact bound decodes.
 	t.Run("bounded diagnostic", func(t *testing.T) {
 		v := validAssistantEntry(testOpID)
-		v.AdvertisedNames = []string{"echo"}
+		v.Evidence.ToolNames = []string{"echo"}
 		call := validToolCallRecord()
 		call.NormalizationFailure = strings.Repeat("x", maxToolDiagnosticBytes+1)
 		v.ToolCalls = []toolCallRecord{call}
@@ -1338,7 +1337,7 @@ func TestToolCallNormalizationFailureRules(t *testing.T) {
 		} {
 			items[0]["normalization_failure"] = tc.member
 			if tc.name == "both members" {
-				items[0]["normalized_arguments"] = json.RawMessage(`{"x":1}`)
+				items[0]["normalized_arguments_base64"] = frame([]byte(`{"x":1}`))
 			}
 			edited, err := json.Marshal(items)
 			testassert.NoError(t, err)
@@ -1350,7 +1349,7 @@ func TestToolCallNormalizationFailureRules(t *testing.T) {
 				_, err := decodeAssistantEntry(env)
 				testassert.Require(t, err != nil, "decode %s must fail", tc.name)
 			}
-			delete(items[0], "normalized_arguments")
+			delete(items[0], "normalized_arguments_base64")
 		}
 	})
 }
@@ -1367,7 +1366,7 @@ func TestToolResultMetadataRules(t *testing.T) {
 	raw, err := encodeToolResultEntry(v)
 	testassert.NoError(t, err)
 	{
-		_, present := wireObject(t, raw)["metadata"]
+		_, present := wireObject(t, raw)["metadata_base64"]
 		testassert.Require(t, present, "encoded payload %s carries no metadata member", raw)
 	}
 	env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryToolResult, Payload: raw}
@@ -1383,7 +1382,7 @@ func TestToolResultMetadataRules(t *testing.T) {
 	bare, err := encodeToolResultEntry(validToolResultEntry(testOpID))
 	testassert.NoError(t, err)
 	{
-		_, present := wireObject(t, bare)["metadata"]
+		_, present := wireObject(t, bare)["metadata_base64"]
 		testassert.Require(t, !present, "metadata-less payload encodes the member: %s", bare)
 	}
 
@@ -1394,7 +1393,6 @@ func TestToolResultMetadataRules(t *testing.T) {
 		{"null metadata", json.RawMessage(`null`)},
 		{"malformed metadata", json.RawMessage(`{broken`)},
 		{"oversized metadata", json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes) + `"`)},
-		{"raw-at-bound metadata whose HTML-escaped durable encoding exceeds the bound", json.RawMessage(`"` + strings.Repeat("<", maxToolMetadataBytes-2) + `"`)},
 	}
 	for _, tc := range rejected {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1424,7 +1422,7 @@ func TestToolResultMetadataRules(t *testing.T) {
 		{"at the bound", json.RawMessage(`"` + strings.Repeat("x", maxToolMetadataBytes-2) + `"`)},
 	} {
 		env := env
-		env.Payload = setKey(raw, "metadata", tc.metadata)
+		env.Payload = setKey(raw, "metadata_base64", frame(tc.metadata))
 		_, err := decodeToolResultEntry(env)
 		if tc.name == "at the bound" {
 			testassert.NoError(t, err)
@@ -1434,14 +1432,11 @@ func TestToolResultMetadataRules(t *testing.T) {
 	}
 }
 
-// TestOwnedToolMetadataEncodedForm proves the shared owning helper returns
-// the exact durable encoding json.Marshal produces for the raw input —
-// whitespace compacts, HTML characters escape, numeric lexemes stay exact —
-// never a clone of the caller's raw bytes: the caller's buffer stays
-// unchanged and the returned bytes are independent of it.
+// TestOwnedToolMetadataEncodedForm proves metadata retains its exact bytes
+// and the returned buffer is independent of the caller.
 func TestOwnedToolMetadataEncodedForm(t *testing.T) {
 	const input = `{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`
-	const want = `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}`
+	const want = input
 	raw := json.RawMessage(input)
 	got := ownedToolMetadata(raw)
 	testassert.Require(t, string(got) == want, "owned metadata = %s, want the durable encoded bytes %s", got, want)
@@ -1724,11 +1719,11 @@ func TestCodecOwnedValues(t *testing.T) {
 // bytes as independent of them.
 func TestAdoptedFormsAcrossInsertAndFork(t *testing.T) {
 	const (
-		verbatimExtra   = `{"path":"a/b","list":[1,2]}`
-		nestedExtra     = `{"deep":{"a":[{"b":1},[[2],"c"]]},"keep":true}`
-		lexemeExtra     = `{"n":[1,1.0,1e0,9007199254740993,-0]}`
-		nestedArguments = `{"deep":{"a":[{"b":1},[[2],"c"]]},"n":[1,1.0,1e0,9007199254740993]}`
-		nestedMetadata  = `{"marker":[{"tool":{"nested":[1,{"x":[2,3]}]}}]}`
+		verbatimExtra   = ` { "path" : "<a/b>", "list" : [1, 2] } `
+		nestedExtra     = ` { "deep" : {"a":[{"b":1},[[2],"<c>"]]},"keep":true} `
+		lexemeExtra     = ` {"n": [1, 1.0, 1e0, 9007199254740993, -0]} `
+		nestedArguments = ` {"deep": {"a":[{"b":1},[[2],"<c>"]]}, "n": [1,1.0,1e0,9007199254740993]} `
+		nestedMetadata  = ` {"marker": [{"tool":{"nested":[1,{"x":[2,3]}]}}], "s":"<"} `
 	)
 	// wantReplacedText pins one U+FFFD per invalid byte with the ordinary
 	// multi-byte text around it untouched.
@@ -1757,12 +1752,12 @@ func TestAdoptedFormsAcrossInsertAndFork(t *testing.T) {
 		failed.NormalizationFailure = "arguments must be one non-null JSON object"
 		v := validAssistantEntry(testOpID)
 		v.EntryID = entryID
-		v.AdvertisedNames = []string{"echo"}
+		v.Evidence.ToolNames = []string{"echo"}
 		v.Content = []model.ContentPart{
 			{Kind: model.PartText, Text: invalidText(), Extra: model.Extra{"raw": freshRaw(verbatimExtra), "utf8": invalidRawString()}},
 			{Kind: model.PartOpaque, OpaqueWireType: "thinking", Extra: model.Extra{"nested": freshRaw(nestedExtra), "lexemes": freshRaw(lexemeExtra)}},
 		}
-		v.Extra = model.Extra{"msg": freshRaw(nestedExtra)}
+		v.Extra = model.Extra{"msg": freshRaw(nestedExtra), "": freshRaw(`true`), string([]byte{0xff}): freshRaw(`"invalid key"`)}
 		v.ToolCalls = []toolCallRecord{call, failed}
 		return v
 	}
@@ -1796,6 +1791,7 @@ func TestAdoptedFormsAcrossInsertAndFork(t *testing.T) {
 		testassert.Require(t, string(got.Content[1].Extra["nested"]) == nestedExtra, "adopted nested content extra = %q, want the nested form unchanged", got.Content[1].Extra["nested"])
 		testassert.Require(t, string(got.Content[1].Extra["lexemes"]) == lexemeExtra, "adopted numeric lexemes = %q, want 9007199254740993 and its siblings exact", got.Content[1].Extra["lexemes"])
 		testassert.Require(t, string(got.Extra["msg"]) == nestedExtra, "adopted message extra = %q, want the nested form unchanged", got.Extra["msg"])
+		testassert.Require(t, string(got.Extra[""]) == `true` && string(got.Extra[string([]byte{0xff})]) == `"invalid key"`, "adopted opaque keys = %+v", got.Extra)
 		testassert.Require(t, string(got.ToolCalls[0].Extra["nested"]) == nestedExtra, "adopted call extra = %q, want the nested form unchanged", got.ToolCalls[0].Extra["nested"])
 		testassert.Require(t, string(got.ToolCalls[0].NormalizedArguments) == nestedArguments, "adopted normalized arguments = %q, want the nested form with exact lexemes unchanged", got.ToolCalls[0].NormalizedArguments)
 		testassert.Require(t, got.ToolCalls[1].NormalizationFailure == "arguments must be one non-null JSON object", "adopted normalization failure = %q, want the stored diagnostic verbatim", got.ToolCalls[1].NormalizationFailure)
@@ -2481,6 +2477,7 @@ func TestCompactionEntryPayloadRules(t *testing.T) {
 	t.Run("round trips owned with and without fact usage", func(t *testing.T) {
 		for _, withUsage := range []bool{false, true} {
 			v := validCompactionEntry(testOpID)
+			v.Evidence.ToolNames = []string{}
 			if withUsage {
 				v.Facts[0].Usage = &UsageCount{InputTokens: 11, CachedInputTokens: 4, OutputTokens: 7}
 			}
@@ -2825,8 +2822,7 @@ func TestHookResultKnowledgeAndBindingDomains(t *testing.T) {
 
 // TestAssistantEntryRequestEvidenceRequiredMembers proves the assistant
 // payload's required ownership members on both codec sides: the producing
-// request identity, the advertised view (present-empty included; null and
-// absence reject), and the final effective request evidence with its required
+// request identity and the final effective request evidence with its required
 // canonical boundary; decoded values stay deep-owned from the payload bytes.
 func TestAssistantEntryRequestEvidenceRequiredMembers(t *testing.T) {
 	raw, err := encodeAssistantEntry(validAssistantEntry(testOpID))
@@ -2834,17 +2830,13 @@ func TestAssistantEntryRequestEvidenceRequiredMembers(t *testing.T) {
 	env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: raw}
 	decoded, err := decodeAssistantEntry(env)
 	testassert.NoError(t, err)
-	testassert.Require(t, decoded.RequestID != "" && decoded.AdvertisedNames != nil && len(decoded.AdvertisedNames) == 0 &&
-		decoded.Evidence != nil && decoded.Evidence.BoundaryEntryID == hexID(1), "decoded assistant = %+v, want the request identity, the present-empty view, and the consumed evidence", decoded)
-	for _, name := range []string{"request_id", "advertised_names", "evidence"} {
+	testassert.Require(t, decoded.RequestID != "" && decoded.Evidence != nil && decoded.Evidence.ToolNames != nil && len(decoded.Evidence.ToolNames) == 0 &&
+		decoded.Evidence.BoundaryEntryID == hexID(1), "decoded assistant = %+v, want the request identity, the present-empty view, and the consumed evidence", decoded)
+	for _, name := range []string{"request_id", "evidence"} {
 		{
 			_, derr := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: setKey(raw, name, nil)})
 			testassert.Require(t, derr != nil, "absence of %s must reject", name)
 		}
-	}
-	{
-		_, derr := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: setKey(raw, "advertised_names", json.RawMessage(`null`))})
-		testassert.Require(t, derr != nil, "a null advertised_names must reject")
 	}
 	{
 		_, derr := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: setKey(raw, "evidence", json.RawMessage(`{"checkpoint_entry_id":""}`))})
@@ -2852,14 +2844,13 @@ func TestAssistantEntryRequestEvidenceRequiredMembers(t *testing.T) {
 	}
 	// Present-empty prompt contribution survives the wire as present.
 	v := validAssistantEntry(testOpID)
-	empty := ""
-	v.Evidence.Prompt = &empty
+	v.Evidence.Prompt = ""
 	v.Evidence.ToolNames = []string{}
 	raw, err = encodeAssistantEntry(v)
 	testassert.NoError(t, err)
 	decoded, err = decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: raw})
 	testassert.NoError(t, err)
-	testassert.Require(t, decoded.Evidence.Prompt != nil && *decoded.Evidence.Prompt == "", "prompt contribution = %+v, want the present-empty prompt retained", decoded.Evidence.Prompt)
+	testassert.Require(t, decoded.Evidence.Prompt == "", "prompt contribution = %+v, want the empty prompt retained", decoded.Evidence.Prompt)
 	testassert.Require(t, decoded.Evidence.ToolNames != nil && len(decoded.Evidence.ToolNames) == 0, "tool view = %+v, want the present-empty view retained", decoded.Evidence.ToolNames)
 	// Decoded evidence is deep-owned: mutating it cannot reach a later decode.
 	decoded.Evidence.BoundaryEntryID = hexID(9)
@@ -2868,7 +2859,35 @@ func TestAssistantEntryRequestEvidenceRequiredMembers(t *testing.T) {
 	}
 	again, err := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: raw})
 	testassert.NoError(t, err)
-	testassert.Require(t, again.Evidence.BoundaryEntryID == hexID(1) && again.Evidence.Prompt != nil && *again.Evidence.Prompt == "", "payload bytes changed by a decoded mutation")
+	testassert.Require(t, again.Evidence.BoundaryEntryID == hexID(1) && again.Evidence.Prompt == "", "payload bytes changed by a decoded mutation")
+}
+
+func TestAssistantEvidenceIsStoredAdvertisement(t *testing.T) {
+	for _, operationID := range []string{testOpID, ""} {
+		v := validAssistantEntry(operationID)
+		v.Evidence.ToolNames = []string{"echo"}
+		call := validToolCallRecord()
+		call.NormalizedArguments = json.RawMessage(`{"x":1}`)
+		v.ToolCalls = []toolCallRecord{call}
+		raw, err := encodeAssistantEntry(v)
+		testassert.NoError(t, err)
+		if _, exists := wireObject(t, raw)["advertised_names"]; exists {
+			t.Fatal("assistant encoded a second advertisement")
+		}
+		env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: operationID, Kind: EntryAssistant, Payload: raw}
+		decoded, err := decodeAssistantEntry(env)
+		if err != nil {
+			t.Errorf("operation %q: valid evidence-only assistant refused: %v", operationID, err)
+			continue
+		}
+		if !reflect.DeepEqual(decoded.Evidence.ToolNames, []string{"echo"}) || string(decoded.ToolCalls[0].NormalizedArguments) != `{"x":1}` {
+			t.Fatalf("decoded = %+v", decoded)
+		}
+		env.Payload = setKey(raw, "advertised_names", json.RawMessage(`["echo"]`))
+		if _, err := decodeAssistantEntry(env); err == nil {
+			t.Fatal("obsolete advertisement member accepted")
+		}
+	}
 }
 
 // TestRequestEvidenceContributionMessageDomain proves the shared message gate
@@ -2923,7 +2942,7 @@ func TestRequestEvidenceContributionMessageDomain(t *testing.T) {
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "call id"), "encode-side tool-result call id: %v", err)
 	}
 	{
-		badRaw := setKey(raw, "messages", json.RawMessage(`[{"role":"assistant","content":[{"kind":"text","text":"wire"}],"tool_calls":[{"id":"c","name":"echo","arguments":"{}"}]}]`))
+		badRaw := setKey(raw, "messages", json.RawMessage(`[{"role":"assistant","source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":"wire"}],"tool_calls":[{"id":"c","name":"echo","arguments_base64":"e30="}]}]`))
 		_, err := decodeRequestEvidence(badRaw)
 		testassert.Require(t, err != nil, "decode-side tool-call contribution must reject")
 	}
@@ -3099,12 +3118,12 @@ func TestStrategyCaptureSettingsRawAcceptance(t *testing.T) {
 		obj, err := decodePayloadObject(encode(t, nil))
 		testassert.NoError(t, err)
 		if settings != "" {
-			obj["strategy"] = json.RawMessage(`{"id":"test.strategy/v1","settings":` + settings + `,"requires_context_window":false}`)
+			obj["strategy"] = json.RawMessage(`{"id":"test.strategy/v1","settings_base64":` + string(frame([]byte(settings))) + `,"requires_context_window":false}`)
 		}
 		return obj
 	}
 
-	for _, accepted := range []string{"null", "1e999", `{"nested":[1,{"a":"b"}]}`, "[]"} {
+	for _, accepted := range []string{"null", "1e999", ` { "nested" : [1,{"a":"<b>"}] } `, "[]", string([]byte{'"', 0xff, '"'})} {
 		obj := with(accepted)
 		got, err := decodeExecutionCapture(obj)
 		testassert.Require(t, err == nil && string(got.Strategy.Settings) == accepted, "settings %s = %s err %v, want the original accepted bytes", accepted, got.Strategy.Settings, err)
@@ -3131,7 +3150,7 @@ func TestStrategyCaptureSettingsRawAcceptance(t *testing.T) {
 		testassert.Require(t, present, "the strategy member is required")
 		members, err := decodePayloadObject(strategy)
 		testassert.NoError(t, err)
-		_, has := members["settings"]
+		_, has := members["settings_base64"]
 		testassert.Require(t, !has, "absent settings leaked the settings member")
 	}
 
@@ -3161,6 +3180,148 @@ func TestStrategyCaptureSettingsSurviveColdReadAndRecovery(t *testing.T) {
 	rec, err = h.ReadOperation(context.Background(), sessionID, testOpID)
 	testassert.NoError(t, err)
 	testassert.Require(t, string(rec.Admission.Execution.Strategy.Settings) == "1e999", "post-recovery settings = %s, want the admitted bytes", rec.Admission.Execution.Strategy.Settings)
+}
+
+func TestOpaqueFramesPreserveBytesAndRejectInvalidFrames(t *testing.T) {
+	invalidKey := string([]byte{0xff})
+	invalidJSON := json.RawMessage{'"', 0xff, '"'}
+	part := model.ContentPart{Kind: model.PartText, Text: "text", Extra: model.Extra{
+		"": json.RawMessage(` { "s" : "<>&" } `), invalidKey: invalidJSON,
+	}}
+	wire, err := encodeContentPart(part)
+	testassert.NoError(t, err)
+	got, err := decodeContentPart(wire)
+	testassert.NoError(t, err)
+	if !reflect.DeepEqual(part, got) {
+		t.Fatalf("opaque extra changed: got %+v want %+v", got.Extra, part.Extra)
+	}
+	invalidJSON[1] = 'x'
+	if got.Extra[invalidKey][1] != 0xff {
+		t.Fatal("decoded bytes alias input")
+	}
+	for _, bad := range []json.RawMessage{json.RawMessage(`null`), json.RawMessage(`42`), json.RawMessage(`"a"`), json.RawMessage(`"YQ==\n"`), json.RawMessage(`"YR=="`), json.RawMessage(`""`)} {
+		obj := wireObject(t, wire)
+		obj["extra"] = mustMarshal(map[string]json.RawMessage{"aw==": bad})
+		broken := mustMarshal(obj)
+		if _, err := decodeContentPart(broken); err == nil {
+			t.Errorf("accepted invalid value frame %s", bad)
+		}
+	}
+	for _, key := range []string{"a", "YR==", "YQ==\n"} {
+		obj := wireObject(t, wire)
+		obj["extra"] = mustMarshal(map[string]json.RawMessage{key: frame([]byte(`true`))})
+		if _, err := decodeContentPart(mustMarshal(obj)); err == nil {
+			t.Errorf("accepted invalid key frame %q", key)
+		}
+	}
+	definition := testToolDefinition()
+	definition.Parameters = json.RawMessage(` { "type" : "object", "s" : "<" } `)
+	wire, err = encodeToolDefinition(definition)
+	testassert.NoError(t, err)
+	d, err := decodeToolDefinition(wire)
+	testassert.NoError(t, err)
+	if string(d.Parameters) != string(definition.Parameters) {
+		t.Fatalf("parameters changed: %s", d.Parameters)
+	}
+	obj := wireObject(t, wire)
+	delete(obj, "parameters_base64")
+	if _, err := decodeToolDefinition(mustMarshal(obj)); err == nil {
+		t.Fatal("missing parameters accepted")
+	}
+	obj["parameters_base64"] = frame([]byte(`[]`))
+	if _, err := decodeToolDefinition(mustMarshal(obj)); err == nil {
+		t.Fatal("non-object parameters accepted")
+	}
+	for _, bad := range []json.RawMessage{json.RawMessage(`null`), json.RawMessage(`1`), json.RawMessage(`"bad!"`), json.RawMessage(`"YR=="`)} {
+		obj["parameters_base64"] = bad
+		if _, err := decodeToolDefinition(mustMarshal(obj)); err == nil {
+			t.Errorf("accepted parameter frame %s", bad)
+		}
+		strategy := map[string]json.RawMessage{"id": mustMarshal("test.strategy/v1"), "requires_context_window": mustMarshal(false), "settings_base64": bad}
+		if _, err := decodeStrategyCapture(strategy); err == nil {
+			t.Errorf("accepted settings frame %s", bad)
+		}
+	}
+}
+
+func TestRequestEvidenceRequiresConcretePromptAndNames(t *testing.T) {
+	for _, names := range [][]string{nil, {}} {
+		raw, err := encodeRequestEvidence(RequestEvidence{BoundaryEntryID: hexID(1), ToolNames: names})
+		testassert.NoError(t, err)
+		got, err := decodeRequestEvidence(raw)
+		testassert.NoError(t, err)
+		if got.Prompt != "" || got.ToolNames == nil || len(got.ToolNames) != 0 {
+			t.Fatalf("evidence = %+v", got)
+		}
+		for _, key := range []string{"prompt", "tool_names"} {
+			for _, broken := range []json.RawMessage{dropKey(raw, key), setKey(raw, key, json.RawMessage(`null`))} {
+				if _, err := decodeRequestEvidence(broken); err == nil {
+					t.Errorf("accepted malformed %s: %s", key, broken)
+				}
+			}
+		}
+	}
+	assistant := validAssistantEntry(testOpID)
+	assistant.Evidence.ToolNames = []string{"echo"}
+	if _, err := encodeAssistantEntry(assistant); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := encodeRequestEvidence(RequestEvidence{BoundaryEntryID: hexID(1), ToolNames: []string{"echo", "echo"}}); err == nil {
+		t.Fatal("duplicate evidence names accepted")
+	}
+}
+
+func TestArgumentAndMetadataFramesAcrossOwners(t *testing.T) {
+	const raw = ` { "n" : 1e999, "text" : "<" } `
+	hook := validHookResultEntry(hookSucceeded)
+	hook.Arguments = json.RawMessage(raw)
+	hookWire, err := encodeHookResultEntry(hook)
+	testassert.NoError(t, err)
+	hookEnv := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryHookResult, Payload: hookWire}
+	gotHook, err := decodeHookResultEntry(hookEnv)
+	testassert.NoError(t, err)
+	if string(gotHook.Arguments) != raw {
+		t.Fatalf("hook arguments changed: %s", gotHook.Arguments)
+	}
+	effect := ActiveEffect{Kind: EffectTool, ResultEntryID: hexID(9), ToolCallID: "call-1", FinalArguments: json.RawMessage(raw)}
+	effectWire, err := encodeActiveEffect(effect)
+	testassert.NoError(t, err)
+	gotEffect, err := decodeActiveEffect(wireObject(t, effectWire))
+	testassert.NoError(t, err)
+	if string(gotEffect.FinalArguments) != raw {
+		t.Fatalf("active arguments changed: %s", gotEffect.FinalArguments)
+	}
+	result := validToolResultEntry(testOpID)
+	result.NormalizedArguments, result.Metadata = json.RawMessage(raw), json.RawMessage(raw)
+	resultWire, err := encodeToolResultEntry(result)
+	testassert.NoError(t, err)
+	resultEnv := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryToolResult, Payload: resultWire}
+	gotResult, err := decodeToolResultEntry(resultEnv)
+	testassert.NoError(t, err)
+	if string(gotResult.NormalizedArguments) != raw || string(gotResult.Metadata) != raw {
+		t.Fatalf("result bytes changed: %+v", gotResult)
+	}
+	for _, malformed := range []json.RawMessage{json.RawMessage(`null`), json.RawMessage(`false`), json.RawMessage(`"bad!"`), frame([]byte(`[]`))} {
+		hookEnv.Payload = setKey(hookWire, "arguments_base64", malformed)
+		if _, err := decodeHookResultEntry(hookEnv); err == nil {
+			t.Errorf("accepted hook arguments %s", malformed)
+		}
+		obj := wireObject(t, effectWire)
+		obj["final_arguments_base64"] = malformed
+		if _, err := decodeActiveEffect(obj); err == nil {
+			t.Errorf("accepted active arguments %s", malformed)
+		}
+		resultEnv.Payload = setKey(resultWire, "normalized_arguments_base64", malformed)
+		if _, err := decodeToolResultEntry(resultEnv); err == nil {
+			t.Errorf("accepted normalized arguments %s", malformed)
+		}
+	}
+	for _, malformed := range []json.RawMessage{json.RawMessage(`null`), json.RawMessage(`false`), json.RawMessage(`"bad!"`), frame([]byte(`null`)), frame([]byte(`{`))} {
+		resultEnv.Payload = setKey(resultWire, "metadata_base64", malformed)
+		if _, err := decodeToolResultEntry(resultEnv); err == nil {
+			t.Errorf("accepted metadata %s", malformed)
+		}
+	}
 }
 
 // TestOperationStateUnreportedMaintenanceCodec proves the incomplete-maintenance

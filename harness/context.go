@@ -29,7 +29,6 @@ var errSteeringBoundary = errors.New("harness: steering boundary")
 // and no later history reread re-derives it.
 type conversationRound struct {
 	requestID string
-	canonical []model.Message // frozen canonical conversation view, prompt stripped
 	net       RequestEvidence // final effective contribution evidence of the round
 }
 
@@ -42,13 +41,17 @@ type requestView struct {
 	boundary     string
 	prompt       string // effective prompt text
 	additions    []model.Message
-	names        []string // effective visible tool names; nil means the full captured catalog
+	names        []string // effective visible tool names
 	contributors []HookIdentity
 }
 
 // newRequestView freezes the captured prompt and the canonical projection
 // into one live view.
 func newRequestView(capture ExecutionCapture, checkpoint, boundary string, canonical []model.Message) *requestView {
+	names := make([]string, len(capture.Tools))
+	for i, tool := range capture.Tools {
+		names[i] = tool.Name
+	}
 	return &requestView{
 		capture:    capture,
 		canonical:  canonical,
@@ -56,7 +59,7 @@ func newRequestView(capture ExecutionCapture, checkpoint, boundary string, canon
 		boundary:   boundary,
 		prompt:     capture.SystemPrompt,
 		additions:  nil,
-		names:      nil,
+		names:      names,
 	}
 }
 
@@ -76,9 +79,6 @@ func (v *requestView) currentCanonical() []model.Message {
 // effectiveTools renders the view's effective tool catalog: the captured
 // catalog unchanged, or its selected members in captured catalog order.
 func (v *requestView) effectiveTools() []model.ToolDefinition {
-	if v.names == nil {
-		return cloneToolDefinitions(v.capture.Tools)
-	}
 	out := make([]model.ToolDefinition, 0, len(v.names))
 	for _, tool := range v.capture.Tools {
 		for _, name := range v.names {
@@ -89,23 +89,6 @@ func (v *requestView) effectiveTools() []model.ToolDefinition {
 		}
 	}
 	return out
-}
-
-// coversCaptured reports whether one already-accepted selection names every
-// tool of the captured catalog. Selections are validated catalog-internal and
-// canonicalized to catalog order by the accepting owner, so a selection that
-// names each captured tool presents the unchanged full view.
-func coversCaptured(names []string, tools []model.ToolDefinition) bool {
-	seen := make(map[string]bool, len(names))
-	for _, name := range names {
-		seen[name] = true
-	}
-	for _, tool := range tools {
-		if !seen[tool.Name] {
-			return false
-		}
-	}
-	return true
 }
 
 // cloneToolDefinitions returns an independent owned copy of one tool
@@ -125,8 +108,7 @@ func cloneToolDefinitions(tools []model.ToolDefinition) []model.ToolDefinition {
 // applyConsequence transforms the live view with one already-validated
 // consequence: a present Prompt replaces the prompt text, Messages append to
 // the conversation view, and a present ToolNames replaces visibility with
-// those names rebuilt from the captured catalog in catalog order. A selection
-// covering the captured catalog normalizes the live view to the full catalog.
+// those names in captured catalog order.
 func (v *requestView) applyConsequence(con RequestConsequence) {
 	if con.Prompt != nil {
 		v.prompt = *con.Prompt
@@ -135,20 +117,7 @@ func (v *requestView) applyConsequence(con RequestConsequence) {
 		v.additions = append(v.additions, con.Messages...)
 	}
 	if con.ToolNames != nil {
-		if coversCaptured(con.ToolNames, v.capture.Tools) {
-			v.names = nil
-		} else {
-			ordered := make([]string, 0, len(con.ToolNames))
-			for _, tool := range v.capture.Tools {
-				for _, name := range con.ToolNames {
-					if name == tool.Name {
-						ordered = append(ordered, tool.Name)
-						break
-					}
-				}
-			}
-			v.names = ordered
-		}
+		v.names = append([]string{}, con.ToolNames...)
 	}
 }
 
@@ -162,29 +131,27 @@ func (v *requestView) recordAccepted(identity HookIdentity, con RequestConsequen
 	v.contributors = append(v.contributors, identity)
 }
 
-// evidenceFor renders one evidence value over the frozen capture baseline.
-// The delta fields are baseline-relative at every consumed boundary: only
-// dimensions the view actually changed are recorded. Every accepted hook
-// identity renders in contribution order regardless of the deltas.
+// evidenceFor renders the complete effective view and accepted hook identities.
 func (v *requestView) evidenceFor() RequestEvidence {
 	evidence := RequestEvidence{
 		CheckpointEntryID: v.checkpoint,
 		BoundaryEntryID:   v.boundary,
-	}
-	if v.prompt != v.capture.SystemPrompt {
-		prompt := v.prompt
-		evidence.Prompt = &prompt
+		Prompt:            v.prompt,
+		ToolNames:         append([]string{}, v.names...),
 	}
 	if len(v.additions) > 0 {
 		evidence.Messages = cloneRequestMessages(v.additions)
 	}
-	if v.names != nil && !coversCaptured(v.names, v.capture.Tools) {
-		names := make([]string, len(v.names))
-		copy(names, v.names)
-		evidence.ToolNames = names
-	}
 	evidence.HookIDs = append([]HookIdentity(nil), v.contributors...)
 	return evidence
+}
+
+func acceptRequestEvidence(v RequestEvidence) (RequestEvidence, error) {
+	raw, err := encodeRequestEvidence(v)
+	if err != nil {
+		return RequestEvidence{}, err
+	}
+	return decodeRequestEvidence(raw)
 }
 
 // validateRequestConsequence is the accepting gate for one consequence at the
@@ -235,21 +202,17 @@ func validateRequestConsequence(capture ExecutionCapture, con RequestConsequence
 		}
 		owned.ToolNames = ordered
 	}
-	return owned, nil
+	raw, err := encodeRequestConsequence(owned)
+	if err != nil {
+		return RequestConsequence{}, err
+	}
+	return decodeRequestConsequence(raw)
 }
 
-// buildDispatchRequest materializes one model dispatch request from the
-// evidence adopted at the committed intent over the round's frozen canonical
-// messages, never from a reread history or replayed hooks. The materialized
-// view is the one the recovery path rebuilds with materializeRequestView:
-// the actual request carries the captured catalog, and a narrowed selection
-// (present-empty advertises none) narrows the request's tool entries, which
-// are the advertisement the Engine gates on and the assistant records.
-func buildDispatchRequest(capture ExecutionCapture, canonical []model.Message, evidence RequestEvidence) (model.Request, []string) {
-	prompt := capture.SystemPrompt
-	if evidence.Prompt != nil {
-		prompt = *evidence.Prompt
-	}
+// buildDispatchRequest composes the accepted evidence over frozen canonical
+// messages; its tool entries are the advertisement the Engine gates on.
+func buildDispatchRequest(capture ExecutionCapture, canonical []model.Message, evidence RequestEvidence) model.Request {
+	prompt := evidence.Prompt
 	messages := make([]model.Message, 0, 1+len(canonical)+len(evidence.Messages))
 	if prompt != "" {
 		messages = append(messages, model.Message{
@@ -259,15 +222,8 @@ func buildDispatchRequest(capture ExecutionCapture, canonical []model.Message, e
 	}
 	messages = append(messages, canonical...)
 	messages = append(messages, evidence.Messages...)
-	tools := capture.Tools
-	if evidence.ToolNames != nil {
-		tools = (&requestView{capture: capture, names: evidence.ToolNames}).effectiveTools()
-	}
-	names := make([]string, len(tools))
-	for i, def := range tools {
-		names[i] = def.Name
-	}
-	return model.Request{Messages: messages, Tools: tools}, names
+	tools := (&requestView{capture: capture, names: evidence.ToolNames}).effectiveTools()
+	return model.Request{Messages: messages, Tools: tools}
 }
 
 // cloneRequestMessages deep-copies one message list at every ownership
@@ -343,7 +299,10 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 		if err := h.runRequestHooks(ctx, c, operationID, inv, requestID, view); err != nil {
 			return model.Request{}, err
 		}
-		contributions := view.evidenceFor() // the maintenance procedure consumes the frozen contribution evidence
+		contributions, err := acceptRequestEvidence(view.evidenceFor()) // the maintenance procedure consumes the frozen contribution evidence
+		if err != nil {
+			return model.Request{}, err
+		}
 		planInput := PlanInput{
 			Trigger:           triggerAutomatic,
 			Messages:          cloneRequestMessages(canonical),
@@ -377,18 +336,16 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 			if err != nil {
 				return model.Request{}, err
 			}
-			view.checkpoint, view.boundary = checkpointID, boundaryID
+			contributions.CheckpointEntryID, contributions.BoundaryEntryID = checkpointID, boundaryID
 		} else {
 			_ = closeMaintenance() // no checkpoint to precede: dispose the unused maintenance stage
 		}
 		// The frozen contribution view is applied exactly once to the rebuilt
 		// projection; its references now name the new checkpoint and tail.
-		evidence := view.evidenceFor()
-		req, _ := buildDispatchRequest(capture, canonical, evidence)
+		req := buildDispatchRequest(capture, canonical, contributions)
 		*round = conversationRound{
 			requestID: requestID,
-			canonical: canonical,
-			net:       evidence,
+			net:       contributions,
 		}
 		return req, nil
 	}

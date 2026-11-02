@@ -414,7 +414,6 @@ func usageSeedMessageOperation(t *testing.T, store harness.Storage, sessionID, o
 		ToolCalls   []harness.ToolCallRecord `json:"tool_calls"`
 		Usage       *harness.UsageCount      `json:"usage,omitempty"`
 		RequestID   string                   `json:"request_id"`
-		Advertised  []string                 `json:"advertised_names"`
 		Evidence    json.RawMessage          `json:"evidence"`
 	}{
 		SessionID: sessionID, EntryID: assistantID, OperationID: operationID,
@@ -422,7 +421,7 @@ func usageSeedMessageOperation(t *testing.T, store harness.Storage, sessionID, o
 		Content:   json.RawMessage(`[{"kind":"text","text":"answer ` + operationID + `"}]`),
 		ToolCalls: []harness.ToolCallRecord{},
 		Usage:     assistantUsage,
-		RequestID: "request-a-" + assistantID, Advertised: []string{}, Evidence: json.RawMessage(`{"boundary_entry_id":"` + inputID + `"}`),
+		RequestID: "request-a-" + assistantID, Evidence: json.RawMessage(`{"boundary_entry_id":"` + inputID + `","prompt":"compact-sys","tool_names":[]}`),
 	})
 	testassert.NoError(t, err)
 	settlementExtra := ""

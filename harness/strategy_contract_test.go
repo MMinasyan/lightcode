@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -1152,6 +1153,7 @@ func TestMaintenanceRequestMessageDomain(t *testing.T) {
 	}{
 		{"empty request", nil},
 		{"historical tool exchange", exchange},
+		{"opaque bytes and typed text", []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: string([]byte{'a', 0xff, 'b'}), Extra: model.Extra{"raw": json.RawMessage(` { "n" : 1e999, "s" : "<" } `)}}}}}},
 	}
 	outcomes := []string{"checkpoint", "failure", "none-success"}
 	for _, shape := range shapes {
@@ -1159,7 +1161,9 @@ func TestMaintenanceRequestMessageDomain(t *testing.T) {
 			t.Run(shape.name+" on "+outcome, func(t *testing.T) {
 				h, store, c, sessionID := newEffectHarness(t, nil)
 				capture := captureForHandoff()
+				var sent model.Request
 				exec := compactionExecution(t, func(ctx context.Context, req model.Request) (model.Stream, error) {
+					sent = req
 					return streamOf(turnDelta("stop", "one pass"), usageDelta(model.Usage{InputTokens: 4, OutputTokens: 2})), nil
 				}, nil)
 				exec.Strategy = fixtureStrategyBinding(requestShapeStrategy{request: shape.request, outcome: outcome})
@@ -1191,8 +1195,13 @@ func TestMaintenanceRequestMessageDomain(t *testing.T) {
 					published = settlementEntryOf(t, graph).Facts
 				}
 				testassert.Require(t, len(published) == 1, "published facts = %+v, want the one effect fact, empty input included", published)
+				testassert.Require(t, reflect.DeepEqual(sent.Messages, published[0].Input) || len(sent.Messages) == 0 && len(published[0].Input) == 0, "physical request and stored fact differ: %+v / %+v", sent.Messages, published[0].Input)
 				testassert.Require(t, len(published[0].Input) == len(shape.request), "fact input = %+v, want the actual request messages", published[0].Input)
 				for i := range shape.request {
+					if shape.name == "opaque bytes and typed text" {
+						testassert.Require(t, published[0].Input[i].TextContent() == "a\ufffdb" && string(published[0].Input[i].Content[0].Extra["raw"]) == ` { "n" : 1e999, "s" : "<" } `, "accepted input = %+v", published[0].Input[i])
+						continue
+					}
 					testassert.Require(t, published[0].Input[i].TextContent() == shape.request[i].TextContent() && published[0].Input[i].Role == shape.request[i].Role,
 						"fact input[%d] = %+v, want %+v", i, published[0].Input[i], shape.request[i])
 				}
@@ -1201,6 +1210,90 @@ func TestMaintenanceRequestMessageDomain(t *testing.T) {
 						"fact input = %+v, want the historical tool exchange preserved", published[0].Input)
 				}
 				testassert.Require(t, published[0].Usage != nil, "fact usage = %+v, want the reported counts", published[0].Usage)
+			})
+		}
+	}
+}
+
+func TestMaintenanceMalformedRequestAfterOpeningCancellation(t *testing.T) {
+	for _, manual := range []bool{false, true} {
+		for _, cancelOnOpen := range []bool{false, true} {
+			t.Run(fmt.Sprintf("manual=%v/cancel=%v", manual, cancelOnOpen), func(t *testing.T) {
+				var h *Harness
+				var store *graphStorage
+				var c *coordinator
+				var sessionID string
+				capture := captureForHandoff()
+				operationID := testOpID
+				if manual {
+					fixture := validTestGraph()
+					stamp := testTime
+					fixture.ops[0].State.Status, fixture.ops[0].State.SettledAt = OperationSuccess, &stamp
+					fixture.ops[0].State.Terminal = &OperationTerminal{SettlementEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(3)}}
+					settlement := validSettlementEntry()
+					settlement.EntryID = hexID(3)
+					fixture.entries = append(fixture.entries, testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryOperationSettlement, Sequence: 3, CommittedAt: testTime}, settlement: &settlement})
+					compact := validOperationRecord()
+					compact.Admission.OperationID, compact.Admission.RequestKind, compact.Admission.AdmittedEntry = "compact-op", RequestKindCompact, EntryRef{}
+					compact.Admission.Execution = capture
+					fixture.ops = append(fixture.ops, compact)
+					fixture.session.State.CurrentOperationID = "compact-op"
+					store = fixture.storage(t)
+					h = newTestHarness(t, store, nil)
+					sessionID, operationID = testSessionID, "compact-op"
+					c = leaseCoordinator(t, h, sessionID)
+				} else {
+					h, store, c, sessionID = newEffectHarness(t, nil)
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				dispatches, closes := 0, 0
+				modelFn := func(context.Context, model.Request) (model.Stream, error) {
+					dispatches++
+					return completedTurnStream(), nil
+				}
+				exec := compactionExecution(t, modelFn, nil)
+				original := exec.OpenInvocation
+				exec.OpenInvocation = func(ctx context.Context, request InvocationRequest) (InvocationExecution, error) {
+					inv, err := original(ctx, request)
+					inv.Close = func() error { closes++; return nil }
+					if cancelOnOpen {
+						cancel()
+					}
+					return inv, err
+				}
+				exec.Strategy = fixtureStrategyBinding(requestShapeStrategy{request: []model.Message{{Role: "bad"}}})
+				frozen, checkpoint, boundary, err := h.projectCanonical(c, operationID)
+				testassert.NoError(t, err)
+				trigger := triggerAutomatic
+				suspended := &RunningRequest{RequestID: "request-conversation", BoundaryEntryID: boundary}
+				if manual {
+					trigger, suspended = triggerManual, nil
+				}
+				_, _, closeInvocation, err := h.runContextMaintenance(ctx, c, operationID, exec, capture, PlanInput{Trigger: trigger, Messages: frozen, CheckpointEntryID: checkpoint, BoundaryEntryID: boundary}, suspended)
+				_ = closeInvocation()
+				if cancelOnOpen {
+					if err != errExecutionInterrupted {
+						t.Fatalf("canceled opener = %v, want interruption", err)
+					}
+				} else {
+					var protocol *agent.ProtocolError
+					if !errors.As(err, &protocol) {
+						t.Fatalf("live malformed request = %v, want Agent protocol error", err)
+					}
+				}
+				if dispatches != 0 || closes != 1 {
+					t.Fatalf("dispatches=%d closes=%d", dispatches, closes)
+				}
+				graph, err := validateFixture(t, store, sessionID)
+				testassert.NoError(t, err)
+				want := OperationFailure
+				if cancelOnOpen {
+					want = OperationInterruption
+				}
+				if got := operationStateOf(t, graph, operationID).Status; got != want {
+					t.Fatalf("status = %s, want %s", got, want)
+				}
 			})
 		}
 	}

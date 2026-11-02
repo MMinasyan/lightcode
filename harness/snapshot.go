@@ -576,9 +576,6 @@ func ownAssistantPayload(v assistantEntry) *assistantEntry {
 		usage := *v.Usage
 		out.Usage = &usage
 	}
-	if v.AdvertisedNames != nil {
-		out.AdvertisedNames = append([]string(nil), v.AdvertisedNames...)
-	}
 	out.Evidence = copyRequestEvidencePointer(v.Evidence)
 	return &out
 }

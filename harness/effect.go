@@ -216,9 +216,7 @@ type modelResult struct {
 // invocation's model function in one logical model-effect intent/result pair:
 // it commits the active-effect intent carrying the round's request identity,
 // purpose, model, and effective input evidence, dispatches the physical
-// attempts against the request materialized from the committed intent's
-// adopted evidence over the round's frozen canonical view (never a reread
-// history or replayed hooks), invokes the assembly callback exactly once
+// attempts against the Engine-accepted request, invokes the assembly callback exactly once
 // after a stream is accepted, derives the settlement from the assembled
 // output, validates it, and commits the result and complete next Operation
 // state before returning the committed settlement. The automatic maintenance
@@ -271,16 +269,17 @@ func (h *Harness) modelEffect(c *coordinator, operationID string, exec Execution
 			}
 			return agent.ModelSettlement{}, cause
 		}
-		// The dispatch view is materialized from the committed intent's
-		// adopted evidence over the round's frozen canonical messages, so
-		// actual I/O consumes exactly the values the durable intent owns.
-		dispatchReq, dispatchNames := buildDispatchRequest(capture, round.canonical, *intent.evidence)
+		// Derive the advertisement from the same request the Engine accepted.
+		dispatchNames := make([]string, len(req.Tools))
+		for i, tool := range req.Tools {
+			dispatchNames[i] = tool.Name
+		}
 		// The one shared attempt loop lives inside the committed intent: every
 		// failed attempt is classified by the retry policy, waits run behind
 		// the cancellation checks, and an accepted stream never re-enters
 		// retry — assembly owns it, including closure.
 		var output model.Output
-		switch res := runModelAttempts(ctx, dispatchReq, attempt, exec.Retry); res.kind {
+		switch res := runModelAttempts(ctx, req, attempt, exec.Retry); res.kind {
 		case attemptAccepted:
 			out, attemptErr := assemble(intent.expected, h.observeStream(intent.sessionID, operationID, res.stream)) // exactly one assembly after acceptance
 			if attemptErr != nil {
@@ -1234,10 +1233,9 @@ var errMalformedNormalization = errors.New("malformed normalization")
 
 // newAssistantEntry builds one assistant entry from one validated model
 // output under the given entry identity, reserving one result identity per
-// completed call and recording the producing request identity, the
-// effective advertised names, and the request evidence the model effect
-// consumed. An output without an eligible model-visible payload writes no
-// assistant entry and returns its reported usage for the consuming settlement
+// completed call and recording the producing request identity and the request
+// evidence the model effect consumed. An output without an eligible model-visible
+// payload writes no assistant entry and returns its reported usage for the consuming settlement
 // entry instead. Before the entry commits, every completed call whose name is
 // in the producing request's ordered advertised names is normalized through
 // the execution's pure callback exactly once: its successful owned object
@@ -1251,16 +1249,12 @@ func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output
 		return nil, nil, nil
 	}
 	entry := &assistantEntry{
-		SessionID:       sessionID,
-		EntryID:         entryID,
-		OperationID:     operationID,
-		Status:          out.Status,
-		Source:          out.Source,
-		RequestID:       requestID,
-		AdvertisedNames: append([]string(nil), advertised...),
-	}
-	if entry.AdvertisedNames == nil {
-		entry.AdvertisedNames = []string{}
+		SessionID:   sessionID,
+		EntryID:     entryID,
+		OperationID: operationID,
+		Status:      out.Status,
+		Source:      out.Source,
+		RequestID:   requestID,
 	}
 	if evidence != nil {
 		owned := copyRequestEvidence(*evidence)
@@ -1315,14 +1309,10 @@ func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output
 }
 
 // copyRequestEvidence returns an independent deep-owned copy of one evidence
-// value: canonical references, the prompt pointee, every recorded message's
+// value: canonical references, the prompt, every recorded message's
 // nested parts and extras, and the name and provenance lists.
 func copyRequestEvidence(v RequestEvidence) RequestEvidence {
 	out := v
-	if v.Prompt != nil {
-		prompt := *v.Prompt
-		out.Prompt = &prompt
-	}
 	out.Messages = cloneRequestMessages(v.Messages)
 	if v.ToolNames != nil {
 		names := make([]string, len(v.ToolNames))
@@ -2552,7 +2542,10 @@ func (h *Harness) runOneRequestHookPure(ctx context.Context, requestID string, v
 func (h *Harness) runRequestHookEffect(ctx context.Context, c *coordinator, operationID string, hook RequestHook, requestID string, view *requestView) error {
 	// The consumed evidence the hook will actually receive is rendered from
 	// the live view before anything durable commits.
-	consumed := view.evidenceFor()
+	consumed, err := acceptRequestEvidence(view.evidenceFor())
+	if err != nil {
+		return err
+	}
 	resultID, err := h.beginRequestHookEffect(ctx, c, operationID, requestID, hook.ID, hook.ExtensionID, consumed)
 	if err != nil {
 		return err
@@ -2566,25 +2559,18 @@ func (h *Harness) runRequestHookEffect(ctx context.Context, c *coordinator, oper
 		}
 		return errExecutionInterrupted
 	}
-	// The callback consumes the adopted evidence the committed intent owns,
-	// materialized over the round's frozen canonical context — never a reread
-	// projection.
-	committedIntent, err := h.readRequestHookIntent(c, operationID, resultID)
-	if err != nil {
-		return err
-	}
-	materialized := materializeRequestView(view.capture, view.canonical, *committedIntent.Evidence)
-	view.prompt, view.additions, view.names = materialized.prompt, materialized.additions, materialized.names
+	// The callback consumes the accepted view also published in the intent.
+	view.prompt, view.additions, view.names = consumed.Prompt, consumed.Messages, consumed.ToolNames
 	input := RequestHookInput{
 		RequestID:         requestID,
 		CanonicalMessages: cloneRequestMessages(view.canonical),
-		Messages:          cloneRequestMessages(materialized.currentCanonical()),
-		CheckpointEntryID: committedIntent.Evidence.CheckpointEntryID,
-		BoundaryEntryID:   committedIntent.Evidence.BoundaryEntryID,
+		Messages:          cloneRequestMessages(view.currentCanonical()),
+		CheckpointEntryID: consumed.CheckpointEntryID,
+		BoundaryEntryID:   consumed.BoundaryEntryID,
 		CapturedPrompt:    view.capture.SystemPrompt,
-		Prompt:            materialized.prompt,
+		Prompt:            view.prompt,
 		Catalog:           cloneToolDefinitions(view.capture.Tools),
-		Tools:             materialized.effectiveTools(),
+		Tools:             view.effectiveTools(),
 	}
 	consequence, runErr := hook.Run(ctx, input)
 	settleCtx := context.WithoutCancel(h.ctx)
@@ -2628,22 +2614,6 @@ func (h *Harness) runRequestHookEffect(ctx context.Context, c *coordinator, oper
 	applied := *entry.Consequence
 	view.recordAccepted(HookIdentity{ExtensionID: hook.ExtensionID, HookID: hook.ID}, applied)
 	return nil
-}
-
-// readRequestHookIntent returns the committed request-hook effect intent of
-// the given reserved identity from the coordinator's validated view.
-func (h *Harness) readRequestHookIntent(c *coordinator, operationID, resultID string) (*ActiveEffect, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	op, ok := c.graph.Operation(operationID)
-	if !ok {
-		return nil, fmt.Errorf("%w: operation %q in session %q", ErrNotFound, operationID, c.graph.Session.Identity.SessionID)
-	}
-	if op.State.ActiveEffect == nil || op.State.ActiveEffect.Kind != EffectHook ||
-		op.State.ActiveEffect.ResultEntryID != resultID || op.State.ActiveEffect.Evidence == nil {
-		return nil, invalidInput("operation %q carries no committed request hook effect intent for result identity %q", operationID, resultID)
-	}
-	return ownActiveEffect(op.State.ActiveEffect), nil
 }
 
 // execute is the private agent.Run composition of one admitted execution:
@@ -2959,19 +2929,4 @@ func (h *Harness) settleAgentTerminal(c *coordinator, operationID string, res ag
 		return err
 	}
 	return runErr
-}
-
-// materializeRequestView rebuilds one effective view from the frozen capture
-// and canonical messages plus one committed evidence value: the adopted
-// representation the durable boundary owns, never a fresh-history reread.
-func materializeRequestView(capture ExecutionCapture, canonical []model.Message, evidence RequestEvidence) *requestView {
-	view := newRequestView(capture, evidence.CheckpointEntryID, evidence.BoundaryEntryID, canonical)
-	if evidence.Prompt != nil {
-		view.prompt = *evidence.Prompt
-	}
-	view.additions = cloneRequestMessages(evidence.Messages)
-	if evidence.ToolNames != nil && !coversCaptured(evidence.ToolNames, capture.Tools) {
-		view.names = append([]string{}, evidence.ToolNames...)
-	}
-	return view
 }

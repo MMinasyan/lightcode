@@ -612,7 +612,7 @@ func (th *toolsHarness) readToolResults(sessionID string) map[string]model.ToolR
 			ToolCallID string                 `json:"tool_call_id"`
 			Status     model.ToolResultStatus `json:"status"`
 			Content    string                 `json:"content"`
-			Metadata   json.RawMessage        `json:"metadata"`
+			Metadata   []byte                 `json:"metadata_base64"`
 		}
 		if err := json.Unmarshal(entry.Payload, &wire); err != nil {
 			th.t.Fatalf("decode tool_result payload: %v", err)

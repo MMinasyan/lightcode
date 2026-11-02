@@ -109,16 +109,15 @@ type HookIdentity struct {
 
 // RequestEvidence is the one closed request-evidence value: the canonical
 // boundary/checkpoint references of the projection actually consumed at that
-// boundary, the effective prompt/context/tool-view deltas against the frozen
-// capture (absent members mean unchanged), and the contributing hook
-// identities in contribution order. It records changes plus canonical input
-// references, never a copy of unchanged conversation history.
+// boundary, concrete effective prompt and tool names, request-only additions,
+// and contributing hook identities in order. Unchanged history is referenced,
+// never copied.
 type RequestEvidence struct {
 	CheckpointEntryID string          `json:"checkpoint_entry_id,omitempty"`
 	BoundaryEntryID   string          `json:"boundary_entry_id"`
-	Prompt            *string         `json:"prompt,omitempty"`
+	Prompt            string          `json:"prompt"`
 	Messages          []model.Message `json:"messages,omitempty"`
-	ToolNames         []string        `json:"tool_names,omitempty"`
+	ToolNames         []string        `json:"tool_names"`
 	HookIDs           []HookIdentity  `json:"hook_ids,omitempty"`
 }
 
@@ -424,22 +423,21 @@ type toolCallRecord struct {
 
 // assistantEntry is one finalized model output: status, complete source
 // identity, eligible model-visible payload, reported usage when present, and
-// the producing request identity with its final effective request evidence
-// and advertised names. The evidence is not conversation text.
+// the producing request identity with its final effective request evidence.
+// The evidence carries the advertisement and is not conversation text.
 type assistantEntry struct {
-	SessionID       string              `json:"session_id"`
-	EntryID         string              `json:"entry_id"`
-	OperationID     string              `json:"operation_id,omitempty"`
-	Status          model.OutputStatus  `json:"status"`
-	Source          model.ModelRef      `json:"source"`
-	Content         []model.ContentPart `json:"content"`
-	Refusal         string              `json:"refusal,omitempty"`
-	Extra           model.Extra         `json:"extra,omitempty"`
-	ToolCalls       []toolCallRecord    `json:"tool_calls"`
-	Usage           *UsageCount         `json:"usage,omitempty"`
-	RequestID       string              `json:"request_id"`
-	AdvertisedNames []string            `json:"advertised_names"`
-	Evidence        *RequestEvidence    `json:"evidence"`
+	SessionID   string              `json:"session_id"`
+	EntryID     string              `json:"entry_id"`
+	OperationID string              `json:"operation_id,omitempty"`
+	Status      model.OutputStatus  `json:"status"`
+	Source      model.ModelRef      `json:"source"`
+	Content     []model.ContentPart `json:"content"`
+	Refusal     string              `json:"refusal,omitempty"`
+	Extra       model.Extra         `json:"extra,omitempty"`
+	ToolCalls   []toolCallRecord    `json:"tool_calls"`
+	Usage       *UsageCount         `json:"usage,omitempty"`
+	RequestID   string              `json:"request_id"`
+	Evidence    *RequestEvidence    `json:"evidence"`
 }
 
 // toolResultEntry is one settled tool result answering a published call by

@@ -289,7 +289,7 @@ func corruptSessionRegister(t *testing.T, store harness.Storage, sessionID strin
 
 // --- raw durable-state seeders ---
 
-const lifecycleSeedToolDefinition = `{"name":"echo","description":"echoes","parameters":{"type":"object"}}`
+const lifecycleSeedToolDefinition = `{"name":"echo","description":"echoes","parameters_base64":"eyJ0eXBlIjoib2JqZWN0In0="}`
 
 // lifecycleInsertRegister inserts one register payload directly through the
 // storage contract.

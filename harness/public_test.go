@@ -1797,29 +1797,18 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 
 // TestPublicToolMetadataPersistsOpaqueAcrossStores proves the durable metadata
 // boundary through the public surface over both storage implementations:
-// a tool's metadata commits as its encoded durable bytes — even a raw value
-// over the bound whose compacted encoding fits, before and after a
-// restarted Harness revalidates the payloads — an executor returning
-// malformed metadata still commits its result without the member, a raw
-// value within the bound whose durable HTML-escaped encoding exceeds it is
-// dropped while its result still commits, the model-visible projection
-// carries only each committed result's content, and recovery revalidates
-// both payloads.
+// accepted metadata keeps exact bytes before and after recovery, malformed
+// and oversized candidates are omitted, and exact-bound metadata survives.
 func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
-		// the accepted executor returns the formatted fixture prefixed with
-		// 1 MiB of ordinary spaces: raw over the bound, but its compacted,
-		// HTML-escaped durable encoding is the short literal below it.
 		const formatted = `{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`
-		const encoded = `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}`
 		rawOverBound := json.RawMessage(strings.Repeat(" ", 1<<20) + formatted)
-		// exactly 1 MiB of raw bytes, but every '<' encodes as \u003c in the
-		// durable payload, expanding it far past the bound.
+		// HTML-sensitive bytes are measured before base64 framing.
 		const durableBound = 1 << 20
 		expanded := json.RawMessage(`"` + strings.Repeat("<", durableBound-2) + `"`)
 		testassert.Equal(t, len(expanded), durableBound)
 		script := newScriptModel(
-			publicTurn("call-1", "call-2", "call-3"),
+			publicTurn("call-1", "call-2", "call-3", "call-4"),
 			publicTurn(),
 		)
 		f := newPublicFixture(t, store, script, nil)
@@ -1834,16 +1823,18 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "no preview"},
 								Metadata: json.RawMessage(`{broken`),
 							}}
-						case "call-3": // durable-oversized after escaping: dropped, no transaction failure
+						case "call-3": // exactly at the raw byte bound
 							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "expanded metadata"},
 								Metadata: expanded,
 							}}
+						case "call-4":
+							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "oversized metadata"}, Metadata: rawOverBound}}
 						}
 						return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
 							return harness.ToolOutcome{
 								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
-								Metadata: rawOverBound,
+								Metadata: json.RawMessage(formatted),
 							}
 						}}
 					}), nil
@@ -1859,7 +1850,7 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 		<-script.arrived // the completion turn: all three results projected before it
 		{
 			got := texts(script.seen()[1])
-			testassert.Require(t, len(got) == 6 && got[3] == "ran call-1" && got[4] == "no preview" && got[5] == "expanded metadata", "projection = %v, want the committed contents only", got)
+			testassert.Require(t, len(got) == 7 && got[3] == "ran call-1" && got[4] == "no preview" && got[5] == "expanded metadata" && got[6] == "oversized metadata", "projection = %v, want the committed contents only", got)
 		}
 		{
 			err := converge(t, f)
@@ -1887,17 +1878,21 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 			return results
 		}
 		results := readResults()
-		testassert.Require(t, string(results["call-1"]["metadata"]) == encoded, "call-1 metadata = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
+		var decoded []byte
+		testassert.NoError(t, json.Unmarshal(results["call-1"]["metadata_base64"], &decoded))
+		testassert.Require(t, string(decoded) == formatted, "call-1 metadata = %s, want original bytes", decoded)
 		{
-			_, present := results["call-2"]["metadata"]
-			testassert.Require(t, !present, "call-2 carries malformed metadata %s, want it dropped while the result committed", results["call-2"]["metadata"])
+			_, present := results["call-2"]["metadata_base64"]
+			testassert.Require(t, !present, "call-2 carries malformed metadata %s, want it dropped while the result committed", results["call-2"]["metadata_base64"])
 		}
 		testassert.Require(t, string(results["call-2"]["content"]) == `"no preview"`, "call-2 payload = %s, want the settled result alongside the dropped metadata", results["call-2"]["content"])
 		{
-			_, present := results["call-3"]["metadata"]
-			testassert.Require(t, !present, "call-3 carries durable-oversized metadata, want it dropped while the result committed")
+			testassert.NoError(t, json.Unmarshal(results["call-3"]["metadata_base64"], &decoded))
+			testassert.Require(t, bytes.Equal(decoded, expanded), "call-3 metadata must preserve exact bytes at the bound")
 		}
 		testassert.Require(t, string(results["call-3"]["content"]) == `"expanded metadata"`, "call-3 payload = %s, want the settled result committed past the metadata drop", results["call-3"]["content"])
+		_, present := results["call-4"]["metadata_base64"]
+		testassert.Require(t, !present && string(results["call-4"]["content"]) == `"oversized metadata"`, "oversized metadata must be omitted without losing its result")
 
 		// a restarted Harness revalidates every committed payload: the durable
 		// states prove no transaction failed and the Session stayed sound,
@@ -1907,7 +1902,8 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		results = readResults()
-		testassert.Require(t, string(results["call-1"]["metadata"]) == encoded, "call-1 metadata after Recover = %s, want the committed encoded bytes verbatim", results["call-1"]["metadata"])
+		testassert.NoError(t, json.Unmarshal(results["call-1"]["metadata_base64"], &decoded))
+		testassert.Require(t, string(decoded) == formatted, "call-1 metadata after Recover = %s, want original bytes", decoded)
 	})
 }
 
@@ -1982,8 +1978,8 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 			switch entry.Kind {
 			case harness.EntryAssistant:
 				var calls []struct {
-					ID                  string          `json:"id"`
-					NormalizedArguments json.RawMessage `json:"normalized_arguments"`
+					ID                  string `json:"id"`
+					NormalizedArguments []byte `json:"normalized_arguments_base64"`
 				}
 				{
 					err := json.Unmarshal(wire["tool_calls"], &calls)
@@ -2008,7 +2004,7 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 					denial++
 					testassert.Require(t, status == "denied" && string(wire["content"]) == `"Permission denied."`, "call-2 result = %s, want the fixed public denial", entry.Payload)
 					{
-						_, present := wire["metadata"]
+						_, present := wire["metadata_base64"]
 						testassert.Require(t, !present, "denied call-2 carries a metadata member")
 					}
 				} else if status != "success" {
@@ -3270,7 +3266,7 @@ func insertRawEntry(t *testing.T, store harness.Storage, sessionID, id, operatio
 }
 
 // rawToolDefinition is the one tool definition every recovery fixture captures.
-const rawToolDefinition = `{"name":"echo","description":"echoes","parameters":{"type":"object"}}`
+const rawToolDefinition = `{"name":"echo","description":"echoes","parameters_base64":"eyJ0eXBlIjoib2JqZWN0In0="}`
 
 // rawSessionRegister builds one open root Session register payload with empty
 // usage; currentOp is omitted when empty.
@@ -3320,7 +3316,7 @@ func rawAssistantEntryPayload(sessionID, entryID, operationID, boundaryID string
 	}
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":[]}}`,
 		sessionID, entryID, operationID, strings.Join(parts, ","), "request-a-"+entryID, boundaryID)
 }
 
@@ -3349,10 +3345,10 @@ func seedRunningOperationShape(t *testing.T, store harness.Storage, activeEffect
 	switch activeEffect {
 	case "model":
 		modelReserved = newRawSessionID(t)
-		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"request-live","model":{"provider":"prov","model":"gpt-x"},"purpose":"conversation","evidence":{"boundary_entry_id":%q}}`, modelReserved, entryID)
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"model","result_entry_id":%q,"request_id":"request-live","model":{"provider":"prov","model":"gpt-x"},"purpose":"conversation","evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":["echo"]}}`, modelReserved, entryID)
 		requestJSON = fmt.Sprintf(`,"running_request":{"request_id":"request-live","boundary_entry_id":%q,"hook_results":[]}`, entryID)
 	case "tool":
-		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"tool","result_entry_id":%q,"tool_call_id":%q,"final_arguments":{"x":1}}`, reserved[0], calls[0])
+		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"tool","result_entry_id":%q,"tool_call_id":%q,"final_arguments_base64":"eyJ4IjoxfQ=="}`, reserved[0], calls[0])
 	case "hook":
 		modelReserved = newRawSessionID(t) // the hook effect's own reserved result identity
 		activeEffectJSON = fmt.Sprintf(`,"active_effect":{"kind":"hook","result_entry_id":%q,"tool_call_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","input_arguments_base64":""}`, modelReserved, calls[0])
@@ -3739,7 +3735,7 @@ func rawSignalPayload(sessionID, entryID, operationID string) string {
 // for one hook execution of the given call.
 func rawHookResultPayload(sessionID, entryID, operationID, hookID, callID string) string {
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"extension_id":"ext.raw","tool_call_id":%q,"status":"success","evidence":"observed","input_arguments_base64":"eyJ4IjoxfQ==","arguments":{"x":1}}`,
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"hook_id":%q,"extension_id":"ext.raw","tool_call_id":%q,"status":"success","evidence":"observed","input_arguments_base64":"eyJ4IjoxfQ==","arguments_base64":"eyJ4IjoxfQ=="}`,
 		sessionID, entryID, operationID, hookID, callID)
 }
 
@@ -3808,7 +3804,7 @@ func rawCopiedAssistantPayload(sessionID, entryID, boundaryID string, calls [][2
 	}
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":[]}}`,
 		sessionID, entryID, strings.Join(parts, ","), "request-a-"+entryID, boundaryID)
 }
 
@@ -4554,11 +4550,11 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				input := snapEntryOf(snap, harness.EntryInput)
 				hookEntry := newRawSessionID(t)
 				snapAppendEntry(snap, sessionID, hookEntry, "op-1", harness.EntryHookResult, fmt.Sprintf(
-					`{"session_id":%q,"entry_id":%q,"operation_id":"op-1","hook_id":"cap.hook.one","extension_id":"ext.raw","request_id":"request-corrupt","status":"success","evidence":"observed","input_evidence":{"boundary_entry_id":%q},"consequence":{}}`,
+					`{"session_id":%q,"entry_id":%q,"operation_id":"op-1","hook_id":"cap.hook.one","extension_id":"ext.raw","request_id":"request-corrupt","status":"success","evidence":"observed","input_evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":["echo"]},"consequence":{}}`,
 					sessionID, hookEntry, input.ID))
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.two","hook_extension_id":"ext.raw2","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q}}`, newRawSessionID(t), input.ID))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.two","hook_extension_id":"ext.raw2","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":["echo"]}}`, newRawSessionID(t), input.ID))
 					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q,"hook_results":[{"session_id":%q,"entry_id":%q}]}`, input.ID, sessionID, hookEntry))
 				})
 			},
@@ -4597,7 +4593,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				})
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q,"checkpoint_entry_id":%q}}`, newRawSessionID(t), input.ID, comp))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q,"checkpoint_entry_id":%q,"prompt":"system","tool_names":["echo"]}}`, newRawSessionID(t), input.ID, comp))
 					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","checkpoint_entry_id":%q,"boundary_entry_id":%q}`, comp, input.ID))
 				})
 			},
@@ -4613,7 +4609,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 					rawHookResultPayload(sessionID, hook, "op-1", "cap.hook.one", "call-1"))
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1","final_arguments":{"x":1}}`, snapReservedResultID(t, snap)))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1","final_arguments_base64":"eyJ4IjoxfQ=="}`, snapReservedResultID(t, snap)))
 				})
 			},
 		},
@@ -4889,6 +4885,42 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 		}
 	}
 
+	for _, mutation := range []struct {
+		name, key string
+		value     json.RawMessage
+		detail    string
+	}{
+		{"missing prompt", "prompt", nil, `required member "prompt" is missing`},
+		{"null names", "tool_names", json.RawMessage(`null`), `member "tool_names" must not be null`},
+	} {
+		rows = append(rows, corruptSiblingRow{
+			name:   "assistant evidence: " + mutation.name,
+			seed:   seedCorruptSiblingPendingCall,
+			detail: mutation.detail,
+			mutate: func(t *testing.T, snap *sessionSnapshot) {
+				entry := snapEntryOf(snap, harness.EntryAssistant)
+				entry.Payload = editPayloadObject(t, entry.Payload, func(obj map[string]json.RawMessage) {
+					obj["evidence"] = editPayloadObject(t, obj["evidence"], func(ev map[string]json.RawMessage) {
+						if mutation.value == nil {
+							delete(ev, mutation.key)
+						} else {
+							ev[mutation.key] = mutation.value
+						}
+					})
+				})
+			},
+		})
+	}
+	rows = append(rows, corruptSiblingRow{
+		name: "assistant evidence: foreign catalog name", seed: seedCorruptSiblingPendingCall,
+		detail: "evidence tool names are outside captured catalog",
+		mutate: func(t *testing.T, snap *sessionSnapshot) {
+			entry := snapEntryOf(snap, harness.EntryAssistant)
+			entry.Payload = editPayloadObject(t, entry.Payload, func(obj map[string]json.RawMessage) {
+				obj["evidence"] = editPayloadObject(t, obj["evidence"], func(ev map[string]json.RawMessage) { ev["tool_names"] = json.RawMessage(`["foreign"]`) })
+			})
+		},
+	})
 	// The tool_result metadata member inventory: persisted values that
 	// violate the durable member rules — a null member (the schema-valid
 	// representation of malformed metadata: absence encodes by omission,
@@ -4908,7 +4940,11 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				entry := snapEntryOf(snap, harness.EntryToolResult)
 				entry.Payload = editPayloadObject(t, entry.Payload, func(obj map[string]json.RawMessage) {
-					obj["metadata"] = mutation.metadata
+					if mutation.name == "null member" {
+						obj["metadata_base64"] = mutation.metadata
+					} else {
+						obj["metadata_base64"], _ = json.Marshal(base64.StdEncoding.EncodeToString(mutation.metadata))
+					}
 				})
 			},
 		})
@@ -4933,7 +4969,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				entry := snapEntryOf(snap, harness.EntryAssistant)
 				entry.Payload = editPayloadObject(t, entry.Payload, func(obj map[string]json.RawMessage) {
 					obj["tool_calls"] = editJSONArray(t, obj["tool_calls"], func(items []map[string]json.RawMessage) {
-						items[0]["normalized_arguments"] = mutation.wrong
+						items[0]["normalized_arguments_base64"], _ = json.Marshal(base64.StdEncoding.EncodeToString(mutation.wrong))
 					})
 				})
 			},
@@ -4954,7 +4990,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				input := snapEntryOf(snap, harness.EntryInput)
 				hook := newRawSessionID(t)
 				snapAppendEntry(snap, sessionID, hook, "op-1", harness.EntryHookResult, fmt.Sprintf(
-					`{"session_id":%q,"entry_id":%q,"operation_id":"op-1","hook_id":"cap.hook.one","extension_id":"ext.raw","request_id":"request-corrupt","status":"success","evidence":"observed","input_evidence":{"boundary_entry_id":%q},"consequence":{},"input_arguments_base64":""}`,
+					`{"session_id":%q,"entry_id":%q,"operation_id":"op-1","hook_id":"cap.hook.one","extension_id":"ext.raw","request_id":"request-corrupt","status":"success","evidence":"observed","input_evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":["echo"]},"consequence":{},"input_arguments_base64":""}`,
 					sessionID, hook, input.ID))
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
@@ -4970,7 +5006,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				input := snapEntryOf(snap, harness.EntryInput)
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q},"input_arguments_base64":""}`, newRawSessionID(t), input.ID))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"hook","result_entry_id":%q,"hook_id":"cap.hook.one","hook_extension_id":"ext.raw","request_id":"request-corrupt","evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":["echo"]},"input_arguments_base64":""}`, newRawSessionID(t), input.ID))
 					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q}`, input.ID))
 				})
 			},
@@ -4983,7 +5019,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 				input := snapEntryOf(snap, harness.EntryInput)
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q,"request_id":"request-corrupt","model":{"provider":"prov","model":"m"},"purpose":"conversation","evidence":{"boundary_entry_id":%q},"input_arguments_base64":""}`, newRawSessionID(t), input.ID))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"model","result_entry_id":%q,"request_id":"request-corrupt","model":{"provider":"prov","model":"m"},"purpose":"conversation","evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":["echo"]},"input_arguments_base64":""}`, newRawSessionID(t), input.ID))
 					state["running_request"] = json.RawMessage(fmt.Sprintf(`{"request_id":"request-corrupt","boundary_entry_id":%q}`, input.ID))
 				})
 			},
@@ -5006,7 +5042,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 			mutate: func(t *testing.T, snap *sessionSnapshot) {
 				reg := snapRegisterOf(snap, harness.RegisterOperation, "op-1")
 				reg.Payload = editStateObject(t, reg.Payload, func(state map[string]json.RawMessage) {
-					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1","final_arguments":{},"input_arguments_base64":""}`, snapReservedResultID(t, snap)))
+					state["active_effect"] = json.RawMessage(fmt.Sprintf(`{"kind":"tool","result_entry_id":%q,"tool_call_id":"call-1","final_arguments_base64":"e30=","input_arguments_base64":""}`, snapReservedResultID(t, snap)))
 				})
 			},
 		},
@@ -5413,9 +5449,9 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		testassert.Equal(t, copiedInput.Origin, "user")
 		var copiedAssistant struct {
 			ToolCalls []struct {
-				ID                  string          `json:"id"`
-				ResultEntryID       string          `json:"result_entry_id"`
-				NormalizedArguments json.RawMessage `json:"normalized_arguments"`
+				ID                  string `json:"id"`
+				ResultEntryID       string `json:"result_entry_id"`
+				NormalizedArguments []byte `json:"normalized_arguments_base64"`
 			} `json:"tool_calls"`
 			Usage *struct{} `json:"usage"`
 		}
@@ -5431,14 +5467,14 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 				SessionID string `json:"session_id"`
 				EntryID   string `json:"entry_id"`
 			} `json:"assistant_entry"`
-			ToolCallID string          `json:"tool_call_id"`
-			Metadata   json.RawMessage `json:"metadata"`
+			ToolCallID string `json:"tool_call_id"`
+			Metadata   []byte `json:"metadata_base64"`
 		}
 		{
 			err := json.Unmarshal(entries[2].Payload, &copiedResult)
 			testassert.NoError(t, err)
 		}
-		testassert.Require(t, copiedResult.AssistantEntry.SessionID == dest && copiedResult.AssistantEntry.EntryID == entries[1].ID && copiedResult.ToolCallID == "call-1" && string(copiedResult.Metadata) == `{"n":[1,1.0,1e0,9007199254740993],"s":"\u003c\u003e\u0026"}`, "copied result reference = %+v, want it rewritten inside the copied prefix; copied result metadata = %s, want the source's encoded metadata preserved verbatim", copiedResult.AssistantEntry, copiedResult.Metadata)
+		testassert.Require(t, copiedResult.AssistantEntry.SessionID == dest && copiedResult.AssistantEntry.EntryID == entries[1].ID && copiedResult.ToolCallID == "call-1" && string(copiedResult.Metadata) == `{ "n" : [1, 1.0, 1e0, 9007199254740993], "s" : "<>&" }`, "copied result reference = %+v, want it rewritten inside the copied prefix; copied result metadata = %s, want the source metadata preserved verbatim", copiedResult.AssistantEntry, copiedResult.Metadata)
 		var copiedSignal struct {
 			RelatedOperation struct {
 				SessionID   string `json:"session_id"`
@@ -6574,7 +6610,7 @@ func rawCompactionEntryPayload(sessionID, entryID, operationID, summary, boundar
 			`"messages":[{"role":"assistant","source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}]}],`+
 			`"boundary_entry_id":%q,"configuration_revision":"rev-1",`+
 			`"facts":[{"request_id":%q,"model":{"provider":"prov","model":"gpt-x"},"input":[{"role":"user","content":[{"kind":"text","text":"transcript seed"}]}]}],`+
-			`"consumed_request_id":"request-seed","evidence":{"boundary_entry_id":%q}}`,
+			`"consumed_request_id":"request-seed","evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":["echo"]}}`,
 		sessionID, entryID, operationID, "[Previous conversation summary]\n\n"+summary+"\n\n[End of summary. Continue from here.]", boundaryID, "maintainer-"+entryID, boundaryID)
 }
 
@@ -6591,7 +6627,7 @@ func rawSettledSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 			sessionID, inputID, operationID, inputText))
 	insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant,
 		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q}}`,
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":[]}}`,
 			sessionID, assistantID, operationID, assistantText, "request-a-"+assistantID, inputID))
 	insertRawEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement,
 		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"success"}`, sessionID, settlementID, operationID))
