@@ -423,22 +423,21 @@ type toolCallRecord struct {
 
 // assistantEntry is one finalized model output: status, complete source
 // identity, eligible model-visible payload, reported usage when present, and
-// the producing request identity with its final effective request evidence
-// and advertised names. The evidence is not conversation text.
+// the producing request identity with its final effective request evidence.
+// The evidence carries the advertisement and is not conversation text.
 type assistantEntry struct {
-	SessionID       string              `json:"session_id"`
-	EntryID         string              `json:"entry_id"`
-	OperationID     string              `json:"operation_id,omitempty"`
-	Status          model.OutputStatus  `json:"status"`
-	Source          model.ModelRef      `json:"source"`
-	Content         []model.ContentPart `json:"content"`
-	Refusal         string              `json:"refusal,omitempty"`
-	Extra           model.Extra         `json:"extra,omitempty"`
-	ToolCalls       []toolCallRecord    `json:"tool_calls"`
-	Usage           *UsageCount         `json:"usage,omitempty"`
-	RequestID       string              `json:"request_id"`
-	AdvertisedNames []string            `json:"advertised_names"`
-	Evidence        *RequestEvidence    `json:"evidence"`
+	SessionID   string              `json:"session_id"`
+	EntryID     string              `json:"entry_id"`
+	OperationID string              `json:"operation_id,omitempty"`
+	Status      model.OutputStatus  `json:"status"`
+	Source      model.ModelRef      `json:"source"`
+	Content     []model.ContentPart `json:"content"`
+	Refusal     string              `json:"refusal,omitempty"`
+	Extra       model.Extra         `json:"extra,omitempty"`
+	ToolCalls   []toolCallRecord    `json:"tool_calls"`
+	Usage       *UsageCount         `json:"usage,omitempty"`
+	RequestID   string              `json:"request_id"`
+	Evidence    *RequestEvidence    `json:"evidence"`
 }
 
 // toolResultEntry is one settled tool result answering a published call by

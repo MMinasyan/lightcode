@@ -534,7 +534,7 @@ func TestModelAttemptDeepOwnedRequestCopies(t *testing.T) {
 	testassert.Require(t, len(seen) == 2 && seen[0] == seen[1], "attempt views differ after mutation: %v", seen)
 	assistant := compositionAssistant(t, store, sessionID)
 	testassert.Require(t, assistant.Evidence != nil && assistant.Evidence.BoundaryEntryID != "", "assistant evidence = %+v, want the untouched logical request evidence", assistant.Evidence)
-	testassert.Require(t, string(assistant.Evidence.Messages[0].Content[0].Extra["raw"]) == ` { "x" : "<" } ` && reflect.DeepEqual(assistant.AdvertisedNames, []string{"echo"}), "mutation reached evidence or advertisement")
+	testassert.Require(t, string(assistant.Evidence.Messages[0].Content[0].Extra["raw"]) == ` { "x" : "<" } ` && reflect.DeepEqual(assistant.Evidence.ToolNames, []string{"echo"}), "mutation reached evidence or advertisement")
 	{
 		if _, err := validateFixture(t, store, sessionID); err != nil {
 			t.Fatalf("graph validation: %v", err)
@@ -605,6 +605,44 @@ func TestPhysicalDispatchMatchesSourceRequest(t *testing.T) {
 	if assistant.Evidence.BoundaryEntryID != graph.Entries[0].Envelope.ID || assistant.Evidence.Prompt != "system" || !reflect.DeepEqual(assistant.Evidence.ToolNames, []string{"echo"}) || !reflect.DeepEqual(assistant.Evidence.Messages, []model.Message{contribution}) || !reflect.DeepEqual(graph.Operations[0].Admission.Execution.Tools, want.Tools) {
 		t.Fatalf("cold evidence differs from accepted request: %+v", assistant.Evidence)
 	}
+}
+
+func TestUnadvertisedCallSettlesUnavailable(t *testing.T) {
+	h, store, c, sessionID := newEffectHarness(t, nil)
+	modelCalls, normalizeCalls, prepareCalls := 0, 0, 0
+	modelFn := func(context.Context, model.Request) (model.Stream, error) {
+		modelCalls++
+		if modelCalls == 1 {
+			return completedTurnStream(model.ToolCall{ID: "ghost-call", Name: "ghost", Arguments: json.RawMessage(`{"x":1}`)}), nil
+		}
+		return completedTurnStream(), nil
+	}
+	normalize := func(call model.ToolCall) (json.RawMessage, error) { normalizeCalls++; return objectNormalize(call) }
+	prepare := func(context.Context, model.ToolCall) PreparedTool { prepareCalls++; return PreparedTool{} }
+	exec := effectExecution(modelFn, prepare)
+	inv := InvocationExecution{Model: modelFn, NormalizeTool: normalize, Tool: prepare}
+	round := &conversationRound{}
+	result, err := agent.Run(context.Background(), agent.Invocation{
+		ExpectedModel: testCapture().Model,
+		Request:       h.requestSource(c, testOpID, testCapture(), exec, inv, round),
+		ModelEffect:   h.modelEffect(c, testOpID, exec, inv, testCapture(), round),
+		ToolEffect:    h.toolEffect(c, testOpID, exec, inv, testCapture()),
+	})
+	testassert.NoError(t, err)
+	testassert.Require(t, result.Status == agent.TerminalSuccess && modelCalls == 2 && normalizeCalls == 0 && prepareCalls == 0, "result=%+v model=%d normalize=%d prepare=%d", result, modelCalls, normalizeCalls, prepareCalls)
+	graph, err := validateFixture(t, store, sessionID)
+	testassert.NoError(t, err)
+	var call *toolCallRecord
+	var toolResult *toolResultEntry
+	for _, entry := range graph.Entries {
+		if entry.Assistant != nil && len(entry.Assistant.ToolCalls) != 0 {
+			call = &entry.Assistant.ToolCalls[0]
+		}
+		if entry.ToolResult != nil {
+			toolResult = entry.ToolResult
+		}
+	}
+	testassert.Require(t, call != nil && len(call.NormalizedArguments) == 0 && call.NormalizationFailure == "" && toolResult != nil && toolResult.Status == model.ResultError && toolResult.Content == `Tool "ghost" is not available.`, "call=%+v result=%+v", call, toolResult)
 }
 
 // TestRequestHookConsequenceToolMembersRejectBeforeDispatch proves the shared
@@ -1111,20 +1149,28 @@ func TestRequestHooksRunBeforeCanonicalOnlyMaintenance(t *testing.T) {
 	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
 	hookSeq, compactionSeq, assistantSeq := -1, -1, -1
+	var checkpoint *contextCheckpointEntry
+	var answering *assistantEntry
 	for _, entry := range graph.Entries {
 		switch {
 		case entry.HookResult != nil && entry.HookResult.RequestID != "":
 			hookSeq = int(entry.Envelope.Sequence)
 		case entry.Compaction != nil:
 			compactionSeq = int(entry.Envelope.Sequence)
+			checkpoint = entry.Compaction
 		case entry.Assistant != nil:
 			if int(entry.Envelope.Sequence) > assistantSeq {
 				assistantSeq = int(entry.Envelope.Sequence) // the round's answering assistant is the last
+				answering = entry.Assistant
 			}
 		}
 	}
 	testassert.Require(t, hookSeq >= 0 && compactionSeq >= 0 && assistantSeq >= 0 && hookSeq < compactionSeq && compactionSeq < assistantSeq,
 		"committed sequences = hook %d checkpoint %d assistant %d, want hooks before the checkpoint before the assistant", hookSeq, compactionSeq, assistantSeq)
+	testassert.Require(t, checkpoint != nil && checkpoint.Evidence != nil && answering != nil && answering.Evidence != nil, "missing checkpoint or assistant evidence")
+	advanced := copyRequestEvidence(*checkpoint.Evidence)
+	advanced.CheckpointEntryID, advanced.BoundaryEntryID = checkpoint.EntryID, checkpoint.EntryID
+	testassert.Require(t, reflect.DeepEqual(advanced, *answering.Evidence), "advanced contribution = %+v, want assistant evidence %+v", advanced, *answering.Evidence)
 	{
 		if _, err := validateFixture(t, store, sessionID); err != nil {
 			t.Fatalf("graph validation: %v", err)

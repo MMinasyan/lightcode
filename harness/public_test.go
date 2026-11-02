@@ -3316,7 +3316,7 @@ func rawAssistantEntryPayload(sessionID, entryID, operationID, boundaryID string
 	}
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":[]}}`,
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":[]}}`,
 		sessionID, entryID, operationID, strings.Join(parts, ","), "request-a-"+entryID, boundaryID)
 }
 
@@ -3804,7 +3804,7 @@ func rawCopiedAssistantPayload(sessionID, entryID, boundaryID string, calls [][2
 	}
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":[]}}`,
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":"done"}],"tool_calls":[%s],"request_id":%q,"evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":[]}}`,
 		sessionID, entryID, strings.Join(parts, ","), "request-a-"+entryID, boundaryID)
 }
 
@@ -4917,7 +4917,6 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 		mutate: func(t *testing.T, snap *sessionSnapshot) {
 			entry := snapEntryOf(snap, harness.EntryAssistant)
 			entry.Payload = editPayloadObject(t, entry.Payload, func(obj map[string]json.RawMessage) {
-				obj["advertised_names"] = json.RawMessage(`["foreign"]`)
 				obj["evidence"] = editPayloadObject(t, obj["evidence"], func(ev map[string]json.RawMessage) { ev["tool_names"] = json.RawMessage(`["foreign"]`) })
 			})
 		},
@@ -6628,7 +6627,7 @@ func rawSettledSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 			sessionID, inputID, operationID, inputText))
 	insertRawEntry(t, store, sessionID, assistantID, operationID, harness.EntryAssistant,
 		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":[]}}`,
+			`"source":{"provider":"prov","model":"gpt-x"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"evidence":{"boundary_entry_id":%q,"prompt":"system","tool_names":[]}}`,
 			sessionID, assistantID, operationID, assistantText, "request-a-"+assistantID, inputID))
 	insertRawEntry(t, store, sessionID, settlementID, operationID, harness.EntryOperationSettlement,
 		fmt.Sprintf(`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"success"}`, sessionID, settlementID, operationID))

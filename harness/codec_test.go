@@ -118,16 +118,15 @@ func validToolCallRecord() toolCallRecord {
 
 func validAssistantEntry(operationID string) assistantEntry {
 	return assistantEntry{
-		SessionID:       testSessionID,
-		EntryID:         testEntryID,
-		OperationID:     operationID,
-		Status:          model.OutputCompleted,
-		Source:          testModelRef(),
-		Content:         []model.ContentPart{model.ContentPart{Kind: model.PartText, Text: "hi"}},
-		ToolCalls:       []toolCallRecord{},
-		RequestID:       "request-one",
-		AdvertisedNames: []string{},
-		Evidence:        &RequestEvidence{BoundaryEntryID: hexID(1)},
+		SessionID:   testSessionID,
+		EntryID:     testEntryID,
+		OperationID: operationID,
+		Status:      model.OutputCompleted,
+		Source:      testModelRef(),
+		Content:     []model.ContentPart{model.ContentPart{Kind: model.PartText, Text: "hi"}},
+		ToolCalls:   []toolCallRecord{},
+		RequestID:   "request-one",
+		Evidence:    &RequestEvidence{BoundaryEntryID: hexID(1)},
 	}
 }
 
@@ -1001,7 +1000,6 @@ func TestUsageAccounting(t *testing.T) {
 // while a non-null JSON value round-trips verbatim.
 func TestToolCallNormalizedArgumentsNullRejected(t *testing.T) {
 	entry := validAssistantEntry(testOpID)
-	entry.AdvertisedNames = []string{"echo"}
 	entry.Evidence.ToolNames = []string{"echo"}
 	call := validToolCallRecord()
 	call.NormalizedArguments = json.RawMessage("null")
@@ -1032,7 +1030,6 @@ func TestToolCallNormalizedArgumentsNullRejected(t *testing.T) {
 func TestToolCallNormalizedArgumentsObjectOnly(t *testing.T) {
 	const wrong = `[1,2]`
 	entry := validAssistantEntry(testOpID)
-	entry.AdvertisedNames = []string{"echo"}
 	entry.Evidence.ToolNames = []string{"echo"}
 	call := validToolCallRecord()
 	call.NormalizedArguments = json.RawMessage(wrong)
@@ -1045,7 +1042,6 @@ func TestToolCallNormalizedArgumentsObjectOnly(t *testing.T) {
 	// decode side: rewrite one valid encoded payload's member to the wrong
 	// kind and prove decode rejects it.
 	valid := validAssistantEntry(testOpID)
-	valid.AdvertisedNames = []string{"echo"}
 	valid.Evidence.ToolNames = []string{"echo"}
 	vcall := validToolCallRecord()
 	vcall.NormalizedArguments = json.RawMessage(`{"x":1}`)
@@ -1247,7 +1243,6 @@ func TestToolCallNormalizationFailureRules(t *testing.T) {
 	// One bounded diagnostic round-trips verbatim and encodes by omission
 	// when absent.
 	advertised := validAssistantEntry(testOpID)
-	advertised.AdvertisedNames = []string{"echo"}
 	advertised.Evidence.ToolNames = []string{"echo"}
 	failed := validToolCallRecord()
 	failed.NormalizationFailure = diag
@@ -1291,7 +1286,6 @@ func TestToolCallNormalizationFailureRules(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := validAssistantEntry(testOpID)
-			v.AdvertisedNames = tc.advertised
 			v.Evidence.ToolNames = tc.advertised
 			v.ToolCalls = []toolCallRecord{tc.call}
 			{
@@ -1305,7 +1299,6 @@ func TestToolCallNormalizationFailureRules(t *testing.T) {
 	// rejected by both codec sides; the exact bound decodes.
 	t.Run("bounded diagnostic", func(t *testing.T) {
 		v := validAssistantEntry(testOpID)
-		v.AdvertisedNames = []string{"echo"}
 		v.Evidence.ToolNames = []string{"echo"}
 		call := validToolCallRecord()
 		call.NormalizationFailure = strings.Repeat("x", maxToolDiagnosticBytes+1)
@@ -1759,7 +1752,6 @@ func TestAdoptedFormsAcrossInsertAndFork(t *testing.T) {
 		failed.NormalizationFailure = "arguments must be one non-null JSON object"
 		v := validAssistantEntry(testOpID)
 		v.EntryID = entryID
-		v.AdvertisedNames = []string{"echo"}
 		v.Evidence.ToolNames = []string{"echo"}
 		v.Content = []model.ContentPart{
 			{Kind: model.PartText, Text: invalidText(), Extra: model.Extra{"raw": freshRaw(verbatimExtra), "utf8": invalidRawString()}},
@@ -2830,8 +2822,7 @@ func TestHookResultKnowledgeAndBindingDomains(t *testing.T) {
 
 // TestAssistantEntryRequestEvidenceRequiredMembers proves the assistant
 // payload's required ownership members on both codec sides: the producing
-// request identity, the advertised view (present-empty included; null and
-// absence reject), and the final effective request evidence with its required
+// request identity and the final effective request evidence with its required
 // canonical boundary; decoded values stay deep-owned from the payload bytes.
 func TestAssistantEntryRequestEvidenceRequiredMembers(t *testing.T) {
 	raw, err := encodeAssistantEntry(validAssistantEntry(testOpID))
@@ -2839,17 +2830,13 @@ func TestAssistantEntryRequestEvidenceRequiredMembers(t *testing.T) {
 	env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: raw}
 	decoded, err := decodeAssistantEntry(env)
 	testassert.NoError(t, err)
-	testassert.Require(t, decoded.RequestID != "" && decoded.AdvertisedNames != nil && len(decoded.AdvertisedNames) == 0 &&
-		decoded.Evidence != nil && decoded.Evidence.BoundaryEntryID == hexID(1), "decoded assistant = %+v, want the request identity, the present-empty view, and the consumed evidence", decoded)
-	for _, name := range []string{"request_id", "advertised_names", "evidence"} {
+	testassert.Require(t, decoded.RequestID != "" && decoded.Evidence != nil && decoded.Evidence.ToolNames != nil && len(decoded.Evidence.ToolNames) == 0 &&
+		decoded.Evidence.BoundaryEntryID == hexID(1), "decoded assistant = %+v, want the request identity, the present-empty view, and the consumed evidence", decoded)
+	for _, name := range []string{"request_id", "evidence"} {
 		{
 			_, derr := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: setKey(raw, name, nil)})
 			testassert.Require(t, derr != nil, "absence of %s must reject", name)
 		}
-	}
-	{
-		_, derr := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: setKey(raw, "advertised_names", json.RawMessage(`null`))})
-		testassert.Require(t, derr != nil, "a null advertised_names must reject")
 	}
 	{
 		_, derr := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: setKey(raw, "evidence", json.RawMessage(`{"checkpoint_entry_id":""}`))})
@@ -2873,6 +2860,34 @@ func TestAssistantEntryRequestEvidenceRequiredMembers(t *testing.T) {
 	again, err := decodeAssistantEntry(Entry{SessionID: testSessionID, ID: testEntryID, OperationID: testOpID, Kind: EntryAssistant, Payload: raw})
 	testassert.NoError(t, err)
 	testassert.Require(t, again.Evidence.BoundaryEntryID == hexID(1) && again.Evidence.Prompt == "", "payload bytes changed by a decoded mutation")
+}
+
+func TestAssistantEvidenceIsStoredAdvertisement(t *testing.T) {
+	for _, operationID := range []string{testOpID, ""} {
+		v := validAssistantEntry(operationID)
+		v.Evidence.ToolNames = []string{"echo"}
+		call := validToolCallRecord()
+		call.NormalizedArguments = json.RawMessage(`{"x":1}`)
+		v.ToolCalls = []toolCallRecord{call}
+		raw, err := encodeAssistantEntry(v)
+		testassert.NoError(t, err)
+		if _, exists := wireObject(t, raw)["advertised_names"]; exists {
+			t.Fatal("assistant encoded a second advertisement")
+		}
+		env := Entry{SessionID: testSessionID, ID: testEntryID, OperationID: operationID, Kind: EntryAssistant, Payload: raw}
+		decoded, err := decodeAssistantEntry(env)
+		if err != nil {
+			t.Errorf("operation %q: valid evidence-only assistant refused: %v", operationID, err)
+			continue
+		}
+		if !reflect.DeepEqual(decoded.Evidence.ToolNames, []string{"echo"}) || string(decoded.ToolCalls[0].NormalizedArguments) != `{"x":1}` {
+			t.Fatalf("decoded = %+v", decoded)
+		}
+		env.Payload = setKey(raw, "advertised_names", json.RawMessage(`["echo"]`))
+		if _, err := decodeAssistantEntry(env); err == nil {
+			t.Fatal("obsolete advertisement member accepted")
+		}
+	}
 }
 
 // TestRequestEvidenceContributionMessageDomain proves the shared message gate
@@ -3247,10 +3262,6 @@ func TestRequestEvidenceRequiresConcretePromptAndNames(t *testing.T) {
 		}
 	}
 	assistant := validAssistantEntry(testOpID)
-	assistant.AdvertisedNames = []string{"echo"}
-	if _, err := encodeAssistantEntry(assistant); err == nil {
-		t.Fatal("mismatched advertisement accepted")
-	}
 	assistant.Evidence.ToolNames = []string{"echo"}
 	if _, err := encodeAssistantEntry(assistant); err != nil {
 		t.Fatal(err)

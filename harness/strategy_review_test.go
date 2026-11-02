@@ -2,7 +2,9 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -591,7 +593,8 @@ func TestReviewRetainResolution(t *testing.T) {
 		frozen, frozenCheckpoint, frozenBoundary, ferr := h.projectCanonical(c, testOpID)
 		testassert.NoError(t, ferr)
 		pristine := frozen[0].TextContent()
-		planInput := PlanInput{Trigger: triggerManual, Messages: frozen, CheckpointEntryID: frozenCheckpoint, BoundaryEntryID: frozenBoundary}
+		contributions := RequestEvidence{CheckpointEntryID: frozenCheckpoint, BoundaryEntryID: frozenBoundary, Prompt: "accepted prompt", ToolNames: []string{"echo"}, Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "addition", Extra: model.Extra{"raw": json.RawMessage(` { "n" : 1 } `)}}}}}}
+		planInput := PlanInput{Trigger: triggerManual, Messages: frozen, CheckpointEntryID: frozenCheckpoint, BoundaryEntryID: frozenBoundary, Contributions: &contributions}
 		checkpoint, facts, closeMaintenance, err := h.runContextMaintenance(context.Background(), c, testOpID, exec, capture, planInput,
 			&RunningRequest{RequestID: "request-conversation", BoundaryEntryID: fixtureInputEntryID(c)})
 		defer closeMaintenance()
@@ -607,6 +610,7 @@ func TestReviewRetainResolution(t *testing.T) {
 			"checkpoint message = %+v, want the frozen source copy resolved unchanged (pristine %q)", comp.Messages, pristine)
 		testassert.Require(t, planInput.Messages[0].TextContent() == pristine,
 			"the frozen input copy was rewritten to %q", planInput.Messages[0].TextContent())
+		testassert.Require(t, contributions.Prompt == "accepted prompt" && reflect.DeepEqual(contributions.ToolNames, []string{"echo"}) && contributions.Messages[0].TextContent() == "addition" && string(contributions.Messages[0].Content[0].Extra["raw"]) == ` { "n" : 1 } ` && reflect.DeepEqual(comp.Evidence, &contributions), "strategy changed accepted contribution: input=%+v evidence=%+v", contributions, comp.Evidence)
 	})
 }
 
@@ -617,6 +621,12 @@ type mutatingStrategy struct{ passes int }
 
 func (s *mutatingStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	s.passes++
+	if in.Contributions != nil {
+		in.Contributions.Prompt = "mutated"
+		in.Contributions.ToolNames[0] = "mutated"
+		in.Contributions.Messages[0].Content[0].Text = "mutated"
+		in.Contributions.Messages[0].Content[0].Extra["raw"][0] = 'x'
+	}
 	for i := range in.Messages {
 		for j := range in.Messages[i].Content {
 			in.Messages[i].Content[j].Text = "mutated by the callback"

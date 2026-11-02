@@ -1233,10 +1233,9 @@ var errMalformedNormalization = errors.New("malformed normalization")
 
 // newAssistantEntry builds one assistant entry from one validated model
 // output under the given entry identity, reserving one result identity per
-// completed call and recording the producing request identity, the
-// effective advertised names, and the request evidence the model effect
-// consumed. An output without an eligible model-visible payload writes no
-// assistant entry and returns its reported usage for the consuming settlement
+// completed call and recording the producing request identity and the request
+// evidence the model effect consumed. An output without an eligible model-visible
+// payload writes no assistant entry and returns its reported usage for the consuming settlement
 // entry instead. Before the entry commits, every completed call whose name is
 // in the producing request's ordered advertised names is normalized through
 // the execution's pure callback exactly once: its successful owned object
@@ -1250,16 +1249,12 @@ func newAssistantEntry(sessionID, operationID, entryID string, out *model.Output
 		return nil, nil, nil
 	}
 	entry := &assistantEntry{
-		SessionID:       sessionID,
-		EntryID:         entryID,
-		OperationID:     operationID,
-		Status:          out.Status,
-		Source:          out.Source,
-		RequestID:       requestID,
-		AdvertisedNames: append([]string(nil), advertised...),
-	}
-	if entry.AdvertisedNames == nil {
-		entry.AdvertisedNames = []string{}
+		SessionID:   sessionID,
+		EntryID:     entryID,
+		OperationID: operationID,
+		Status:      out.Status,
+		Source:      out.Source,
+		RequestID:   requestID,
 	}
 	if evidence != nil {
 		owned := copyRequestEvidence(*evidence)

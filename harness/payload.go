@@ -373,38 +373,32 @@ func encodeAssistantEntry(v assistantEntry) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	advertised := v.AdvertisedNames
-	if advertised == nil {
-		advertised = []string{}
-	}
 	wire, err := json.Marshal(struct {
-		SessionID       string            `json:"session_id"`
-		EntryID         string            `json:"entry_id"`
-		OperationID     string            `json:"operation_id,omitempty"`
-		Status          string            `json:"status"`
-		Source          json.RawMessage   `json:"source"`
-		Content         []json.RawMessage `json:"content"`
-		Refusal         string            `json:"refusal,omitempty"`
-		Extra           json.RawMessage   `json:"extra,omitempty"`
-		ToolCalls       []json.RawMessage `json:"tool_calls"`
-		Usage           *UsageCount       `json:"usage,omitempty"`
-		RequestID       string            `json:"request_id"`
-		AdvertisedNames []string          `json:"advertised_names"`
-		Evidence        json.RawMessage   `json:"evidence"`
+		SessionID   string            `json:"session_id"`
+		EntryID     string            `json:"entry_id"`
+		OperationID string            `json:"operation_id,omitempty"`
+		Status      string            `json:"status"`
+		Source      json.RawMessage   `json:"source"`
+		Content     []json.RawMessage `json:"content"`
+		Refusal     string            `json:"refusal,omitempty"`
+		Extra       json.RawMessage   `json:"extra,omitempty"`
+		ToolCalls   []json.RawMessage `json:"tool_calls"`
+		Usage       *UsageCount       `json:"usage,omitempty"`
+		RequestID   string            `json:"request_id"`
+		Evidence    json.RawMessage   `json:"evidence"`
 	}{
-		SessionID:       v.SessionID,
-		EntryID:         v.EntryID,
-		OperationID:     v.OperationID,
-		Status:          string(v.Status),
-		Source:          source,
-		Content:         content,
-		Refusal:         v.Refusal,
-		Extra:           extra,
-		ToolCalls:       calls,
-		Usage:           v.Usage,
-		RequestID:       v.RequestID,
-		AdvertisedNames: advertised,
-		Evidence:        evidence,
+		SessionID:   v.SessionID,
+		EntryID:     v.EntryID,
+		OperationID: v.OperationID,
+		Status:      string(v.Status),
+		Source:      source,
+		Content:     content,
+		Refusal:     v.Refusal,
+		Extra:       extra,
+		ToolCalls:   calls,
+		Usage:       v.Usage,
+		RequestID:   v.RequestID,
+		Evidence:    evidence,
 	})
 	if err != nil {
 		return nil, err
@@ -423,7 +417,7 @@ func decodeAssistantEntry(env Entry) (assistantEntry, error) {
 	if err != nil {
 		return assistantEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "status", "source", "content", "refusal", "extra", "tool_calls", "usage", "request_id", "advertised_names", "evidence"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "status", "source", "content", "refusal", "extra", "tool_calls", "usage", "request_id", "evidence"); err != nil {
 		return assistantEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -482,13 +476,6 @@ func decodeAssistantEntry(env Entry) (assistantEntry, error) {
 	if err != nil {
 		return assistantEntry{}, err
 	}
-	advertisedNames, err := optionalStringMemberList(obj, "advertised_names")
-	if err != nil {
-		return assistantEntry{}, err
-	}
-	if advertisedNames == nil {
-		return assistantEntry{}, errors.New(`required member "advertised_names" is missing`)
-	}
 	evidence, err := decodeRequestEvidence(obj["evidence"])
 	if err != nil {
 		return assistantEntry{}, fmt.Errorf("member %q: %w", "evidence", err)
@@ -503,17 +490,16 @@ func decodeAssistantEntry(env Entry) (assistantEntry, error) {
 		return assistantEntry{}, fmt.Errorf("payload operation id %q does not agree with the envelope", operationID)
 	}
 	v := assistantEntry{
-		SessionID:       sessionID,
-		EntryID:         entryID,
-		OperationID:     operationID,
-		Status:          model.OutputStatus(status),
-		Source:          source,
-		Refusal:         refusal,
-		Extra:           extra,
-		Usage:           usage,
-		RequestID:       requestID,
-		AdvertisedNames: advertisedNames,
-		Evidence:        &evidence,
+		SessionID:   sessionID,
+		EntryID:     entryID,
+		OperationID: operationID,
+		Status:      model.OutputStatus(status),
+		Source:      source,
+		Refusal:     refusal,
+		Extra:       extra,
+		Usage:       usage,
+		RequestID:   requestID,
+		Evidence:    &evidence,
 	}
 	for i, raw := range contentRaw {
 		part, err := decodeContentPart(raw)
@@ -592,14 +578,14 @@ func validateAssistantEntry(v assistantEntry) error {
 	if err := validateOperationIdentity(v.RequestID, "assistant request id"); err != nil {
 		return err
 	}
-	seenNames := make(map[string]bool, len(v.AdvertisedNames))
-	for _, name := range v.AdvertisedNames {
-		if name == "" {
-			return errors.New("assistant advertised_names carries an empty name")
-		}
-		if seenNames[name] {
-			return fmt.Errorf("assistant advertised_names has duplicate name %q", name)
-		}
+	if v.Evidence == nil {
+		return errors.New("assistant entry requires its effective request evidence")
+	}
+	if err := validateRequestEvidence(*v.Evidence); err != nil {
+		return err
+	}
+	seenNames := make(map[string]bool, len(v.Evidence.ToolNames))
+	for _, name := range v.Evidence.ToolNames {
 		seenNames[name] = true
 	}
 	// One closed normalization rule over the producing request's advertised
@@ -615,20 +601,6 @@ func validateAssistantEntry(v assistantEntry) error {
 			}
 		case normalized || failed:
 			return fmt.Errorf("tool_calls[%d]: unadvertised call %q must carry neither normalized_arguments nor normalization_failure", i, call.ID)
-		}
-	}
-	if v.Evidence == nil {
-		return errors.New("assistant entry requires its effective request evidence")
-	}
-	if err := validateRequestEvidence(*v.Evidence); err != nil {
-		return err
-	}
-	if len(v.Evidence.ToolNames) != len(v.AdvertisedNames) {
-		return errors.New("assistant evidence does not match advertised names")
-	}
-	for i, name := range v.AdvertisedNames {
-		if v.Evidence.ToolNames[i] != name {
-			return errors.New("assistant evidence does not match advertised names")
 		}
 	}
 	if !assistantPayloadEligible(v) {

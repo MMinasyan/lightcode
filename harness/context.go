@@ -342,14 +342,10 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 		}
 		// The frozen contribution view is applied exactly once to the rebuilt
 		// projection; its references now name the new checkpoint and tail.
-		evidence, err := acceptRequestEvidence(contributions)
-		if err != nil {
-			return model.Request{}, err
-		}
-		req := buildDispatchRequest(capture, canonical, evidence)
+		req := buildDispatchRequest(capture, canonical, contributions)
 		*round = conversationRound{
 			requestID: requestID,
-			net:       evidence,
+			net:       contributions,
 		}
 		return req, nil
 	}

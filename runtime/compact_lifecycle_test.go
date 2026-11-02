@@ -341,7 +341,7 @@ func compactRawInputEntry(sessionID, entryID, operationID, origin, text string) 
 func compactRawAssistantEntry(sessionID, entryID, operationID, boundaryID, text string) string {
 	return fmt.Sprintf(
 		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"status":"completed",`+
-			`"source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"advertised_names":[],"evidence":{"boundary_entry_id":%q,"prompt":"compact-sys","tool_names":[]}}`,
+			`"source":{"provider":"prov","model":"m"},"content":[{"kind":"text","text":%q}],"tool_calls":[],"request_id":%q,"evidence":{"boundary_entry_id":%q,"prompt":"compact-sys","tool_names":[]}}`,
 		sessionID, entryID, operationID, text, "request-a-"+entryID, boundaryID)
 }
 

@@ -2062,9 +2062,8 @@ func TestRequestHookEmptyToolSelectionStaysHidden(t *testing.T) {
 		committed[0].InputEvidence != nil && committed[0].InputEvidence.ToolNames != nil && len(committed[0].InputEvidence.ToolNames) == 0,
 		"hook results = %+v, want the present-empty selection recorded as consumed", committed)
 	assistant := compositionAssistant(t, store, sessionID)
-	testassert.Require(t, assistant.AdvertisedNames != nil && len(assistant.AdvertisedNames) == 0 &&
-		assistant.Evidence != nil && assistant.Evidence.ToolNames != nil && len(assistant.Evidence.ToolNames) == 0,
-		"assistant = advertised %v evidence %v, want the recorded empty view carried to the boundary", assistant.AdvertisedNames, assistant.Evidence.ToolNames)
+	testassert.Require(t, assistant.Evidence != nil && assistant.Evidence.ToolNames != nil && len(assistant.Evidence.ToolNames) == 0,
+		"assistant evidence = %v, want the recorded empty view carried to the boundary", assistant.Evidence)
 	{
 		if _, err := validateFixture(t, store, sessionID); err != nil {
 			t.Fatalf("graph validation: %v", err)

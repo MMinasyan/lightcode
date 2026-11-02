@@ -438,7 +438,6 @@ func TestEvidenceCatalogOwnershipAndCopiedPrefix(t *testing.T) {
 			tool := testToolDefinition()
 			tool.Name = "other"
 			fixture.ops[0].Admission.Execution.Tools = append(fixture.ops[0].Admission.Execution.Tools, tool)
-			fixture.entries[1].assistant.AdvertisedNames = tc.names
 			fixture.entries[1].assistant.Evidence.ToolNames = tc.names
 			_, err := validateFixture(t, fixture.storage(t), testSessionID)
 			if (err == nil) != tc.valid {
@@ -473,11 +472,17 @@ func TestEvidenceCatalogOwnershipAndCopiedPrefix(t *testing.T) {
 	fixture.entries[1].env.OperationID = ""
 	assistant := fixture.entries[1].assistant
 	assistant.OperationID = ""
-	assistant.AdvertisedNames = []string{"foreign"}
 	assistant.Evidence.ToolNames = []string{"foreign"}
+	call := validToolCallRecord()
+	call.Name, call.ResultEntryID, call.NormalizedArguments = "foreign", hexID(4), json.RawMessage(`{"x":1}`)
+	assistant.ToolCalls = []toolCallRecord{call}
+	result := validToolResultEntry("")
+	result.EntryID, result.AssistantEntry.EntryID = hexID(4), hexID(2)
+	result.NormalizedArguments = json.RawMessage(`{"x":1}`)
+	fixture.entries = append(fixture.entries, testEntry{env: Entry{SessionID: testSessionID, ID: hexID(4), Kind: EntryToolResult, Sequence: 3, CommittedAt: testTime}, toolResult: &result})
 	input := validInputEntry(testOpID)
 	input.EntryID = hexID(3)
-	fixture.entries = append(fixture.entries, testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryInput, Sequence: 3, CommittedAt: testTime}, input: &input})
+	fixture.entries = append(fixture.entries, testEntry{env: Entry{SessionID: testSessionID, ID: hexID(3), OperationID: testOpID, Kind: EntryInput, Sequence: 4, CommittedAt: testTime}, input: &input})
 	fixture.ops[0].Admission.AdmittedEntry.EntryID = hexID(3)
 	_, err := validateFixture(t, fixture.storage(t), testSessionID)
 	if err != nil {
@@ -485,17 +490,32 @@ func TestEvidenceCatalogOwnershipAndCopiedPrefix(t *testing.T) {
 	}
 	stored, err := encodeAssistantEntry(*assistant)
 	testassert.NoError(t, err)
-	obj := wireObject(t, stored)
-	evidence := wireObject(t, obj["evidence"])
-	evidence["tool_names"] = mustMarshal([]string{"echo"})
-	obj["evidence"] = mustMarshal(evidence)
-	fixture.entries[1].rawOverride = mustMarshal(obj)
-	if _, err := validateFixture(t, fixture.storage(t), testSessionID); err == nil {
-		t.Fatal("stored copied advertisement mismatch accepted")
-	}
-	assistant.Evidence.ToolNames = []string{"echo"}
-	if _, err := encodeAssistantEntry(*assistant); err == nil {
-		t.Fatal("copied advertisement mismatch accepted")
+	for _, tc := range []struct {
+		name   string
+		detail string
+		mutate func(map[string]json.RawMessage)
+	}{
+		{"advertised without normalization", "advertised call", func(obj map[string]json.RawMessage) {
+			var calls []map[string]json.RawMessage
+			testassert.NoError(t, json.Unmarshal(obj["tool_calls"], &calls))
+			delete(calls[0], "normalized_arguments_base64")
+			obj["tool_calls"] = mustMarshal(calls)
+		}},
+		{"unadvertised with normalization", "unadvertised call", func(obj map[string]json.RawMessage) {
+			evidence := wireObject(t, obj["evidence"])
+			evidence["tool_names"] = mustMarshal([]string{"echo"})
+			obj["evidence"] = mustMarshal(evidence)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := wireObject(t, stored)
+			tc.mutate(obj)
+			fixture.entries[1].rawOverride = mustMarshal(obj)
+			_, err := validateFixture(t, fixture.storage(t), testSessionID)
+			if err == nil || !strings.Contains(err.Error(), tc.detail) {
+				t.Fatalf("copied normalization violation = %v", err)
+			}
+		})
 	}
 }
 
