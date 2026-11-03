@@ -281,7 +281,10 @@ mkdir -p "$install_dir" 2>/dev/null || as_root mkdir -p "$install_dir" || fail "
 if [ -w "$install_dir" ]; then
     tmp_install=$install_dir/.lightcode.tmp.$$
     rm -f "$tmp_install"
-    cp "$extracted" "$tmp_install" || fail "could not copy binary into $install_dir"
+    cp "$extracted" "$tmp_install" || {
+        rm -f "$tmp_install"
+        fail "could not copy binary into $install_dir"
+    }
     chmod 755 "$tmp_install" || {
         rm -f "$tmp_install"
         fail "could not set executable bit on temporary install"

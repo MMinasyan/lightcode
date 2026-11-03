@@ -1,9 +1,13 @@
 package catalog
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,9 +15,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 const discoveryCacheTTL = 24 * time.Hour
+
+// maxDiscoveryResponseBytes bounds one successful discovery response body:
+// the complete decoded document must fit inside it. The count is the bytes
+// the transport delivers, whatever any Content-Length header claims.
+const maxDiscoveryResponseBytes = 16 << 20
 
 // RawDiscoveredModel is one provider-supplied model object from /v1/models.
 type RawDiscoveredModel map[string]any
@@ -23,9 +34,60 @@ type discoveryResponse struct {
 }
 
 type discoveryCacheFile struct {
-	FetchedAt   time.Time                      `json:"fetched_at,omitempty"`
-	AttemptedAt time.Time                      `json:"attempted_at,omitempty"`
-	Models      map[string]discoveryCacheModel `json:"models"`
+	TransportFingerprint string                         `json:"transport_fingerprint,omitempty"`
+	FetchedAt            time.Time                      `json:"fetched_at,omitempty"`
+	AttemptedAt          time.Time                      `json:"attempted_at,omitempty"`
+	Models               map[string]discoveryCacheModel `json:"models"`
+}
+
+// DiscoveryRecord is one transport-bound discovery result and its attempt
+// timing. A record with an empty fingerprint is unbound and cannot contribute
+// models or TTL state to a catalog.
+type DiscoveryRecord struct {
+	TransportFingerprint string
+	FetchedAt            time.Time
+	AttemptedAt          time.Time
+	Models               map[string]DiscoveredModel
+}
+
+// BoundTo reports whether the record belongs to the configured transport. A
+// record whose persisted fingerprint is empty is unbound.
+func (r DiscoveryRecord) BoundTo(transport Transport) bool {
+	if r.TransportFingerprint == "" {
+		return false
+	}
+	return r.TransportFingerprint == transportFingerprint(transport)
+}
+
+// SameTransport reports whether two configured transports have the same
+// catalog identity. Runtime credentials are not part of that identity; a
+// provisional authorization header is excluded because callers pass the
+// captured configured transport, not the provisional fetch copy.
+func SameTransport(a, b Transport) bool {
+	return transportFingerprint(a) == transportFingerprint(b)
+}
+
+// transportFingerprint returns the lowercase SHA-256 identity of a configured
+// transport: its base URL, credential binding and configured headers — the
+// effective discovery inputs. Every configured transport yields one hash.
+func transportFingerprint(transport Transport) string {
+	headers := map[string]string{}
+	for name, value := range transport.Headers {
+		digest := sha256.Sum256([]byte(value))
+		headers[name] = hex.EncodeToString(digest[:])
+	}
+	payload := struct {
+		BaseURL   string            `json:"base_url"`
+		APIKeyEnv string            `json:"api_key_env"`
+		Headers   map[string]string `json:"headers"`
+	}{
+		BaseURL:   transport.BaseURL,
+		APIKeyEnv: transport.APIKeyEnv,
+		Headers:   headers,
+	}
+	data, _ := json.Marshal(payload)
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
 }
 
 type discoveryCacheModel struct {
@@ -75,11 +137,27 @@ func FetchDiscovery(ctx context.Context, client *http.Client, provider *Provider
 		return DiscoveredProvider{}, fmt.Errorf("discovery for %s returned HTTP %d", provider.ID, resp.StatusCode)
 	}
 
+	// The complete successful body is bounded: read at most the maximum plus
+	// one and reject before decoding, then decode exactly one complete
+	// document. The count is the bytes the transport delivers — the
+	// Content-Length header is never consulted and transport decompression
+	// is unchanged.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDiscoveryResponseBytes+1))
+	if err != nil {
+		return DiscoveredProvider{}, fmt.Errorf("parse discovery response for %s: %w", provider.ID, err)
+	}
+	if len(body) > maxDiscoveryResponseBytes {
+		return DiscoveredProvider{}, fmt.Errorf("discovery for %s returned a body over the %d-byte maximum", provider.ID, maxDiscoveryResponseBytes)
+	}
 	var parsed discoveryResponse
-	decoder := json.NewDecoder(resp.Body)
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
 	if err := decoder.Decode(&parsed); err != nil {
 		return DiscoveredProvider{}, fmt.Errorf("parse discovery response for %s: %w", provider.ID, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return DiscoveredProvider{}, fmt.Errorf("parse discovery response for %s: unexpected trailing data", provider.ID)
 	}
 	if len(parsed.Data) == 0 {
 		return DiscoveredProvider{}, fmt.Errorf("discovery for %s returned no models", provider.ID)
@@ -359,19 +437,18 @@ func rawObject(value any) (map[string]any, bool) {
 	return object, ok
 }
 
-// ReadDiscoveryCache reads all on-disk discovery cache files and last-attempt
-// timestamps. Old cache files without attempted_at use fetched_at as the
-// attempt time for backwards compatibility.
-func ReadDiscoveryCache(home string) (map[string]DiscoveredProvider, map[string]time.Time, []Warning) {
-	cache := map[string]DiscoveredProvider{}
-	attempts := map[string]time.Time{}
+// ReadDiscoveryCache reads all on-disk discovery cache files. Legacy files
+// without a transport fingerprint are readable but unbound: they contribute
+// neither models nor attempt timing.
+func ReadDiscoveryCache(home string) (map[string]DiscoveryRecord, []Warning) {
+	records := map[string]DiscoveryRecord{}
 	dir := discoveryCacheDir(home)
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
-		return cache, attempts, nil
+		return records, nil
 	}
 	if err != nil {
-		return cache, attempts, []Warning{{Kind: "discovery_failure", Message: fmt.Sprintf("read discovery cache dir: %v", err)}}
+		return records, []Warning{{Kind: "discovery_failure", Message: fmt.Sprintf("read discovery cache dir: %v", err)}}
 	}
 	var warnings []Warning
 	for _, entry := range entries {
@@ -379,36 +456,36 @@ func ReadDiscoveryCache(home string) (map[string]DiscoveredProvider, map[string]
 			continue
 		}
 		providerID := strings.TrimSuffix(entry.Name(), ".json")
-		fileCache, attemptedAt, err := readDiscoveryCacheFile(filepath.Join(dir, entry.Name()))
+		record, err := readDiscoveryCacheFile(filepath.Join(dir, entry.Name()))
 		if err != nil {
 			warnings = append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("read discovery cache: %v", err)})
 			continue
 		}
-		cache[providerID] = fileCache
-		if !attemptedAt.IsZero() {
-			attempts[providerID] = attemptedAt
-		}
+		records[providerID] = record
 	}
-	return cache, attempts, warnings
+	return records, warnings
 }
 
 // DiscoveryAttemptRecent reports whether provider discovery had a real network
 // attempt inside the cache TTL.
-func DiscoveryAttemptRecent(home, providerID string, now time.Time) (bool, error) {
+func DiscoveryAttemptRecent(home, providerID string, transport Transport, now time.Time) (bool, error) {
 	if !safeProviderID(providerID) {
 		return false, fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	_, attemptedAt, err := readDiscoveryCacheFile(filepath.Join(discoveryCacheDir(home), providerID+".json"))
+	record, err := readDiscoveryCacheFile(filepath.Join(discoveryCacheDir(home), providerID+".json"))
 	if os.IsNotExist(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	return !discoveryAttemptDue(attemptedAt, now), nil
+	if !record.BoundTo(transport) {
+		return false, nil
+	}
+	return !discoveryAttemptDue(record.AttemptedAt, now), nil
 }
 
 func discoveryAttemptDue(attemptedAt, now time.Time) bool {
@@ -421,9 +498,28 @@ func discoveryAttemptDue(attemptedAt, now time.Time) bool {
 	return now.Sub(attemptedAt) >= discoveryCacheTTL
 }
 
+// discoveryLockAcquiredHook fires after the per-provider discovery lock is
+// acquired, exactly once per acquisition, with the acquired lock path.
+// Production no-op; tests record acquisitions to prove every discovery cache
+// writer serializes on the same per-provider lock. Follows the snapshot
+// mintPublishHook precedent.
+var discoveryLockAcquiredHook = func(lockPath string) {}
+
+// withDiscoveryLock runs fn while holding the per-provider discovery lock for
+// providerID. It is the single locking helper for every discovery cache
+// writer, so all writers for one provider share one lock path.
+func withDiscoveryLock(home, providerID string, fn func() error) error {
+	return atomicfs.WithLock(discoveryLockPath(home, providerID), func() error {
+		discoveryLockAcquiredHook(discoveryLockPath(home, providerID))
+		return fn()
+	})
+}
+
 // WriteDiscoveryAttempt records a real discovery network attempt without
-// changing any cached model metadata.
-func WriteDiscoveryAttempt(home, providerID string, attemptedAt time.Time) error {
+// changing any cached model metadata. The whole read-modify-write runs under
+// the per-provider discovery lock, so a stale attempt can never clobber a
+// discovery published concurrently by another refresh.
+func WriteDiscoveryAttempt(home, providerID string, transport Transport, attemptedAt time.Time) error {
 	if !safeProviderID(providerID) {
 		return fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
 	}
@@ -431,14 +527,50 @@ func WriteDiscoveryAttempt(home, providerID string, attemptedAt time.Time) error
 		attemptedAt = time.Now().UTC()
 	}
 	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
-	raw := discoveryCacheFile{Models: map[string]discoveryCacheModel{}}
+	return withDiscoveryLock(home, providerID, func() error {
+		return writeDiscoveryAttemptPayload(path, transportFingerprint(transport), attemptedAt)
+	})
+}
+
+// TryWriteDiscoveryAttempt is the one-attempt counterpart of
+// WriteDiscoveryAttempt for owner paths that must not block a shutting-down
+// owner on a foreign discovery-lock holder. On contention it returns
+// (false, nil) without touching the cache file; on success it returns
+// (true, the payload result), so a payload failure is distinguishable from
+// contention.
+func TryWriteDiscoveryAttempt(home, providerID string, transport Transport, attemptedAt time.Time) (bool, error) {
+	if !safeProviderID(providerID) {
+		return false, fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
+	}
+	if attemptedAt.IsZero() {
+		attemptedAt = time.Now().UTC()
+	}
+	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
+	return atomicfs.TryWithLock(discoveryLockPath(home, providerID), func() error {
+		discoveryLockAcquiredHook(discoveryLockPath(home, providerID))
+		return writeDiscoveryAttemptPayload(path, transportFingerprint(transport), attemptedAt)
+	})
+}
+
+// writeDiscoveryAttemptPayload stamps the attempted timestamp onto one
+// provider's cache file, preserving any cached models. It runs under the
+// per-provider discovery lock held by the caller (the blocking
+// withDiscoveryLock or the one-attempt TryWithLock), so it never reacquires
+// the leaf.
+func writeDiscoveryAttemptPayload(path, fingerprint string, attemptedAt time.Time) error {
+	raw := discoveryCacheFile{TransportFingerprint: fingerprint, Models: map[string]discoveryCacheModel{}}
 	data, err := os.ReadFile(path)
 	if err == nil {
-		if err := json.Unmarshal(data, &raw); err != nil {
+		var existing discoveryCacheFile
+		if err := json.Unmarshal(data, &existing); err != nil {
 			return err
 		}
-		if raw.Models == nil {
-			raw.Models = map[string]discoveryCacheModel{}
+		if existing.TransportFingerprint == fingerprint && validTransportFingerprint(existing.TransportFingerprint) {
+			raw.FetchedAt = existing.FetchedAt
+			raw.Models = existing.Models
+			if raw.Models == nil {
+				raw.Models = map[string]discoveryCacheModel{}
+			}
 		}
 	} else if !os.IsNotExist(err) {
 		return err
@@ -447,15 +579,49 @@ func WriteDiscoveryAttempt(home, providerID string, attemptedAt time.Time) error
 	return writeDiscoveryCacheFile(path, raw)
 }
 
-// WriteDiscoveryCache writes one provider's discovery cache file.
-func WriteDiscoveryCache(home, providerID string, discovered DiscoveredProvider, fetchedAt time.Time) error {
+// WriteDiscoveryCache writes one provider's discovery cache file. It builds
+// its payload fresh from the discovery result and publishes it under the
+// per-provider discovery lock, so it never interleaves with the attempt
+// writer's read-modify-write or another whole-file write for the same provider.
+func WriteDiscoveryCache(home, providerID string, transport Transport, discovered DiscoveredProvider, fetchedAt time.Time) error {
 	if !safeProviderID(providerID) {
 		return fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
 	}
 	if fetchedAt.IsZero() {
 		fetchedAt = time.Now().UTC()
 	}
-	raw := discoveryCacheFile{FetchedAt: fetchedAt.UTC(), AttemptedAt: fetchedAt.UTC(), Models: map[string]discoveryCacheModel{}}
+	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
+	return withDiscoveryLock(home, providerID, func() error {
+		return writeDiscoveryCachePayload(path, transportFingerprint(transport), discovered, fetchedAt)
+	})
+}
+
+// TryWriteDiscoveryCache is the one-attempt counterpart of
+// WriteDiscoveryCache for owner paths that must not block a shutting-down
+// owner on a foreign discovery-lock holder. On contention it returns
+// (false, nil) without touching the cache file; on success it returns
+// (true, the payload result), so a payload failure is distinguishable from
+// contention.
+func TryWriteDiscoveryCache(home, providerID string, transport Transport, discovered DiscoveredProvider, fetchedAt time.Time) (bool, error) {
+	if !safeProviderID(providerID) {
+		return false, fmt.Errorf("%w: provider id %q", ErrInvalidModelRef, providerID)
+	}
+	if fetchedAt.IsZero() {
+		fetchedAt = time.Now().UTC()
+	}
+	path := filepath.Join(discoveryCacheDir(home), providerID+".json")
+	return atomicfs.TryWithLock(discoveryLockPath(home, providerID), func() error {
+		discoveryLockAcquiredHook(discoveryLockPath(home, providerID))
+		return writeDiscoveryCachePayload(path, transportFingerprint(transport), discovered, fetchedAt)
+	})
+}
+
+// writeDiscoveryCachePayload publishes one provider's discovery cache file
+// fresh from the discovery result. It runs under the per-provider discovery
+// lock held by the caller (the blocking withDiscoveryLock or the one-attempt
+// TryWithLock), so it never reacquires the leaf.
+func writeDiscoveryCachePayload(path, fingerprint string, discovered DiscoveredProvider, fetchedAt time.Time) error {
+	raw := discoveryCacheFile{TransportFingerprint: fingerprint, FetchedAt: fetchedAt.UTC(), AttemptedAt: fetchedAt.UTC(), Models: map[string]discoveryCacheModel{}}
 	for modelID, model := range discovered.Models {
 		raw.Models[modelID] = discoveryCacheModel{
 			ID:              modelID,
@@ -466,17 +632,20 @@ func WriteDiscoveryCache(home, providerID string, discovered DiscoveredProvider,
 			Metadata:        model.metadata,
 		}
 	}
-	return writeDiscoveryCacheFile(filepath.Join(discoveryCacheDir(home), providerID+".json"), raw)
+	return writeDiscoveryCacheFile(path, raw)
 }
 
-func readDiscoveryCacheFile(path string) (DiscoveredProvider, time.Time, error) {
+func readDiscoveryCacheFile(path string) (DiscoveryRecord, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return DiscoveredProvider{}, time.Time{}, err
+		return DiscoveryRecord{}, err
 	}
 	var raw discoveryCacheFile
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return DiscoveredProvider{}, time.Time{}, err
+		return DiscoveryRecord{}, err
+	}
+	if !validTransportFingerprint(raw.TransportFingerprint) {
+		return DiscoveryRecord{}, nil
 	}
 	attemptedAt := raw.AttemptedAt
 	if attemptedAt.IsZero() {
@@ -492,7 +661,24 @@ func readDiscoveryCacheFile(path string) (DiscoveredProvider, time.Time, error) 
 			metadata:        model.Metadata,
 		}
 	}
-	return DiscoveredProvider{Models: models}, attemptedAt, nil
+	return DiscoveryRecord{
+		TransportFingerprint: raw.TransportFingerprint,
+		FetchedAt:            raw.FetchedAt,
+		AttemptedAt:          attemptedAt,
+		Models:               models,
+	}, nil
+}
+
+func validTransportFingerprint(fingerprint string) bool {
+	if len(fingerprint) != sha256.Size*2 {
+		return false
+	}
+	for _, char := range fingerprint {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func writeDiscoveryCacheFile(path string, raw discoveryCacheFile) error {
@@ -507,11 +693,18 @@ func writeDiscoveryCacheFile(path string, raw discoveryCacheFile) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	return atomicfs.Write(path, data, 0o600)
 }
 
 func safeProviderID(providerID string) bool {
 	return providerID != "" && !strings.Contains(providerID, "/") && !strings.Contains(providerID, `\`)
+}
+
+// discoveryLockPath is the per-provider sidecar lock that serializes all
+// writers of one provider's discovery cache file. It lives in a .locks
+// directory inside the cache dir and is never the provider's own cache file.
+func discoveryLockPath(home, providerID string) string {
+	return filepath.Join(discoveryCacheDir(home), ".locks", providerID+".lock")
 }
 
 func discoveryCacheDir(home string) string {

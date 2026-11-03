@@ -4,26 +4,20 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestResolveFilePathPreservesMultipleMissingParents(t *testing.T) {
 	realRoot := t.TempDir()
 	linkDir := filepath.Join(t.TempDir(), "link")
-	if err := os.Symlink(realRoot, linkDir); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Symlink(realRoot, linkDir))
 
 	requested := filepath.Join(linkDir, "a", "b", "new.txt")
 	resolved, err := ResolveFilePath(requested)
-	if err != nil {
-		t.Fatalf("ResolveFilePath error = %v", err)
-	}
+	testassert.NoError(t, err)
 
 	want := filepath.Join(realRoot, "a", "b", "new.txt")
-	if resolved.CanonicalPath != want {
-		t.Fatalf("CanonicalPath = %q, want %q", resolved.CanonicalPath, want)
-	}
-	if resolved.LeafExists {
-		t.Fatal("LeafExists = true, want false")
-	}
+	testassert.Equal(t, resolved.CanonicalPath, want)
+	testassert.Require(t, !resolved.LeafExists, "LeafExists = true, want false")
 }

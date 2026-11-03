@@ -1,7 +1,6 @@
 package tool
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -43,56 +42,27 @@ var dangerousReadOnlyFlags = []string{
 	"--textconv",
 }
 
-const readOnlyRunCommandDescription = `Executes a read-only shell command and returns combined stdout and stderr.
-- Only a fixed allowlist of read-only commands runs; anything outside it is rejected, even when harmless. Allowed: ls, cat, grep, find, head, tail, wc, stat, which, pwd, echo, printf, rg, and read-only git (status, log, diff, show, blame, rev-parse). Output redirection (>, >>), command substitution ($(...) or backticks), and write/exec flags (e.g. --output, -exec) are rejected.
-- Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls. Use "cd /path && command" if you need a different working directory.
+// ReadOnlyRunCommandDescription is the retained read-only run_command
+// description: allowlist/rejected syntax and background bullets.
+const ReadOnlyRunCommandDescription = `Executes a read-only shell command and returns combined stdout and stderr.
+- Only a fixed allowlist of read-only commands runs; anything outside it is rejected, even when harmless. Allowed: ls, cat, grep, find, head, tail, wc, stat, which, pwd, echo, printf, rg, and read-only git (status, log, diff, show, blame, rev-parse, branch/tag listing). Output redirection (>, >>), command substitution ($(...) or backticks), and write/exec flags (e.g. --output, -exec) are rejected.
+- Each call starts a fresh shell in the project root. Environment variables, aliases, and working directory do not persist between calls.
 - Foreground commands use the default timeout. Background commands run until they exit, are killed, or reach an explicit timeout parameter.
 - For commands that may run for a long time, keep producing output, wait on external state, and are not needed before your next step, set background=true. It returns immediately with a process ID. You will be notified when it finishes. To read output while it is still running, use sleep to wait, then process to read the output. To kill it, use process. Do not use background=true for commands that will probably finish in a few seconds.
 - Do not use this tool to read file contents — use read_file.`
 
-const readOnlyRunCommandRejected = "You are a read-only agent, so `run_command` only accepts a fixed allowlist of read-only commands, and this command is not allowed. Commands outside the list are rejected even when harmless. Allowed: ls, cat, grep, find, head, tail, wc, stat, which, pwd, echo, printf, and read-only git/rg/find."
-
-// ReadOnlyRunCommand wraps RunCommand and restricts commands to a
-// whitelist of non-destructive operations (ls, cat, grep, git log, etc.).
-type ReadOnlyRunCommand struct {
-	inner *RunCommand
-}
-
-// NewReadOnlyRunCommand creates a read-only command tool.
-func NewReadOnlyRunCommand(inner *RunCommand) *ReadOnlyRunCommand {
-	return &ReadOnlyRunCommand{inner: inner}
-}
-
-func (*ReadOnlyRunCommand) Name() string { return "run_command" }
-func (*ReadOnlyRunCommand) Description() string {
-	return readOnlyRunCommandDescription
-}
-func (r *ReadOnlyRunCommand) ParametersSchema() map[string]any {
-	return r.inner.ParametersSchema()
-}
-
-func (r *ReadOnlyRunCommand) Execute(ctx context.Context, params map[string]any) (string, error) {
-	command, _ := params["command"].(string)
-	safeCommand, err := readOnlyCommand(command)
-	if err != nil {
-		return "", fmt.Errorf("%s", readOnlyRunCommandRejected)
-	}
-	cleanParams := map[string]any{"command": safeCommand}
-	if background, _ := params["background"].(bool); background {
-		cleanParams["background"] = true
-		if timeout, ok := params["timeout"]; ok {
-			cleanParams["timeout"] = timeout
-		}
-	}
-	return r.inner.Execute(ctx, cleanParams)
-}
+const ReadOnlyRunCommandRejected = "You are a read-only agent, so `run_command` only accepts a fixed allowlist of read-only commands, and this command is not allowed. Commands outside the list are rejected even when harmless. Allowed: ls, cat, grep, find, head, tail, wc, stat, which, pwd, echo, printf, and read-only git/rg/find."
 
 func isReadOnlyCommand(command string) bool {
-	_, err := readOnlyCommand(command)
+	_, err := ReadOnlyCommand(command)
 	return err == nil
 }
 
-func readOnlyCommand(command string) (string, error) {
+// ReadOnlyCommand validates one command against the read-only allowlist and
+// returns its safely quoted rewritten form. The rewritten text is the
+// command that must be authorized and executed; the raw input is never
+// echoed back to the model.
+func ReadOnlyCommand(command string) (string, error) {
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return "", fmt.Errorf("empty command")
@@ -103,7 +73,7 @@ func readOnlyCommand(command string) (string, error) {
 	}
 	parts := make([]string, 0, len(segments)*2)
 	for i, segment := range segments {
-		if segment.UnsafeExpansion || len(segment.Redirections) > 0 {
+		if segment.UnsafeExpansion || segment.HasRedirection {
 			return "", fmt.Errorf("unsupported shell syntax")
 		}
 		argv, ok := readOnlyArgv(segment.Argv)

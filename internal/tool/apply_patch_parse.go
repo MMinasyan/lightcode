@@ -44,9 +44,10 @@ const (
 	lineRemove
 )
 
+// hunkLine is one classified V4A hunk line: its kind and raw text.
 type hunkLine struct {
-	kind lineKind
-	text string
+	Kind lineKind
+	Text string
 }
 
 type hunk struct {
@@ -112,7 +113,7 @@ func parsePatch(input string) (*patch, error) {
 				if !strings.HasPrefix(b, "+") {
 					return nil, fmt.Errorf("%w: %q", errApplyPatchAddBody, b)
 				}
-				op.hunks = append(op.hunks, hunk{lines: []hunkLine{{kind: lineAdd, text: b[1:]}}})
+				op.hunks = append(op.hunks, hunk{lines: []hunkLine{{Kind: lineAdd, Text: b[1:]}}})
 				i++
 			}
 			if len(op.hunks) == 0 {
@@ -169,11 +170,11 @@ func parsePatch(input string) (*patch, error) {
 					}
 					switch b[0] {
 					case ' ':
-						h.lines = append(h.lines, hunkLine{kind: lineContext, text: b[1:]})
+						h.lines = append(h.lines, hunkLine{Kind: lineContext, Text: b[1:]})
 					case '-':
-						h.lines = append(h.lines, hunkLine{kind: lineRemove, text: b[1:]})
+						h.lines = append(h.lines, hunkLine{Kind: lineRemove, Text: b[1:]})
 					case '+':
-						h.lines = append(h.lines, hunkLine{kind: lineAdd, text: b[1:]})
+						h.lines = append(h.lines, hunkLine{Kind: lineAdd, Text: b[1:]})
 					default:
 						return nil, fmt.Errorf("%w: %q", errApplyPatchHunkLine, b)
 					}

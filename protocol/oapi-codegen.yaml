@@ -1,0 +1,7 @@
+package: protocol
+generate:
+  models: true
+  std-http-server: true
+  client: true
+compatibility:
+  preserve-original-operation-id-casing-in-embedded-spec: true

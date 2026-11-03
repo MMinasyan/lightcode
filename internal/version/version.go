@@ -25,31 +25,30 @@ func IsRelease(v string) bool {
 	return ok
 }
 
-func parseTag(v string) (major, minor, patch int, ok bool) {
+// parseTag validates the tag grammar and returns the three decimal
+// components as written. Components stay digit strings, so valid sizes
+// beyond the machine integer range remain orderable without a cap.
+func parseTag(v string) (major, minor, patch string, ok bool) {
 	if !strings.HasPrefix(v, "v") {
-		return 0, 0, 0, false
+		return "", "", "", false
 	}
 	parts := strings.Split(v[1:], ".")
 	if len(parts) != 3 {
-		return 0, 0, 0, false
+		return "", "", "", false
 	}
-	var nums [3]int
-	for i, p := range parts {
+	for _, p := range parts {
 		// Empty components and leading zeros ("v0.0.03") are not tag shapes.
 		if p == "" || (len(p) > 1 && p[0] == '0') {
-			return 0, 0, 0, false
+			return "", "", "", false
 		}
-		n := 0
 		for j := 0; j < len(p); j++ {
 			c := p[j]
 			if c < '0' || c > '9' {
-				return 0, 0, 0, false
+				return "", "", "", false
 			}
-			n = n*10 + int(c-'0')
 		}
-		nums[i] = n
 	}
-	return nums[0], nums[1], nums[2], true
+	return parts[0], parts[1], parts[2], true
 }
 
 // Compare orders two exact vMAJOR.MINOR.PATCH tags: -1 if a < b, 0 if
@@ -58,25 +57,27 @@ func parseTag(v string) (major, minor, patch int, ok bool) {
 func Compare(a, b string) int {
 	am, an, ap, _ := parseTag(a)
 	bm, bn, bp, _ := parseTag(b)
-	switch {
-	case am != bm:
-		return sign(am - bm)
-	case an != bn:
-		return sign(an - bn)
-	default:
-		return sign(ap - bp)
+	if c := compareComponent(am, bm); c != 0 {
+		return c
 	}
+	if c := compareComponent(an, bn); c != 0 {
+		return c
+	}
+	return compareComponent(ap, bp)
 }
 
-func sign(n int) int {
-	switch {
-	case n < 0:
-		return -1
-	case n > 0:
+// compareComponent orders two validated decimal components as nonnegative
+// integers. Validated components carry no leading zeros, so the longer
+// digit string is always the larger number and equal lengths order
+// digit-by-digit.
+func compareComponent(a, b string) int {
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
+		}
 		return 1
-	default:
-		return 0
 	}
+	return strings.Compare(a, b)
 }
 
 // String renders the identity: the tag for releases, "dev (abc1234)" or

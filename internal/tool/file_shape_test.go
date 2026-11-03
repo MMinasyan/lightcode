@@ -1,8 +1,6 @@
 package tool
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -13,8 +11,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/permission"
-	"github.com/MMinasyan/lightcode/internal/snapshot"
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"golang.org/x/sys/unix"
 )
 
@@ -30,7 +27,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, NewFileTracker()).Execute(context.Background(), map[string]any{"path": path})
+				_, err := execRead(t, filepath.Dir(path), "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": path})
 				return err
 			},
 		},
@@ -42,7 +39,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 			},
 			run: func(path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, NewFileTracker()).Execute(context.Background(), map[string]any{"path": path})
+					_, err := execRead(t, filepath.Dir(path), "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": path})
 					return err
 				})
 			},
@@ -53,7 +50,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularUnixSocket(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, NewFileTracker()).Execute(context.Background(), map[string]any{"path": path})
+				_, err := execRead(t, filepath.Dir(path), "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": path})
 				return err
 			},
 		},
@@ -63,7 +60,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewWriteFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+				_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"path": path, "content": "after"})
 				return err
 			},
 		},
@@ -74,7 +71,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 			},
 			run: func(path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewWriteFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+					_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"path": path, "content": "after"})
 					return err
 				})
 			},
@@ -85,7 +82,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularUnixSocket(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewWriteFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+				_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{"path": path, "content": "after"})
 				return err
 			},
 		},
@@ -95,7 +92,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewEditFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+				_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 					"path":       path,
 					"old_string": "before",
 					"new_string": "after",
@@ -111,7 +108,7 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 			},
 			run: func(path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewEditFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+					_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 						"path":       path,
 						"old_string": "before",
 						"new_string": "after",
@@ -126,51 +123,12 @@ func TestFileToolsRejectNonRegularExistingTargets(t *testing.T) {
 				return nonRegularUnixSocket(t), func() {}
 			},
 			run: func(path string) error {
-				_, err := NewEditFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+				_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 					"path":       path,
 					"old_string": "before",
 					"new_string": "after",
 				})
 				return err
-			},
-		},
-		{
-			name: "staged_directory",
-			target: func(t *testing.T) (string, func()) {
-				return nonRegularDirectoryTarget(t), func() {}
-			},
-			run: func(path string) error {
-				results := NewStagedExecutor(nil, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedNonRegularWrite(path, "call-1", "after"),
-				})
-				return singleNonRegularBatchError(results)
-			},
-		},
-		{
-			name: "staged_FIFO",
-			target: func(t *testing.T) (string, func()) {
-				path := nonRegularFIFO(t)
-				return path, startNonRegularFIFOFeed(t, path, "before")
-			},
-			run: func(path string) error {
-				return runNonRegularTargetWithTimeout(func() error {
-					results := NewStagedExecutor(nil, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-						stagedNonRegularWrite(path, "call-1", "after"),
-					})
-					return singleNonRegularBatchError(results)
-				})
-			},
-		},
-		{
-			name: "staged_socket",
-			target: func(t *testing.T) (string, func()) {
-				return nonRegularUnixSocket(t), func() {}
-			},
-			run: func(path string) error {
-				results := NewStagedExecutor(nil, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-					stagedNonRegularWrite(path, "call-1", "after"),
-				})
-				return singleNonRegularBatchError(results)
 			},
 		},
 	} {
@@ -187,15 +145,15 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		target func(t *testing.T) (path string, release func())
-		run    func(store *recordingNonRegularSnapshotStore, path string) error
+		run    func(store *recordingCodeGroupStore, path string) error
 	}{
 		{
 			name: "write_directory",
 			target: func(t *testing.T) (string, func()) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
-			run: func(store *recordingNonRegularSnapshotStore, path string) error {
-				_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+			run: func(store *recordingCodeGroupStore, path string) error {
+				_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{"path": path, "content": "after"})
 				return err
 			},
 		},
@@ -204,9 +162,9 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 			target: func(t *testing.T) (string, func()) {
 				return nonRegularFIFO(t), func() {}
 			},
-			run: func(store *recordingNonRegularSnapshotStore, path string) error {
+			run: func(store *recordingCodeGroupStore, path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+					_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{"path": path, "content": "after"})
 					return err
 				})
 			},
@@ -216,8 +174,8 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 			target: func(t *testing.T) (string, func()) {
 				return nonRegularDirectoryTarget(t), func() {}
 			},
-			run: func(store *recordingNonRegularSnapshotStore, path string) error {
-				_, err := NewEditFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+			run: func(store *recordingCodeGroupStore, path string) error {
+				_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{
 					"path":       path,
 					"old_string": "before",
 					"new_string": "after",
@@ -231,9 +189,9 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 				path := nonRegularFIFO(t)
 				return path, startNonRegularFIFOFeed(t, path, "before")
 			},
-			run: func(store *recordingNonRegularSnapshotStore, path string) error {
+			run: func(store *recordingCodeGroupStore, path string) error {
 				return runNonRegularTargetWithTimeout(func() error {
-					_, err := NewEditFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+					_, err := execEdit(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{
 						"path":       path,
 						"old_string": "before",
 						"new_string": "after",
@@ -247,132 +205,46 @@ func TestNonRegularFileToolsDoNotSnapshot(t *testing.T) {
 			target: func(t *testing.T) (string, func()) {
 				return nonRegularUnixSocket(t), func() {}
 			},
-			run: func(store *recordingNonRegularSnapshotStore, path string) error {
-				_, err := NewWriteFileWithSnapshot(store, nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{"path": path, "content": "after"})
+			run: func(store *recordingCodeGroupStore, path string) error {
+				_, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, store, map[string]any{"path": path, "content": "after"})
 				return err
-			},
-		},
-		{
-			name: "staged_FIFO",
-			target: func(t *testing.T) (string, func()) {
-				path := nonRegularFIFO(t)
-				return path, startNonRegularFIFOFeed(t, path, "before")
-			},
-			run: func(store *recordingNonRegularSnapshotStore, path string) error {
-				return runNonRegularTargetWithTimeout(func() error {
-					results := NewStagedExecutor(store, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(context.Background(), []StagedCall{
-						stagedNonRegularWrite(path, "call-1", "after"),
-					})
-					return singleNonRegularBatchError(results)
-				})
 			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store := &recordingNonRegularSnapshotStore{turn: 1}
+			store := newRecordingCodeGroupStore(t)
 			path, release := tc.target(t)
 			err := tc.run(store, path)
 			release()
 			assertNonRegularRefusal(t, path, err)
-			if len(store.calls) != 0 {
-				t.Fatalf("snapshot calls = %+v, want none", store.calls)
-			}
+			testassert.Require(t, len(store.calls) == 0, "snapshot calls = %+v, want none", store.calls)
 		})
 	}
 }
 
 func TestMissingWriteFileStillCreatesNewFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "new.txt")
-	result, err := NewWriteFile(nil, config.ToolsConfig{}).Execute(context.Background(), map[string]any{
+	result, err := execWrite(t, filepath.Dir(path), "", "", CapabilityOptions{}, newTempCodeGroupStore(t), map[string]any{
 		"path":    path,
 		"content": "created",
 	})
-	if err != nil {
-		t.Fatalf("WriteFile missing target error = %v", err)
-	}
-	if !strings.Contains(result, "Wrote") {
-		t.Fatalf("result = %q, want write success", result)
-	}
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(result, "Wrote"), "result = %q, want write success", result)
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "created" {
-		t.Fatalf("content = %q, want created", data)
-	}
-}
-
-type nonRegularSnapshotCall struct {
-	turn      int
-	original  string
-	canonical string
-}
-
-type recordingNonRegularSnapshotStore struct {
-	turn  int
-	calls []nonRegularSnapshotCall
-}
-
-func (s *recordingNonRegularSnapshotStore) Snapshot(turn int, absPath string) error {
-	return s.SnapshotResolved(turn, absPath, absPath)
-}
-
-func (s *recordingNonRegularSnapshotStore) SnapshotResolved(turn int, originalPath, canonicalPath string) error {
-	s.calls = append(s.calls, nonRegularSnapshotCall{turn: turn, original: originalPath, canonical: canonicalPath})
-	return nil
-}
-
-func (s *recordingNonRegularSnapshotStore) CurrentTurn() int {
-	return s.turn
-}
-
-func allowNonRegularStagedCall(string, string) permission.Decision {
-	return permission.DecisionAllow
-}
-
-func stagedNonRegularWrite(path, id, content string) StagedCall {
-	return StagedCall{
-		ToolName:   "write_file",
-		ToolCallID: id,
-		Params: map[string]any{
-			"path":    path,
-			"content": content,
-		},
-	}
-}
-
-func singleNonRegularBatchError(results []BatchResult) error {
-	if len(results) != 1 {
-		return fmt.Errorf("batch returned %d results, want 1", len(results))
-	}
-	if results[0].Success {
-		return nil
-	}
-	return errors.New(results[0].Error)
+	testassert.NoError(t, err)
+	testassert.Require(t, string(data) == "created", "content = %q, want created", data)
 }
 
 func assertNonRegularRefusal(t *testing.T, path string, err error) {
 	t.Helper()
-	if err == nil {
-		t.Fatal("operation succeeded, want non-regular target refusal")
-	}
+	testassert.Require(t, err != nil, "operation succeeded, want non-regular target refusal")
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "has not been read yet") {
-		t.Fatalf("error = %v, want target-shape refusal before read-required checks", err)
-	}
-	if strings.Contains(msg, "did not fail closed before blocking") {
-		t.Fatalf("error = %v, want target-shape refusal before blocking on target I/O", err)
-	}
-	if !strings.Contains(msg, "non-regular") {
-		t.Fatalf("error = %v, want explicit non-regular target-shape refusal", err)
-	}
+	testassert.Require(t, !strings.Contains(msg, "has not been read yet"), "error = %v, want target-shape refusal before read-required checks", err)
+	testassert.Require(t, !strings.Contains(msg, "did not fail closed before blocking"), "error = %v, want target-shape refusal before blocking on target I/O", err)
+	testassert.Require(t, strings.Contains(msg, "non-regular"), "error = %v, want explicit non-regular target-shape refusal", err)
 	info, statErr := os.Lstat(path)
-	if statErr != nil {
-		t.Fatalf("lstat %s = %v, want non-regular target still present", path, statErr)
-	}
-	if info.Mode().IsRegular() {
-		t.Fatalf("%s became a regular file after refused operation", path)
-	}
+	testassert.Require(t, statErr == nil, "lstat %s = %v, want non-regular target still present", path, statErr)
+	testassert.Require(t, !info.Mode().IsRegular(), "%s became a regular file after refused operation", path)
 }
 
 func runNonRegularTargetWithTimeout(fn func() error) error {
@@ -391,9 +263,7 @@ func runNonRegularTargetWithTimeout(fn func() error) error {
 func nonRegularDirectoryTarget(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "target-dir")
-	if err := os.Mkdir(path, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testassert.NoError(t, os.Mkdir(path, 0o755))
 	return path
 }
 
@@ -451,77 +321,47 @@ func nonRegularUnixSocket(t *testing.T) string {
 
 // A hardlink inside the project pointing to an outside-boundary inode
 // must be refused at every file-tool entry point: read_file, write_file,
-// edit_file, the staged executor (write + edit), and snapshot capture.
+// edit_file, and snapshot capture.
 func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
 	makeHardlink := func(t *testing.T) (hardlinked, outside string) {
 		t.Helper()
 		project := t.TempDir()
 		outsideDir := t.TempDir()
 		outside = filepath.Join(outsideDir, "outside.txt")
-		if err := os.WriteFile(outside, []byte("outside-content"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.WriteFile(outside, []byte("outside-content"), 0o644))
 		hardlinked = filepath.Join(project, "hardlinked.txt")
-		if err := os.Link(outside, hardlinked); err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, os.Link(outside, hardlinked))
 		info, err := os.Stat(hardlinked)
-		if err != nil {
-			t.Fatal(err)
-		}
+		testassert.NoError(t, err)
 		st, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || st.Nlink < 2 {
-			t.Fatalf("setup: hardlinked target nlink = %d, want >= 2", st.Nlink)
-		}
+		testassert.Require(t, ok && st.Nlink >= 2, "setup: hardlinked target nlink = %d, want >= 2", st.Nlink)
 		return hardlinked, outside
 	}
 
 	assertHardlinkRefusal := func(t *testing.T, err error) {
 		t.Helper()
-		if err == nil {
-			t.Fatal("operation succeeded on hardlinked target; want refusal")
-		}
+		testassert.Require(t, err != nil, "operation succeeded on hardlinked target; want refusal")
 		msg := strings.ToLower(err.Error())
-		if !strings.Contains(msg, "hardlink") && !strings.Contains(msg, "link count") && !strings.Contains(msg, "nlink") {
-			t.Fatalf("error %v does not mention hardlink/link count/nlink", err)
-		}
-	}
-
-	preTrack := func(t *testing.T, tracker *FileTracker, path string) {
-		t.Helper()
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		tracker.TrackIdentity(path, 0, 500, FileIdentityFromFileInfoAndData(info, data))
+		testassert.Require(t, strings.Contains(msg, "hardlink") || strings.Contains(msg, "link count") || strings.Contains(msg, "nlink"), "error %v does not mention hardlink/link count/nlink", err)
 	}
 
 	t.Run("read_file", func(t *testing.T) {
 		hardlinked, _ := makeHardlink(t)
-		_, err := NewReadFile(config.ToolsConfig{ReadMaxLines: 500}, NewFileTracker()).Execute(
-			context.Background(), map[string]any{"path": hardlinked})
+		_, err := execRead(t, filepath.Dir(hardlinked), "", config.ToolsConfig{ReadMaxLines: 500}, map[string]any{"path": hardlinked})
 		assertHardlinkRefusal(t, err)
 	})
 
 	t.Run("write_file", func(t *testing.T) {
 		hardlinked, _ := makeHardlink(t)
-		tracker := NewFileTracker()
-		preTrack(t, tracker, hardlinked)
-		_, err := NewWriteFile(tracker, config.ToolsConfig{}).Execute(
-			context.Background(), map[string]any{"path": hardlinked, "content": "mutated"})
+		_, err := execWrite(t, filepath.Dir(hardlinked), "", "", CapabilityOptions{}, newTempCodeGroupStore(t),
+			map[string]any{"path": hardlinked, "content": "mutated"})
 		assertHardlinkRefusal(t, err)
 	})
 
 	t.Run("edit_file", func(t *testing.T) {
 		hardlinked, _ := makeHardlink(t)
-		tracker := NewFileTracker()
-		preTrack(t, tracker, hardlinked)
-		_, err := NewEditFile(tracker, config.ToolsConfig{}).Execute(
-			context.Background(), map[string]any{
+		_, err := execEdit(t, filepath.Dir(hardlinked), "", "", CapabilityOptions{}, newTempCodeGroupStore(t),
+			map[string]any{
 				"path":       hardlinked,
 				"old_string": "outside-content",
 				"new_string": "tampered",
@@ -529,47 +369,11 @@ func TestPR11Closure_HardlinkRefusedAcrossAllOperations(t *testing.T) {
 		assertHardlinkRefusal(t, err)
 	})
 
-	t.Run("staged_write", func(t *testing.T) {
-		hardlinked, _ := makeHardlink(t)
-		results := NewStagedExecutor(nil, nil, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(
-			context.Background(), []StagedCall{stagedNonRegularWrite(hardlinked, "call-1", "mutated")})
-		assertHardlinkRefusal(t, singleNonRegularBatchError(results))
-	})
-
-	t.Run("staged_edit", func(t *testing.T) {
-		hardlinked, _ := makeHardlink(t)
-		tracker := NewFileTracker()
-		preTrack(t, tracker, hardlinked)
-		call := StagedCall{
-			ToolName:   "edit_file",
-			ToolCallID: "call-1",
-			Params: map[string]any{
-				"path":       hardlinked,
-				"old_string": "outside-content",
-				"new_string": "tampered",
-			},
-		}
-		results := NewStagedExecutor(nil, tracker, config.ToolsConfig{}, allowNonRegularStagedCall, nil).ExecutePending(
-			context.Background(), []StagedCall{call})
-		assertHardlinkRefusal(t, singleNonRegularBatchError(results))
-	})
-
 	t.Run("snapshot_capture", func(t *testing.T) {
 		hardlinked, _ := makeHardlink(t)
-		store, err := snapshot.NewForSessionsRoot(t.TempDir(), "", "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := store.BeginNewSession(t.TempDir()); err != nil {
-			t.Fatal(err)
-		}
-		if turn := store.BeginTurn(); turn != 1 {
-			t.Fatalf("BeginTurn = %d, want 1", turn)
-		}
-		tracker := NewFileTracker()
-		preTrack(t, tracker, hardlinked)
-		_, err = NewWriteFileWithSnapshot(store, tracker, config.ToolsConfig{}).Execute(
-			context.Background(), map[string]any{"path": hardlinked, "content": "mutated"})
+		store := newCodeGroupStore(t, filepath.Join(t.TempDir(), "group"))
+		_, err := execWrite(t, filepath.Dir(hardlinked), "", "", CapabilityOptions{}, store,
+			map[string]any{"path": hardlinked, "content": "mutated"})
 		assertHardlinkRefusal(t, err)
 	})
 }

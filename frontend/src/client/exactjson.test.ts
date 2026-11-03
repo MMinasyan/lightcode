@@ -1,0 +1,173 @@
+// The exact-JSON editor helpers: source-context parsing keeps every unedited
+// numeric lexeme (including signed int64 tokens beyond Number precision)
+// exactly as the document carried it, top-level baseline objects stay raw
+// objects, optional plugin documents stay their exact string values, and the
+// composed patches/fork bodies carry raw user tokens verbatim.
+import { describe, expect, it } from 'vitest';
+
+import {
+  composeForkBody,
+  composeMemberPatch,
+  composeObjectPatch,
+  composePluginsPatch,
+  composeSessionsPatch,
+  extractSettingsText,
+  parseExactJSON,
+  parseSettingsObject,
+  presentNumber,
+  replaceObjectMembers,
+} from './exactjson';
+
+const CONFIGURATION = '{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"1"},'
+  + '"settings":{"sessions":{"auto_archive":false,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1e400},'
+  + '"tools":{"max_output_bytes":9007199254740993,"command_timeout":1e400},"jobs":{},"compaction":{},'
+  + '"plugins":{"tasks":"{\\"max_concurrent\\":2}"}},"agents":[],"providers":[]}';
+
+describe('parseExactJSON', () => {
+  it('preserves exact numeric source tokens through the ordinary round trip', () => {
+    const text = '{"n":-9223372036854775808,"big":9007199254740993,"float":1e400,"plain":2}';
+    const parsed = parseExactJSON(text);
+    expect(JSON.stringify(parsed)).toBe(text);
+  });
+
+  it('exposes the raw token and renders booleans and strings ordinarily', () => {
+    const parsed = parseExactJSON('{"n":-9223372036854775808,"flag":true,"s":"x"}') as Record<string, unknown>;
+    expect(JSON.stringify(parsed.n)).toBe('-9223372036854775808');
+    expect(JSON.stringify(parsed.flag)).toBe('true');
+    expect(JSON.stringify(parsed.s)).toBe('"x"');
+  });
+
+  it('rejects malformed text through the native JSON boundary', () => {
+    expect(() => parseExactJSON('{not json')).toThrow();
+  });
+});
+
+describe('presentNumber', () => {
+  it('interprets one exact raw token and leaves every other value unchanged', () => {
+    const parsed = parseExactJSON('{"n":5,"huge":1e400,"big":9007199254740993}') as Record<string, unknown>;
+    expect(presentNumber(parsed.n)).toBe(5);
+    expect(presentNumber(parsed.huge)).toBe(Infinity);
+    expect(presentNumber(parsed.big)).toBe(9007199254740992);
+    expect(presentNumber(3)).toBe(3);
+    expect(presentNumber(undefined)).toBeUndefined();
+    expect(presentNumber('7')).toBe('7');
+    const ordinary = { rawJSON: '5' };
+    expect(presentNumber(ordinary)).toBe(ordinary);
+  });
+});
+
+// The local exact object replacement the settings editor edits through: every
+// numeric lexeme of an unedited member survives, ordinary prototype-named
+// members stay data, and a non-object root (raw-number wrapper included) or a
+// malformed patch rejects the whole edit without touching the source text.
+describe('replaceObjectMembers', () => {
+  it('replaces patch members, preserves absent members and keeps exact lexemes', () => {
+    const out = replaceObjectMembers(
+      '{"a":{"old":1},"keep":"x","n":9007199254740993,"f":1e400}',
+      '{"a":{"new":2},"added":[1,2]}',
+    );
+    expect(out).toBe('{"a":{"new":2},"keep":"x","n":9007199254740993,"f":1e400,"added":[1,2]}');
+  });
+
+  it('keeps a prototype-named member ordinary data', () => {
+    const out = replaceObjectMembers('{"__proto__":{"polluted":true},"a":1}', '{"a":2}');
+    expect(Object.hasOwn(JSON.parse(out), '__proto__')).toBe(true);
+    expect(JSON.parse(out).__proto__).toEqual({ polluted: true });
+    expect(JSON.parse(out).a).toBe(2);
+  });
+
+  it('does not mistake an ordinary rawJSON member for a raw-number wrapper', () => {
+    const out = replaceObjectMembers('{"rawJSON":"kept"}', '{"a":1}');
+    expect(JSON.parse(out)).toEqual({ rawJSON: 'kept', a: 1 });
+  });
+
+  it('rejects non-object roots and malformed members without touching the document', () => {
+    const document = '{"a":1}';
+    for (const [root, patch] of [['9007199254740993', '{}'], ['[1]', '{}'], ['null', '{}'], ['"s"', '{}']]) {
+      expect(() => replaceObjectMembers(root, patch)).toThrow();
+    }
+    for (const patch of ['5', '[1]', '{"a":', '{"a":1} x']) {
+      expect(() => replaceObjectMembers(document, patch)).toThrow();
+    }
+    expect(() => replaceObjectMembers('{not json', '{}')).toThrow();
+    expect(document).toBe('{"a":1}');
+  });
+});
+
+describe('settings extraction', () => {
+  it('keeps the exact settings subtree, numeric tokens and plugin document values', () => {
+    const settingsText = extractSettingsText(CONFIGURATION);
+    // The unedited interval and baseline-section tokens survive byte-for-byte.
+    expect(settingsText).toContain('-9223372036854775808');
+    expect(settingsText).toContain('1e400');
+    expect(settingsText).toContain('9007199254740993');
+    const parsed = parseSettingsObject(settingsText);
+    expect(parsed.sessions.auto_archive).toBe(false);
+    // The baseline tools object is carried raw, never as a document string.
+    expect(JSON.stringify(parsed.tools)).toBe('{"max_output_bytes":9007199254740993,"command_timeout":1e400}');
+    // The optional plugin document is carried as its exact string value.
+    expect(parsed.plugins.tasks).toBe('{"max_concurrent":2}');
+  });
+
+  it('rejects a document without a settings member', () => {
+    expect(() => extractSettingsText('{"agents":[]}')).toThrow();
+  });
+});
+
+describe('patch composition', () => {
+  it('carries a raw user token verbatim in a one-member patch', () => {
+    expect(composeMemberPatch('archive_after_days', '-9223372036854775808'))
+      .toBe('{"archive_after_days":-9223372036854775808}');
+    expect(composeObjectPatch([['a', '1e400'], ['b', 'true']])).toBe('{"a":1e400,"b":true}');
+  });
+
+  it('rebuilds the sessions member preserving auto_archive and the unedited token', () => {
+    const settings = parseSettingsObject(extractSettingsText(CONFIGURATION));
+    const patch = composeSessionsPatch(settings.sessions, 'delete_after_archive_days', '30');
+    expect(patch).toContain('"auto_archive":false');
+    expect(patch).toContain('"archive_after_days":-9223372036854775808');
+    expect(patch).toContain('"delete_after_archive_days":30');
+  });
+
+  it('replaces or removes one plugin document while keeping the others exact', () => {
+    const plugins = { tools: '{"a":1}', jobs: '{"b":2}' };
+    const replaced = composePluginsPatch(plugins, 'jobs', '{"b":3}');
+    expect(replaced).toBe('{"tools":"{\\"a\\":1}","jobs":"{\\"b\\":3}"}');
+    const removed = composePluginsPatch(plugins, 'jobs', null);
+    expect(removed).toBe('{"tools":"{\\"a\\":1}"}');
+  });
+
+  it('treats prototype-named plugin documents as ordinary members for add, update and remove', () => {
+    const plugins = JSON.parse('{"__proto__":"{\\"a\\":1}","constructor":"{\\"b\\":2}"}') as Record<string, string>;
+    expect(Object.hasOwn(plugins, '__proto__')).toBe(true);
+    // Update an existing prototype-named member; the sibling keeps its exact text.
+    const updated = composePluginsPatch(plugins, 'constructor', '{"b":3}');
+    expect(updated).toContain('"__proto__":"{\\"a\\":1}"');
+    expect(updated).toContain('"constructor":"{\\"b\\":3}"');
+    // Add a new prototype-named member without disturbing the others.
+    const added = composePluginsPatch(plugins, '__proto__', '{"c":1}');
+    expect(added).toContain('"__proto__":"{\\"c\\":1}"');
+    expect(added).toContain('"constructor":"{\\"b\\":2}"');
+    // Remove one as an ordinary own member.
+    const removed = composePluginsPatch(plugins, '__proto__', null);
+    expect(removed).not.toContain('__proto__');
+    expect(removed).toContain('"constructor":"{\\"b\\":2}"');
+    // The input map is never mutated.
+    expect(Object.hasOwn(plugins, '__proto__')).toBe(true);
+    expect(plugins['__proto__']).toBe('{"a":1}');
+  });
+});
+
+describe('fork body', () => {
+  it('composes the Fork body from the immutable IDs and the exact replacement text', () => {
+    const body = composeForkBody('item-1', 'abcdef', '[{"kind":"text","text":"x"}]');
+    expect(JSON.parse(body)).toEqual({
+      boundary_item_id: 'item-1',
+      operation_id: 'abcdef',
+      content: [{ kind: 'text', text: 'x' }],
+    });
+    // A malformed replacement stays byte-verbatim: the server decides.
+    expect(composeForkBody('i', 'o', '[not json')).toBe('{"boundary_item_id":"i","operation_id":"o","content":[not json}');
+  });
+
+});

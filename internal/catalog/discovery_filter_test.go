@@ -1,6 +1,9 @@
 package catalog
 
-import "testing"
+import (
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"testing"
+)
 
 func TestDiscoveredModelAllowedClassifier(t *testing.T) {
 	tests := []struct {
@@ -67,10 +70,7 @@ func TestDiscoveredModelAllowedClassifier(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := discoveredModelAllowed(DiscoveredModel{metadata: tt.meta})
-			if got != tt.allow {
-				t.Fatalf("discoveredModelAllowed = %v, want %v", got, tt.allow)
-			}
+			testassert.Equal(t, discoveredModelAllowed(DiscoveredModel{metadata: tt.meta}), tt.allow)
 		})
 	}
 }

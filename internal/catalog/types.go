@@ -1,17 +1,17 @@
 // Package catalog builds and validates Lightcode's provider/model catalog.
 package catalog
 
-import "github.com/MMinasyan/lightcode/internal/engine/coremodel"
+import "github.com/MMinasyan/lightcode/model"
 
 // ErrInvalidModelRef is returned when a provider-prefixed model reference is malformed.
-var ErrInvalidModelRef = coremodel.ErrInvalidModelRef
+var ErrInvalidModelRef = model.ErrInvalidModelRef
 
 // ModelRef is the canonical internal identity of a model.
-type ModelRef = coremodel.ModelRef
+type ModelRef = model.ModelRef
 
 // ParseModelRef parses a provider-prefixed model reference.
 func ParseModelRef(s string) (ModelRef, error) {
-	return coremodel.Parse(s)
+	return model.Parse(s)
 }
 
 // SystemRole is the request role used for the system prompt.
@@ -45,7 +45,6 @@ type Transport struct {
 	BaseURL   string            `json:"base_url"`
 	APIKeyEnv string            `json:"api_key_env"`
 	Headers   map[string]string `json:"headers,omitempty"`
-	Options   map[string]any    `json:"options,omitempty"`
 }
 
 // Cost is per-million-token USD pricing.
@@ -76,6 +75,10 @@ type Model struct {
 	ExtraBody        map[string]any    `json:"extra_body,omitempty"`
 	Cost             *Cost             `json:"cost,omitempty"`
 	ProtocolMetadata *ProtocolMetadata `json:"protocol_metadata,omitempty"`
+
+	// Source is the model's provenance label stamped by Build (user, bundled
+	// or discovered); never serialized with the catalog itself.
+	Source string `json:"-"`
 }
 
 // Provider is a resolved provider entry in the effective catalog.
@@ -85,7 +88,6 @@ type Provider struct {
 	Transport        Transport         `json:"transport"`
 	SystemRole       SystemRole        `json:"system_role"`
 	UsageInStream    bool              `json:"usage_in_stream"`
-	MaxTokensField   string            `json:"max_tokens_field"`
 	ExtraBody        map[string]any    `json:"extra_body,omitempty"`
 	Discovery        bool              `json:"discovery"`
 	Hidden           bool              `json:"hidden,omitempty"`

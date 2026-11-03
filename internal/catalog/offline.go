@@ -13,8 +13,8 @@ func BuildOffline(home string, userRaw map[string]any) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("read bundled catalog: %w", err)
 	}
-	cache, _, cacheWarnings := ReadDiscoveryCache(home)
-	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
+	records, cacheWarnings := ReadDiscoveryCache(home)
+	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Records: records})
 	result.Warnings = append(cacheWarnings, result.Warnings...)
 	return result, nil
 }
@@ -36,6 +36,19 @@ func ProviderConnected(prov *Provider, envIsSet func(string) bool) bool {
 		}
 	}
 	if !usable {
+		return false
+	}
+	if prov.Transport.APIKeyEnv != "" {
+		return envIsSet != nil && envIsSet(prov.Transport.APIKeyEnv)
+	}
+	return prov.Transport.BaseURL != ""
+}
+
+// DiscoveryTransportReady reports whether discovery may use a provider's
+// configured transport. It intentionally does not require any usable model;
+// an empty catalog is one of the states discovery is meant to repair.
+func DiscoveryTransportReady(prov *Provider, envIsSet func(string) bool) bool {
+	if prov == nil || !prov.Discovery {
 		return false
 	}
 	if prov.Transport.APIKeyEnv != "" {

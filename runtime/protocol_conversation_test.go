@@ -1,0 +1,1281 @@
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
+)
+
+// The client conversation projection: every row runs the private pure
+// projector over owned committed facts. The typed-fixture rows pin the exact
+// item shapes and value fidelity against stable validated facts; the live
+// rows drive real model/tool/storage effects through the composed Runtime and
+// project the facts the Harness actually validated.
+
+// convSessionID and convEntryID are the known-vector identities: a realistic
+// 32-hex Session and entry.
+const (
+	convSessionID = "0123456789abcdef0123456789abcdef"
+	convEntryID   = "fedcba9876543210fedcba9876543210"
+)
+
+// convTime is one fixed UTC commit instant for the typed fixtures.
+var convTime = time.Date(2026, 9, 29, 10, 20, 30, 0, time.UTC)
+
+func convArgs(raw string) string {
+	return base64.StdEncoding.Strict().EncodeToString([]byte(raw))
+}
+
+// convSnapshot and its aggregate fixture are retired: the conversation
+// projector consumes owned fact values, the narrow history view accessors
+// consume value metadata, and no test rebuilds a removed aggregate.
+
+func convInputFact(entryID, operationID string, parts ...model.ContentPart) harness.HistoryFact {
+	return harness.HistoryFact{
+		EntryID: entryID, OperationID: operationID, Sequence: 1, CommittedAt: convTime, Kind: harness.EntryInput,
+		Input: &harness.InputEntry{
+			SessionID: convSessionID, EntryID: entryID, OperationID: operationID,
+			Origin: harness.InputOriginUser, Content: parts,
+		},
+	}
+}
+
+func convAssistantFact(entryID, operationID string, entry harness.AssistantEntry) harness.HistoryFact {
+	return harness.HistoryFact{
+		EntryID: entryID, OperationID: operationID, Sequence: 2, CommittedAt: convTime, Kind: harness.EntryAssistant,
+		Assistant: &entry,
+	}
+}
+
+func convResultFact(entryID, assistantID, callID, status, content, metadata string) harness.HistoryFact {
+	result := harness.ToolResultEntry{
+		SessionID: convSessionID, EntryID: entryID,
+		AssistantEntry: harness.EntryRef{SessionID: convSessionID, EntryID: assistantID},
+		ToolCallID:     callID, Status: model.ToolResultStatus(status), Content: content,
+	}
+	if metadata != "" {
+		result.Metadata = json.RawMessage(metadata)
+	}
+	return harness.HistoryFact{
+		EntryID: entryID, Sequence: 3, CommittedAt: convTime, Kind: harness.EntryToolResult,
+		ToolResult: &result,
+	}
+}
+
+// TestConversationItemIDKnownVector pins the exact item identity derivation:
+// the unpadded base64url of the first 16 bytes of SHA-256 over the
+// Session/entry binding, stable per binding and distinct per binding.
+func TestConversationItemIDKnownVector(t *testing.T) {
+	const want = "4EngWdrqzp5Q-GPdY7_DFw"
+	testassert.Equal(t, projectItemID(convSessionID, convEntryID), want)
+	otherSession := projectItemID("ffffffffffffffffffffffffffffffff", convEntryID)
+	otherEntry := projectItemID(convSessionID, "ffffffffffffffffffffffffffffffff")
+	testassert.Require(t, otherSession != want && otherEntry != want && otherSession != otherEntry, "derived identities collide: %q %q %q", want, otherSession, otherEntry)
+}
+
+// TestConversationProjectionDeterministicItemKinds proves the exact item
+// shapes of every kind from one stable typed snapshot: literal user text
+// stays an input, a signal stays typed, an assistant is indivisible with its
+// attached and pending calls, and a terminal settlement carries its required
+// detail even when the success detail is empty.
+func TestConversationProjectionDeterministicItemKinds(t *testing.T) {
+	assistantID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02"
+	resultID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03"
+	facts := []harness.HistoryFact{
+		convInputFact("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01", "op-1",
+			model.ContentPart{Kind: model.PartText, Text: "Operation interrupted."},
+			model.ContentPart{Kind: model.PartImageURL, URL: "https://img.test/p.png"},
+			model.ContentPart{Kind: model.PartOpaque, OpaqueWireType: "thinking", Extra: model.Extra{"depth": json.RawMessage(`1e1000`)}},
+		),
+		convAssistantFact(assistantID, "op-1", harness.AssistantEntry{
+			SessionID: convSessionID, EntryID: assistantID, OperationID: "op-1",
+			Status: model.OutputCompleted, Source: model.ModelRef{Provider: "prov", Model: "m"},
+			Content: []model.ContentPart{{Kind: model.PartText, Text: "answer", Extra: model.Extra{"grade": json.RawMessage(`9007199254740993`)}}},
+			Refusal: "no",
+			Extra:   model.Extra{"model_extra": json.RawMessage(`{"k":1}`)},
+			ToolCalls: []harness.ToolCallRecord{
+				{ID: "call-1", Ordinal: 0, Name: "read", ArgumentsBase64: convArgs(`{"n":9007199254740993}`), Extra: model.Extra{"tool_extra": json.RawMessage(`{"tool_n":9007199254740993}`)}, NormalizedArguments: json.RawMessage(`{"x":1e1000}`), ResultEntryID: resultID},
+				{ID: "call-2", Ordinal: 1, Name: "grep", ArgumentsBase64: convArgs(`[]`), ResultEntryID: "cccccccccccccccccccccccccccccc04"},
+			},
+		}),
+		convResultFact(resultID, assistantID, "call-1", "success", "", `{"rows":1e1000,"zero":0}`),
+		{
+			EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05", OperationID: "op-1", Sequence: 4, CommittedAt: convTime, Kind: harness.EntrySignal,
+			Signal: &harness.SignalEntry{SessionID: convSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05", OperationID: "op-1", Signal: harness.SignalInterruption, Content: "Operation interrupted."},
+		},
+		{
+			EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06", Sequence: 5, CommittedAt: convTime, Kind: harness.EntrySignal,
+			Signal: &harness.SignalEntry{
+				SessionID: convSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06", Signal: harness.SignalBackgroundCompletion,
+				RelatedMember: &harness.RelatedMember{Kind: "child", ID: "dddddddddddddddddddddddddddddd07"},
+				Content:       "the child finished",
+			},
+		},
+		{
+			EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa08", OperationID: "op-2", Sequence: 6, CommittedAt: convTime, Kind: harness.EntryCompaction,
+			Checkpoint: &harness.ContextCheckpointEntry{
+				SessionID: convSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa08", OperationID: "op-2",
+				StrategyID: "melta.summary/v1",
+				Messages: []model.Message{
+					{Role: model.RoleAssistant, Source: model.ModelRef{Provider: "prov", Model: "m2"}, Content: []model.ContentPart{{Kind: model.PartText, Text: "summary two"}}, Refusal: "declined"},
+				},
+				BoundaryEntryID:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06",
+				ConfigurationRevision: "rev-1",
+				Facts: []harness.MaintenanceFact{{
+					RequestID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa11",
+					Model:     model.ModelRef{Provider: "prov", Model: "m2"},
+					Input:     []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "transcript"}}}},
+				}},
+				Evidence: &harness.RequestEvidence{BoundaryEntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06"},
+			},
+		},
+		{
+			EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa09", OperationID: "op-2", Sequence: 7, CommittedAt: convTime, Kind: harness.EntryOperationSettlement,
+			Settlement: &harness.OperationSettlementEntry{
+				SessionID: convSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa09", OperationID: "op-2",
+				Status: harness.OperationFailure, Detail: "boom",
+			},
+		},
+		{
+			EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10", OperationID: "op-3", Sequence: 8, CommittedAt: convTime, Kind: harness.EntryOperationSettlement,
+			Settlement: &harness.OperationSettlementEntry{
+				SessionID: convSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10", OperationID: "op-3",
+				Status: harness.OperationSuccess,
+			},
+		},
+	}
+	items, err := projectConversation(convSessionID, facts)
+	testassert.NoError(t, err)
+	// the tool result stays absorbed
+	testassert.Equal(t, len(items), 7)
+
+	// The input item keeps its literal text and per-part extras.
+	input, err := items[0].AsInputItem()
+	testassert.NoError(t, err)
+	testassert.Require(t, input.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01") && input.Origin == protocol.InputOriginUser && input.CommittedAt.Equal(convTime) && input.OperationId != nil && *input.OperationId == "op-1" && len(input.Content) == 3, "input item = %+v, want the op-1 user input at the pinned identity; got %v, want %v", input, len(input.Content), 3)
+	textPart, err := input.Content[0].AsTextPart()
+	testassert.Require(t, err == nil && textPart.Text == "Operation interrupted.", "first part = %+v err %v, want the literal user text", textPart, err)
+	imagePart, err := input.Content[1].AsImageURLPart()
+	testassert.Require(t, err == nil && imagePart.Url == "https://img.test/p.png", "second part = %+v err %v, want the image part", imagePart, err)
+	opaquePart, err := input.Content[2].AsOpaquePart()
+	testassert.Require(t, err == nil && opaquePart.OpaqueWireType == "thinking" && opaquePart.Extra != nil && string((*opaquePart.Extra)["depth"]) == `1e1000`, "third part = %+v err %v, want the opaque part with its raw extra", opaquePart, err)
+
+	// The assistant item is indivisible: both calls in published order, the
+	// first carrying its terminal outcome, the second pending.
+	assistant, err := items[1].AsAssistantItem()
+	testassert.NoError(t, err)
+	testassert.Require(t, assistant.Status == protocol.AssistantItemStatusCompleted && assistant.Source == "prov/m" && assistant.ItemId == projectItemID(convSessionID, assistantID) && assistant.CommittedAt.Equal(convTime) && assistant.Extra != nil && string((*assistant.Extra)["model_extra"]) == `{"k":1}` && assistant.Refusal != nil && *assistant.Refusal == "no", "assistant item = %+v, want the completed prov/m item at the pinned identity and commit time; assistant extra = %v, want the validated message-level extra; assistant refusal = %v, want the projected refusal", assistant, assistant.Extra, assistant.Refusal)
+	textPart, err = assistant.Content[0].AsTextPart()
+	testassert.Require(t, err == nil && textPart.Extra != nil && string((*textPart.Extra)["grade"]) == `9007199254740993`, "assistant part extra = %+v err %v, want the raw number preserved", textPart, err)
+	testassert.Require(t, len(assistant.ToolCalls) == 2 && assistant.ToolCalls[0].Id == "call-1" && assistant.ToolCalls[1].Id == "call-2", "tool calls = %+v, want call-1 then call-2 in published order", assistant.ToolCalls)
+	call1 := assistant.ToolCalls[0]
+	testassert.Equal(t, call1.Arguments, `{"n":9007199254740993}`)
+	// The call-level extra is its own level, independent of the message and
+	// content-part extras, with the same raw-number fidelity.
+	testassert.Require(t, call1.Extra != nil && string((*call1.Extra)["tool_extra"]) == `{"tool_n":9007199254740993}` && call1.NormalizedArguments != nil && string((*call1.NormalizedArguments)["x"]) == `1e1000` && call1.Status != nil && *call1.Status == protocol.ToolCallStatusSuccess && call1.Content != nil && *call1.Content == "" && call1.Metadata != nil && string(*call1.Metadata) == `{"rows":1e1000,"zero":0}`, "call-1 extra = %v, want the call-level extra with its raw number; call-1 normalized arguments = %v, want the raw object; call-1 terminal outcome = (%v, %v), want success with a present empty content; call-1 metadata = %v, want the raw value preserved", call1.Extra, call1.NormalizedArguments, call1.Status, call1.Content, call1.Metadata)
+	call2 := assistant.ToolCalls[1]
+	testassert.Require(t, call2.Status == nil && call2.Content == nil && call2.Metadata == nil && call2.NormalizedArguments == nil && call2.Arguments == `[]`, "pending call-2 = %+v, want every terminal member omitted; got %v, want %v", call2, call2.Arguments, `[]`)
+
+	// The signals carry their typed subtypes; the background completion names
+	// its related member and no operation. Every kind's item identity is the
+	// fixture entry bound to this fixture Session's namespace.
+	interruption, err := items[2].AsSignalItem()
+	testassert.Require(t, err == nil && interruption.Subtype == protocol.SignalItemSubtypeInterruption && interruption.Content == "Operation interrupted." && interruption.OperationId != nil, "interruption item = %+v err %v, want the typed interruption signal", interruption, err)
+	testassert.Require(t, interruption.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05"), "interruption item_id = %q, want the fixture entry's namespace identity", interruption.ItemId)
+	completion, err := items[3].AsSignalItem()
+	testassert.Require(t, err == nil && completion.Subtype == protocol.SignalItemSubtypeBackgroundCompletion && completion.Content == "the child finished" && completion.OperationId == nil && completion.RelatedMember != nil && completion.RelatedMember.Kind == protocol.BackgroundMemberKindChild && completion.RelatedMember.Id == "dddddddddddddddddddddddddddddd07", "background completion item = %+v err %v, want the operationless typed signal with its member", completion, err)
+	testassert.Require(t, completion.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06"), "completion item_id = %q, want the fixture entry's namespace identity", completion.ItemId)
+
+	// The compaction and terminal outcomes, each at its own entry's identity.
+	compaction, err := items[4].AsCheckpointItem()
+	testassert.Require(t, err == nil && len(compaction.Messages) == 1 && compaction.Messages[0].Role == protocol.MessageRoleAssistant && compaction.Messages[0].Content != nil && compaction.Messages[0].Refusal != nil && *compaction.Messages[0].Refusal == "declined" && compaction.Strategy == "melta.summary/v1" && compaction.Model != nil && *compaction.Model == "prov/m2" && compaction.OperationId != nil && *compaction.OperationId == "op-2", "compaction item = %+v err %v, want the op-2 compaction carrying its refusal", compaction, err)
+	testassert.Require(t, compaction.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa08"), "compaction item_id = %q, want the fixture entry's namespace identity", compaction.ItemId)
+	failureEnd, err := items[5].AsOperationEndItem()
+	testassert.Require(t, err == nil && failureEnd.Status == protocol.OperationEndItemStatusFailure && failureEnd.Detail == "boom", "failure end item = %+v err %v, want the failure detail", failureEnd, err)
+	testassert.Require(t, failureEnd.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa09"), "failure end item_id = %q, want the fixture entry's namespace identity", failureEnd.ItemId)
+	successEnd, err := items[6].AsOperationEndItem()
+	testassert.Require(t, err == nil && successEnd.Status == protocol.OperationEndItemStatusSuccess && successEnd.Detail == "", "success end item = %+v err %v, want the required present empty detail", successEnd, err)
+	testassert.Require(t, successEnd.ItemId == projectItemID(convSessionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10"), "success end item_id = %q, want the fixture entry's namespace identity", successEnd.ItemId)
+
+	// Every item's wire shape is exactly its kind's schema surface, the raw
+	// entry identities never leave the facts, and the required arrays stay
+	// present.
+	for i, item := range items {
+		data, err := json.Marshal(item)
+		testassert.Require(t, err == nil, "marshal item %d: %v", i, err)
+		for _, raw := range []string{assistantID, resultID, "cccccccccccccccccccccccccccccc04"} {
+			testassert.Require(t, !strings.Contains(string(data), raw), "item %d wire = %s, want no raw entry identity %q", i, data, raw)
+		}
+		testassert.Require(t, !strings.Contains(string(data), "arguments_base64") && !strings.Contains(string(data), "result_entry_id"), "item %d wire = %s, want no internal payload keys", i, data)
+	}
+	assertExactJSONKeys(t, items[0], []string{
+		"committed_at", "content", "item_id", "kind", "operation_id", "origin",
+	})
+	assertExactJSONKeys(t, items[1], []string{
+		"committed_at", "content", "extra", "extra.model_extra", "item_id", "kind", "operation_id",
+		"refusal", "source", "status", "tool_calls",
+	})
+	empty, err := json.Marshal(items[0])
+	testassert.NoError(t, err)
+	testassert.Require(t, strings.Contains(string(empty), `"content":[`), "input item wire = %s, want a present content array", empty)
+
+	// Determinism: a second projection of the same snapshot is identical.
+	again, err := projectConversation(convSessionID, facts)
+	testassert.NoError(t, err)
+	first, err := json.Marshal(items)
+	testassert.NoError(t, err)
+	second, err := json.Marshal(again)
+	testassert.NoError(t, err)
+	testassert.Require(t, string(first) == string(second), "second projection = %s, want the deterministic %s", second, first)
+}
+
+// TestConversationProjectionSameCallIDAcrossOperations proves the tool-result
+// binding when two Operations of one Session publish the same call ID: call
+// identities are unique per Operation, while the reserved result entry
+// identities are Session-unique — each assistant item keeps its own result's
+// content and metadata, at its own independent item identity. The fixture's
+// distinct result identities discriminate a call-ID-only shortcut; the
+// result-identity lookup itself is owned by the validated facts' reservation
+// rule, whose uniqueness and binding the Harness graph validation proves.
+func TestConversationProjectionSameCallIDAcrossOperations(t *testing.T) {
+	assistantA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02"
+	resultA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03"
+	assistantB := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05"
+	resultB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb06"
+	toolCalls := []harness.ToolCallRecord{{ID: "call-1", Ordinal: 0, Name: "read", ArgumentsBase64: convArgs(`{}`)}}
+	facts := []harness.HistoryFact{
+		convAssistantFact(assistantA, "op-1", harness.AssistantEntry{
+			SessionID: convSessionID, EntryID: assistantA, OperationID: "op-1",
+			Status: model.OutputCompleted, Source: model.ModelRef{Provider: "prov", Model: "m"},
+			Content: []model.ContentPart{{Kind: model.PartText, Text: "first answer"}},
+			ToolCalls: []harness.ToolCallRecord{func() harness.ToolCallRecord {
+				call := toolCalls[0]
+				call.ResultEntryID = resultA
+				return call
+			}()},
+		}),
+		convResultFact(resultA, assistantA, "call-1", "success", "answer-a", `{"which":"a"}`),
+		convAssistantFact(assistantB, "op-2", harness.AssistantEntry{
+			SessionID: convSessionID, EntryID: assistantB, OperationID: "op-2",
+			Status: model.OutputCompleted, Source: model.ModelRef{Provider: "prov", Model: "m"},
+			Content: []model.ContentPart{{Kind: model.PartText, Text: "second answer"}},
+			ToolCalls: []harness.ToolCallRecord{func() harness.ToolCallRecord {
+				call := toolCalls[0]
+				call.ResultEntryID = resultB
+				return call
+			}()},
+		}),
+		convResultFact(resultB, assistantB, "call-1", "success", "answer-b", `{"which":"b"}`),
+	}
+	items, err := projectConversation(convSessionID, facts)
+	testassert.NoError(t, err)
+	// the results stay absorbed
+	testassert.Equal(t, len(items), 2)
+	first, err := items[0].AsAssistantItem()
+	testassert.NoError(t, err)
+	second, err := items[1].AsAssistantItem()
+	testassert.NoError(t, err)
+	// Independent item identities in the shared Session namespace.
+	testassert.Require(t, first.ItemId == projectItemID(convSessionID, assistantA) && second.ItemId == projectItemID(convSessionID, assistantB) && first.ItemId != second.ItemId, "item identities = (%q, %q), want each assistant's own namespace identity", first.ItemId, second.ItemId)
+	// Each projected call carries its own assistant's result, never the
+	// same-ID sibling's.
+	testassert.Require(t, first.ToolCalls[0].Content != nil && *first.ToolCalls[0].Content == "answer-a" && first.ToolCalls[0].Metadata != nil && string(*first.ToolCalls[0].Metadata) == `{"which":"a"}`, "first call = %+v, want its own answer-a result", first.ToolCalls[0])
+	testassert.Require(t, second.ToolCalls[0].Content != nil && *second.ToolCalls[0].Content == "answer-b" && second.ToolCalls[0].Metadata != nil && string(*second.ToolCalls[0].Metadata) == `{"which":"b"}`, "second call = %+v, want its own answer-b result", second.ToolCalls[0])
+}
+
+// TestConversationProjectionMetadataShapeFidelity pins the tool-owned
+// metadata representation: every non-null JSON kind is preserved verbatim
+// through the projection and the generated item's re-encode, while absent
+// metadata stays omitted.
+func TestConversationProjectionMetadataShapeFidelity(t *testing.T) {
+	for name, raw := range map[string]string{
+		"object":      `{"n":9007199254740993}`,
+		"array":       `[1, null, "x"]`,
+		"string":      `"line count"`,
+		"bool":        `true`,
+		"zero":        `0`,
+		"nested null": `{"rows": [null, {"depth": 1}]}`,
+		"large int":   `9007199254740993`,
+		"extreme exp": `1e1000`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assistantID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02"
+			resultID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03"
+			facts := []harness.HistoryFact{
+				convAssistantFact(assistantID, "op-1", harness.AssistantEntry{
+					SessionID: convSessionID, EntryID: assistantID, OperationID: "op-1",
+					Status: model.OutputCompleted, Source: model.ModelRef{Provider: "prov", Model: "m"},
+					Content:   []model.ContentPart{{Kind: model.PartText, Text: "answer"}},
+					ToolCalls: []harness.ToolCallRecord{{ID: "call-1", Ordinal: 0, Name: "read", ArgumentsBase64: convArgs(`{}`), ResultEntryID: resultID}},
+				}),
+				convResultFact(resultID, assistantID, "call-1", "success", "out", raw),
+			}
+			items, err := projectConversation(convSessionID, facts)
+			testassert.NoError(t, err)
+			// The generated union's own encoding compacts raw values, so the
+			// fidelity contract is the compacted byte form: every value stays
+			// byte-exact after compaction, never re-decoded to a Go float.
+			var compacted bytes.Buffer
+			{
+				err := json.Compact(&compacted, []byte(raw))
+				testassert.Require(t, err == nil, "compacting %s: %v", raw, err)
+			}
+			assistant, err := items[0].AsAssistantItem()
+			testassert.NoError(t, err)
+			if assistant.ToolCalls[0].Metadata == nil || string(*assistant.ToolCalls[0].Metadata) != compacted.String() {
+				t.Fatalf("projected metadata = %v, want %s preserved", assistant.ToolCalls[0].Metadata, compacted.String())
+			}
+			data, err := json.Marshal(items[0])
+			testassert.NoError(t, err)
+			if !strings.Contains(string(data), compacted.String()) {
+				t.Fatalf("item wire = %s, want %s preserved", data, compacted.String())
+			}
+		})
+	}
+
+	// Absent metadata stays omitted on every terminal status.
+	assistantID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02"
+	resultID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03"
+	facts := []harness.HistoryFact{
+		convAssistantFact(assistantID, "op-1", harness.AssistantEntry{
+			SessionID: convSessionID, EntryID: assistantID, OperationID: "op-1",
+			Status: model.OutputCompleted, Source: model.ModelRef{Provider: "prov", Model: "m"},
+			Content:   []model.ContentPart{{Kind: model.PartText, Text: "answer"}},
+			ToolCalls: []harness.ToolCallRecord{{ID: "call-1", Ordinal: 0, Name: "read", ArgumentsBase64: convArgs(`{}`), ResultEntryID: resultID}},
+		}),
+		convResultFact(resultID, assistantID, "call-1", "denied", "Permission denied.", ""),
+	}
+	items, err := projectConversation(convSessionID, facts)
+	testassert.NoError(t, err)
+	assistant, err := items[0].AsAssistantItem()
+	testassert.NoError(t, err)
+	testassert.Require(t, assistant.ToolCalls[0].Metadata == nil && assistant.ToolCalls[0].Status != nil && *assistant.ToolCalls[0].Status == protocol.ToolCallStatusDenied, "denied call = %+v, want the denied status and omitted metadata", assistant.ToolCalls[0])
+}
+
+// TestConversationProjectionRawArgumentText proves the decoded argument text
+// carries no JSON validity gate: malformed and non-UTF-8 argument bytes
+// project to the native JSON string encoding's replacement text, never to an
+// error or a base64 field.
+func TestConversationProjectionRawArgumentText(t *testing.T) {
+	assistantID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02"
+	facts := []harness.HistoryFact{
+		convAssistantFact(assistantID, "op-1", harness.AssistantEntry{
+			SessionID: convSessionID, EntryID: assistantID, OperationID: "op-1",
+			Status: model.OutputCompleted, Source: model.ModelRef{Provider: "prov", Model: "m"},
+			Content: []model.ContentPart{{Kind: model.PartText, Text: "answer"}},
+			ToolCalls: []harness.ToolCallRecord{
+				{ID: "call-1", Ordinal: 0, Name: "read", ArgumentsBase64: convArgs(`[1,2,`), ResultEntryID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb03"},
+				{ID: "call-2", Ordinal: 1, Name: "read", ArgumentsBase64: convArgs("\xff\xfe"), ResultEntryID: "cccccccccccccccccccccccccccccc04"},
+			},
+		}),
+	}
+	items, err := projectConversation(convSessionID, facts)
+	testassert.NoError(t, err)
+	assistant, err := items[0].AsAssistantItem()
+	testassert.NoError(t, err)
+	testassert.Equal(t, assistant.ToolCalls[0].Arguments, `[1,2,`)
+	testassert.Require(t, strings.ContainsRune(assistant.ToolCalls[1].Arguments, '\uFFFD'), "non-UTF-8 arguments = %q, want the replacement text", assistant.ToolCalls[1].Arguments)
+	data, err := json.Marshal(items[0])
+	testassert.NoError(t, err)
+	testassert.Require(t, !strings.Contains(string(data), "arguments_base64"), "item wire = %s, want no base64 arguments", data)
+}
+
+// TestConversationProjectionHookEvidenceExcluded proves, over real validated
+// Harness facts, that a committed argument-hook execution never reaches the
+// client conversation: the hook ran, its evidence entry is in storage, and
+// the projection carries only the conversation items.
+func TestConversationProjectionHookEvidenceExcluded(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newPrepEnv(t, store)
+		t.Cleanup(func() { e.converge() })
+		e.echo.mu.Lock()
+		e.echo.fail = true // this row's one deliberate error outcome, after the hook chain
+		e.echo.mu.Unlock()
+		e.server.setScript(func(_ context.Context, body string) []string {
+			if lastMessageRole(body) == "tool" {
+				return nil // the default completed text turn
+			}
+			return toolCallTurnEvents("call-1", "echo", ` {"x": 1} `)
+		})
+		session := e.session("hooky")
+		e.admit(session, "op-1", "one")
+		e.awaitTerminal(session, "op-1", harness.OperationSuccess)
+
+		runtimeSeen, _ := e.argHooks[0].received()
+		testassert.Require(t, len(runtimeSeen) == 1, "argument hook received = %v, want the one real call", runtimeSeen)
+		entries, err := store.ReadEntries(context.Background(), session, 0)
+		testassert.NoError(t, err)
+		var hookEntries int
+		for _, entry := range entries {
+			if entry.Kind == harness.EntryHookResult {
+				hookEntries++
+			}
+		}
+		// the hooky type's four argument hooks, one entry each
+		testassert.Equal(t, hookEntries, 4)
+
+		view, err := e.sessionView(context.Background(), session)
+		testassert.NoError(t, err)
+		hookFacts := historyFactsOf(view.History)
+		for _, fact := range hookFacts {
+			testassert.Require(t, fact.Kind != harness.EntryHookResult, "hook evidence became a client fact")
+		}
+		items, err := projectConversation(view.Header.Identity.SessionID, hookFacts)
+		testassert.NoError(t, err)
+		if len(items) != 4 { // input, publishing assistant, continuation assistant, end
+			t.Fatalf("items = %d (%s), want exactly the conversation items", len(items), itemKinds(t, items))
+		}
+		for _, item := range items {
+			data, err := json.Marshal(item)
+			testassert.NoError(t, err)
+			testassert.Require(t, !strings.Contains(string(data), "hook"), "item wire = %s, want no hook evidence", data)
+		}
+		// The publishing assistant keeps the call and its normalized arguments.
+		assistant, err := items[1].AsAssistantItem()
+		testassert.Require(t, err == nil && len(assistant.ToolCalls) == 1 && assistant.ToolCalls[0].Id == "call-1" && assistant.ToolCalls[0].Status != nil && *assistant.ToolCalls[0].Status == protocol.ToolCallStatusError, "publishing assistant = %+v err %v, want the settled call-1", assistant, err)
+	})
+}
+
+// TestConversationProjectionToolCallLifecycle proves, over real validated
+// facts, the whole call lifecycle: a settled call carries its terminal
+// outcome inside its indivisible assistant item, a later commit fills a
+// pending call under the same item ID, and one assistant's published calls
+// stay ordered and together.
+func TestConversationProjectionToolCallLifecycle(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer closeProjectionRuntime(bg.r) // failure-safe: runs after the release below
+		session := bg.session("lifecycle")
+		releaseTool := make(chan struct{})
+		releaseToolOnce := sync.OnceFunc(func() { close(releaseTool) })
+		defer releaseToolOnce()
+		toolStarted := make(chan struct{}, 1)
+		// The wire dispatch: each request's tool results name the turn the
+		// provider serves next.
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			switch {
+			case strings.Contains(body, `"call-4 ran"`):
+				return textTurnEvents("done")
+			case strings.Contains(body, `"second"`):
+				return []string{
+					`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-3","type":"function","function":{"name":"read","arguments":"{\"third\":1}"}},{"index":1,"id":"call-4","type":"function","function":{"name":"read","arguments":"{\"fourth\":2}"}}]},"finish_reason":null}]}`,
+					`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+				}
+			case strings.Contains(body, `"first"`):
+				return toolCallTurnEvents("call-2", "grep", `{"q":"late"}`)
+			default:
+				return toolCallTurnEvents("call-1", "read", `{}`)
+			}
+		})
+		// The declared tools' prepared outcomes: the first result carries its
+		// big-number metadata, the second parks until released, the rest
+		// settle immediately.
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			permissions := []harness.PermissionRequest{{Permission: "command.run", Target: "test"}}
+			switch call.ID {
+			case "call-1":
+				return harness.PreparedTool{
+					Permissions: permissions,
+					Immediate: &harness.ToolOutcome{
+						Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
+						Metadata: json.RawMessage(`{"n":9007199254740993}`),
+					},
+				}
+			case "call-2": // parks: its result lands after the pending read
+				return harness.PreparedTool{
+					Permissions: permissions,
+					Execute: func(context.Context) harness.ToolOutcome {
+						select {
+						case toolStarted <- struct{}{}:
+						default:
+						}
+						<-releaseTool
+						return harness.ToolOutcome{
+							Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "second"},
+							Metadata: json.RawMessage(`{"late":true}`),
+						}
+					},
+				}
+			default:
+				return harness.PreparedTool{
+					Permissions: permissions,
+					Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
+				}
+			}
+		})
+
+		submitThroughRuntime(t, bg.r, session, "op-1", "work")
+		bg.e.server.awaitRequests(2) // the parked second call's turn arrived
+		<-toolStarted
+		pending := projectSessionItems(t, bg.r, session)
+		// input, publishing assistant, pending assistant
+		testassert.Equal(t, len(pending), 3)
+		first, err := pending[1].AsAssistantItem()
+		testassert.Require(t, err == nil && len(first.ToolCalls) == 1 && first.ToolCalls[0].Status != nil && first.ToolCalls[0].Content != nil && *first.ToolCalls[0].Content == "first" && first.ToolCalls[0].Metadata != nil && string(*first.ToolCalls[0].Metadata) == `{"n":9007199254740993}`, "settled assistant = %+v err %v, want call-1 attached with its metadata", first, err)
+		second, err := pending[2].AsAssistantItem()
+		testassert.Require(t, err == nil && len(second.ToolCalls) == 1 && second.ToolCalls[0].Id == "call-2" && second.ToolCalls[0].Status == nil && second.ToolCalls[0].Content == nil && second.ToolCalls[0].Metadata == nil, "pending assistant = %+v err %v, want call-2 with every terminal member omitted", second, err)
+		pendingIDs := itemIDs(t, pending)
+
+		releaseToolOnce()
+		bg.e.server.awaitRequests(4)
+		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
+
+		attached := projectSessionItems(t, bg.r, session)
+		attachedIDs := itemIDs(t, attached)
+		// + the two-call assistant, the closing assistant
+		testassert.Equal(t, len(attached), 6)
+		for i, id := range pendingIDs {
+			if attachedIDs[i] != id {
+				t.Fatalf("item %d identity drifted from %q to %q", i, id, attachedIDs[i])
+			}
+		}
+		second, err = attached[2].AsAssistantItem()
+		testassert.Require(t, err == nil && second.ToolCalls[0].Status != nil && *second.ToolCalls[0].Status == protocol.ToolCallStatusSuccess && second.ToolCalls[0].Content != nil && *second.ToolCalls[0].Content == "second" && second.ToolCalls[0].Metadata != nil && string(*second.ToolCalls[0].Metadata) == `{"late":true}`, "late-attached call = %+v err %v, want the second outcome under the same item", second, err)
+		pair, err := attached[3].AsAssistantItem()
+		testassert.Require(t, err == nil && len(pair.ToolCalls) == 2 && pair.ToolCalls[0].Id == "call-3" && pair.ToolCalls[1].Id == "call-4" && pair.ToolCalls[0].Status != nil && pair.ToolCalls[1].Status != nil, "multi-call assistant = %+v err %v, want both calls attached in published order", pair, err)
+		testassert.NoError(t, bg.r.Close(context.Background()))
+	})
+}
+
+// projectSessionItems reads one Session through the Runtime and projects its
+// complete conversation.
+func projectSessionItems(t *testing.T, r *Runtime, sessionID string) []protocol.ConversationItem {
+	t.Helper()
+	snap := sessionViewThroughRuntime(t, r, sessionID)
+	items, err := projectConversation(sessionID, historyFactsOf(snap.History))
+	testassert.NoError(t, err)
+	return items
+}
+
+// submitConvergedThroughRuntime submits one regular message and waits for its
+// operation's terminal state. The tolerated disposition set is exactly the
+// buffered-disposition helper's closed rule — the retiring-run window routes
+// to the steering or queued buffer — but that helper lives in the external
+// runtime_test suite and cannot reach the private projector this file tests,
+// so the one-rule check repeats here; awaitOperation owns the convergence.
+func submitConvergedThroughRuntime(t *testing.T, r *Runtime, sessionID, operationID, text string, want harness.OperationState) {
+	t.Helper()
+	res, err := submitRawThroughRuntime(context.Background(), r, sessionID, operationID, text, harness.MessageModeRegular)
+	testassert.Require(t, err == nil, "Submit(%q): %v", operationID, err)
+	switch res.Disposition {
+	case harness.DispositionAdmitted, harness.DispositionSteering, harness.DispositionQueued:
+	default:
+		t.Fatalf("Submit(%q) = %+v, want an admitted or buffered disposition", operationID, res.Disposition)
+	}
+	awaitOperation(t, r, sessionID, operationID, want)
+}
+
+func itemIDs(t *testing.T, items []protocol.ConversationItem) []string {
+	t.Helper()
+	out := make([]string, len(items))
+	for i, item := range items {
+		out[i] = itemIdentity(t, item)
+	}
+	return out
+}
+
+// itemIdentity reads one item's kind and identity member.
+func itemIdentity(t *testing.T, item protocol.ConversationItem) string {
+	t.Helper()
+	return itemKind(t, item) + ":" + wireItemID(t, item)
+}
+
+// itemKind reports one projected item's discriminator kind.
+func itemKind(t *testing.T, item protocol.ConversationItem) string {
+	t.Helper()
+	kind, err := item.Discriminator()
+	testassert.NoError(t, err)
+	return kind
+}
+
+// TestConversationProjectionSyntheticToolResult proves a synthetic error
+// outcome projects as the call's terminal state with no invented metadata.
+func TestConversationProjectionSyntheticToolResult(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer closeProjectionRuntime(bg.r)
+		session := bg.session("synthetic")
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if lastMessageRole(body) == "tool" {
+				return nil // the default completed text turn
+			}
+			return toolCallTurnEvents("call-1", "read", `{}`)
+		})
+		// The declared read tool fails its prepared call immediately: the
+		// synthetic error outcome settles the published call.
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return harness.PreparedTool{
+				Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}},
+			}
+		})
+		submitThroughRuntime(t, bg.r, session, "op-1", "work")
+		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
+
+		items := projectSessionItems(t, bg.r, session)
+		// input, assistant with the synthetic result, closing assistant, end
+		testassert.Equal(t, len(items), 4)
+		assistant, err := items[1].AsAssistantItem()
+		testassert.Require(t, err == nil && len(assistant.ToolCalls) == 1 && assistant.ToolCalls[0].Status != nil && *assistant.ToolCalls[0].Status == protocol.ToolCallStatusError && assistant.ToolCalls[0].Content != nil && *assistant.ToolCalls[0].Content == "no concrete tools yet" && assistant.ToolCalls[0].Metadata == nil, "synthetic result call = %+v err %v, want the error outcome and no metadata", assistant.ToolCalls, err)
+		testassert.NoError(t, bg.r.Close(context.Background()))
+	})
+}
+
+// twoReadCallTurnEvents returns the two-call assistant turn shared by the
+// interrupted projection and the paging attachment rows: one assistant turn
+// publishing read calls call-1 and call-2 indivisibly.
+func twoReadCallTurnEvents() []string {
+	return []string{
+		`{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"call-2","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+	}
+}
+
+// parkedReadCallPrepare builds the prepared-tool callback shared by the
+// interrupted projection and the paging attachment rows: the started call-1
+// parks its execution until the release channel or the run's cancellation
+// releases it — the returned real outcome wins the cancellation race — while
+// every other call settles immediately.
+func parkedReadCallPrepare(releaseTool <-chan struct{}, toolStarted chan<- struct{}) func(context.Context, model.ToolCall) harness.PreparedTool {
+	return func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+		if call.ID != "call-1" {
+			return harness.PreparedTool{
+				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
+				Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
+			}
+		}
+		return harness.PreparedTool{
+			Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
+			Execute: func(execCtx context.Context) harness.ToolOutcome {
+				select {
+				case toolStarted <- struct{}{}:
+				default:
+				}
+				select {
+				case <-releaseTool: // never released on the main path
+				case <-execCtx.Done(): // the interrupt releases the started call
+				}
+				// A returned real outcome wins the cancellation race.
+				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
+			},
+		}
+	}
+}
+
+// TestConversationProjectionSyntheticInterruptedResult proves, over real
+// facts, the interrupted synthetic terminal result: an unstarted published
+// call's reserved identity receives the fixed interrupted outcome — present
+// content, no invented metadata — when the interruption settles every
+// remaining pending call, while the already-started call's real returned
+// outcome wins the cancellation race.
+func TestConversationProjectionSyntheticInterruptedResult(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer closeProjectionRuntime(bg.r)
+		session := bg.session("interrupted-synthetic")
+		releaseTool := make(chan struct{})
+		releaseToolOnce := sync.OnceFunc(func() { close(releaseTool) })
+		defer releaseToolOnce()
+		toolStarted := make(chan struct{}, 1)
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if lastMessageRole(body) == "tool" {
+				return textTurnEvents("never reached")
+			}
+			return twoReadCallTurnEvents()
+		})
+		// The started call parks its execution until the run's cancellation
+		// releases it and returns its real outcome; the unstarted call never
+		// begins.
+		bg.tools.setPrepare(parkedReadCallPrepare(releaseTool, toolStarted))
+		submitThroughRuntime(t, bg.r, session, "op-1", "work")
+		select {
+		case <-toolStarted:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the first call never started")
+		}
+		testassert.NoError(t, bg.r.interruptSession(context.Background(), session))
+		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
+
+		items := projectSessionItems(t, bg.r, session)
+		// input, the two-call assistant, the typed interruption signal, the end.
+		if len(items) != 4 {
+			t.Fatalf("items = %d (%s), want the complete interrupted conversation", len(items), itemKinds(t, items))
+		}
+		assistant, err := items[1].AsAssistantItem()
+		testassert.Require(t, err == nil && len(assistant.ToolCalls) == 2, "assistant = %+v err %v, want both published calls indivisible", assistant, err)
+		started := assistant.ToolCalls[0]
+		testassert.Require(t, started.Id == "call-1" && started.Status != nil && *started.Status == protocol.ToolCallStatusSuccess && started.Content != nil && *started.Content == "first ran" && started.Metadata == nil, "started call = %+v, want the real returned outcome", started)
+		unstarted := assistant.ToolCalls[1]
+		testassert.Require(t, unstarted.Id == "call-2" && unstarted.Status != nil && *unstarted.Status == protocol.ToolCallStatusInterrupted && unstarted.Content != nil && *unstarted.Content == "Tool call interrupted." && unstarted.Metadata == nil, "unstarted call = %+v, want the synthetic interrupted result and no metadata", unstarted)
+		signal, err := items[2].AsSignalItem()
+		testassert.Require(t, err == nil && signal.Subtype == protocol.SignalItemSubtypeInterruption, "signal = %+v err %v, want the typed interruption", signal, err)
+		end, err := items[3].AsOperationEndItem()
+		testassert.Require(t, err == nil && end.Status == protocol.OperationEndItemStatusInterruption && end.Detail != "", "end = %+v err %v, want the interruption detail", end, err)
+	})
+}
+
+// TestConversationProjectionErroredPartialAssistant proves the errored
+// partial axis: a stream that fails after yielding its partial answer keeps
+// that content visible, rides the typed model_failure_continuation signal,
+// and the operation's later failure still ends the conversation in committed
+// order — distinct from both the interruption and the no-assistant failure.
+func TestConversationProjectionErroredPartialAssistant(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer closeProjectionRuntime(bg.r)
+		session := bg.session("errored")
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if strings.Contains(body, "The previous model response failed after partial output.") {
+				// The continuation request fails nonretryably: the operation
+				// settles failure carrying the provider's diagnostic.
+				return []string{"HTTP 400", `{"error":{"message":"model down"}}`}
+			}
+			// The first turn: the partial answer streams, then the malformed
+			// event fails the response after its accepted fragment.
+			return []string{
+				`{"choices":[{"delta":{"role":"assistant","content":"partial answer"},"finish_reason":null}]}`,
+				`{"choices":[{"delta":`,
+			}
+		})
+		submitThroughRuntime(t, bg.r, session, "op-1", "work")
+		// Request 2's arrival is the rendezvous proving the errored partial
+		// assistant and its continuation signal committed.
+		bg.e.server.awaitRequests(2)
+		awaitOperation(t, bg.r, session, "op-1", harness.OperationFailure)
+
+		items := projectSessionItems(t, bg.r, session)
+		if len(items) != 4 ||
+			itemKind(t, items[0]) != "input" || itemKind(t, items[1]) != "assistant" ||
+			itemKind(t, items[2]) != "signal" || itemKind(t, items[3]) != "operation_end" {
+			t.Fatalf("items = %d (%s), want the committed order input, assistant, signal, end", len(items), itemKinds(t, items))
+		}
+		partial, err := items[1].AsAssistantItem()
+		testassert.Require(t, err == nil && partial.Status == protocol.AssistantItemStatusErrored, "partial assistant = %+v err %v, want the errored status", partial, err)
+		textPart, err := partial.Content[0].AsTextPart()
+		testassert.Require(t, err == nil && textPart.Text == "partial answer", "partial content = %+v, want the retained fragment", partial.Content)
+		continuation, err := items[2].AsSignalItem()
+		testassert.Require(t, err == nil && continuation.Subtype == protocol.SignalItemSubtypeModelFailureContinuation && continuation.Content == "The previous model response failed after partial output. Continue from the retained response.", "continuation signal = %+v err %v, want the typed signal with its required content", continuation, err)
+		end, err := items[3].AsOperationEndItem()
+		testassert.Require(t, err == nil && end.Status == protocol.OperationEndItemStatusFailure && strings.Contains(end.Detail, "model down"), "end = %+v err %v, want the failure detail", end, err)
+	})
+}
+
+// TestConversationProjectionInterruptedPartialAssistant proves a stream
+// interruption after partial output keeps the errored/interrupted assistant
+// visible beside its typed signal and terminal end.
+func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer closeProjectionRuntime(bg.r)
+		// One row-local streaming endpoint: it writes and flushes the single
+		// incomplete "partial answer" delta, then holds the response open until
+		// the run's cancellation ends the request context — the fragment is
+		// real wire output, and no completion event or terminator follows it.
+		stream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + `{"choices":[{"delta":{"role":"assistant","content":"partial answer"},"finish_reason":null}]}` + "\n\n"))
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		}))
+		t.Cleanup(stream.Close)
+		// The real provider serves this row through the owning configuration:
+		// the endpoint change publishes before any admission runs.
+		writeServiceFile(t, bg.e.configPath, backgroundLifecycleConfigDocument(stream.URL))
+		{
+			_, err := bg.r.Reload(context.Background())
+			testassert.NoError(t, err)
+		}
+		sub, err := bg.r.Subscribe(256)
+		testassert.NoError(t, err)
+		defer sub.Close()
+		session := bg.session("interrupted")
+		submitThroughRuntime(t, bg.r, session, "op-1", "work")
+		// The rendezvous is the published progress itself: the real text_delta
+		// carrying the flushed fragment for this session and operation, not a
+		// fixture-side signal.
+		sawFragment := false
+		deadline := time.After(10 * time.Second)
+		for !sawFragment {
+			select {
+			case event, ok := <-sub.Events():
+				testassert.Require(t, ok, "the subscription closed before the fragment's progress arrived")
+				if eventKind(t, event) != "text_delta" {
+					continue
+				}
+				delta, err := event.AsTextDeltaEvent()
+				testassert.NoError(t, err)
+				scope, err := delta.Scope.AsOperationScope()
+				testassert.NoError(t, err)
+				testassert.Require(t, scope.SessionId == session && scope.OperationId == "op-1", "progress scope = %+v, want this session's operation", delta.Scope)
+				testassert.Equal(t, delta.Content, "partial answer")
+				sawFragment = true
+			case <-deadline:
+				t.Fatal("the partial fragment never became published progress")
+			}
+		}
+		testassert.NoError(t, bg.r.interruptSession(context.Background(), session))
+		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
+
+		items := projectSessionItems(t, bg.r, session)
+		var sawAssistant, sawSignal, sawEnd bool
+		for _, item := range items {
+			switch itemKind(t, item) {
+			case "assistant":
+				assistant, err := item.AsAssistantItem()
+				testassert.NoError(t, err)
+				testassert.Equal(t, assistant.Status, protocol.AssistantItemStatusInterrupted)
+				textPart, err := assistant.Content[0].AsTextPart()
+				testassert.Require(t, err == nil && textPart.Text == "partial answer", "partial content = %+v, want the retained fragment", assistant.Content)
+				sawAssistant = true
+			case "signal":
+				signal, err := item.AsSignalItem()
+				testassert.NoError(t, err)
+				testassert.Require(t, signal.Subtype == protocol.SignalItemSubtypeInterruption && signal.Content == "Operation interrupted.", "signal item = %+v, want the typed interruption", signal)
+				sawSignal = true
+			case "operation_end":
+				end, err := item.AsOperationEndItem()
+				testassert.NoError(t, err)
+				testassert.Require(t, end.Status == protocol.OperationEndItemStatusInterruption && end.Detail != "", "end item = %+v, want the interruption detail", end)
+				sawEnd = true
+			}
+		}
+		testassert.Require(t, sawAssistant && sawSignal && sawEnd, "interrupted conversation = %d items (assistant %v signal %v end %v), want all three", len(items), sawAssistant, sawSignal, sawEnd)
+		testassert.NoError(t, bg.r.Close(context.Background()))
+	})
+}
+
+// TestConversationProjectionForkPrefixIsIndependent proves a copied fork
+// prefix projects with new identities, no Operation ownership, and no source
+// identity — while the source keeps its own items unchanged.
+func TestConversationProjectionForkPrefixIsIndependent(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer closeProjectionRuntime(bg.r)
+		root := bg.session("fork-root")
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if lastMessageRole(body) == "tool" {
+				return nil // the closing turn: the default completed text turn
+			}
+			if lastUserText(body) == "hello fork" {
+				return toolCallTurnEvents("call-1", "read", `{"n":9007199254740993}`)
+			}
+			return nil // later user turns close with the default turn
+		})
+		// The declared read tool settles its call with the big-number
+		// metadata the projection keeps.
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return harness.PreparedTool{
+				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
+				Immediate: &harness.ToolOutcome{
+					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
+					Metadata: json.RawMessage(`{"n":9007199254740993}`),
+				},
+			}
+		})
+		submitThroughRuntime(t, bg.r, root, "op-1", "hello fork")
+		awaitOperation(t, bg.r, root, "op-1", harness.OperationSuccess)
+		awaitIdleSession(t, bg.r, root)
+		submitConvergedThroughRuntime(t, bg.r, root, "op-2", "second turn", harness.OperationSuccess)
+		awaitIdleSession(t, bg.r, root)
+		// The fork boundary is the second user input: the prefix inherited by
+		// the destination is the first turn's input and its completed tool
+		// assistant.
+		boundary := inputEntryID(t, bg.r, root, "op-2")
+
+		forked := forkThroughRuntime(t, bg.r, root, boundary, "fork-op-1")
+		awaitOperation(t, bg.r, forked, "fork-op-1", harness.OperationSuccess)
+
+		sourceItems := projectSessionItems(t, bg.r, root)
+		forkItems := projectSessionItems(t, bg.r, forked)
+		// The fork's prefix repeats the source's first turn with new
+		// identities and no Operation ownership: the call-turn assistant, its
+		// closing text assistant, and the input. A standalone tool-result
+		// item would break the count.
+		if len(forkItems) != 6 { // the three copied items plus the fork's own turn
+			t.Fatalf("fork items = %d (%s), want the copied prefix plus the fork's own turn", len(forkItems), itemKinds(t, forkItems))
+		}
+		sourceIDs := make(map[string]bool)
+		for _, item := range sourceItems {
+			sourceIDs[itemIdentity(t, item)] = true
+			data, err := json.Marshal(item)
+			testassert.NoError(t, err)
+			testassert.Require(t, !strings.Contains(string(data), forked), "source item wire = %s, want no fork identity", data)
+		}
+		for i, item := range forkItems[:3] {
+			data, err := json.Marshal(item)
+			testassert.NoError(t, err)
+			testassert.Require(t, !strings.Contains(string(data), root), "fork prefix item wire = %s, want no source identity", data)
+			if sourceIDs[itemIdentity(t, item)] {
+				t.Fatalf("fork prefix item %d shares the source identity %q", i, itemIdentity(t, item))
+			}
+			testassert.Require(t, !strings.Contains(string(data), `"operation_id"`), "fork prefix item wire = %s, want no Operation ownership", data)
+		}
+
+		// The copied assistant's call is a real completed tool turn: the
+		// fork copied its reserved result under new identities, so the
+		// destination's item keeps the decoded arguments, normalized
+		// arguments, and terminal outcome inside the assistant — under a
+		// destination-namespace identity.
+		copiedAssistant, err := forkItems[1].AsAssistantItem()
+		testassert.NoError(t, err)
+		copiedAssistantEntry := ""
+		forkSnap := sessionViewThroughRuntime(t, bg.r, forked)
+		for _, fact := range historyFactsOf(forkSnap.History) {
+			// The first copied assistant (committed before its own closing
+			// text assistant and the fork's own turn) publishes call-1; all
+			// copied assistants carry the cleared source Operation.
+			if fact.Kind == harness.EntryAssistant && fact.OperationID == "" {
+				copiedAssistantEntry = fact.EntryID
+				break
+			}
+		}
+		testassert.Require(t, copiedAssistantEntry != "", "the fork copied no assistant entry")
+		testassert.Require(t, copiedAssistant.ItemId == projectItemID(forked, copiedAssistantEntry) && copiedAssistant.OperationId == nil, "copied assistant item_id = %q, want the destination namespace identity; copied assistant operation_id = %v, want the cleared source attribution", copiedAssistant.ItemId, copiedAssistant.OperationId)
+		call := copiedAssistant.ToolCalls[0]
+		testassert.Require(t, call.Id == "call-1" && call.Arguments == `{"n":9007199254740993}` && call.NormalizedArguments != nil && string((*call.NormalizedArguments)["n"]) == `9007199254740993` && call.Status != nil && *call.Status == protocol.ToolCallStatusSuccess && call.Content != nil && *call.Content == "first" && call.Metadata != nil && string(*call.Metadata) == `{"n":9007199254740993}`, "copied tool call = %+v, want the attached copied result with its fidelity", call)
+
+		// The fork's own admission keeps its Operation attribution.
+		forkInput, err := forkItems[3].AsInputItem()
+		testassert.Require(t, err == nil && forkInput.Origin == protocol.InputOriginUser && forkInput.OperationId != nil && *forkInput.OperationId == "fork-op-1", "fork input = %+v err %v, want the fork operation's own input", forkInput, err)
+		testassert.NoError(t, bg.r.Close(context.Background()))
+	})
+}
+
+// TestConversationProjectionChildAndBackgroundCompletion proves, over real
+// facts, the child's conversation parity and both completion surfaces: the
+// parent's runtime-origin completion input, and the durable
+// background_completion signal naming its member.
+func TestConversationProjectionChildAndBackgroundCompletion(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer closeProjectionRuntime(bg.r)
+		stopper.arm(bg.r.harness)
+		root := bg.session("completion-root")
+		bg.e.server.setScript(func(_ context.Context, body string) []string {
+			if lastUserText(body) == "child work" {
+				return textTurnEvents("child finished") // the child's final answer
+			}
+			return nil
+		})
+		child := launchChildThroughRuntime(t, bg.r, root, "child-op-1")
+		awaitOperation(t, bg.r, child, "child-op-1", harness.OperationSuccess)
+
+		completionID := bg.startJob(child, "cc000003")
+		stopper.addDelivery(child, completionID, "job report")
+		testassert.NoError(t, bg.r.stopSession(context.Background(), child))
+
+		// The child's conversation: its own turn plus the typed completion
+		// signal naming the job member.
+		childItems := projectSessionItems(t, bg.r, child)
+		var sawSignal bool
+		for _, item := range childItems {
+			if itemKind(t, item) != "signal" {
+				continue
+			}
+			signal, err := item.AsSignalItem()
+			testassert.NoError(t, err)
+			testassert.Require(t, signal.Subtype == protocol.SignalItemSubtypeBackgroundCompletion && signal.Content == "job report" && signal.RelatedMember != nil && signal.RelatedMember.Kind == protocol.BackgroundMemberKindJob && signal.RelatedMember.Id == "cc000003", "completion signal = %+v, want the job member's typed record", signal)
+			sawSignal = true
+		}
+		if !sawSignal {
+			t.Fatalf("child items = %s, want the background_completion signal item", itemKinds(t, childItems))
+		}
+
+		// The parent's conversation gains the child's completion as a
+		// runtime-origin input under the completion identity; the delivery
+		// converges after the child's run retirement.
+		var rootItems []protocol.ConversationItem
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			rootItems = projectSessionItems(t, bg.r, root)
+			if hasRuntimeOriginInput(t, rootItems, "child finished") {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("root items = %s, want the runtime-origin completion input", itemKinds(t, rootItems))
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		testassert.NoError(t, bg.r.Close(context.Background()))
+	})
+}
+
+// hasRuntimeOriginInput reports whether one projected item list contains a
+// runtime-origin input with the given text.
+func hasRuntimeOriginInput(t *testing.T, items []protocol.ConversationItem, want string) bool {
+	t.Helper()
+	for _, item := range items {
+		if itemKind(t, item) != "input" {
+			continue
+		}
+		input, err := item.AsInputItem()
+		testassert.NoError(t, err)
+		if input.Origin != protocol.InputOriginRuntime || len(input.Content) == 0 {
+			continue
+		}
+		textPart, err := input.Content[0].AsTextPart()
+		if err == nil && strings.Contains(textPart.Text, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// itemKinds renders one projection's kinds in order for failure messages.
+func itemKinds(t *testing.T, items []protocol.ConversationItem) string {
+	t.Helper()
+	kinds := make([]string, len(items))
+	for i, item := range items {
+		kinds[i] = itemKind(t, item)
+	}
+	return strings.Join(kinds, ",")
+}
+
+// TestConversationProjectionCompactionTwiceRetainsEarlierItems proves two
+// compactions contribute their own items while every earlier client item
+// stays pageable: no model-summary truncation of the client history.
+func TestConversationProjectionCompactionTwiceRetainsEarlierItems(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		f := openCodeRuntime(t, store)
+		defer closeProjectionRuntime(f.r)
+		s := f.session("twice")
+		f.submit(s, "op-1", "hello first")
+		awaitOperation(t, f.r, s, "op-1", harness.OperationSuccess)
+		awaitIdleSession(t, f.r, s)
+		f.compactIdle(s, "compact-1")
+		f.submit(s, "op-2", "hello second")
+		awaitOperation(t, f.r, s, "op-2", harness.OperationSuccess)
+		awaitIdleSession(t, f.r, s)
+		f.compactIdle(s, "compact-2")
+		awaitOperation(t, f.r, s, "compact-2", harness.OperationSuccess)
+
+		items := projectSessionItems(t, f.r, s)
+		var compactions int
+		var sawFirstInput, sawFirstAssistant, sawSecondInput, sawSecondAssistant bool
+		var sawEnds int
+		for _, item := range items {
+			switch itemKind(t, item) {
+			case "context_checkpoint":
+				compaction, err := item.AsCheckpointItem()
+				testassert.NoError(t, err)
+				compactions++
+				compactionText := ""
+				if len(compaction.Messages) > 0 && compaction.Messages[0].Content != nil {
+					parts := *compaction.Messages[0].Content
+					if len(parts) > 0 {
+						if text, terr := parts[0].AsTextPart(); terr == nil {
+							compactionText = text.Text
+						}
+					}
+				}
+				testassert.Require(t, compactionText != "" && compaction.Model != nil && *compaction.Model == "prov/m", "compaction item = %+v, want the summary and model", compaction)
+			case "input":
+				input, err := item.AsInputItem()
+				testassert.NoError(t, err)
+				textPart, err := input.Content[0].AsTextPart()
+				testassert.NoError(t, err)
+				switch textPart.Text {
+				case "hello first":
+					sawFirstInput = true
+				case "hello second":
+					sawSecondInput = true
+				}
+			case "assistant":
+				assistant, err := item.AsAssistantItem()
+				testassert.NoError(t, err)
+				textPart, err := assistant.Content[0].AsTextPart()
+				testassert.NoError(t, err)
+				if textPart.Text == "done" {
+					if !sawFirstAssistant && !sawSecondAssistant {
+						sawFirstAssistant = true
+					} else {
+						sawSecondAssistant = true
+					}
+				}
+			case "operation_end":
+				end, err := item.AsOperationEndItem()
+				testassert.NoError(t, err)
+				testassert.Require(t, end.Status == protocol.OperationEndItemStatusSuccess, "end item = %+v, want the settled success", end)
+				sawEnds++
+			}
+		}
+		testassert.Equal(t, compactions, 2)
+		testassert.Require(t, sawFirstInput && sawFirstAssistant && sawSecondInput && sawSecondAssistant && sawEnds == 4, "retained items = (input %v/%v assistant %v/%v ends %d), want every earlier item and all four ends", sawFirstInput, sawSecondInput, sawFirstAssistant, sawSecondAssistant, sawEnds)
+		testassert.NoError(t, f.r.Close(context.Background()))
+	})
+}
+
+// TestConversationProjectionTerminalFailureWithoutAssistant proves a
+// pre-acceptance model failure projects the terminal failure end with its
+// required detail and no fabricated assistant — while a literal user message
+// that repeats a signal's fixed text stays an input item.
+func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		stopper := newLifecycleStopper()
+		bg := openBackgroundRuntime(t, store, stopper)
+		defer closeProjectionRuntime(bg.r)
+		session := bg.session("failure")
+		bg.e.server.setScript(func(sctx context.Context, body string) []string {
+			switch lastUserText(body) {
+			case "again":
+				// The failing turn: the provider's nonretryable diagnostic.
+				return []string{"HTTP 400", `{"error":{"message":"model down"}}`}
+			case "hold":
+				// The no-output interruption: the request parks and releases
+				// with no content under the run's cancellation.
+				<-sctx.Done()
+				return nil
+			default:
+				return nil // the literal-text turn: the default completed turn
+			}
+		})
+
+		// The literal text that exactly matches a fixed signal's content.
+		submitThroughRuntime(t, bg.r, session, "op-1", "Operation interrupted.")
+		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
+		awaitIdleSession(t, bg.r, session)
+
+		items := projectSessionItems(t, bg.r, session)
+		if len(items) != 3 { // the literal input, its assistant, the success end
+			t.Fatalf("first turn items = %d (%s), want input, assistant, end", len(items), itemKinds(t, items))
+		}
+		literal, err := items[0].AsInputItem()
+		testassert.NoError(t, err)
+		textPart, err := literal.Content[0].AsTextPart()
+		testassert.Require(t, err == nil && textPart.Text == "Operation interrupted.", "first item = %+v, want the literal input", literal)
+
+		submitConvergedThroughRuntime(t, bg.r, session, "op-2", "again", harness.OperationFailure)
+
+		items = projectSessionItems(t, bg.r, session)
+		if len(items) != 5 { // + the failing input and its failure end
+			t.Fatalf("items = %d (%s), want the prefix plus input and failure end", len(items), itemKinds(t, items))
+		}
+		failureEnd, err := items[4].AsOperationEndItem()
+		testassert.NoError(t, err)
+		failingInput, err := items[3].AsInputItem()
+		testassert.NoError(t, err)
+		testassert.Require(t, failureEnd.Status == protocol.OperationEndItemStatusFailure && strings.Contains(failureEnd.Detail, "model down") && failingInput.OperationId != nil && *failingInput.OperationId == "op-2", "failure projection = (end %+v, input %+v), want the failed op-2 end with its detail", failureEnd, failingInput)
+
+		// The no-output interruption on a fresh Session: the model effect
+		// arrives and cooperatively parks without yielding any content, the
+		// existing Harness Interrupt settles the terminal interruption, and
+		// no assistant is fabricated — the input, the typed interruption
+		// signal, and the end are the whole conversation.
+		interrupted := bg.session("no-output-interruption")
+		submitThroughRuntime(t, bg.r, interrupted, "op-int", "hold")
+		drainCommandModelArrivals(bg.e)
+		select {
+		case <-bg.e.server.arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the model effect never arrived")
+		}
+		testassert.NoError(t, bg.r.interruptSession(context.Background(), interrupted))
+		awaitOperation(t, bg.r, interrupted, "op-int", harness.OperationInterruption)
+
+		items = projectSessionItems(t, bg.r, interrupted)
+		if len(items) != 3 ||
+			itemKind(t, items[0]) != "input" || itemKind(t, items[1]) != "signal" || itemKind(t, items[2]) != "operation_end" {
+			t.Fatalf("interruption items = %d (%s), want input, signal, end with no assistant", len(items), itemKinds(t, items))
+		}
+		// Every identity is the stable namespace derivation of its own
+		// committed fact entry.
+		wantEntries := make(map[harness.EntryKind]string, 3)
+		interruptedSnap := sessionViewThroughRuntime(t, bg.r, interrupted)
+		for _, fact := range historyFactsOf(interruptedSnap.History) {
+			switch fact.Kind {
+			case harness.EntryInput, harness.EntrySignal, harness.EntryOperationSettlement:
+				wantEntries[fact.Kind] = fact.EntryID
+			}
+		}
+		testassert.Require(t, len(wantEntries) == 3, "committed facts = %v, want exactly input, signal, settlement", wantEntries)
+		interruptionInput, err := items[0].AsInputItem()
+		testassert.Require(t, err == nil && interruptionInput.Origin == protocol.InputOriginUser && interruptionInput.OperationId != nil && *interruptionInput.OperationId == "op-int" && interruptionInput.ItemId == projectItemID(interrupted, wantEntries[harness.EntryInput]), "interruption input = %+v err %v, want the op-int input at its fact identity", interruptionInput, err)
+		interruptionSignal, err := items[1].AsSignalItem()
+		testassert.Require(t, err == nil && interruptionSignal.Subtype == protocol.SignalItemSubtypeInterruption && interruptionSignal.Content == "Operation interrupted." && interruptionSignal.ItemId == projectItemID(interrupted, wantEntries[harness.EntrySignal]), "interruption signal = %+v err %v, want the typed signal at its fact identity", interruptionSignal, err)
+		interruptedEnd, err := items[2].AsOperationEndItem()
+		testassert.Require(t, err == nil && interruptedEnd.Status == protocol.OperationEndItemStatusInterruption && interruptedEnd.Detail != "" && interruptedEnd.ItemId == projectItemID(interrupted, wantEntries[harness.EntryOperationSettlement]), "interruption end = %+v err %v, want the interruption detail at its fact identity", interruptedEnd, err)
+		// The identities are stable across an immediate second read.
+		if again := itemIDs(t, projectSessionItems(t, bg.r, interrupted)); !reflect.DeepEqual(again, itemIDs(t, items)) {
+			t.Fatalf("re-read identities = %v, want the stable %v", again, itemIDs(t, items))
+		}
+
+		testassert.NoError(t, bg.r.Close(context.Background()))
+	})
+}
+
+// TestConversationProjectionOverEmptySession proves an idle Session projects
+// the present empty item list with no error.
+func TestConversationProjectionOverEmptySession(t *testing.T) {
+	r, _ := openProjectionRuntime(t, storage.NewMemory())
+	defer closeProjectionRuntime(r)
+	session := projectionSession(t, r, "/tmp/conv-empty", "solo").Identity.SessionID
+	items := projectSessionItems(t, r, session)
+	testassert.Require(t, items != nil && len(items) == 0, "items = %v, want the present empty list", items)
+}
+
+// TestProjectCheckpointMessageWireFields proves the checkpoint message wire
+// fields: refusal, name, extras and the retained tool exchange members ride
+// the generated Message with byte-preserving arguments, and a checkpoint no
+// model produced omits the singular display model instead of fabricating
+// one.
+func TestProjectCheckpointMessageWireFields(t *testing.T) {
+	arguments := []byte{0x7b, 0xff, 0x00, 0x7d} // not valid JSON
+	facts := []harness.HistoryFact{
+		{
+			EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa21", Sequence: 1, CommittedAt: convTime, Kind: harness.EntryCompaction,
+			Checkpoint: &harness.ContextCheckpointEntry{
+				SessionID: convSessionID, EntryID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa21",
+				StrategyID: "test.strategy/v1",
+				Messages: []model.Message{
+					{
+						Role:      model.RoleAssistant,
+						Source:    model.ModelRef{Provider: "prov", Model: "m2"},
+						Content:   []model.ContentPart{{Kind: model.PartText, Text: "calling"}},
+						Refusal:   "declined",
+						Name:      "named",
+						Extra:     model.Extra{"vendor": json.RawMessage(`1`)},
+						ToolCalls: []model.ToolCall{{ID: "call-1", Name: "echo", Arguments: arguments, Extra: model.Extra{"call": json.RawMessage(`"x"`)}}},
+					},
+					{Role: model.RoleTool, ToolCallID: "call-1", Content: []model.ContentPart{{Kind: model.PartText, Text: "done"}}},
+				},
+				BoundaryEntryID:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa21",
+				ConfigurationRevision: "rev-1",
+			},
+		},
+	}
+	items, err := projectConversation(convSessionID, facts)
+	testassert.NoError(t, err)
+	testassert.Require(t, len(items) == 1, "items = %+v, want the one checkpoint item", items)
+	item, err := items[0].AsCheckpointItem()
+	testassert.NoError(t, err)
+	testassert.Require(t, item.Model == nil, "model = %v, want absent when no model produced the checkpoint", item.Model)
+	testassert.Equal(t, item.Strategy, "test.strategy/v1")
+	testassert.Require(t, len(item.Messages) == 2, "messages = %+v, want the retained tool exchange pair", item.Messages)
+	call := item.Messages[0]
+	testassert.Require(t, call.Refusal != nil && *call.Refusal == "declined" && call.Name != nil && *call.Name == "named" && call.Extra != nil && string((*call.Extra)["vendor"]) == `1`, "wire message = %+v, want refusal, name and extras preserved", call)
+	testassert.Require(t, call.ToolCalls != nil && len(*call.ToolCalls) == 1, "tool calls = %+v, want the retained call", call.ToolCalls)
+	wireCall := (*call.ToolCalls)[0]
+	testassert.Require(t, wireCall.Id == "call-1" && wireCall.Name == "echo" && wireCall.ArgumentsBase64 == base64.StdEncoding.EncodeToString(arguments) && wireCall.Extra != nil && string((*wireCall.Extra)["call"]) == `"x"`, "wire tool call = %+v, want byte-preserving arguments and extras", wireCall)
+	result := item.Messages[1]
+	testassert.Require(t, result.Role == protocol.MessageRoleTool && result.ToolCallId != nil && *result.ToolCallId == "call-1" && result.Content != nil, "wire tool result = %+v, want the paired result message", result)
+}

@@ -1,4 +1,4 @@
-PREFIX ?= ~/.local
+PREFIX ?= $(HOME)/.local
 
 # VERSION stays "dev" for source builds (an exact vX.Y.Z stamps a release
 # build; used when testing upgrade flows). COMMIT is best-effort.
@@ -8,7 +8,7 @@ VERSION_PKG := github.com/MMinasyan/lightcode/internal/version
 LDFLAGS := -X $(VERSION_PKG).Version=$(VERSION) -X $(VERSION_PKG).Commit=$(COMMIT)
 
 build:
-	~/go/bin/wails build -ldflags '$(LDFLAGS)'
+	~/go/bin/wails build -tags webkit2_41 -ldflags '$(LDFLAGS)'
 
 test:
 	go test ./...
@@ -17,12 +17,12 @@ test-race:
 	go test -race ./...
 
 test-integration:
-	go test -tags=integration -race ./...
+	go test -race -tags webkit2_41 ./runtime ./internal/desktopclient
 
 bench:
 	go test -bench=. -benchmem ./...
 
-PKG ?= ./internal/provider
+PKG ?= ./model
 
 fuzz-short:
 	go test $(PKG) -fuzz=. -fuzztime=30s
@@ -45,11 +45,29 @@ lint: install-lint-tools
 	$(GOBIN)/ineffassign ./...
 
 install: build
-	mkdir -p $(PREFIX)/bin
-	rm -f $(PREFIX)/bin/lightcode
-	cp build/bin/lightcode $(PREFIX)/bin/lightcode
+	dest="$(PREFIX)/bin"; \
+	mkdir -p "$$dest" || exit 1; \
+	tmp=$$(mktemp "$$dest/.lightcode.tmp.XXXXXX") || exit 1; \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	cp build/bin/lightcode "$$tmp" || exit 1; \
+	chmod 755 "$$tmp" || exit 1; \
+	mv "$$tmp" "$$dest/lightcode" || exit 1
 
 uninstall:
 	rm -f $(PREFIX)/bin/lightcode
 
-.PHONY: build test test-race test-integration bench fuzz-short install-lint-tools lint install uninstall
+generate-protocol:
+	go run ./internal/protocolgen -schema protocol/openapi.yaml -config protocol/oapi-codegen.yaml -sdk-out protocol/protocol.gen.go -out internal/clientops/operations.gen.go -native-contract-out frontend/src/generated/native-invocations.json
+	cd frontend && npm run generate-protocol
+
+check-protocol: generate-protocol
+	sh scripts/check-generated-files.sh protocol/protocol.gen.go frontend/src/generated/protocol internal/clientops/operations.gen.go frontend/src/generated/native-invocations.json
+	cd frontend && npm run typecheck:protocol
+
+# Compares the Wails-generated Go bindings against the index. Prerequisite:
+# the real Wails build (which runs the models.ts normalizer) has produced the
+# tracked files under frontend/client-bindings/wailsjs/go.
+check-wails-bindings:
+	sh scripts/check-generated-files.sh frontend/client-bindings/wailsjs/go
+
+.PHONY: build test test-race test-integration bench fuzz-short install-lint-tools lint install uninstall generate-protocol check-protocol check-wails-bindings

@@ -1,0 +1,115 @@
+package agent
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/model"
+)
+
+func assemble(t *testing.T, ctx context.Context, ref model.ModelRef, steps ...func() (model.StreamDelta, error)) (model.Output, *fakeStream) {
+	t.Helper()
+	s := newFakeStream(steps...)
+	out, err := Assemble(ctx, ref, s)
+	testassert.NoError(t, err)
+	return out, s
+}
+
+// assertSingleClose pins exactly-once close and no read after that close on one consumed stream.
+func assertSingleClose(t *testing.T, s *fakeStream) {
+	t.Helper()
+	testassert.Require(t, s.closeCount == 1 && s.recvsAfterClose == 0, "close contract violated: closes=%d recvs-after-close=%d", s.closeCount, s.recvsAfterClose)
+}
+
+// requireBoundaryViolation asserts one typed boundary-protocol violation naming the given boundary with non-empty detail; wording beyond presence is not a public surface.
+func requireBoundaryViolation(t *testing.T, err error, want string) {
+	t.Helper()
+	// sentinel reachability at any wrap depth is the classification contract.
+	testassert.Require(t, errors.Is(err, ErrBoundaryProtocol), "expected errors.Is(ErrBoundaryProtocol), got: %v", err)
+	var pe *ProtocolError
+	// typed category plus boundary name; detail must merely be present.
+	testassert.Require(t, errors.As(err, &pe) && pe.Boundary == want && pe.Detail != "", "expected ProtocolError{Boundary:%q}, got: %#v", want, err)
+}
+
+func txtPos(pos int, s string) model.ContentFragment {
+	return model.ContentFragment{Position: pos, Kind: model.PartText, Text: s}
+}
+
+// imgPos builds one image_url fragment for a given position.
+func imgPos(pos int, url string) model.ContentFragment {
+	return model.ContentFragment{Position: pos, Kind: model.PartImageURL, URL: url}
+}
+
+// opaquePos builds one opaque-kind fragment carrying its structural original wire type; that value never enters the generic extra accumulator by contract.
+func opaquePos(pos int, wt string) model.ContentFragment {
+	return model.ContentFragment{Position: pos, Kind: model.PartOpaque, OpaqueWireType: wt}
+}
+
+// toolFrag builds a minimal id+name pair for correlation cases needing neither positions nor wire types.
+func toolFrag(id, name string) model.ToolCallFragment {
+	return model.ToolCallFragment{ID: id, Name: name}
+}
+
+// choiceDelta wraps content fragments in one present-choice delta so tests focus on the accumulator path without noise fields.
+func choiceDelta(frags ...model.ContentFragment) model.StreamDelta {
+	return model.StreamDelta{HasChoice: true, ContentFragments: frags}
+}
+
+// toolDelta wraps tool-call fragments in one present-choice delta for correlation and finalization cases alike through this single helper only.
+func toolDelta(frags ...model.ToolCallFragment) model.StreamDelta {
+	return model.StreamDelta{HasChoice: true, ToolFragments: frags}
+}
+
+// stopDelta is a trailing choice carrying only finish reason stop; any payload arrived in earlier deltas.
+func stopDelta() model.StreamDelta { return model.StreamDelta{HasChoice: true, FinishReason: "stop"} }
+
+// toolCallsDelta is a trailing choice carrying only finish reason tool_calls; its fragments arrived in earlier deltas of the same stream.
+func toolCallsDelta() model.StreamDelta {
+	return model.StreamDelta{HasChoice: true, FinishReason: "tool_calls"}
+}
+
+// msgContent, msgRefusal and msgCalls are nil-safe projections of an output's optional message for compact assertions.
+func msgContent(out model.Output) []model.ContentPart {
+	if out.Message == nil {
+		return nil
+	}
+	return out.Message.Content
+}
+
+// msgRefusal returns the refusal string of a present output message, or the marker <nil-message> when no message was retained.
+func msgRefusal(out model.Output) string {
+	if out.Message == nil {
+		return "<nil-message>"
+	}
+	return out.Message.Refusal
+}
+
+// msgCalls returns the ordered tool calls of a present output message, or nil when none were retained.
+func msgCalls(out model.Output) []model.ToolCall {
+	if out.Message == nil {
+		return nil
+	}
+	return out.Message.ToolCalls
+}
+
+// posI wraps one supplied normalized tool-call position for test fragments; true absence is expressed as a literal nil instead.
+func posI(v int) *int { return &v }
+
+// usageStep serves one choice-less trailing chunk carrying only its usage value — the shape final chunks take on real streams after the finished response.
+func usageStep(u model.Usage) func() (model.StreamDelta, error) {
+	return deltaStep(model.StreamDelta{HasChoice: false, Usage: &u})
+}
+
+// expectStatus asserts one output's closed status with its detail rules and source identity in a single check shared by every behavior test below.
+func expectStatus(t *testing.T, out model.Output, want model.OutputStatus) {
+	t.Helper()
+	// Wrong closed status is the primary failure mode.
+	testassert.Require(t, out.Status == want, "status = %q, want %q (detail=%q)", out.Status, want, out.Detail)
+
+	// Completed outputs carry empty detail; errored/interrupted output requires non-empty detail.
+	testassert.Require(t, (want != model.OutputCompleted || out.Detail == "") && (want == model.OutputCompleted || out.Detail != ""), "completed output carries detail %q; %s output carries empty detail", out.Detail, want)
+
+	testassert.Equal(t, out.Source, testRef)
+}

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
 
 // bundledFS contains Lightcode's hand-curated built-in provider catalog files.
@@ -43,8 +45,87 @@ func NewLoaderWithConfigPath(home string, bundled fs.FS, configPath string) *Loa
 	return loader
 }
 
-// Load reads the bundled catalog, user config, and discovery cache, then calls Build.
+// Load reads the bundled catalog, user config, and discovery cache, then calls
+// Build. It is the blocking entry used by pre-owner startup, where discovery
+// publication may block on the per-provider discovery lock.
 func (l *Loader) Load() (*Catalog, []Warning, error) {
+	return l.loadReadInputs(false)
+}
+
+// LoadTry is Load with every discovery publication routed through the
+// one-attempt Try writers, so a foreign discovery-lock holder yields the
+// existing discovery_failure warning instead of hanging the owner shutdown.
+func (l *Loader) LoadTry() (*Catalog, []Warning, error) {
+	return l.loadReadInputs(true)
+}
+
+// LoadCaptured is the captured-input entry: the user provider layer arrives
+// as the caller's already-read map and the main configuration is never read.
+// It preserves the bundled source and the AllowRefresh filter, routes every
+// discovery publication through the one-attempt Try writers, and honors
+// cancellation on ctx: a cancellation observed after a provider fetch and
+// before the start of a cache writer skips that write and returns the context
+// error instead of a discovery warning. Once a cache write has started it
+// keeps the existing atomicfs semantics and may finish despite the later
+// cancellation. Ordinary discovery and cache failures keep their existing
+// warnings and the cached input.
+func (l *Loader) LoadCaptured(ctx context.Context, userRaw map[string]any) (BuildResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	catalog, warnings, err := l.loadCaptured(ctx, userRaw)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	return BuildResult{Catalog: catalog, Warnings: warnings}, nil
+}
+
+// Home returns the loader's home root.
+func (l *Loader) Home() string {
+	return l.home
+}
+
+// LoadCapturedConnection is the connection-candidate entry: over the same
+// captured bundled FS, discovery-cache read, and Build producer as
+// LoadCaptured, it performs no network fetch, no cache write, and no
+// refresh — a connection candidate is fully built and validated before its
+// caller's first persistence. A nonnil discovered overlays ONLY that
+// provider's in-memory discovery record: the fingerprint is computed here
+// over the caller's original configured transport, and the fetched models are
+// carried verbatim, their unexported metadata included — never round-tripped
+// through the cache. A nil discovered leaves the ordinary cached inputs.
+func (l *Loader) LoadCapturedConnection(ctx context.Context, userRaw map[string]any, providerID string, transport Transport, discovered *DiscoveredProvider) (BuildResult, error) {
+	catalog, warnings, err := l.loadCapturedConnection(userRaw, providerID, transport, discovered)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	return BuildResult{Catalog: catalog, Warnings: warnings}, nil
+}
+
+func (l *Loader) loadCapturedConnection(userRaw map[string]any, providerID string, transport Transport, discovered *DiscoveredProvider) (*Catalog, []Warning, error) {
+	home, err := l.resolvedHome()
+	if err != nil {
+		return nil, nil, err
+	}
+	bundled, err := readBundledProviders(l.bundled)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read bundled catalog: %w", err)
+	}
+	records, warnings := ReadDiscoveryCache(home)
+	if discovered != nil {
+		records[providerID] = DiscoveryRecord{
+			TransportFingerprint: transportFingerprint(transport),
+			FetchedAt:            time.Now().UTC(),
+			AttemptedAt:          time.Now().UTC(),
+			Models:               discovered.Models,
+		}
+	}
+	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Records: records})
+	warnings = append(warnings, result.Warnings...)
+	return result.Catalog, warnings, nil
+}
+
+func (l *Loader) loadReadInputs(try bool) (*Catalog, []Warning, error) {
 	home, err := l.resolvedHome()
 	if err != nil {
 		return nil, nil, err
@@ -54,18 +135,44 @@ func (l *Loader) Load() (*Catalog, []Warning, error) {
 		return nil, nil, fmt.Errorf("read bundled catalog: %w", err)
 	}
 	userRaw, warnings := readUserConfigProvidersAt(home, l.configPath)
-	cache, attempts, cacheWarnings := ReadDiscoveryCache(home)
+	return l.assemble(context.Background(), home, bundled, userRaw, try, warnings)
+}
+
+func (l *Loader) loadCaptured(ctx context.Context, userRaw map[string]any) (*Catalog, []Warning, error) {
+	home, err := l.resolvedHome()
+	if err != nil {
+		return nil, nil, err
+	}
+	bundled, err := readBundledProviders(l.bundled)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read bundled catalog: %w", err)
+	}
+	return l.assemble(ctx, home, bundled, userRaw, true, nil)
+}
+
+// assemble is the shared cache-read/build/refresh/rebuild body behind every
+// Loader entry. It builds the effective catalog over the bundled, already-
+// read user, and cached discovery inputs, refreshes each filtered due provider
+// in sorted order (try selects the one-attempt publications), and rebuilds
+// over freshly read records once a publication changed the cache. userRaw is
+// the already-read user layer whose declared cost fields the refresh
+// publications retain, so no input is reread mid-build.
+func (l *Loader) assemble(ctx context.Context, home string, bundled map[string]json.RawMessage, userRaw map[string]any, try bool, warnings []Warning) (*Catalog, []Warning, error) {
+	records, cacheWarnings := ReadDiscoveryCache(home)
 	warnings = append(warnings, cacheWarnings...)
 
-	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
-	candidates := DiscoveryRefreshCandidates(result.Catalog, attempts, time.Now().UTC())
+	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Records: records})
+	candidates := DiscoveryRefreshCandidates(result.Catalog, records, time.Now().UTC())
 	candidates = l.filterRefreshCandidates(candidates, result.Catalog)
-	discoveryWarnings, discoveryChanged, _ := refreshDiscoveryCandidatesFor(home, l.configPath, candidates, result.Catalog)
+	discoveryWarnings, discoveryChanged, err := refreshDiscoveryCandidates(ctx, home, candidates, result.Catalog, try, userRaw)
 	warnings = append(warnings, discoveryWarnings...)
+	if err != nil {
+		return nil, warnings, err
+	}
 	if discoveryChanged {
-		cache, _, cacheWarnings = ReadDiscoveryCache(home)
+		records, cacheWarnings = ReadDiscoveryCache(home)
 		warnings = append(warnings, cacheWarnings...)
-		result = Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Cache: cache})
+		result = Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Records: records})
 	}
 	warnings = append(warnings, result.Warnings...)
 	return result.Catalog, warnings, nil
@@ -84,25 +191,46 @@ func (l *Loader) filterRefreshCandidates(candidateIDs []string, cat *Catalog) []
 	return filtered
 }
 
-func refreshDiscoveryCandidatesFor(home, configPath string, candidateIDs []string, cat *Catalog) ([]Warning, bool, []string) {
+// refreshDiscoveryCandidates is the loader's sorted refresh loop over the
+// filtered candidates: per provider it performs the fetch, checks ctx
+// cancellation once the network attempt began and before any cache writer
+// starts, and then publishes through the shared per-provider code with the
+// already-read userRaw as the cost-protection source. A cancellation observed
+// between the fetch and the publication skips that write and returns the
+// context error with the warnings collected so far; it is not a discovery
+// warning.
+func refreshDiscoveryCandidates(ctx context.Context, home string, candidateIDs []string, cat *Catalog, try bool, userRaw map[string]any) ([]Warning, bool, error) {
 	var warnings []Warning
-	var refreshed []string
 	changed := false
 	if cat == nil {
-		return warnings, changed, refreshed
+		return warnings, changed, nil
 	}
 	for _, providerID := range candidateIDs {
-		refreshedProvider, providerWarnings := RefreshProviderDiscoveryWithConfigPath(context.Background(), home, configPath, cat, providerID)
+		provider := catalogProvider(cat, providerID)
+		if provider == nil {
+			warnings = append(warnings, Warning{Kind: "discovery_failure", Provider: providerID, Message: fmt.Sprintf("unknown provider %q", providerID)})
+			continue
+		}
+		attempted, discovered, providerWarnings := FetchDiscoveryIfDue(ctx, home, provider, time.Now().UTC())
+		if !attempted {
+			warnings = append(warnings, providerWarnings...)
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return warnings, changed, err
+		}
+		refreshed, providerWarnings := publishDiscoveryResult(home, provider, providerID, discovered, providerWarnings, try, cat, func() map[string]map[string]bool {
+			return userCostProtection(userRaw, providerID)
+		})
 		if len(providerWarnings) != 0 {
 			warnings = append(warnings, providerWarnings...)
 			continue
 		}
-		if refreshedProvider {
+		if refreshed {
 			changed = true
-			refreshed = append(refreshed, providerID)
 		}
 	}
-	return warnings, changed, refreshed
+	return warnings, changed, nil
 }
 
 func (l *Loader) resolvedHome() (string, error) {
@@ -153,7 +281,10 @@ func readUserConfigProvidersAt(home, configPath string) (map[string]any, []Warni
 		if writeErr := writeEmptyCatalogConfig(configPath); writeErr != nil {
 			return map[string]any{}, []Warning{{Kind: "user_config_skip", Message: fmt.Sprintf("create empty config: %v", writeErr)}}
 		}
-		return map[string]any{}, nil
+		// The file now exists — either the empty one just created, or one a
+		// concurrent creator won. Re-read so a losing creator still observes
+		// the winner's providers instead of an empty map.
+		data, err = os.ReadFile(configPath)
 	}
 	if err != nil {
 		return map[string]any{}, []Warning{{Kind: "user_config_skip", Message: fmt.Sprintf("read config: %v", err)}}
@@ -173,14 +304,13 @@ func readUserConfigProvidersAt(home, configPath string) (map[string]any, []Warni
 	if !ok {
 		return map[string]any{}, []Warning{{Kind: "user_config_skip", Message: "providers must be an object"}}
 	}
-	return cloneJSONValue(providers).(map[string]any), nil
+	return CloneJSONValue(providers).(map[string]any), nil
 }
-
 func writeEmptyCatalogConfig(configPath string) error {
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+	if _, err := atomicfs.CreateExclusive(configPath, []byte(catalogEmptyConfigTemplate), 0o600); err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, []byte(catalogEmptyConfigTemplate), 0o600)
+	return nil
 }
 
 func lightcodeDir(home string) string {

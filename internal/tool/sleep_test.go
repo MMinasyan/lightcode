@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
 func TestSleepCustomDurationAndClampsMinimum(t *testing.T) {
@@ -23,14 +25,11 @@ func TestSleepCustomDurationAndClampsMinimum(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			start := time.Now()
 			result, err := (Sleep{}).Execute(context.Background(), tt.params)
-			if err != nil {
-				t.Fatalf("Execute error = %v", err)
-			}
-			if result != tt.want {
-				t.Fatalf("Execute result = %q, want %q", result, tt.want)
-			}
-			if elapsed := time.Since(start); elapsed < tt.minWait {
-				t.Fatalf("elapsed = %s, want at least %s", elapsed, tt.minWait)
+			testassert.NoError(t, err)
+			testassert.Equal(t, result, tt.want)
+			{
+				elapsed := time.Since(start)
+				testassert.Require(t, elapsed >= tt.minWait, "elapsed = %s, want at least %s", elapsed, tt.minWait)
 			}
 		})
 	}
@@ -42,11 +41,10 @@ func TestSleepContextCancelReturnsPromptly(t *testing.T) {
 	start := time.Now()
 
 	result, err := (Sleep{}).Execute(ctx, map[string]any{"seconds": float64(300)})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Execute result=%q error=%v, want context.Canceled", result, err)
-	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
-		t.Fatalf("cancelled sleep elapsed %s, want prompt return", elapsed)
+	testassert.Require(t, errors.Is(err, context.Canceled), "Execute result=%q error=%v, want context.Canceled", result, err)
+	{
+		elapsed := time.Since(start)
+		testassert.Require(t, elapsed <= 100*time.Millisecond, "cancelled sleep elapsed %s, want prompt return", elapsed)
 	}
 }
 
@@ -59,10 +57,9 @@ func TestSleepContextCancelDuringSleep(t *testing.T) {
 	start := time.Now()
 
 	_, err := (Sleep{}).Execute(ctx, map[string]any{"seconds": float64(10)})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Execute error = %v, want context.Canceled", err)
-	}
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Fatalf("cancelled sleep elapsed %s, want prompt return", elapsed)
+	testassert.Require(t, errors.Is(err, context.Canceled), "Execute error = %v, want context.Canceled", err)
+	{
+		elapsed := time.Since(start)
+		testassert.Require(t, elapsed <= 500*time.Millisecond, "cancelled sleep elapsed %s, want prompt return", elapsed)
 	}
 }

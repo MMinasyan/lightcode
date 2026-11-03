@@ -1,11 +1,15 @@
 package catalog
 
-import "testing"
+import (
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"testing"
+)
 
 func TestValidateRawAcceptsValidProvider(t *testing.T) {
 	raw := validRawProvider()
-	if errs := ValidateRaw("openai", raw, true); len(errs) != 0 {
-		t.Fatalf("ValidateRaw returned errors: %#v", errs)
+	{
+		errs := ValidateRaw("openai", raw, true)
+		testassert.Require(t, len(errs) == 0, "ValidateRaw returned errors: %#v", errs)
 	}
 }
 
@@ -13,8 +17,9 @@ func TestValidateRawAcceptsDiscoveryOnlyProviderWithoutModels(t *testing.T) {
 	raw := validRawProvider()
 	delete(raw, "models")
 
-	if errs := ValidateRaw("openai", raw, true); len(errs) != 0 {
-		t.Fatalf("ValidateRaw returned errors: %#v, want discovery-only provider without models to validate", errs)
+	{
+		errs := ValidateRaw("openai", raw, true)
+		testassert.Require(t, len(errs) == 0, "ValidateRaw returned errors: %#v, want discovery-only provider without models to validate", errs)
 	}
 }
 
@@ -22,8 +27,9 @@ func TestValidateRawAcceptsDiscoveryOnlyProviderWithEmptyModels(t *testing.T) {
 	raw := validRawProvider()
 	raw["models"] = map[string]any{}
 
-	if errs := ValidateRaw("openai", raw, true); len(errs) != 0 {
-		t.Fatalf("ValidateRaw returned errors: %#v, want discovery-only provider with empty models to validate", errs)
+	{
+		errs := ValidateRaw("openai", raw, true)
+		testassert.Require(t, len(errs) == 0, "ValidateRaw returned errors: %#v, want discovery-only provider with empty models to validate", errs)
 	}
 }
 
@@ -32,8 +38,26 @@ func TestValidateRawStrictRejectsUnknownProviderKey(t *testing.T) {
 	raw["base_uri"] = "https://api.openai.com/v1"
 
 	errs := ValidateRaw("openai", raw, true)
-	if !hasValidationError(errs, "base_uri") {
-		t.Fatalf("ValidateRaw errors = %#v, want base_uri error", errs)
+	testassert.Require(t, hasValidationError(errs, "base_uri"), "ValidateRaw errors = %#v, want base_uri error", errs)
+}
+
+// TestValidateRawStrictRejectsRetiredProviderControls pins the retired
+// controls' shared unknown-field policy: the removed max_tokens_field and
+// transport.options members are ordinary unknown members now, refused by the
+// same strict check as any other forged key.
+func TestValidateRawStrictRejectsRetiredProviderControls(t *testing.T) {
+	raw := validRawProvider()
+	raw["max_tokens_field"] = "max_completion_tokens"
+	{
+		errs := ValidateRaw("openai", raw, true)
+		testassert.Require(t, hasValidationError(errs, "max_tokens_field"), "ValidateRaw errors = %#v, want the retired max_tokens_field refused as unknown", errs)
+	}
+
+	raw = validRawProvider()
+	raw["transport"].(map[string]any)["options"] = map[string]any{"retries": float64(3)}
+	{
+		errs := ValidateRaw("openai", raw, true)
+		testassert.Require(t, hasValidationError(errs, "transport.options"), "ValidateRaw errors = %#v, want the retired transport.options refused as unknown", errs)
 	}
 }
 
@@ -42,9 +66,7 @@ func TestValidateRawReportsMissingRequiredTransportBaseURL(t *testing.T) {
 	delete(raw["transport"].(map[string]any), "base_url")
 
 	errs := ValidateRaw("openai", raw, true)
-	if !hasValidationError(errs, "transport.base_url") {
-		t.Fatalf("ValidateRaw errors = %#v, want transport.base_url error", errs)
-	}
+	testassert.Require(t, hasValidationError(errs, "transport.base_url"), "ValidateRaw errors = %#v, want transport.base_url error", errs)
 }
 
 func TestValidateRawRejectsReservedProviderExtraBodyKey(t *testing.T) {
@@ -52,9 +74,7 @@ func TestValidateRawRejectsReservedProviderExtraBodyKey(t *testing.T) {
 	raw["extra_body"] = map[string]any{"model": "bad"}
 
 	errs := ValidateRaw("openai", raw, true)
-	if !hasValidationError(errs, "extra_body.model") {
-		t.Fatalf("ValidateRaw errors = %#v, want reserved extra_body.model error", errs)
-	}
+	testassert.Require(t, hasValidationError(errs, "extra_body.model"), "ValidateRaw errors = %#v, want reserved extra_body.model error", errs)
 }
 
 func TestValidateRawRejectsInvalidProtocolMetadata(t *testing.T) {
@@ -67,9 +87,7 @@ func TestValidateRawRejectsInvalidProtocolMetadata(t *testing.T) {
 
 	errs := ValidateRaw("openai", raw, true)
 	for _, field := range []string{"protocol_metadata.family", "protocol_metadata.must_preserve[1]", "protocol_metadata.drop[0]"} {
-		if !hasValidationError(errs, field) {
-			t.Fatalf("ValidateRaw errors = %#v, want %s error", errs, field)
-		}
+		testassert.Require(t, hasValidationError(errs, field), "ValidateRaw errors = %#v, want %s error", errs, field)
 	}
 }
 
@@ -79,12 +97,7 @@ func TestValidateRawRejectsIllegalEnums(t *testing.T) {
 	raw["models"].(map[string]any)["gpt-5.4-mini"].(map[string]any)["input_modalities"] = []any{"text", "video"}
 
 	errs := ValidateRaw("openai", raw, true)
-	if !hasValidationError(errs, "system_role") {
-		t.Fatalf("ValidateRaw errors = %#v, want system_role error", errs)
-	}
-	if !hasValidationError(errs, "models.gpt-5.4-mini.input_modalities[1]") {
-		t.Fatalf("ValidateRaw errors = %#v, want input modality error", errs)
-	}
+	testassert.Require(t, hasValidationError(errs, "system_role") && hasValidationError(errs, "models.gpt-5.4-mini.input_modalities[1]"), "ValidateRaw errors = %#v, want system_role error; ValidateRaw errors = %#v, want input modality error", errs, errs)
 }
 
 func TestValidateEffectiveRejectsReservedModelExtraBodyKey(t *testing.T) {
@@ -110,9 +123,7 @@ func TestValidateEffectiveRejectsReservedModelExtraBodyKey(t *testing.T) {
 	}
 
 	errs := ValidateEffective(p)
-	if !hasValidationError(errs, "models.gpt-5.4-mini.extra_body.messages") {
-		t.Fatalf("ValidateEffective errors = %#v, want reserved model extra_body error", errs)
-	}
+	testassert.Require(t, hasValidationError(errs, "models.gpt-5.4-mini.extra_body.messages"), "ValidateEffective errors = %#v, want reserved model extra_body error", errs)
 }
 
 func TestValidateEffectiveAllowsIncompleteCapacity(t *testing.T) {
@@ -135,8 +146,9 @@ func TestValidateEffectiveAllowsIncompleteCapacity(t *testing.T) {
 		},
 	}
 
-	if errs := ValidateEffective(p); len(errs) != 0 {
-		t.Fatalf("ValidateEffective errors = %#v, want incomplete model to remain loadable", errs)
+	{
+		errs := ValidateEffective(p)
+		testassert.Require(t, len(errs) == 0, "ValidateEffective errors = %#v, want incomplete model to remain loadable", errs)
 	}
 }
 
@@ -148,7 +160,6 @@ func validRawProvider() map[string]any {
 			"base_url":    "https://api.openai.com/v1",
 			"api_key_env": "OPENAI_API_KEY",
 			"headers":     map[string]any{"OpenAI-Beta": "assistants=v2"},
-			"options":     map[string]any{"timeout": float64(60)},
 		},
 		"system_role":     "system",
 		"usage_in_stream": true,

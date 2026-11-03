@@ -7,8 +7,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 )
 
-const applyPatchReceiptParam = "_lightcode_apply_patch_receipt"
-
 type applyPatchTargetRole string
 
 const (
@@ -27,24 +25,12 @@ type applyPatchTarget struct {
 	Destination   bool
 }
 
-type applyPatchReceiptValue struct {
-	targets []applyPatchTarget
-}
-
-func (applyPatchReceiptValue) String() string { return "<internal apply_patch approval>" }
-
-func (applyPatchReceiptValue) GoString() string { return "applyPatchReceiptValue{}" }
-
-func resolveApplyPatchTargets(root string, params map[string]any) (*patch, []applyPatchTarget, error) {
-	return resolveApplyPatchTargetsWithOptions(root, params, CapabilityOptions{})
-}
-
-func resolveApplyPatchTargetsWithOptions(root string, params map[string]any, opts CapabilityOptions) (*patch, []applyPatchTarget, error) {
-	input, _ := params["input"].(string)
-	p, err := parsePatch(input)
-	if err != nil {
-		return nil, nil, err
-	}
+// resolveApplyPatchTargetsFromParsed resolves every op (and Move
+// destination) of an already-parsed patch into canonical targets. This is
+// pure path/stat/canonicalization plus the collision and write-dir checks;
+// no content is read. The V4A patch is parsed exactly once per call by the
+// caller.
+func resolveApplyPatchTargetsFromParsed(root string, p *patch, opts CapabilityOptions) ([]applyPatchTarget, error) {
 	targets := make([]applyPatchTarget, 0, len(p.ops)*2)
 	for _, op := range p.ops {
 		role := applyPatchTargetUpdate
@@ -60,19 +46,19 @@ func resolveApplyPatchTargetsWithOptions(root string, params map[string]any, opt
 		}
 		target, err := resolveApplyPatchTarget(root, op.path, role, false)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if err := checkWriteDirTarget(root, "apply_patch", target.CanonicalPath, opts); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		targets = append(targets, target)
 		if op.movePath != "" {
 			target, err := resolveApplyPatchTarget(root, op.movePath, applyPatchTargetMoveDest, true)
 			if err != nil {
-				return nil, nil, err
+				return nil, err
 			}
 			if err := checkWriteDirTarget(root, "apply_patch", target.CanonicalPath, opts); err != nil {
-				return nil, nil, err
+				return nil, err
 			}
 			targets = append(targets, target)
 		}
@@ -85,11 +71,11 @@ func resolveApplyPatchTargetsWithOptions(root string, params map[string]any, opt
 	for _, t := range targets {
 		key := filepath.Clean(t.CanonicalPath)
 		if seen[key] {
-			return nil, nil, fmt.Errorf("apply_patch: multiple patch entries resolve to the same file: %s", t.CanonicalPath)
+			return nil, fmt.Errorf("apply_patch: multiple patch entries resolve to the same file: %s", t.CanonicalPath)
 		}
 		seen[key] = true
 	}
-	return p, targets, nil
+	return targets, nil
 }
 
 func resolveApplyPatchTarget(root, path string, role applyPatchTargetRole, destination bool) (applyPatchTarget, error) {
@@ -106,70 +92,18 @@ func resolveApplyPatchTarget(root, path string, role applyPatchTargetRole, desti
 	}, nil
 }
 
-func applyPatchDisplayFiles(targets []applyPatchTarget) []string {
-	if len(targets) == 0 {
-		return nil
-	}
-	files := make([]string, 0, len(targets))
-	for _, target := range targets {
-		files = append(files, target.AbsPath)
-	}
-	return files
-}
-
-func applyPatchCanonicalFiles(targets []applyPatchTarget) []string {
-	if len(targets) == 0 {
-		return nil
-	}
-	files := make([]string, 0, len(targets))
-	for _, target := range targets {
-		files = append(files, target.CanonicalPath)
-	}
-	return files
-}
-
-func withApplyPatchReceipt(params map[string]any, targets []applyPatchTarget) map[string]any {
-	next := withoutApplyPatchReceipt(params)
-	copied := make([]applyPatchTarget, len(targets))
-	copy(copied, targets)
-	next[applyPatchReceiptParam] = applyPatchReceiptValue{targets: copied}
-	return next
-}
-
-func withoutApplyPatchReceipt(params map[string]any) map[string]any {
-	next := make(map[string]any, len(params)+1)
-	for k, v := range params {
-		if k == applyPatchReceiptParam {
-			continue
-		}
-		next[k] = v
-	}
-	return next
-}
-
-func applyPatchReceiptFromParams(params map[string]any) (applyPatchReceiptValue, bool) {
-	receipt, ok := params[applyPatchReceiptParam].(applyPatchReceiptValue)
-	return receipt, ok
-}
-
-func validateApplyPatchReceipt(root string, params map[string]any) (*patch, []applyPatchTarget, error) {
-	p, current, err := resolveApplyPatchTargets(root, params)
-	if err != nil {
-		return nil, nil, err
-	}
-	receipt, ok := applyPatchReceiptFromParams(params)
-	if !ok {
-		return p, current, nil
-	}
-	if len(receipt.targets) != len(current) {
-		return nil, nil, fmt.Errorf("apply_patch: approved target list changed")
+// compareApplyPatchTargets refuses any change between the approved target
+// list bound at authorization and the freshly resolved plan.
+func compareApplyPatchTargets(approved, current []applyPatchTarget) error {
+	if len(approved) != len(current) {
+		return fmt.Errorf("apply_patch: approved target list changed")
 	}
 	for i := range current {
-		approved := filepath.Clean(receipt.targets[i].CanonicalPath)
+		bound := filepath.Clean(approved[i].CanonicalPath)
 		resolved := filepath.Clean(current[i].CanonicalPath)
-		if approved != resolved {
-			return nil, nil, fmt.Errorf("apply_patch: approved canonical path changed from %s to %s", approved, resolved)
+		if bound != resolved {
+			return fmt.Errorf("apply_patch: approved canonical path changed from %s to %s", bound, resolved)
 		}
 	}
-	return p, current, nil
+	return nil
 }

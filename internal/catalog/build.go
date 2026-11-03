@@ -1,8 +1,10 @@
 package catalog
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -10,7 +12,7 @@ import (
 type BuildInputs struct {
 	Bundled map[string]json.RawMessage
 	UserRaw map[string]any
-	Cache   map[string]DiscoveredProvider
+	Records map[string]DiscoveryRecord
 }
 
 // DiscoveredProvider is provider metadata loaded from discovery cache.
@@ -41,6 +43,18 @@ type discoveryModelMetadata struct {
 	Capabilities                 map[string]bool `json:"capabilities,omitempty"`
 	SupportedParameters          []string        `json:"supported_parameters,omitempty"`
 }
+
+// Model-source labels: the provenance class of one effective catalog model.
+// Custom providers have no bundled layer, so every model under one is
+// user-added; a bundled provider's model is bundled when its ID ships in the
+// embedded catalog, discovered when the accepted transport-bound discovery
+// record supplied it, and user otherwise. The label rides the effective
+// Model entry, not a parallel map.
+const (
+	SourceUser       = "user"
+	SourceBundled    = "bundled"
+	SourceDiscovered = "discovered"
+)
 
 // BuildResult contains the effective catalog and non-fatal warnings.
 type BuildResult struct {
@@ -74,7 +88,13 @@ func Build(inputs BuildInputs) BuildResult {
 		_, bundledProvider := bundled[providerID]
 		merged := DeepMergeCatalog(bundled[providerID], user[providerID])
 		applyProviderDefaults(providerID, merged)
-		applyDiscovery(providerID, merged, inputs.Cache[providerID], user[providerID], bundledProvider)
+		record := DiscoveryRecord{}
+		if transportRaw, ok := merged["transport"].(map[string]any); ok {
+			if candidate, exists := inputs.Records[providerID]; exists && candidate.BoundTo(rawToTransport(transportRaw)) {
+				record = candidate
+			}
+		}
+		applyDiscovery(providerID, merged, record, user[providerID], bundledProvider)
 		errs := ValidateRaw(providerID, merged, true)
 		if len(errs) != 0 {
 			result.Warnings = append(result.Warnings, validationWarning(providerID, "", warningKind(providerID, user), errs))
@@ -87,6 +107,7 @@ func Build(inputs BuildInputs) BuildResult {
 			continue
 		}
 		result.Catalog.Providers[providerID] = provider
+		labelModelSources(provider, bundled[providerID], record)
 		for _, ref := range (&Catalog{Providers: map[string]*Provider{providerID: provider}}).IncompleteModels() {
 			result.Warnings = append(result.Warnings, Warning{
 				Kind:     "incomplete_model",
@@ -106,12 +127,51 @@ func Build(inputs BuildInputs) BuildResult {
 	return result
 }
 
+// labelModelSources stamps each accepted provider's effective models with
+// their provenance, using the same accepted bundled layer and transport-bound
+// discovery record that produced the provider in this same Build loop. No
+// second file read: bundled model IDs come from the already-decoded layer.
+func labelModelSources(provider *Provider, bundledRaw map[string]any, record DiscoveryRecord) {
+	var bundledModels map[string]struct{}
+	if models, ok := bundledRaw["models"].(map[string]any); ok {
+		bundledModels = make(map[string]struct{}, len(models))
+		for modelID := range models {
+			bundledModels[modelID] = struct{}{}
+		}
+	}
+	for _, model := range provider.Models {
+		if !provider.Builtin {
+			model.Source = SourceUser
+			continue
+		}
+		if _, ok := bundledModels[model.ID]; ok {
+			model.Source = SourceBundled
+		} else if _, ok := record.Models[model.ID]; ok {
+			model.Source = SourceDiscovered
+		} else {
+			model.Source = SourceUser
+		}
+	}
+}
+
 func decodeBundledProviders(raw map[string]json.RawMessage, result *BuildResult) map[string]map[string]any {
 	providers := map[string]map[string]any{}
 	for providerID, data := range raw {
 		var decoded map[string]any
-		if err := json.Unmarshal(data, &decoded); err != nil {
-			result.Warnings = append(result.Warnings, Warning{Kind: "bundled_config_skip", Provider: providerID, Message: fmt.Sprintf("parse bundled provider: %v", err)})
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
+		decodeErr := decoder.Decode(&decoded)
+		if decodeErr == nil {
+			var trailing any
+			decodeErr = decoder.Decode(&trailing)
+			if decodeErr == nil {
+				decodeErr = fmt.Errorf("unexpected trailing JSON value")
+			} else if decodeErr == io.EOF {
+				decodeErr = nil
+			}
+		}
+		if decodeErr != nil {
+			result.Warnings = append(result.Warnings, Warning{Kind: "bundled_config_skip", Provider: providerID, Message: fmt.Sprintf("parse bundled provider: %v", decodeErr)})
 			continue
 		}
 		providers[providerID] = decoded
@@ -127,7 +187,7 @@ func decodeUserProviders(raw map[string]any, result *BuildResult) map[string]map
 			result.Warnings = append(result.Warnings, Warning{Kind: "user_config_skip", Provider: providerID, Message: "provider must be an object"})
 			continue
 		}
-		providers[providerID] = cloneJSONValue(providerRaw).(map[string]any)
+		providers[providerID] = CloneJSONValue(providerRaw).(map[string]any)
 	}
 	return providers
 }
@@ -160,9 +220,6 @@ func applyProviderDefaults(providerID string, raw map[string]any) {
 	if _, ok := raw["usage_in_stream"]; !ok {
 		raw["usage_in_stream"] = true
 	}
-	if _, ok := raw["max_tokens_field"]; !ok {
-		raw["max_tokens_field"] = "max_tokens"
-	}
 	if _, ok := raw["discovery"]; !ok {
 		raw["discovery"] = true
 	}
@@ -176,9 +233,6 @@ func applyProviderDefaults(providerID string, raw map[string]any) {
 	if ok {
 		if _, ok := transport["headers"]; !ok {
 			transport["headers"] = map[string]any{}
-		}
-		if _, ok := transport["options"]; !ok {
-			transport["options"] = map[string]any{}
 		}
 	}
 	modelsVal, exists := raw["models"]
@@ -216,8 +270,8 @@ func applyProviderDefaults(providerID string, raw map[string]any) {
 	}
 }
 
-func applyDiscovery(providerID string, raw map[string]any, discovered DiscoveredProvider, userRaw map[string]any, bundledProvider bool) {
-	if len(discovered.Models) == 0 {
+func applyDiscovery(providerID string, raw map[string]any, record DiscoveryRecord, userRaw map[string]any, bundledProvider bool) {
+	if len(record.Models) == 0 {
 		return
 	}
 	discovery, ok := raw["discovery"].(bool)
@@ -232,7 +286,7 @@ func applyDiscovery(providerID string, raw map[string]any, discovered Discovered
 	} else if !ok {
 		return
 	}
-	for modelID, modelDiscovery := range discovered.Models {
+	for modelID, modelDiscovery := range record.Models {
 		modelRaw, ok := models[modelID].(map[string]any)
 		if !ok {
 			if !bundledProvider {
@@ -342,7 +396,6 @@ func rawToProvider(providerID string, raw map[string]any, bundledProvider bool) 
 		Transport:        rawToTransport(transportRaw),
 		SystemRole:       SystemRole(stringValue(raw["system_role"], string(RoleSystem))),
 		UsageInStream:    boolValue(raw["usage_in_stream"], true),
-		MaxTokensField:   stringValue(raw["max_tokens_field"], "max_tokens"),
 		ExtraBody:        anyMapValue(raw["extra_body"]),
 		Discovery:        boolValue(raw["discovery"], true),
 		Hidden:           boolValue(raw["hidden"], false),
@@ -376,7 +429,6 @@ func rawToTransport(raw map[string]any) Transport {
 		BaseURL:   stringValue(raw["base_url"], ""),
 		APIKeyEnv: stringValue(raw["api_key_env"], ""),
 		Headers:   stringMapValue(raw["headers"]),
-		Options:   anyMapValue(raw["options"]),
 	}
 }
 
@@ -403,7 +455,7 @@ func intValue(v any, fallback int) int {
 
 func anyMapValue(v any) map[string]any {
 	if m, ok := v.(map[string]any); ok {
-		return cloneJSONValue(m).(map[string]any)
+		return CloneJSONValue(m).(map[string]any)
 	}
 	return map[string]any{}
 }

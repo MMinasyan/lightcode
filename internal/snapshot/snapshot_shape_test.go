@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -9,10 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/internal/testassert"
 	"golang.org/x/sys/unix"
 )
 
-func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
+func TestSnapshotResolvedEntryRejectsNonRegularExistingTargets(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		target func(t *testing.T) string
@@ -21,9 +23,7 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 			name: "directory",
 			target: func(t *testing.T) string {
 				path := filepath.Join(t.TempDir(), "target-dir")
-				if err := os.Mkdir(path, 0o755); err != nil {
-					t.Fatal(err)
-				}
+				testassert.NoError(t, os.Mkdir(path, 0o755))
 				return path
 			},
 		},
@@ -53,31 +53,21 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store := newTestStore(t)
+			store := newTestCodeGroup(t)
 			target := tc.target(t)
-			turn := store.BeginTurn()
 
 			err := runSnapshotShapeWithTimeout(func() error {
-				return store.SnapshotResolved(turn, target, target)
+				_, _, err := store.SnapshotResolvedEntry(target, target)
+				return err
 			})
-			if err == nil {
-				t.Fatalf("SnapshotResolved(%s) succeeded, want non-regular target refusal", tc.name)
-			}
+			testassert.Require(t, err != nil, "SnapshotResolvedEntry(%s) succeeded, want non-regular target refusal", tc.name)
 			msg := strings.ToLower(err.Error())
-			if strings.Contains(msg, "did not fail closed before blocking") {
-				t.Fatalf("SnapshotResolved(%s) error = %v, want refusal before blocking on target I/O", tc.name, err)
-			}
-			if !strings.Contains(msg, "non-regular") {
-				t.Fatalf("SnapshotResolved(%s) error = %v, want explicit non-regular target refusal", tc.name, err)
-			}
+			testassert.Require(t, !strings.Contains(msg, "did not fail closed before blocking"), "SnapshotResolvedEntry(%s) error = %v, want refusal before blocking on target I/O", tc.name, err)
+			testassert.Require(t, strings.Contains(msg, "non-regular"), "SnapshotResolvedEntry(%s) error = %v, want explicit non-regular target refusal", tc.name, err)
 
 			entries, readErr := os.ReadDir(filepath.Join(store.snapshotsDir, "1"))
-			if readErr != nil {
-				t.Fatal(readErr)
-			}
-			if len(entries) != 0 {
-				t.Fatalf("snapshot entries = %d, want none for refused %s", len(entries), tc.name)
-			}
+			testassert.Require(t, readErr == nil || errors.Is(readErr, os.ErrNotExist), "%v", readErr)
+			testassert.Require(t, len(entries) == 0, "snapshot entries = %d, want none for refused %s", len(entries), tc.name)
 			if info, statErr := os.Lstat(target); statErr != nil {
 				t.Fatalf("lstat %s = %v, want target preserved", target, statErr)
 			} else if info.Mode().IsRegular() {
@@ -87,21 +77,20 @@ func TestSnapshotResolvedRejectsNonRegularExistingTargets(t *testing.T) {
 	}
 }
 
-func TestSnapshotResolvedStillAllowsMissingAndRegularTargets(t *testing.T) {
-	store := newTestStore(t)
-	turn := store.BeginTurn()
+func TestSnapshotResolvedEntryStillAllowsMissingAndRegularTargets(t *testing.T) {
+	store := newTestCodeGroup(t)
 
 	missing := filepath.Join(t.TempDir(), "new-file.txt")
-	if err := store.SnapshotResolved(turn, missing, missing); err != nil {
-		t.Fatalf("SnapshotResolved missing target error = %v", err)
+	{
+		_, _, err := store.SnapshotResolvedEntry(missing, missing)
+		testassert.NoError(t, err)
 	}
 
 	regular := filepath.Join(t.TempDir(), "regular.txt")
-	if err := os.WriteFile(regular, []byte("before"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SnapshotResolved(turn, regular, regular); err != nil {
-		t.Fatalf("SnapshotResolved regular target error = %v", err)
+	testassert.NoError(t, os.WriteFile(regular, []byte("before"), 0o644))
+	{
+		_, _, err := store.SnapshotResolvedEntry(regular, regular)
+		testassert.NoError(t, err)
 	}
 }
 

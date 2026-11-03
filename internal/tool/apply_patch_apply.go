@@ -2,7 +2,6 @@ package tool
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,40 +9,73 @@ import (
 
 	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/safefs"
-	"golang.org/x/sys/unix"
 )
 
-// applyPatchApplyAtRoot is the shared engine for immediate and staged
-// apply_patch execution. The flow is validate-first all-or-nothing: every op
-// is resolved and located against current files before any mutation. The only
-// path to a partial apply is a mid-write I/O error after validation passed; on
-// that rare failure, committed files stay on disk, remain snapshotted, and are
-// recoverable via turn revert. Partial failures return *ExitError carrying the
-// committed-files A/M/D summary for model-visible output.
+// executeParsedPatch is the shared apply engine for an already-parsed patch
+// and its prepared targets. The flow is validate-first all-or-nothing:
+// the bound canonical Workspace root, the bound canonical write-dir
+// boundary and every bound target are revalidated before any content
+// access, every op is located
+// against current files before any mutation, and per-op current-content
+// checks rerun inside the apply loop. The only path to a partial apply is a
+// mid-write I/O error after validation passed; on that rare failure,
+// committed files stay on disk, remain snapshotted, and are recoverable via
+// turn revert. Partial failures return *ExitError carrying the committed-files
+// A/M/D summary for model-visible output.
 //
-// The engine captures per-op pre/post/hunk data during apply and returns it as
-// the second value. Callers attach those previews to immediate or staged
-// display metadata so renderers do not need post-write disk reads. Read-after-
-// apply is not viable for updates, deletes, or moves.
-func applyPatchApplyAtRoot(ctx context.Context, root string, store SnapshotStore, tracker *FileTracker, params map[string]any) (string, []appliedFilePreview, error) {
-	p, targets, err := validateApplyPatchReceipt(root, params)
+// The engine captures per-op pre/post/hunk data during apply and returns it
+// as the second value. Callers attach those previews to display metadata so
+// renderers do not need post-write disk reads. Read-after-apply is not
+// viable for updates, deletes, or moves. A nil approved list means the
+// freshly resolved plan is authoritative.
+func executeParsedPatch(root, rootCanonical string, store SnapshotStore, p *patch, approved []applyPatchTarget, writeDir, writeDirCanonical string) (string, []AppliedFilePreview, error) {
+	// Revalidate the bound root, the canonical write-dir boundary and every
+	// target before content access; the per-op checks rerun where the apply
+	// safety requires.
+	if err := revalidateWorkspaceRoot(root, rootCanonical); err != nil {
+		return "", nil, err
+	}
+	if err := revalidateWriteDirWitness(root, writeDir, writeDirCanonical); err != nil {
+		return "", nil, err
+	}
+	current, err := resolveApplyPatchTargetsFromParsed(root, p, CapabilityOptions{WriteDir: writeDir})
 	if err != nil {
 		return "", nil, err
 	}
+	if approved != nil {
+		if err := compareApplyPatchTargets(approved, current); err != nil {
+			return "", nil, err
+		}
+	}
 
 	// Phase 1: validate (read-only).
-	plans, err := buildApplyPlans(p, root, targets)
+	plans, err := buildApplyPlans(p, root, current)
 	if err != nil {
 		return "", nil, err
 	}
 
 	// Phase 2: apply (mutations). Each op tracks its own committed state
-	// so a later op's failure can report the earlier committed files.
-	previews := make([]appliedFilePreview, 0, len(plans))
+	// so a later op's failure can report the earlier committed files. The
+	// already-approved Workspace root, write-dir and canonical target
+	// witnesses ride to each op's snapshot-to-I/O boundary.
+	previews := make([]AppliedFilePreview, 0, len(plans))
 	committed := make([]appliedOp, 0, len(plans))
 	for i := range plans {
 		pl := &plans[i]
-		preview, err := applyOne(ctx, pl, store, tracker, &committed)
+		srcBound := boundCall{
+			root: root, toolName: "apply_patch", path: pl.op.path,
+			rootCanonical: rootCanonical, canonical: pl.canonicalPath,
+			writeDir: writeDir, writeDirCanonical: writeDirCanonical,
+		}
+		var dstBound boundCall
+		if pl.moveCanonical != "" {
+			dstBound = boundCall{
+				root: root, toolName: "apply_patch", path: pl.op.movePath,
+				rootCanonical: rootCanonical, canonical: pl.moveCanonical,
+				writeDir: writeDir, writeDirCanonical: writeDirCanonical,
+			}
+		}
+		preview, err := applyOne(pl, store, &committed, srcBound, dstBound)
 		if err != nil {
 			return "", nil, err
 		}
@@ -57,27 +89,27 @@ type appliedOp struct {
 	path string
 }
 
-// appliedFilePreview is the per-file data the engine captures so display
+// AppliedFilePreview is the per-file data the engine captures so display
 // metadata can be built without post-write disk reads. Pre is the pre-mutation
 // content (nil for Add); Post is the post-mutation content (nil for Delete);
 // Hunks is the list of applied hunks. A Move produces two entries: destination
 // M and source D.
-type appliedFilePreview struct {
+type AppliedFilePreview struct {
 	Op    string
 	Path  string
 	Pre   []string
 	Post  []string
-	Hunks []appliedHunkPreview
+	Hunks []AppliedHunkPreview
 }
 
-// appliedHunkPreview carries the data needed to reconstruct a hunk's
+// AppliedHunkPreview carries the data needed to reconstruct a hunk's
 // diff rows in DisplayMetadata without re-reading the file. StartLine
 // is the 1-based line in Pre where the hunk's old pattern was
 // matched; Old is the matched pattern (context + remove lines, in
 // order); New is the hunk's new content (context + add lines, in
 // order). Diff rows are derived from these by the same row-derivation
 // the existing editpreview package uses.
-type appliedHunkPreview struct {
+type AppliedHunkPreview struct {
 	StartLine int
 	Old       []string
 	New       []string
@@ -101,7 +133,7 @@ type applyPlan struct {
 	moveDisplay    string
 	preLines       []string             // pre-mutation content (for Update/Delete/Move source)
 	preContent     []byte               // exact content validated before mutation
-	hunks          []appliedHunkPreview // applied hunks (for Update/Move destination)
+	hunks          []AppliedHunkPreview // applied hunks (for Update/Move destination)
 }
 
 func buildApplyPlans(p *patch, root string, targets []applyPatchTarget) ([]applyPlan, error) {
@@ -202,7 +234,7 @@ func buildAddContent(op fileOp) string {
 	parts := make([]string, 0, len(op.hunks))
 	for _, h := range op.hunks {
 		for _, l := range h.lines {
-			parts = append(parts, l.text)
+			parts = append(parts, l.Text)
 		}
 	}
 	// If the original input ended with a newline (it usually does), the parser
@@ -220,7 +252,7 @@ func buildAddContent(op fileOp) string {
 // reconstructed without re-reading the file. Hunk location failures
 // (Failed to find context / Failed to find expected lines) bubble up
 // unchanged so the model sees Codex's exact error string.
-func computeUpdatedContent(canonicalPath string, op fileOp) (preContent []byte, preLines []string, content string, hunks []appliedHunkPreview, err error) {
+func computeUpdatedContent(canonicalPath string, op fileOp) (preContent []byte, preLines []string, content string, hunks []AppliedHunkPreview, err error) {
 	data, err := readFileBytes(canonicalPath)
 	if err != nil {
 		return nil, nil, "", nil, fmt.Errorf("apply_patch: read %s: %w", op.path, err)
@@ -245,7 +277,7 @@ func computeUpdatedContent(canonicalPath string, op fileOp) (preContent []byte, 
 
 func hunkHasMatchLines(h hunk) bool {
 	for _, line := range h.lines {
-		if line.kind == lineContext || line.kind == lineRemove {
+		if line.Kind == lineContext || line.Kind == lineRemove {
 			return true
 		}
 	}
@@ -257,38 +289,38 @@ func hunkHasMatchLines(h hunk) bool {
 // only to locate the hunk: context rows in the replacement are preserved from
 // the actual matched file content, while add rows come from the patch.
 // Returns the new lines slice, the new cursor (positioned just past the new
-// content), and the appliedHunkPreview so the diff rows can be reconstructed
+// content), and the AppliedHunkPreview so the diff rows can be reconstructed
 // without re-reading the file. Anchor handling is inside locate: the anchor
 // is located first if present, advancing the cursor; the pattern is then
 // located at the advanced cursor.
-func applyHunk(fileLines []string, h hunk, path string, cursor int) ([]string, int, appliedHunkPreview, error) {
+func applyHunk(fileLines []string, h hunk, path string, cursor int) ([]string, int, AppliedHunkPreview, error) {
 	match, err := locateHunk(fileLines, h, path, cursor)
 	if err != nil {
-		return nil, 0, appliedHunkPreview{}, err
+		return nil, 0, AppliedHunkPreview{}, err
 	}
 	start := match.start
 	patternLines := hunkPatternLines(h)
 	matchEnd := start + match.realMatchedLen
 	if matchEnd > len(fileLines) {
-		return nil, 0, appliedHunkPreview{}, fmt.Errorf("Failed to find expected lines in %s:\n%s", path, strings.Join(patternLines, "\n"))
+		return nil, 0, AppliedHunkPreview{}, fmt.Errorf("Failed to find expected lines in %s:\n%s", path, strings.Join(patternLines, "\n"))
 	}
 	matchedLines := fileLines[start:matchEnd]
 	oldLines, newLines, lines, err := hunkTransformPreservingMatchedContext(h, matchedLines, match.syntheticTrailingEmpty, path, patternLines)
 	if err != nil {
-		return nil, 0, appliedHunkPreview{}, err
+		return nil, 0, AppliedHunkPreview{}, err
 	}
 	out := make([]string, 0, len(fileLines)+len(newLines)-len(oldLines))
 	out = append(out, fileLines[:start]...)
 	out = append(out, newLines...)
 	out = append(out, fileLines[matchEnd:]...)
-	return out, start + len(newLines), appliedHunkPreview{StartLine: start + 1, Old: oldLines, New: newLines, Lines: lines}, nil
+	return out, start + len(newLines), AppliedHunkPreview{StartLine: start + 1, Old: oldLines, New: newLines, Lines: lines}, nil
 }
 
 func hunkPatternLines(h hunk) []string {
 	out := make([]string, 0, len(h.lines))
 	for _, hl := range h.lines {
-		if hl.kind == lineContext || hl.kind == lineRemove {
-			out = append(out, hl.text)
+		if hl.Kind == lineContext || hl.Kind == lineRemove {
+			out = append(out, hl.Text)
 		}
 	}
 	return out
@@ -298,32 +330,32 @@ func hunkTransformPreservingMatchedContext(h hunk, matchedLines []string, synthe
 	lines = make([]hunkLine, 0, len(h.lines))
 	matchIdx := 0
 	for _, hl := range h.lines {
-		switch hl.kind {
+		switch hl.Kind {
 		case lineContext:
-			if matchIdx >= len(matchedLines) && syntheticTrailingEmpty && hl.text == "" {
+			if matchIdx >= len(matchedLines) && syntheticTrailingEmpty && hl.Text == "" {
 				continue
 			}
-			text := hl.text
+			text := hl.Text
 			if matchIdx < len(matchedLines) {
 				text = matchedLines[matchIdx]
 			}
 			oldLines = append(oldLines, text)
 			newLines = append(newLines, text)
-			lines = append(lines, hunkLine{kind: lineContext, text: text})
+			lines = append(lines, hunkLine{Kind: lineContext, Text: text})
 			matchIdx++
 		case lineRemove:
 			if matchIdx >= len(matchedLines) {
 				return nil, nil, nil, fmt.Errorf("Failed to find expected lines in %s:\n%s", path, strings.Join(patternLines, "\n"))
 			}
-			text := hl.text
+			text := hl.Text
 			if matchIdx < len(matchedLines) {
 				text = matchedLines[matchIdx]
 			}
 			oldLines = append(oldLines, text)
-			lines = append(lines, hunkLine{kind: lineRemove, text: text})
+			lines = append(lines, hunkLine{Kind: lineRemove, Text: text})
 			matchIdx++
 		case lineAdd:
-			newLines = append(newLines, hl.text)
+			newLines = append(newLines, hl.Text)
 			lines = append(lines, hl)
 		}
 	}
@@ -335,16 +367,16 @@ func hunkTransformPreservingMatchedContext(h hunk, matchedLines []string, synthe
 // partial-failure summary in *ExitError so the model sees the committed-files
 // A/M/D list. committed is the running list of ops that have already landed on
 // disk; applyOne appends to it on success and reads it for partial-failure
-// summaries.
-func applyOne(ctx context.Context, pl *applyPlan, store SnapshotStore, tracker *FileTracker, committed *[]appliedOp) ([]appliedFilePreview, error) {
-	_ = ctx
+// summaries. srcBound and dstBound carry the approved witnesses to each
+// mutation's snapshot-to-I/O boundary.
+func applyOne(pl *applyPlan, store SnapshotStore, committed *[]appliedOp, srcBound, dstBound boundCall) ([]AppliedFilePreview, error) {
 	if err := revalidateApplyPlan(pl); err != nil {
 		return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + err.Error()}
 	}
 
 	// Move: write the destination first (so it lands), then snapshot + delete the source.
 	if pl.op.movePath != "" {
-		if err := writeWithSnapshot(store, pl.moveDisplay, pl.moveCanonical, pl.newContent, true, tracker); err != nil {
+		if err := writeWithSnapshot(store, dstBound, pl.moveDisplay, pl.moveCanonical, pl.newContent, true); err != nil {
 			return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + err.Error()}
 		}
 		*committed = append(*committed, appliedOp{kind: "M", path: pl.op.movePath})
@@ -354,7 +386,7 @@ func applyOne(ctx context.Context, pl *applyPlan, store SnapshotStore, tracker *
 	}
 
 	// Now the original-path mutation (Add / Update / Delete), tracked separately for Move.
-	origErr := applyOriginalMutation(pl, store, tracker, committed)
+	origErr := applyOriginalMutation(pl, store, committed, srcBound)
 	if origErr != nil {
 		return nil, &ExitError{Output: buildPartialSummary(*committed) + "\n\n" + origErr.Error()}
 	}
@@ -409,31 +441,31 @@ func revalidateApplyPatchTarget(root, path, approvedCanonical string) error {
 // two entries (destination M with the new content and the applied
 // hunks, source D with the original content and no hunks); other ops
 // produce one entry each.
-func buildOpPreviews(pl *applyPlan) []appliedFilePreview {
+func buildOpPreviews(pl *applyPlan) []AppliedFilePreview {
 	switch {
 	case pl.moveCanonical != "":
 		postLines := splitLinesRaw([]byte(pl.newContent))
-		return []appliedFilePreview{
+		return []AppliedFilePreview{
 			{Op: "M", Path: pl.op.movePath, Post: postLines, Hunks: pl.hunks},
 			{Op: "D", Path: pl.op.path, Pre: pl.preLines},
 		}
 	case pl.op.kind == opAdd:
 		postLines := splitLinesRaw([]byte(pl.newContent))
-		return []appliedFilePreview{{Op: "A", Path: pl.op.path, Post: postLines}}
+		return []AppliedFilePreview{{Op: "A", Path: pl.op.path, Post: postLines}}
 	case pl.op.kind == opUpdate:
 		postLines := splitLinesRaw([]byte(pl.newContent))
-		return []appliedFilePreview{{Op: "M", Path: pl.op.path, Pre: pl.preLines, Post: postLines, Hunks: pl.hunks}}
+		return []AppliedFilePreview{{Op: "M", Path: pl.op.path, Pre: pl.preLines, Post: postLines, Hunks: pl.hunks}}
 	case pl.op.kind == opDelete:
-		return []appliedFilePreview{{Op: "D", Path: pl.op.path, Pre: pl.preLines}}
+		return []AppliedFilePreview{{Op: "D", Path: pl.op.path, Pre: pl.preLines}}
 	}
 	return nil
 }
 
-func applyOriginalMutation(pl *applyPlan, store SnapshotStore, tracker *FileTracker, committed *[]appliedOp) error {
+func applyOriginalMutation(pl *applyPlan, store SnapshotStore, committed *[]appliedOp, srcBound boundCall) error {
 	if pl.moveCanonical != "" {
 		// For Move the source-path delete is the original-path mutation; the
 		// kind is "D" of the source.
-		if err := deleteWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath); err != nil {
+		if err := deleteWithSnapshot(store, srcBound, pl.displayAbsPath, pl.canonicalPath); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "D", path: pl.op.path})
@@ -442,17 +474,17 @@ func applyOriginalMutation(pl *applyPlan, store SnapshotStore, tracker *FileTrac
 
 	switch pl.op.kind {
 	case opAdd:
-		if err := writeWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath, pl.newContent, true, tracker); err != nil {
+		if err := writeWithSnapshot(store, srcBound, pl.displayAbsPath, pl.canonicalPath, pl.newContent, true); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "A", path: pl.op.path})
 	case opUpdate:
-		if err := writeWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath, pl.newContent, false, tracker); err != nil {
+		if err := writeWithSnapshot(store, srcBound, pl.displayAbsPath, pl.canonicalPath, pl.newContent, false); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "M", path: pl.op.path})
 	case opDelete:
-		if err := deleteWithSnapshot(store, pl.displayAbsPath, pl.canonicalPath); err != nil {
+		if err := deleteWithSnapshot(store, srcBound, pl.displayAbsPath, pl.canonicalPath); err != nil {
 			return err
 		}
 		*committed = append(*committed, appliedOp{kind: "D", path: pl.op.path})
@@ -460,106 +492,85 @@ func applyOriginalMutation(pl *applyPlan, store SnapshotStore, tracker *FileTrac
 	return nil
 }
 
-// writeWithSnapshot snapshots the target then writes the new content. The
-// snapshot is retained on any post-snapshot error so the partial state is
-// recoverable via the turn revert. forNew enforces the Add / Move-dest
-// exclusive-create guarantee: if the path was validated to not exist and
-// OpenForWrite reports it now does (concurrent create between validate and
-// apply), the write is refused.
-func writeWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath, content string, forNew bool, tracker *FileTracker) error {
-	var snap snapshotEntry
-	hasSnap := false
-	if store != nil {
-		s, err := snapshotFileForMutation(store, store.CurrentTurn(), displayAbsPath, canonicalPath)
-		if err != nil {
-			return fmt.Errorf("snapshot: %w", err)
+// writeWithSnapshot captures the target's preimage, clears the LastWrite
+// proof, revalidates the approved witnesses, then writes the new content.
+// A failure that proves no mutation ran abandons the snapshot; a failure with
+// known-complete produced bytes records them; an uncertain started mutation
+// retains the preimage with nil identity. forNew enforces the Add /
+// Move-dest exclusive-create guarantee: if the path was validated to not
+// exist and OpenForWrite reports it now does (concurrent create between
+// validate and apply), the write is refused.
+func writeWithSnapshot(store SnapshotStore, bound boundCall, displayAbsPath, canonicalPath, content string, forNew bool) error {
+	snap, err := captureSnapshotEntry(store, displayAbsPath, canonicalPath)
+	if err != nil {
+		return fmt.Errorf("snapshot: %w", err)
+	}
+	// The fail-closed root/write-dir/target revalidators run after capture
+	// and before any open/truncate; a newly resolved target is never
+	// substituted.
+	if err := bound.revalidate(); err != nil {
+		err = fmt.Errorf("apply_patch: resolve path: %w", err)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
-		snap = s
-		hasSnap = true
-		defer releaseSnapshotMutation(snap)
+		return err
 	}
 
-	f, existed, _, err := openWriteTargetForMutation(canonicalPath, tracker)
+	f, existed, err := openWriteTargetForMutation(canonicalPath)
 	if err != nil {
-		if hasSnap {
-			_ = discardUnmutatedSnapshot(snap)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
 		return fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
 
 	if forNew && existed {
+		appearedErr := fmt.Errorf("path %s appeared during apply (Add requires the path to not exist)", canonicalPath)
 		_ = f.Close()
-		if hasSnap {
-			_ = discardUnmutatedSnapshot(snap)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", appearedErr, abandonErr)
 		}
-		return fmt.Errorf("path %s appeared during apply (Add requires the path to not exist)", canonicalPath)
+		return appearedErr
 	}
 
-	if err := f.Truncate(0); err != nil {
-		if hasSnap {
-			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
-		}
-		return fmt.Errorf("truncate: %w", err)
+	complete, werr := writeReplacement(f, []byte(content))
+	if werr != nil {
+		return finishMutationFailure(snap, true, complete, []byte(content), werr)
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		if hasSnap {
-			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
-		}
-		return fmt.Errorf("seek: %w", err)
-	}
-	if _, err := f.Write([]byte(content)); err != nil {
-		if hasSnap {
-			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
-		}
-		return fmt.Errorf("write: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		if hasSnap {
-			err = retainFailedMutatedSnapshot(snap, canonicalPath, err)
-		}
-		return fmt.Errorf("sync: %w", err)
-	}
-	if hasSnap {
-		if err := recordMutatedSnapshotContent(snap, []byte(content)); err != nil {
-			retainMutatedSnapshot(snap)
-			return fmt.Errorf("record snapshot identity: %w", err)
-		}
-	}
-	if hasSnap {
-		retainMutatedSnapshot(snap)
+	if err := recordProducedSnapshotContent(snap, []byte(content)); err != nil {
+		return fmt.Errorf("record snapshot identity: %w", err)
 	}
 	return nil
 }
 
-// deleteWithSnapshot snapshots the target then removes it. The snapshot
-// captures the file's content so RevertCode can restore it.
-func deleteWithSnapshot(store SnapshotStore, displayAbsPath, canonicalPath string) error {
-	var snap snapshotEntry
-	hasSnap := false
-	if store != nil {
-		s, err := snapshotFileForMutation(store, store.CurrentTurn(), displayAbsPath, canonicalPath)
-		if err != nil {
-			return fmt.Errorf("snapshot: %w", err)
+// deleteWithSnapshot captures the target's preimage, clears the LastWrite
+// proof, revalidates the approved witnesses, then removes it. The snapshot
+// captures the file's content so the restore traversal can recover it. A
+// failed absence record leaves nil proof and preserves the preimage for a
+// later restore skip.
+func deleteWithSnapshot(store SnapshotStore, bound boundCall, displayAbsPath, canonicalPath string) error {
+	snap, err := captureSnapshotEntry(store, displayAbsPath, canonicalPath)
+	if err != nil {
+		return fmt.Errorf("snapshot: %w", err)
+	}
+	// The fail-closed root/write-dir/target revalidators run after capture
+	// and before the remove; a newly resolved target is never substituted.
+	if err := bound.revalidate(); err != nil {
+		err = fmt.Errorf("apply_patch: resolve path: %w", err)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
-		snap = s
-		hasSnap = true
-		defer releaseSnapshotMutation(snap)
+		return err
 	}
 	if err := safefs.RemoveLeaf(canonicalPath); err != nil {
-		if hasSnap {
-			_ = discardUnmutatedSnapshot(snap)
+		if abandonErr := abandonUnmutatedSnapshot(snap); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
 		}
 		return fmt.Errorf("remove: %w", err)
 	}
-	if hasSnap {
-		if err := recordMutatedSnapshotAbsence(snap); err != nil {
-			retainMutatedSnapshot(snap)
-			return fmt.Errorf("record snapshot identity: %w", err)
-		}
-	}
-	if hasSnap {
-		retainMutatedSnapshot(snap)
+	if err := recordProducedSnapshotAbsence(snap); err != nil {
+		return fmt.Errorf("record snapshot identity: %w", err)
 	}
 	return nil
 }
@@ -587,11 +598,11 @@ func buildPartialSummary(committed []appliedOp) string {
 }
 
 // readFileBytes reads the entire file at canonicalPath with O_NOFOLLOW and
-// O_NONBLOCK and returns the raw bytes. Used by the Update/Move path to
+// returns the raw bytes. Used by the Update/Move path to
 // read the file's current content; raw bytes (including \r) ride through
 // unchanged.
 func readFileBytes(canonicalPath string) ([]byte, error) {
-	f, err := safefs.OpenExisting(canonicalPath, os.O_RDONLY|unix.O_NONBLOCK)
+	f, err := safefs.OpenExisting(canonicalPath, os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}

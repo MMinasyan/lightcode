@@ -1,0 +1,609 @@
+package client_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/MMinasyan/lightcode/client"
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/protocol"
+)
+
+// The client package's controlled loopback fixtures: a scripted server models
+// the transport for the discovery-shape, health-classification, and
+// frame-parser rows, while the runtime integration tests drive the real
+// authenticated owner. Every record is a real mode-0600 file under the test's
+// temporary root.
+
+const (
+	testInstance   = "0123456789abcdef0123456789abcdef"
+	testCredential = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	// testVersion is the current wire identity every compatible fixture
+	// speaks; the incompatible rows keep the literal old "1".
+	testVersion = string(protocol.N8)
+)
+
+// recordContent builds one private four-field discovery document.
+func recordContent(endpoint, instance, version, credential string) string {
+	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`,
+		endpoint, instance, version, credential)
+}
+
+// writeDiscoveryContent writes one discovery document at mode 0600.
+func writeDiscoveryContent(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "discovery.json")
+	testassert.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	testassert.NoError(t, os.Chmod(path, 0o600))
+	return path
+}
+
+// writeDiscovery writes one well-formed discovery record at mode 0600.
+func writeDiscovery(t *testing.T, endpoint, instance, version, credential string) string {
+	t.Helper()
+	return writeDiscoveryContent(t, recordContent(endpoint, instance, version, credential))
+}
+
+// newFixture starts one controlled loopback fixture with the given health and
+// events handlers; a nil handler leaves that route unmounted.
+func newFixture(t *testing.T, health, events http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	if health != nil {
+		mux.HandleFunc("/v1/health", health)
+	}
+	if events != nil {
+		mux.HandleFunc("/v1/events", events)
+	}
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return server
+}
+
+// jsonHealth answers one authenticated health body.
+func jsonHealth(instance, version string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":%q}`, instance, version)
+	}
+}
+
+// connectFixture connects one client to a discovery path and fails the test
+// on any error.
+func connectFixture(t *testing.T, path string) *client.Client {
+	t.Helper()
+	c, err := client.Connect(context.Background(), path)
+	testassert.Require(t, err == nil, "Connect(%s): %v", path, err)
+	return c
+}
+
+// drainEvents reads every delivered event and then the single terminal error.
+func drainEvents(events <-chan protocol.Event, errs <-chan error) ([]protocol.Event, error) {
+	var delivered []protocol.Event
+	for event := range events {
+		delivered = append(delivered, event)
+	}
+	return delivered, <-errs
+}
+
+// notificationFrame encodes one generated Event as a declared SSE frame.
+func notificationFrame(t *testing.T, event protocol.Event) string {
+	t.Helper()
+	data, err := json.Marshal(event)
+	testassert.NoError(t, err)
+	return "event: notification\ndata: " + string(data) + "\n\n"
+}
+
+// rawNotification wraps one raw JSON document as a declared SSE frame.
+func rawNotification(document string) string {
+	return "event: notification\ndata: " + document + "\n\n"
+}
+
+// ptr returns a pointer to one value.
+func ptr[T any](value T) *T { return &value }
+
+// operationEventScope is the real producer shape of every progress hint: the
+// Operation's scope with its Session and Workspace ancestors.
+func operationEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromOperationScope(protocol.OperationScope{
+		Kind:        protocol.OperationScopeKindOperation,
+		Workspace:   ptr("/w"),
+		SessionId:   testInstance,
+		OperationId: "op-1",
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
+// scopeOpenedEvent builds one valid scope lifecycle hint carrying the given
+// addressable scope.
+func scopeOpenedEvent(t *testing.T, scope protocol.Scope) protocol.Event {
+	t.Helper()
+	var event protocol.Event
+	testassert.NoError(t, event.FromScopeEvent(protocol.ScopeEvent{Kind: protocol.ScopeOpened, Scope: scope}))
+	return event
+}
+
+// sessionEventScope builds one Session-granularity scope, the producer shape
+// of the revisioned invalidation hints.
+func sessionEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromSessionScope(protocol.SessionScope{
+		Kind:      protocol.SessionScopeKindSession,
+		SessionId: testInstance,
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
+// workspaceEventScope builds one Workspace scope carrying the lexical root.
+func workspaceEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromWorkspaceScope(protocol.WorkspaceScope{
+		Kind:      protocol.WorkspaceScopeKindWorkspace,
+		Workspace: "/w",
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
+// agentEventScope builds one Agent scope carrying its complete ancestor
+// identity, the producer shape of the agent lifecycle hints.
+func agentEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromAgentScope(protocol.AgentScope{
+		Kind:        protocol.AgentScopeKindAgent,
+		Workspace:   ptr("/w"),
+		SessionId:   testInstance,
+		OperationId: "op-1",
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
+// jobEventScope builds one job-member scope, the producer shape of the
+// job-granularity invalidation hints.
+func jobEventScope() protocol.Scope {
+	var scope protocol.Scope
+	if err := scope.FromJobScope(protocol.JobScope{
+		Kind:      protocol.JobScopeKindJob,
+		Workspace: ptr("/w"),
+		SessionId: testInstance,
+		JobId:     "job-1",
+	}); err != nil {
+		panic(err) // plain members; the marshal cannot fail
+	}
+	return scope
+}
+
+// sessionChangedEvent builds one valid revisioned invalidation hint.
+func sessionChangedEvent(t *testing.T, instance, durable, local string) protocol.Event {
+	t.Helper()
+	var event protocol.Event
+	testassert.NoError(t, event.FromSessionChangedEvent(protocol.SessionChangedEvent{
+		Kind:  protocol.SessionChanged,
+		Scope: sessionEventScope(),
+		SessionRevision: protocol.SessionRevision{
+			InstanceId:      instance,
+			DurableRevision: durable,
+			LocalRevision:   local,
+		},
+	}))
+	return event
+}
+
+// writeFrames answers the events route with the fixed script and returns.
+func writeFrames(frames string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, frames)
+	}
+}
+
+// TestConnectStrictDiscovery drives the private startup-file shape: a regular
+// mode-0600 single document with the exact four fields and a loopback HTTP
+// endpoint; every deviation is one ErrNoRuntime.
+func TestConnectStrictDiscovery(t *testing.T) {
+	server := newFixture(t, jsonHealth(testInstance, testVersion), nil)
+	valid := recordContent(server.URL, testInstance, testVersion, testCredential)
+
+	t.Run("valid record connects", func(t *testing.T) {
+		c := connectFixture(t, writeDiscoveryContent(t, valid))
+		if c.InstanceID() != testInstance {
+			t.Fatalf("InstanceID = %q, want %q", c.InstanceID(), testInstance)
+		}
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		_, err := client.Connect(context.Background(), filepath.Join(t.TempDir(), "absent.json"))
+		assertNoRuntime(t, err)
+	})
+
+	t.Run("wrong mode", func(t *testing.T) {
+		path := writeDiscoveryContent(t, valid)
+		testassert.NoError(t, os.Chmod(path, 0o644))
+		_, err := client.Connect(context.Background(), path)
+		assertNoRuntime(t, err)
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "discovery.json")
+		testassert.NoError(t, os.Mkdir(path, 0o700))
+		_, err := client.Connect(context.Background(), path)
+		assertNoRuntime(t, err)
+	})
+
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"unknown member", strings.TrimSuffix(valid, "}") + `,"extra":1}`},
+		{"trailing document", valid + valid},
+		{"null document", "null"},
+		{"missing member", fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q}`, server.URL, testInstance, testVersion)},
+		{"wrong member type", fmt.Sprintf(`{"endpoint":1,"instance_id":%q,"protocol_version":%q,"credential":%q}`, testInstance, testVersion, testCredential)},
+		{"endpoint with userinfo", recordContent("http://user@"+strings.TrimPrefix(server.URL, "http://"), testInstance, testVersion, testCredential)},
+		{"endpoint with path", recordContent(server.URL+"/", testInstance, testVersion, testCredential)},
+		{"endpoint with query", recordContent(server.URL+"?x=1", testInstance, testVersion, testCredential)},
+		{"endpoint with fragment", recordContent(server.URL+"#frag", testInstance, testVersion, testCredential)},
+		{"endpoint is https", recordContent("https://"+strings.TrimPrefix(server.URL, "http://"), testInstance, testVersion, testCredential)},
+		{"endpoint host is localhost", recordContent("http://localhost:"+strings.TrimPrefix(server.URL, "http://127.0.0.1:"), testInstance, testVersion, testCredential)},
+		{"endpoint has no port", recordContent("http://127.0.0.1", testInstance, testVersion, testCredential)},
+		{"endpoint port is not numeric", recordContent("http://127.0.0.1:notaport", testInstance, testVersion, testCredential)},
+		{"endpoint port is zero", recordContent("http://127.0.0.1:0", testInstance, testVersion, testCredential)},
+		{"endpoint port overflows", recordContent("http://127.0.0.1:99999999999999999999", testInstance, testVersion, testCredential)},
+		{"instance is uppercase hex", recordContent(server.URL, strings.ToUpper(testInstance), testVersion, testCredential)},
+		{"instance is short", recordContent(server.URL, testInstance[:31], testVersion, testCredential)},
+		{"credential is short", recordContent(server.URL, testInstance, testVersion, testCredential[:63])},
+		{"credential is uppercase hex", recordContent(server.URL, testInstance, testVersion, strings.ToUpper(testCredential))},
+		{"version is empty", recordContent(server.URL, testInstance, "", testCredential)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.Connect(context.Background(), writeDiscoveryContent(t, tc.content))
+			assertNoRuntime(t, err)
+		})
+	}
+}
+
+// TestConnectHealthClassification proves the authenticated-health decision
+// order: instance identity first, then the live version, then the record's
+// version, all against the generated protocol version; every other failure
+// class collapses to ErrNoRuntime and a redirect is never followed.
+func TestConnectHealthClassification(t *testing.T) {
+	other := strings.Repeat("a", 32)
+
+	t.Run("health instance differs", func(t *testing.T) {
+		server := newFixture(t, jsonHealth(other, testVersion), nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		assertNoRuntime(t, err)
+	})
+
+	t.Run("live version is malformed", func(t *testing.T) {
+		bodies := []struct {
+			name string
+			body string
+		}{
+			{"missing", fmt.Sprintf(`{"instance_id":%q}`, testInstance)},
+			{"null", fmt.Sprintf(`{"instance_id":%q,"protocol_version":null}`, testInstance)},
+			{"empty", fmt.Sprintf(`{"instance_id":%q,"protocol_version":""}`, testInstance)},
+		}
+		for _, tc := range bodies {
+			t.Run(tc.name, func(t *testing.T) {
+				server := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, tc.body)
+				}, nil)
+				_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+				assertNoRuntime(t, err)
+			})
+		}
+	})
+
+	t.Run("live version differs", func(t *testing.T) {
+		server := newFixture(t, jsonHealth(testInstance, "1"), nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		assertIncompatible(t, err)
+	})
+
+	t.Run("record and live versions differ", func(t *testing.T) {
+		server := newFixture(t, jsonHealth(testInstance, "1"), nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		assertIncompatible(t, err)
+	})
+
+	t.Run("record version disagrees with a live compatible owner", func(t *testing.T) {
+		server := newFixture(t, jsonHealth(testInstance, testVersion), nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, "1", testCredential))
+		assertNoRuntime(t, err)
+	})
+
+	t.Run("health status failure", func(t *testing.T) {
+		server := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "no", http.StatusInternalServerError)
+		}, nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		assertNoRuntime(t, err)
+	})
+
+	t.Run("health body is malformed", func(t *testing.T) {
+		server := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"instance_id":`)
+		}, nil)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		assertNoRuntime(t, err)
+	})
+
+	t.Run("readiness probe does not follow redirects", func(t *testing.T) {
+		var redirected bool
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/elsewhere", http.StatusTemporaryRedirect)
+		})
+		mux.HandleFunc("/elsewhere", func(w http.ResponseWriter, r *http.Request) {
+			redirected = true
+			jsonHealth(testInstance, testVersion)(w, r)
+		})
+		server := httptest.NewServer(mux)
+		t.Cleanup(server.Close)
+		_, err := client.Connect(context.Background(), writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		assertNoRuntime(t, err)
+		testassert.Require(t, !redirected, "the readiness probe followed the redirect")
+	})
+
+	t.Run("caller cancellation is preserved", func(t *testing.T) {
+		arrived := make(chan struct{})
+		server := newFixture(t, func(_ http.ResponseWriter, r *http.Request) {
+			close(arrived)
+			<-r.Context().Done()
+		}, nil)
+		path := writeDiscovery(t, server.URL, testInstance, testVersion, testCredential)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := client.Connect(ctx, path)
+			done <- err
+		}()
+		<-arrived
+		cancel()
+		{
+			err := <-done
+			testassert.Require(t, errors.Is(err, context.Canceled), "canceled Connect = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// TestEventsFrames drives the SSE parser through the public stream: declared
+// notification frames and keepalive comments are accepted, duplicates and
+// out-of-order hints are preserved, every malformed or unauthenticated frame
+// is one ErrResyncRequired, and intentional cancellation is ctx.Err.
+func TestEventsFrames(t *testing.T) {
+	t.Run("duplicate and out-of-order hints are preserved", func(t *testing.T) {
+		frames := ": keepalive\n\n" +
+			notificationFrame(t, sessionChangedEvent(t, testInstance, "3", "0")) +
+			": keepalive\n\n" +
+			notificationFrame(t, sessionChangedEvent(t, testInstance, "3", "0")) +
+			notificationFrame(t, sessionChangedEvent(t, testInstance, "2", "0"))
+		server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(frames))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		events, errs := c.Events(context.Background())
+		delivered, err := drainEvents(events, errs)
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "disconnect error = %v, want ErrResyncRequired", err)
+		want := []string{"3", "3", "2"}
+		testassert.Equal(t, len(delivered), len(want))
+		for i, event := range delivered {
+			{
+				kind, err := event.Discriminator()
+				testassert.Require(t, err == nil && kind == "session_changed", "hint %d kind = %q (%v), want session_changed", i, kind, err)
+			}
+			body, err := event.AsSessionChangedEvent()
+			testassert.Require(t, err == nil, "hint %d decode: %v", i, err)
+			testassert.Require(t, body.SessionRevision.DurableRevision == want[i], "hint %d durable revision = %q, want %q", i, body.SessionRevision.DurableRevision, want[i])
+			if body.SessionRevision.InstanceId != c.InstanceID() {
+				t.Fatalf("hint %d instance = %q, want the connection instance %q", i, body.SessionRevision.InstanceId, c.InstanceID())
+			}
+		}
+	})
+
+	t.Run("valid transient progress", func(t *testing.T) {
+		var delta protocol.Event
+		testassert.NoError(t, delta.FromTextDeltaEvent(protocol.TextDeltaEvent{
+			Kind: protocol.TextDelta, Scope: operationEventScope(), Position: 7, Content: "chunk",
+		}))
+		var refusal protocol.Event
+		testassert.NoError(t, refusal.FromRefusalDeltaEvent(protocol.RefusalDeltaEvent{
+			Kind: protocol.RefusalDelta, Scope: operationEventScope(), Content: "refused",
+		}))
+		var started protocol.Event
+		testassert.NoError(t, started.FromToolStartedEvent(protocol.ToolStartedEvent{
+			Kind: protocol.ToolStarted, Scope: operationEventScope(), CallId: "call-1", Ordinal: 0, Name: "read",
+		}))
+		var finished protocol.Event
+		evidence := protocol.Unknown
+		testassert.NoError(t, finished.FromToolFinishedEvent(protocol.ToolFinishedEvent{
+			Kind: protocol.ToolFinished, Scope: operationEventScope(), CallId: "call-1", Status: protocol.ToolCallStatusSuccess, Evidence: &evidence,
+		}))
+		frames := notificationFrame(t, delta) + notificationFrame(t, refusal) + notificationFrame(t, started) + notificationFrame(t, finished)
+		server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(frames))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		events, errs := c.Events(context.Background())
+		delivered, err := drainEvents(events, errs)
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "disconnect error = %v, want ErrResyncRequired", err)
+		testassert.Equal(t, len(delivered), 4)
+		for i, want := range []string{"text_delta", "refusal_delta", "tool_started", "tool_finished"} {
+			{
+				kind, _ := delivered[i].Discriminator()
+				testassert.Require(t, kind == want, "event %d kind = %q, want %q", i, kind, want)
+			}
+		}
+		refusalBody, err := delivered[1].AsRefusalDeltaEvent()
+		testassert.Require(t, err == nil && refusalBody.Content == "refused", "delivered refusal delta = (%+v, %v), want its distinct refusal content", refusalBody, err)
+		finishedBody, err := delivered[3].AsToolFinishedEvent()
+		testassert.Require(t, err == nil && finishedBody.Evidence != nil && *finishedBody.Evidence == protocol.Unknown, "delivered tool finished = (%+v, %v), want its unknown evidence carried through", finishedBody, err)
+	})
+
+	// Every non-global scope kind delivers through its real producer shape:
+	// the Workspace and Agent lifecycle hints and the job-member
+	// invalidation hint carry the identities that address their subject.
+	t.Run("addressable scope kinds", func(t *testing.T) {
+		var job protocol.Event
+		testassert.NoError(t, job.FromSessionChangedEvent(protocol.SessionChangedEvent{
+			Kind:            protocol.SessionChanged,
+			Scope:           jobEventScope(),
+			SessionRevision: protocol.SessionRevision{InstanceId: testInstance, DurableRevision: "1", LocalRevision: "0"},
+		}))
+		frames := notificationFrame(t, scopeOpenedEvent(t, workspaceEventScope())) +
+			notificationFrame(t, scopeOpenedEvent(t, agentEventScope())) +
+			notificationFrame(t, job)
+		server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(frames))
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		events, errs := c.Events(context.Background())
+		delivered, err := drainEvents(events, errs)
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "disconnect error = %v, want ErrResyncRequired", err)
+		testassert.Equal(t, len(delivered), 3)
+		for i, want := range []string{"scope_opened", "scope_opened", "session_changed"} {
+			{
+				kind, _ := delivered[i].Discriminator()
+				testassert.Require(t, kind == want, "event %d kind = %q, want %q", i, kind, want)
+			}
+		}
+	})
+
+	malformed := []struct {
+		name  string
+		frame string
+	}{
+		{"unknown kind", rawNotification(`{"kind":"bogus","scope":{"kind":"runtime"}}`)},
+		{"unknown member", rawNotification(strings.TrimSuffix(mustMarshal(t, sessionChangedEvent(t, testInstance, "1", "0")), "}") + `,"extra":1}`)},
+		{"top-level instance_id on a transient", rawNotification(fmt.Sprintf(`{"kind":"scope_opened","scope":{"kind":"runtime"},"instance_id":%q}`, testInstance))},
+		{"missing required member", rawNotification(`{"kind":"session_changed","scope":{"kind":"session"}}`)},
+		{"null required member", rawNotification(`{"kind":"session_changed","scope":null,"session_revision":{"instance_id":"` + testInstance + `","durable_revision":"1","local_revision":"0"}}`)},
+		{"revision instance mismatch", notificationFrame(t, sessionChangedEvent(t, strings.Repeat("b", 32), "1", "0"))},
+		{"unknown scope kind", rawNotification(`{"kind":"scope_opened","scope":{"kind":"bogus"}}`)},
+		{"unknown scope member", rawNotification(fmt.Sprintf(`{"kind":"session_changed","scope":{"kind":"session","bogus":true},"session_revision":{"instance_id":%q,"durable_revision":"1","local_revision":"0"}}`, testInstance))},
+		{"wrong-typed scope member", rawNotification(`{"kind":"scope_opened","scope":{"kind":5}}`)},
+		{"session_id is not hex32", rawNotification(fmt.Sprintf(`{"kind":"session_changed","scope":{"kind":"session","session_id":"nothex"},"session_revision":{"instance_id":%q,"durable_revision":"1","local_revision":"0"}}`, testInstance))},
+		{"workspace scope without its identity", rawNotification(`{"kind":"scope_opened","scope":{"kind":"workspace"}}`)},
+		{"session scope without its identity", rawNotification(`{"kind":"scope_opened","scope":{"kind":"session"}}`)},
+		{"operation scope without the session identity", rawNotification(`{"kind":"scope_opened","scope":{"kind":"operation","workspace":"/w","operation_id":"op-1"}}`)},
+		{"operation scope without the operation identity", rawNotification(fmt.Sprintf(`{"kind":"scope_opened","scope":{"kind":"operation","workspace":"/w","session_id":%q}}`, testInstance))},
+		{"agent scope without the operation identity", rawNotification(fmt.Sprintf(`{"kind":"scope_opened","scope":{"kind":"agent","session_id":%q}}`, testInstance))},
+		{"job scope without the session identity", rawNotification(`{"kind":"scope_opened","scope":{"kind":"job","job_id":"job-1"}}`)},
+		{"job scope without the job identity", rawNotification(fmt.Sprintf(`{"kind":"scope_opened","scope":{"kind":"job","session_id":%q}}`, testInstance))},
+		{"empty scope member", rawNotification(`{"kind":"scope_opened","scope":{"kind":"runtime","workspace":""}}`)},
+		{"negative text position", rawNotification(`{"kind":"text_delta","scope":{"kind":"runtime"},"position":-1,"content":"x"}`)},
+		{"empty text content", rawNotification(`{"kind":"text_delta","scope":{"kind":"runtime"},"position":0,"content":""}`)},
+		{"empty refusal content", rawNotification(`{"kind":"refusal_delta","scope":{"kind":"runtime"},"content":""}`)},
+		{"missing refusal content", rawNotification(`{"kind":"refusal_delta","scope":{"kind":"runtime"}}`)},
+		{"position member on refusal_delta", rawNotification(`{"kind":"refusal_delta","scope":{"kind":"runtime"},"content":"x","position":0}`)},
+		{"unknown tool status", rawNotification(`{"kind":"tool_finished","scope":{"kind":"runtime"},"call_id":"c","status":"pending"}`)},
+		{"unknown tool evidence", rawNotification(`{"kind":"tool_finished","scope":{"kind":"runtime"},"call_id":"c","status":"success","evidence":"pending"}`)},
+		{"negative tool ordinal", rawNotification(`{"kind":"tool_started","scope":{"kind":"runtime"},"call_id":"c","ordinal":-1,"name":"n"}`)},
+		{"wrong event name", "event: other\ndata: {}\n\n"},
+		{"unexpected stream field", "id: 7\nevent: notification\ndata: {}\n\n"},
+		{"unknown stream line", "garbage\n\n"},
+		{"incomplete frame at EOF", "event: notification\ndata: " + mustMarshal(t, sessionChangedEvent(t, testInstance, "1", "0"))},
+	}
+	for _, tc := range malformed {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newFixture(t, jsonHealth(testInstance, testVersion), writeFrames(tc.frame))
+			c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+			events, errs := c.Events(context.Background())
+			delivered, err := drainEvents(events, errs)
+			testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "malformed frame error = %v, want ErrResyncRequired", err)
+			testassert.Equal(t, len(delivered), 0)
+		})
+	}
+
+	t.Run("status failure", func(t *testing.T) {
+		server := newFixture(t, jsonHealth(testInstance, testVersion), func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "no", http.StatusInternalServerError)
+		})
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		events, errs := c.Events(context.Background())
+		delivered, err := drainEvents(events, errs)
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "status failure error = %v, want ErrResyncRequired", err)
+		testassert.Equal(t, len(delivered), 0)
+	})
+
+	t.Run("queue overflow", func(t *testing.T) {
+		const total = 300
+		server := newFixture(t, jsonHealth(testInstance, testVersion), func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			for i := 0; i < total; i++ {
+				if r.Context().Err() != nil {
+					return
+				}
+				if _, err := io.WriteString(w, notificationFrame(t, sessionChangedEvent(t, testInstance, "1", "0"))); err != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		})
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		events, errs := c.Events(context.Background())
+		// The caller never reads, so the bounded queue overflows on frame 257
+		// and the stream ends with the resync signal alone.
+		err := <-errs
+		testassert.Require(t, errors.Is(err, client.ErrResyncRequired), "overflow error = %v, want ErrResyncRequired", err)
+		testassert.Equal(t, len(events), 256)
+	})
+
+	t.Run("caller cancellation", func(t *testing.T) {
+		server := newFixture(t, jsonHealth(testInstance, testVersion), func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		})
+		c := connectFixture(t, writeDiscovery(t, server.URL, testInstance, testVersion, testCredential))
+		ctx, cancel := context.WithCancel(context.Background())
+		events, errs := c.Events(ctx)
+		cancel()
+		delivered, err := drainEvents(events, errs)
+		testassert.Require(t, errors.Is(err, context.Canceled), "canceled stream error = %v, want context.Canceled", err)
+		testassert.Equal(t, len(delivered), 0)
+	})
+}
+
+// assertNoRuntime proves one failure is the single usable-owner classification.
+func assertNoRuntime(t *testing.T, err error) {
+	t.Helper()
+	testassert.Require(t, errors.Is(err, client.ErrNoRuntime) && !errors.Is(err, client.ErrIncompatibleProtocol), "error = %v, want ErrNoRuntime; error = %v, must not be ErrIncompatibleProtocol", err, err)
+}
+
+// assertIncompatible proves one authenticated version mismatch classification.
+func assertIncompatible(t *testing.T, err error) {
+	t.Helper()
+	testassert.Require(t, errors.Is(err, client.ErrIncompatibleProtocol) && !errors.Is(err, client.ErrNoRuntime), "error = %v, want ErrIncompatibleProtocol; error = %v, must not be ErrNoRuntime", err, err)
+}
+
+// mustMarshal encodes one generated event as JSON.
+func mustMarshal(t *testing.T, event protocol.Event) string {
+	t.Helper()
+	data, err := json.Marshal(event)
+	testassert.NoError(t, err)
+	return string(data)
+}

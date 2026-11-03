@@ -1,0 +1,460 @@
+package harness
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/MMinasyan/lightcode/internal/testassert"
+)
+
+// The capture-availability contract regressions: the surviving reads must
+// decide one Session's availability inside the same coordinator-mutex hold
+// that copies their returned state, so a corruption marker that a real
+// transition sticks on a warm coordinator between a reader's acquisition
+// and its capture refuses that capture.
+//
+// The window's real producer is Fork: its store-wide transaction runs outside
+// the source coordinator's c.mu and fails on a corrupted durable session
+// register (decodeSessionRegister -> corruptSession, fork.go), so markCorrupt
+// sticks the warm source's corruption marker under h.mu without holding c.mu.
+// No test injects a marker directly on these rows.
+//
+// The rendezvous is deterministic, with no stack inspection, sleeps, or
+// scheduler guesses: the shared prepareStub gate parks Fork before its
+// transaction; the reader goroutine drives the private capture path itself —
+// it acquires the warm coordinator through the private acquisition (the step
+// whose corruption sample must already be complete), signals acquisition, and parks
+// before calling captureAvailable. Releasing the Fork gate lets the
+// transaction fail and the real marker land while the reader is parked; only
+// then is the reader let through, strictly after the mark. Every wait is
+// bounded by the shared barrier deadline, and the rendezvous registers one
+// failure-safe release — the gate, then the reader — before any wait starts,
+// so no exit path, including a mid-rendezvous t.Fatal with the gate armed or
+// the reader parked, can strand them.
+
+const captureBarrierWait = 5 * time.Second
+
+// corruptRegisterLifecyclePayload rewrites one session register payload with
+// the same invalid lifecycle value the graph_test sessionRawOverride fixture
+// uses, so decodeSessionRegister rejects it.
+func corruptRegisterLifecyclePayload(t *testing.T, regPayload json.RawMessage) json.RawMessage {
+	t.Helper()
+	state, err := decodePayloadObject(mustState(t, regPayload))
+	testassert.NoError(t, err)
+	state["lifecycle"] = json.RawMessage(`"stopping"`)
+	patchedState, err := json.Marshal(state)
+	testassert.NoError(t, err)
+	obj := wireObject(t, regPayload)
+	obj["state"] = patchedState
+	patched, err := json.Marshal(obj)
+	testassert.NoError(t, err)
+	return patched
+}
+
+// foreignCorruptRegister corrupts the durable session register in place
+// through a plain test transaction, the way an external writer would.
+func foreignCorruptRegister(t *testing.T, store *graphStorage, sessionID string) {
+	t.Helper()
+	err := store.Transact(context.Background(), func(tx Transaction) error {
+		key := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+		reg, err := tx.ReadRegister(key)
+		if err != nil {
+			return err
+		}
+		patched := corruptRegisterLifecyclePayload(t, reg.Payload)
+		_, err = tx.ReplaceRegister(key, reg.Revision, patched)
+		return err
+	})
+	testassert.NoError(t, err)
+}
+
+// warmCorruptFixture builds one warm Session whose cached graph carries a
+// settled operation admitted and settled through the real production paths,
+// one valid sibling Session, and a durable session register corrupted by a
+// foreign test write so the real Fork transaction fails on it. It returns the
+// harness, the store, the preparation stub, the subject's cached coordinator,
+// and the sibling's identity.
+func warmCorruptFixture(t *testing.T) (*Harness, *graphStorage, *prepareStub, *coordinator, string) {
+	t.Helper()
+	store := freshSessionStore(t)
+	stub := newPrepareStub(validPrepared())
+	h := newTestHarness(t, store, stub.prepare)
+	ctx := context.Background()
+	{
+		_, err := h.ReadSessionHeader(ctx, testSessionID)
+		testassert.NoError(t, err)
+	}
+	sibling := createSession(t, h)
+	c := cachedCoordinator(t, h, testSessionID)
+	mustAdmitWithoutExecution(t, h, testSessionID, testOpID, admissionContent("hello"))
+	{
+		_, err := h.commitEffectResult(ctx, c, testOpID, nil, modelResult{terminal: OperationSuccess})
+		testassert.NoError(t, err)
+	}
+	{
+		header, err := h.ReadSessionHeader(ctx, testSessionID)
+		testassert.Require(t, err == nil && header.CurrentOperationID == "", "post-settlement header = %+v (%v), want an idle Session", header, err)
+	}
+	foreignCorruptRegister(t, store, testSessionID)
+	return h, store, stub, c, sibling
+}
+
+// drainPreparations consumes every buffered preparation arrival, so the next
+// one belongs to the gated producer under test.
+func drainPreparations(stub *prepareStub) {
+	for {
+		select {
+		case <-stub.arrived:
+			continue
+		default:
+		}
+		break
+	}
+}
+
+// awaitCorruptMark waits (bounded, yielding the processor while waiting for
+// this explicit event) until the warm coordinator carries its sticky
+// corruption marker, and reports whether it landed.
+func awaitCorruptMark(h *Harness, c *coordinator) (error, bool) {
+	deadline := time.Now().Add(captureBarrierWait)
+	for {
+		h.mu.Lock()
+		corru := c.corru
+		h.mu.Unlock()
+		if corru != nil {
+			return corru, true
+		}
+		if !time.Now().Before(deadline) {
+			return nil, false
+		}
+		runtime.Gosched()
+	}
+}
+
+// receiveBounded waits for one rendezvous outcome channel with the shared
+// barrier deadline, so no completion wait can hang a row.
+func receiveBounded[T any](t *testing.T, from <-chan T, what string) T {
+	t.Helper()
+	timer := time.NewTimer(captureBarrierWait)
+	defer timer.Stop()
+	select {
+	case v := <-from:
+		return v
+	case <-timer.C:
+		var zero T
+		t.Fatalf("%s within %s", what, captureBarrierWait)
+		return zero
+	}
+}
+
+// joinBounded waits for the rendezvous goroutines with the shared barrier
+// deadline. A timeout means a released goroutine still runs, so the row fails
+// rather than hanging; its helper waiter dies with the test process.
+func joinBounded(t *testing.T, wg *sync.WaitGroup) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(captureBarrierWait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		t.Fatalf("the rendezvous goroutines did not join within %s", captureBarrierWait)
+	}
+}
+
+// captureOutcome is one parked private capture's outcome: whether the capture
+// callback executed and the captureAvailable error.
+type captureOutcome struct {
+	callbackRan bool
+	err         error
+}
+
+// parkedCaptureReader is the named reader goroutine root: it acquires the warm
+// coordinator through the private acquisition, signals acquisition, parks until
+// released, then runs one real captureAvailable call with a callback that
+// records whether it executed. Its own lease covers the park exactly like a
+// production reader's use.
+func parkedCaptureReader(ctx context.Context, h *Harness, sessionID string, acquired chan<- struct{}, release <-chan struct{}, out chan<- captureOutcome) {
+	c, lease, err := h.acquireCoordinator(ctx, sessionID)
+	if err != nil {
+		out <- captureOutcome{err: err}
+		return
+	}
+	defer lease()
+	acquired <- struct{}{}
+	<-release
+	ran := false
+	err = h.captureAvailable(c, sessionID, func(*coordinator) error {
+		ran = true
+		return nil
+	})
+	out <- captureOutcome{callbackRan: ran, err: err}
+}
+
+// forkMarker is the named Fork goroutine root; its deferred reservation
+// release parks on the test-held c.mu once the mark landed.
+func forkMarker(ctx context.Context, h *Harness, req ForkRequest, out chan<- error) {
+	_, err := h.Fork(ctx, req)
+	out <- err
+}
+
+// assertCaptureCorruption asserts one reader outcome is the typed corruption
+// error of the marked Session, not captured state.
+func assertCaptureCorruption(t *testing.T, err error, sessionID, read string) {
+	t.Helper()
+	testassert.Require(t, isCorruption(err), "%s after the mark = %v, want the typed corruption error", read, err)
+	var corrupt *CorruptionError
+	testassert.Require(t, errors.As(err, &corrupt) && corrupt.SessionID == sessionID, "%s error = %v, want the typed CorruptionError naming %q", read, err, sessionID)
+}
+
+// runMarkWindow performs the shared deterministic window rendezvous for one
+// parked private reader against the warm source of one real Fork transition:
+// it arms the preparation gate, starts Fork and parks it in preparation,
+// starts the reader and waits until its acquisition succeeded and it parked
+// before the availability check, releases the gate so Fork's own
+// register-decode corruption path sticks the marker on the warm source, awaits
+// the marker, and lets the reader through so its real captureAvailable call
+// proceeds strictly after the mark. One deferred failure-safe release — the
+// gate, then the parked reader, then a bounded join of the reader and Fork —
+// is registered before any wait starts, so no exit path can strand the parked
+// reader or the gated Fork; the join also guarantees both outcome channels
+// carry their values before the rendezvous returns. The sticky marker must be
+// the Fork transition's own register corruption naming the source Session.
+func runMarkWindow(t *testing.T, ctx context.Context, h *Harness, stub *prepareStub, c *coordinator,
+	req ForkRequest) (reader chan captureOutcome, forkDone chan error) {
+	t.Helper()
+
+	drainPreparations(stub)
+	gate := make(chan struct{})
+	releaseGate := sync.OnceFunc(func() { close(gate) })
+	stub.gate = gate
+
+	acquired := make(chan struct{}, 1)
+	releaseCapture := make(chan struct{})
+	releaseReader := sync.OnceFunc(func() { close(releaseCapture) })
+
+	var joins sync.WaitGroup
+	defer func() { // failure-safe release on every exit: gate, then parked reader, then join
+		releaseGate()
+		releaseReader()
+		joinBounded(t, &joins)
+	}()
+
+	forkDone = make(chan error, 1)
+	joins.Add(1)
+	go func() { defer joins.Done(); forkMarker(ctx, h, req, forkDone) }()
+	select {
+	case <-stub.arrived: // Fork holds the source reservation and parks in preparation
+	case <-time.After(captureBarrierWait):
+		t.Fatalf("the gated Fork preparation never arrived within %s", captureBarrierWait)
+	}
+
+	reader = make(chan captureOutcome, 1)
+	joins.Add(1)
+	go func() {
+		defer joins.Done()
+		parkedCaptureReader(ctx, h, req.SourceSessionID, acquired, releaseCapture, reader)
+	}()
+	select {
+	case <-acquired: // the reader's acquisition succeeded (its corru sample was nil) and it parked before the availability check
+	case <-time.After(captureBarrierWait):
+		t.Fatalf("the reader never acquired the warm coordinator within %s", captureBarrierWait)
+	}
+
+	releaseGate() // the transaction fails on the corrupt register and the real mark lands, with no c.mu held
+
+	marker, landed := awaitCorruptMark(h, c)
+	testassert.Require(t, landed, "the real Fork transition's corruption marker did not land within %s", captureBarrierWait)
+	releaseReader() // the reader's real capture proceeds, strictly after the mark
+	var corrupt *CorruptionError
+	testassert.Require(t, errors.As(marker, &corrupt) && corrupt.SessionID == req.SourceSessionID && strings.Contains(corrupt.Detail, "session register"), "sticky marker = %v, want the Fork transition's register corruption naming %q", marker, req.SourceSessionID)
+	return reader, forkDone
+}
+
+// TestCorruptMarkBetweenLookupAndCapture is the window regression: a reader
+// whose acquisition passed before the real Fork transition stuck the
+// corruption marker on the warm source must still refuse its capture — the
+// capture callback never executes — because the availability decision runs
+// inside the capture hold. The row also proves both pre-marker ownership
+// observations: the same warm coordinator captures its complete owned state —
+// the composed Session view and the Operation record — and mutating either
+// returned copy cannot reach the coordinator.
+func TestCorruptMarkBetweenLookupAndCapture(t *testing.T) {
+	ctx := context.Background()
+	h, _, stub, c, _ := warmCorruptFixture(t)
+
+	view, err := h.ReadSessionView(ctx, testSessionID)
+	testassert.NoError(t, err)
+	testassert.Require(t, len(view.Operations) == 1 && view.Operations[0].OperationID == testOpID && view.Operations[0].Status == OperationSuccess && !view.History.ExecutionBusy, "pre-marker operations = %+v, want the settled %s; pre-marker view = busy, want the idle post-settlement state", view.Operations, testOpID)
+	// The captured copy is owned: mutating it cannot reach the coordinator.
+	view.Operations[0].Status = OperationRunning
+	facts := view.History.HistoryFacts(historyHeaderIDs(view.History.HistoryHeaders()))
+	inputText := ""
+	for _, fact := range facts {
+		if fact.Input != nil {
+			inputText = fact.Input.Content[0].Text
+			fact.Input.Content[0].Text = "mutated"
+		}
+	}
+	testassert.Require(t, inputText != "", "%v", "pre-marker view carries no input fact to mutate")
+	again, err := h.ReadSessionView(ctx, testSessionID)
+	testassert.NoError(t, err)
+	rereadFacts := again.History.HistoryFacts(historyHeaderIDs(again.History.HistoryHeaders()))
+	for _, fact := range rereadFacts {
+		testassert.Require(t, fact.Input == nil || fact.Input.Content[0].Text != "mutated", "a mutation of the returned view reached the coordinator: %+v", again)
+	}
+	testassert.Require(t, again.Operations[0].Status == OperationSuccess, "a mutation of the returned view reached the coordinator: %+v", again)
+
+	// The same window pins the Operation record's own ownership.
+	rec, err := h.ReadOperation(ctx, testSessionID, testOpID)
+	testassert.NoError(t, err)
+	testassert.Require(t, rec.Admission.OperationID == testOpID && rec.State.Status == OperationSuccess, "pre-marker record = %+v, want the settled %s", rec, testOpID)
+	rec.State.Status = OperationFailure
+	reread, err := h.ReadOperation(ctx, testSessionID, testOpID)
+	testassert.NoError(t, err)
+	testassert.Require(t, reread.State.Status == OperationSuccess, "a mutation of the returned record reached the coordinator: %+v", reread)
+
+	reader, forkDone := runMarkWindow(t, ctx, h, stub, c, ForkRequest{
+		SourceSessionID: testSessionID,
+		BoundaryEntryID: hexID(1),
+		OperationID:     "op-fork-1",
+		Content:         admissionContent("fork"),
+	})
+
+	outcome := receiveBounded(t, reader, "the parked capture never completed")
+	assertCaptureCorruption(t, outcome.err, testSessionID, "captureAvailable")
+	testassert.Require(t, !outcome.callbackRan, "%v", "the capture callback executed after the mark")
+	forkErr := receiveBounded(t, forkDone, "Fork never completed")
+	testassert.Require(t, isCorruption(forkErr), "Fork = %v, want its own register-decode corruption", forkErr)
+}
+
+// TestCaptureAvailabilityFamily pins the surrounding semantic rows of the
+// shared in-hold availability decision: a gone Session answers not-found from
+// both reads, a valid sibling stays fully readable and listed around the marked
+// subject, a warm-marked Session is unavailable to the whole read family, and
+// a cold corrupt register refuses a fresh harness through validation.
+func TestCaptureAvailabilityFamily(t *testing.T) {
+	t.Run("gone session answers not-found from both reads", func(t *testing.T) {
+		ctx := context.Background()
+		h := newTestHarness(t, freshSessionStore(t), newPrepareStub(validPrepared()).prepare)
+		{
+			_, err := h.ReadSessionHeader(ctx, testSessionID)
+			testassert.NoError(t, err)
+		}
+		{
+			_, err := h.ArchiveSession(ctx, testSessionID)
+			testassert.NoError(t, err)
+		}
+		{
+			err := h.DeleteSession(ctx, testSessionID)
+			testassert.NoError(t, err)
+		}
+		{
+			_, err := h.ReadSessionView(ctx, testSessionID)
+			testassert.Require(t, errors.Is(err, ErrNotFound), "ReadSessionView after deletion = %v, want the not-found class", err)
+		}
+		{
+			_, err := h.ReadOperation(ctx, testSessionID, testOpID)
+			testassert.Require(t, errors.Is(err, ErrNotFound), "ReadOperation after deletion = %v, want the not-found class", err)
+		}
+	})
+
+	t.Run("valid sibling stays readable and listed around the marked subject", func(t *testing.T) {
+		ctx := context.Background()
+		h, _, _, _, sibling := warmCorruptFixture(t)
+
+		// The same real transition installs the marker on the warm source.
+		forkDone := make(chan error, 1)
+		go forkMarker(ctx, h, ForkRequest{
+			SourceSessionID: testSessionID,
+			BoundaryEntryID: hexID(1),
+			OperationID:     "op-fork-sibling",
+			Content:         admissionContent("fork"),
+		}, forkDone)
+		{
+			err := receiveBounded(t, forkDone, "Fork never completed")
+			testassert.Require(t, isCorruption(err), "Fork over the corrupt register = %v, want its register-decode corruption", err)
+		}
+
+		listed, err := h.ListSessions(ctx)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(listed) == 1 && listed[0].Identity.SessionID == sibling, "ListSessions = %+v, want exactly the valid sibling %q", listed, sibling)
+		{
+			_, err := h.ReadSessionView(ctx, sibling)
+			testassert.NoError(t, err)
+		}
+		{
+			_, err := h.ReadSessionHeader(ctx, sibling)
+			testassert.NoError(t, err)
+		}
+		// The sibling's own absent Operation answers its not-found class, not
+		// the subject's corruption: the marker never crosses coordinators.
+		{
+			_, err := h.ReadOperation(ctx, sibling, "op-absent")
+			testassert.Require(t, errors.Is(err, ErrNotFound), "sibling ReadOperation = %v, want the sibling's own not-found class", err)
+		}
+	})
+
+	t.Run("warm-marked session is unavailable to the whole read family", func(t *testing.T) {
+		ctx := context.Background()
+		h, _, _, _, _ := warmCorruptFixture(t)
+
+		forkDone := make(chan error, 1)
+		go forkMarker(ctx, h, ForkRequest{
+			SourceSessionID: testSessionID,
+			BoundaryEntryID: hexID(1),
+			OperationID:     "op-fork-family",
+			Content:         admissionContent("fork"),
+		}, forkDone)
+		{
+			err := receiveBounded(t, forkDone, "Fork never completed")
+			testassert.Require(t, isCorruption(err), "Fork over the corrupt register = %v, want its register-decode corruption", err)
+		}
+
+		{
+			_, err := h.ReadSessionView(ctx, testSessionID)
+			testassert.Require(t, isCorruption(err), "fresh ReadSessionView = %v, want the corruption class", err)
+		}
+		{
+			_, err := h.ReadHistoryView(ctx, testSessionID)
+			testassert.Require(t, isCorruption(err), "fresh ReadHistoryView = %v, want the corruption class", err)
+		}
+		{
+			_, err := h.ReadOperation(ctx, testSessionID, testOpID)
+			testassert.Require(t, isCorruption(err), "fresh ReadOperation = %v, want the corruption class", err)
+		}
+		{
+			_, err := h.ReadSessionHeader(ctx, testSessionID)
+			testassert.Require(t, isCorruption(err), "ReadSessionHeader = %v, want the corruption class", err)
+		}
+		{
+			_, _, ok := h.ReadObservation(testSessionID)
+			testassert.Require(t, !ok, "%v", "ReadObservation reported a corrupt Session available")
+		}
+	})
+
+	t.Run("cold corrupt register refuses a fresh harness through validation", func(t *testing.T) {
+		ctx := context.Background()
+		_, store, _, _, _ := warmCorruptFixture(t)
+		cold := newTestHarness(t, store, nil)
+
+		{
+			_, err := cold.ReadSessionView(ctx, testSessionID)
+			testassert.Require(t, isCorruption(err), "cold ReadSessionView = %v, want the corruption class", err)
+		}
+		{
+			_, err := cold.ReadOperation(ctx, testSessionID, testOpID)
+			testassert.Require(t, isCorruption(err), "cold ReadOperation = %v, want the corruption class", err)
+		}
+	})
+}

@@ -16,14 +16,6 @@ type entry struct {
 	adapt   Adaptation
 }
 
-// defaultAdditions is the system-owned fallback for per-section additions.
-// Empty means there is no baseline addition for that section.
-var defaultAdditions map[string]string
-
-// defaultToolDescriptionReplacements is populated from bundled data and applies
-// to model-facing tool descriptions when no active adaptation overrides a key.
-var defaultToolDescriptionReplacements map[string]string
-
 // Match returns the adaptation bound to modelID, or nil for baseline. It is the
 // production Resolver and expects the model component of the active model ref;
 // aggregator model IDs may still contain slashes. The table is loaded from
@@ -32,33 +24,15 @@ func Match(modelID string) *Adaptation {
 	return matchIn(bundledTable, modelID)
 }
 
-// SectionAddition returns the addition for section from the active adaptation
-// if it exists and is non-empty, otherwise the default addition for that
-// section (which may be empty). section is one of the four user-overridable
-// section ids: "safety", "tone", "task_execution", "language".
-func SectionAddition(adapt *Adaptation, section string) string {
-	if adapt != nil && adapt.Additions != nil {
-		if v := adapt.Additions[section]; v != "" {
-			return v
-		}
-	}
-	return defaultAdditions[section]
-}
-
-// RenderToolDescription applies bundled placeholder replacements to a
-// model-facing tool description. Active adaptations override default
-// replacement values. A line that consists only of a placeholder is removed when
-// that placeholder resolves to an empty string.
+// RenderToolDescription applies the active adaptation's literal replacement
+// overrides to a model-facing tool description; a nil adaptation returns the
+// description unchanged. A line that consists only of a replaced value is
+// removed when that value resolves to an empty string.
 func RenderToolDescription(description string, adapt *Adaptation) string {
-	replacements := maps.Clone(defaultToolDescriptionReplacements)
-	if replacements == nil {
-		replacements = map[string]string{}
+	if adapt == nil || len(adapt.ToolDescriptionReplacements) == 0 {
+		return description
 	}
-	if adapt != nil {
-		for k, v := range adapt.ToolDescriptionReplacements {
-			replacements[k] = v
-		}
-	}
+	replacements := adapt.ToolDescriptionReplacements
 
 	lines := strings.Split(description, "\n")
 	for i := 0; i < len(lines); i++ {
@@ -81,17 +55,14 @@ func RenderToolDescription(description string, adapt *Adaptation) string {
 // matches modelID, or nil. Matching is case-insensitive and walks t in order, so
 // the table's most-specific-first ordering decides ties (first match wins). The
 // result aliases nothing mutable in t — its slice fields are cloned — so a caller
-// can never corrupt the table through the resolved adaptation. (The LeakPattern
-// regexp is shared intentionally: it is read-only and safe for concurrent use.)
+// can never corrupt the table through the resolved adaptation.
 func matchIn(t []entry, modelID string) *Adaptation {
 	id := strings.ToLower(modelID)
 	for i := range t {
 		if globMatch(strings.ToLower(t[i].pattern), id) {
 			a := t[i].adapt
 			a.ExcludeTools = slices.Clone(a.ExcludeTools)
-			a.IncludeTools = slices.Clone(a.IncludeTools)
-			a.Blocks = slices.Clone(a.Blocks)
-			a.Additions = maps.Clone(a.Additions)
+			a.Append = slices.Clone(a.Append)
 			a.ToolDescriptionReplacements = maps.Clone(a.ToolDescriptionReplacements)
 			return &a
 		}

@@ -3,24 +3,12 @@ package agents
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/engine/coremodel"
+	"github.com/MMinasyan/lightcode/model"
 )
-
-const emptyAgentsTemplate = "{}\n"
-
-var allowedTools = func() map[string]struct{} {
-	out := make(map[string]struct{}, len(StandardTools)+1)
-	for _, name := range StandardTools {
-		out[name] = struct{}{}
-	}
-	out[submitPlanTool] = struct{}{}
-	return out
-}()
 
 // PathForConfig returns the agents.json path beside the active config.json.
 func PathForConfig(configPath string) string {
@@ -32,27 +20,32 @@ type Config struct {
 	warnings []Warning
 }
 
-func Load(path string) (*Config, error) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, fmt.Errorf("create agents dir: %w", err)
-		}
-		if err := os.WriteFile(path, []byte(emptyAgentsTemplate), 0o600); err != nil {
-			return nil, fmt.Errorf("create agents %s: %w", path, err)
-		}
+// ParseWithCapabilities loads the agent definitions. Capability names are
+// validated against the supplied compiled capability declarations, with
+// missing inheritance, empty-list clearing, and the same invalid-custom
+// warning/drop behavior for unknown, duplicate, or empty IDs; built-ins keep
+// their locked fields and an empty default. Configured tool names are
+// validated against the supplied compiled tool declarations: an unknown
+// explicit custom tool name drops that definition with the retained warning,
+// duplicates remain valid input, and default and inherited tool lists are
+// intersected with the compiled universe. defaultCapabilityIDs is the default
+// capability selection seam: a non-empty list is installed as the built-in
+// primary definition's capabilities before user overlays and inheritance, so
+// ordinary inheritance propagates it and explicit selections override or
+// clear it; a nil or empty list leaves the built-ins with an empty default.
+func ParseWithCapabilities(data []byte, capabilityIDs, toolIDs, defaultCapabilityIDs []string) (*Config, error) {
+	declared := make(map[string]struct{}, len(capabilityIDs))
+	for _, id := range capabilityIDs {
+		declared[id] = struct{}{}
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read agents %s: %w", path, err)
+	tools := make(map[string]struct{}, len(toolIDs))
+	for _, id := range toolIDs {
+		tools[id] = struct{}{}
 	}
-	cfg, err := Parse(data)
-	if err != nil {
-		return nil, fmt.Errorf("parse agents %s: %w", path, err)
-	}
-	return cfg, nil
+	return parse(data, declared, tools, defaultCapabilityIDs)
 }
 
-func Parse(data []byte) (*Config, error) {
+func parse(data []byte, declaredCapabilities, declaredTools map[string]struct{}, defaultCapabilityIDs []string) (*Config, error) {
 	var user map[string]json.RawMessage
 	if err := json.Unmarshal(data, &user); err != nil {
 		return nil, err
@@ -62,6 +55,11 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	cfg := &Config{defs: copyBuiltins()}
+	if len(defaultCapabilityIDs) > 0 {
+		primary := cfg.defs["primary"]
+		primary.Capabilities = toolsPtr(append([]string(nil), defaultCapabilityIDs...))
+		cfg.defs["primary"] = primary
+	}
 	names := make([]string, 0, len(user))
 	for name := range user {
 		names = append(names, name)
@@ -91,7 +89,7 @@ func Parse(data []byte) (*Config, error) {
 			})
 			continue
 		}
-		if err := validateCustom(name, def); err != nil {
+		if err := validateCustom(name, def, declaredCapabilities, declaredTools); err != nil {
 			cfg.warnings = append(cfg.warnings, Warning{
 				Kind:    "invalid_agent_type",
 				Name:    name,
@@ -101,9 +99,31 @@ func Parse(data []byte) (*Config, error) {
 		}
 		cfg.defs[name] = copyDefinition(def)
 	}
+	for name, def := range cfg.defs {
+		def.Tools = intersectCompiledTools(def.Tools, declaredTools)
+		cfg.defs[name] = def
+	}
 	return cfg, nil
 }
 
+// intersectCompiledTools intersects one owned tool list with the compiled
+// tool universe, preserving order and duplicates. An omitted list stays
+// omitted.
+func intersectCompiledTools(tools *[]string, declared map[string]struct{}) *[]string {
+	if tools == nil {
+		return tools
+	}
+	kept := make([]string, 0, len(*tools))
+	for _, name := range *tools {
+		if _, ok := declared[name]; ok {
+			kept = append(kept, name)
+		}
+	}
+	return &kept
+}
+
+// decodeDefinition decodes one custom definition entry: the entry must be an
+// object and every member keeps the ordinary typed decoder's behavior.
 func decodeDefinition(raw json.RawMessage) (Definition, error) {
 	if err := ensureJSONObject(raw); err != nil {
 		return Definition{}, err
@@ -143,21 +163,21 @@ func (c *Config) Warnings() []Warning {
 	return append([]Warning(nil), c.warnings...)
 }
 
-func (c *Config) Resolve(name string, ctx ResolveContext) (Resolved, error) {
+func (c *Config) Resolve(name string) (Resolved, error) {
 	if c == nil {
 		return Resolved{}, fmt.Errorf("unknown agent type %q", name)
 	}
-	return c.resolve(name, ctx, map[string]bool{})
+	return c.resolve(name, map[string]bool{})
 }
 
-func (c *Config) All(ctx ResolveContext) []Resolved {
+func (c *Config) All() []Resolved {
 	if c == nil {
 		return nil
 	}
 	var out []Resolved
 	seen := map[string]bool{}
 	for _, name := range builtinOrder {
-		resolved, err := c.Resolve(name, ctx)
+		resolved, err := c.Resolve(name)
 		if err == nil {
 			out = append(out, resolved)
 			seen[name] = true
@@ -171,7 +191,7 @@ func (c *Config) All(ctx ResolveContext) []Resolved {
 	}
 	sort.Strings(custom)
 	for _, name := range custom {
-		resolved, err := c.Resolve(name, ctx)
+		resolved, err := c.Resolve(name)
 		if err == nil {
 			out = append(out, resolved)
 		}
@@ -183,7 +203,7 @@ func (c *Config) applyBuiltinOverlay(name string, def Definition) {
 	if def.Model == "" {
 		return
 	}
-	if _, err := coremodel.Parse(def.Model); err != nil {
+	if _, err := model.Parse(def.Model); err != nil {
 		c.warnings = append(c.warnings, Warning{
 			Kind:    "invalid_builtin_model",
 			Name:    name,
@@ -196,7 +216,7 @@ func (c *Config) applyBuiltinOverlay(name string, def Definition) {
 	c.defs[name] = current
 }
 
-func (c *Config) resolve(name string, ctx ResolveContext, seen map[string]bool) (Resolved, error) {
+func (c *Config) resolve(name string, seen map[string]bool) (Resolved, error) {
 	def, ok := c.defs[name]
 	if !ok {
 		return Resolved{}, fmt.Errorf("unknown agent type %q", name)
@@ -209,7 +229,7 @@ func (c *Config) resolve(name string, ctx ResolveContext, seen map[string]bool) 
 	var out Resolved
 	parent := parentName(name)
 	if parent != "" {
-		inherited, err := c.resolve(parent, ctx, seen)
+		inherited, err := c.resolve(parent, seen)
 		if err != nil {
 			return Resolved{}, err
 		}
@@ -217,11 +237,11 @@ func (c *Config) resolve(name string, ctx ResolveContext, seen map[string]bool) 
 	}
 	out.Name = name
 	out.Builtin = isBuiltin(name)
-	applyDefinition(&out, def, ctx)
+	applyDefinition(&out, def)
 	return out, nil
 }
 
-func applyDefinition(out *Resolved, def Definition, ctx ResolveContext) {
+func applyDefinition(out *Resolved, def Definition) {
 	if def.Model != "" {
 		out.Model = def.Model
 	}
@@ -234,17 +254,18 @@ func applyDefinition(out *Resolved, def Definition, ctx ResolveContext) {
 	if def.Tools != nil {
 		out.Tools = append([]string(nil), (*def.Tools)...)
 	}
-	if def.Memory != nil {
-		out.Memory = *def.Memory
-	}
-	if def.LSP != nil {
-		out.LSP = *def.LSP
+	if def.Capabilities != nil {
+		if len(*def.Capabilities) == 0 {
+			out.Capabilities = nil // an empty list clears the inherited selection
+		} else {
+			out.Capabilities = append([]string(nil), (*def.Capabilities)...)
+		}
 	}
 	if def.Readonly != nil {
 		out.Readonly = *def.Readonly
 	}
 	if def.WriteDir != nil {
-		out.WriteDir = expandWriteDir(*def.WriteDir, ctx)
+		out.WriteDir = *def.WriteDir
 	}
 	if def.Description != nil {
 		out.Description = *def.Description
@@ -254,97 +275,12 @@ func applyDefinition(out *Resolved, def Definition, ctx ResolveContext) {
 	}
 }
 
-func WriteModel(path, name, ref string) error {
-	if ref != "" {
-		if _, err := coremodel.Parse(ref); err != nil {
-			return err
-		}
-	}
-	root, err := readRoot(path)
-	if err != nil {
-		return err
-	}
-	raw, ok := root[name]
-	if !ok {
-		raw = map[string]any{}
-		root[name] = raw
-	}
-	entry, ok := raw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("agents.%s must be an object", name)
-	}
-	if ref == "" {
-		delete(entry, "model")
-	} else {
-		entry["model"] = ref
-	}
-	return writeAtomic(path, root)
-}
-
-func readRoot(path string) (map[string]any, error) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, fmt.Errorf("create agents dir: %w", err)
-		}
-		if err := os.WriteFile(path, []byte(emptyAgentsTemplate), 0o600); err != nil {
-			return nil, fmt.Errorf("create agents %s: %w", path, err)
-		}
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		return nil, fmt.Errorf("parse agents %s: %w", path, err)
-	}
-	if root == nil {
-		root = map[string]any{}
-	}
-	return root, nil
-}
-
-func writeAtomic(path string, value any) error {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".agents-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	return nil
-}
-
-func validateCustom(name string, def Definition) error {
+func validateCustom(name string, def Definition, declaredCapabilities, declaredTools map[string]struct{}) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("name is empty")
 	}
 	if def.Model != "" {
-		if _, err := coremodel.Parse(def.Model); err != nil {
+		if _, err := model.Parse(def.Model); err != nil {
 			return fmt.Errorf("model must be a provider-prefixed string: %w", err)
 		}
 	}
@@ -357,9 +293,24 @@ func validateCustom(name string, def Definition) error {
 	}
 	if def.Tools != nil {
 		for _, name := range *def.Tools {
-			if _, ok := allowedTools[name]; !ok {
+			if name == "" {
+				return fmt.Errorf("tool name is empty")
+			}
+			if _, ok := declaredTools[name]; !ok {
 				return fmt.Errorf("unknown tool %q", name)
 			}
+		}
+	}
+	if def.Capabilities != nil {
+		seen := make(map[string]bool, len(*def.Capabilities))
+		for _, id := range *def.Capabilities {
+			if _, ok := declaredCapabilities[id]; !ok {
+				return fmt.Errorf("unknown capability %q", id)
+			}
+			if seen[id] {
+				return fmt.Errorf("duplicate capability %q", id)
+			}
+			seen[id] = true
 		}
 	}
 	return nil
@@ -369,7 +320,7 @@ func parentName(name string) string {
 	switch name {
 	case "primary":
 		return ""
-	case "secondary", "plan":
+	case "secondary":
 		return "primary"
 	default:
 		return "secondary"
@@ -379,16 +330,6 @@ func parentName(name string) string {
 func isBuiltin(name string) bool {
 	_, ok := builtins[name]
 	return ok
-}
-
-func expandWriteDir(value string, ctx ResolveContext) string {
-	if value != projectPlansWriteDir {
-		return value
-	}
-	if ctx.Home == "" || ctx.ProjectID == "" {
-		return "~/.lightcode/projects/<project-id>/plans/"
-	}
-	return filepath.Join(ctx.Home, ".lightcode", "projects", ctx.ProjectID, "plans")
 }
 
 func copyBuiltins() map[string]Definition {
@@ -406,11 +347,8 @@ func copyDefinition(def Definition) Definition {
 	if def.Tools != nil {
 		def.Tools = toolsPtr(*def.Tools)
 	}
-	if def.Memory != nil {
-		def.Memory = boolPtr(*def.Memory)
-	}
-	if def.LSP != nil {
-		def.LSP = boolPtr(*def.LSP)
+	if def.Capabilities != nil {
+		def.Capabilities = toolsPtr(*def.Capabilities)
 	}
 	if def.Readonly != nil {
 		def.Readonly = boolPtr(*def.Readonly)

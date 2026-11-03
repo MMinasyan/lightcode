@@ -1,66 +1,36 @@
-// Package snapshot owns ~/.lightcode/sessions/<id>/ — meta.json,
-// snapshots/<turn>/, and turns/<turn>/ (message persistence). It backs
-// both the conversation-anchored revert and the sessions foundation:
-// session lifecycle (active / archived / deleted), message persistence,
-// and session resume.
+// Package snapshot owns the deferred copy-based code capture per target code
+// group: snapshots/1/<path-hash>/ holding each touched file's preimage and
+// metadata, with first-write-wins capture, last-write identity checks and
+// the shared restore traversal. It reads no conversation, claim or session
+// lifecycle state.
 //
-// On-disk layout:
+// On-disk layout of one code group:
 //
-//	~/.lightcode/sessions/<session-id>/
-//	├── meta.json
-//	├── tokens.json              # monotonic, untouched by revert
-//	├── snapshots/
-//	│   └── <turn>/
-//	│       └── <path-hash>/
-//	│           ├── original     # pre-edit bytes, absent if file didn't exist
-//	│           └── meta.json    # {original_path, tool_name, existed}
-//	└── turns/
-//	    └── <turn>/
-//	        ├── messages.jsonl   # one serialized message per line
-//	        └── complete         # empty marker written on turn_end
+//	<group-dir>/
+//	└── snapshots/
+//	    └── 1/
+//	        └── <path-hash>/
+//	            ├── original     # pre-edit bytes, absent if file didn't exist
+//	            └── meta.json    # {original_path, canonical_path, existed, last_write}
 //
-// Turn numbers are integers starting at 1. A turn without a `complete`
-// marker is considered interrupted by a crash and is discarded on
-// session load.
+// Old pre-cutover session directories keep their meta.json/turns/claims files
+// inert and untouched; no snapshot reader interprets them.
 package snapshot
 
 import (
 	"encoding/json"
 	"fmt"
 	"os"
-)
 
-// SessionState values stored in meta.json.
-const (
-	StateActive   = "active"
-	StateArchived = "archived"
+	"github.com/MMinasyan/lightcode/internal/atomicfs"
 )
-
-// SessionMeta is persisted to the session directory's meta.json. The
-// project_hash lets the session list filter sessions by project without
-// re-resolving paths. state / archived_at / last_activity drive the
-// lifecycle sweep.
-type SessionMeta struct {
-	ID               string `json:"id"`
-	CreatedAt        string `json:"created_at"` // RFC3339
-	ProjectPath      string `json:"project_path"`
-	ProjectHash      string `json:"project_hash"`
-	LightcodeVersion string `json:"lightcode_version"`
-	State            string `json:"state"`         // "active" | "archived"
-	ArchivedAt       int64  `json:"archived_at"`   // unix seconds, 0 if active
-	LastActivity     int64  `json:"last_activity"` // unix seconds of last user message
-	Provider         string `json:"provider,omitempty"`
-	Model            string `json:"model,omitempty"`
-	ParentSessionID  string `json:"parent_session_id,omitempty"`
-	ActiveAgentType  string `json:"active_agent_type,omitempty"`
-}
 
 // SnapshotMeta is written alongside each snapshotted file. OriginalPath
 // is the user-facing path shown in history and affected-file output.
-// CanonicalPath is the hidden restore target for new snapshots. Old
-// metadata without CanonicalPath falls back to OriginalPath.
-// Existed is false when the snapshot represents a file that did not
-// exist before the turn — on revert, that file is deleted.
+// CanonicalPath is the capture-time canonical witness every restore is
+// proven against; an entry without it is refused, never reconstructed
+// from a path guess. Existed is false when the snapshot represents a file
+// that did not exist before the mutation — on revert, that file is deleted.
 type SnapshotMeta struct {
 	OriginalPath  string                   `json:"original_path"`
 	CanonicalPath string                   `json:"canonical_path,omitempty"`
@@ -68,8 +38,10 @@ type SnapshotMeta struct {
 	LastWrite     *SnapshotContentIdentity `json:"last_write,omitempty"`
 }
 
-// SnapshotContentIdentity identifies the state produced by the session's
-// latest successful mutation for a snapshot entry.
+// SnapshotContentIdentity identifies the state a completed producer mutation
+// left for a snapshot entry. The pre-mutation proof clear and any uncertain
+// mutation failure leave LastWrite nil, and a restore against a nil LastWrite
+// skips the entry instead of guessing.
 type SnapshotContentIdentity struct {
 	Hash   string `json:"hash,omitempty"`
 	Absent bool   `json:"absent,omitempty"`
@@ -88,16 +60,6 @@ type SkippedRevert struct {
 	Reason string `json:"reason"`
 }
 
-// CompactionRecord is persisted to compaction.json when context
-// lifecycle management summarizes the conversation.
-type CompactionRecord struct {
-	Summary            string `json:"summary"`
-	BoundaryTurn       int    `json:"boundary_turn"`
-	CompactedAt        string `json:"compacted_at"`
-	SummarizerModel    string `json:"summarizer_model"`
-	SummarizerProvider string `json:"summarizer_provider,omitempty"`
-}
-
 // writeJSON serializes v to path with 0o600 permissions and a trailing
 // newline. Overwrites if the file already exists.
 func writeJSON(path string, v any) error {
@@ -106,7 +68,7 @@ func writeJSON(path string, v any) error {
 		return fmt.Errorf("marshal %s: %w", path, err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := atomicfs.Write(path, data, 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil

@@ -60,10 +60,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ steps.release_ref.outputs.ref }}
-          fetch-depth: 0
-          lfs: true
-          persist-credentials: false
+           ref: ${{ steps.release_ref.outputs.ref }}
+           fetch-depth: 0
+           persist-credentials: false
 
       - name: Verify tag checkout
         env:
@@ -99,6 +98,12 @@ jobs:
           pkg=github.com/MMinasyan/lightcode/internal/version
           $(go env GOPATH)/bin/wails build -tags webkit2_41 -ldflags "-X ${pkg}.Version=${TAG} -X ${pkg}.Commit=${commit}"
 
+      - name: Protocol freshness
+        run: make check-protocol
+
+      - name: Check Wails bindings
+        run: make check-wails-bindings
+
       - name: Check formatting
         run: |
           gofmt -l . | tee /tmp/gofmt-out
@@ -116,7 +121,7 @@ jobs:
         run: LIGHTCODE_RELEASE_TAG="$TAG" go test ./internal/selfupdate -run TestFloorWithinReleaseTag -v
 
       - name: Fuzz seed corpus
-        run: go test -tags webkit2_41 -run=Fuzz ./internal/provider/... ./internal/catalog/... ./internal/engine/message/...
+        run: go test -tags webkit2_41 -run=Fuzz ./model/... ./internal/catalog/...
 
       - name: Frontend tests
         run: cd frontend && npm run test

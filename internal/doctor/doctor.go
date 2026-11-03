@@ -15,8 +15,6 @@ import (
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/project"
-	"github.com/MMinasyan/lightcode/internal/server"
 )
 
 // Check statuses.
@@ -120,27 +118,23 @@ func Run(p Params) (Report, bool) {
 		setupModelCheck(agentsCfg, result.Catalog, envIsSet, add)
 	}
 
-	daemonChecks(p, add)
-
 	return summarize(checks), !anyConnected
 }
 
-// dataChecks runs the data-dir group and returns the parsed config (nil when
-// absent or unparseable) and the .env key names, each mapped to whether its
-// value is non-empty.
+// dataChecks runs the data-dir group and returns the parsed config and agent
+// definitions (nil when absent or unparseable) and the .env key names, each
+// mapped to whether its value is non-empty. The directory's own diagnostic
+// never gates the config/agents/.env checks: the resolved ConfigPath may
+// point outside the default data directory.
 func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name, status, detail string)) (*config.Config, *agentcfg.Config, map[string]bool) {
 	dotenvKeys := map[string]bool{}
 
 	info, err := os.Lstat(dataDir)
-	if os.IsNotExist(err) {
-		add("data", "dir", StatusOK, "not created yet (created on first run)")
-		return nil, nil, dotenvKeys
-	}
-	if err != nil {
-		add("data", "dir", StatusFail, err.Error())
-		return nil, nil, dotenvKeys
-	}
 	switch {
+	case os.IsNotExist(err):
+		add("data", "dir", StatusOK, "not created yet (created on first run)")
+	case err != nil:
+		add("data", "dir", StatusFail, err.Error())
 	case info.Mode()&os.ModeSymlink != 0:
 		add("data", "dir", StatusWarn, dataDir+" is a symlink")
 	case !info.IsDir():
@@ -169,7 +163,7 @@ func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name,
 
 		agentsPath := agentcfg.PathForConfig(p.ConfigPath)
 		if _, err := os.Stat(agentsPath); os.IsNotExist(err) {
-			if parsed, parseErr := agentcfg.Parse([]byte("{}")); parseErr == nil {
+			if parsed, parseErr := agentcfg.ParseWithCapabilities([]byte("{}"), nil, agentcfg.StandardTools, nil); parseErr == nil {
 				agentsCfg = parsed
 			}
 			add("data", "agents", StatusOK, "agents.json: not created yet (created on first run)")
@@ -177,7 +171,7 @@ func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name,
 			add("data", "agents", StatusFail, err.Error())
 		} else if data, err := os.ReadFile(agentsPath); err != nil {
 			add("data", "agents", StatusFail, err.Error())
-		} else if parsed, err := agentcfg.Parse(data); err != nil {
+		} else if parsed, err := agentcfg.ParseWithCapabilities(data, nil, agentcfg.StandardTools, nil); err != nil {
 			add("data", "agents", StatusFail, err.Error())
 		} else {
 			agentsCfg = parsed
@@ -283,7 +277,7 @@ func providerChecks(cat *catalog.Catalog, dotenvKeys map[string]bool, lookupEnv 
 // setupModelCheck mirrors the agent's no-model / model-unavailable
 // unavailable warnings, which are mutually exclusive.
 func setupModelCheck(agentsCfg *agentcfg.Config, cat *catalog.Catalog, envIsSet func(string) bool, add func(group, name, status, detail string)) {
-	resolved, err := agentsCfg.Resolve("primary", agentcfg.ResolveContext{})
+	resolved, err := agentsCfg.Resolve("primary")
 	if err != nil {
 		add("setup", "model", StatusWarn, err.Error())
 		return
@@ -307,35 +301,6 @@ func setupModelCheck(agentsCfg *agentcfg.Config, cat *catalog.Catalog, envIsSet 
 		return
 	}
 	add("setup", "model", StatusOK, resolved.Model)
-}
-
-func daemonChecks(p Params, add func(group, name, status, detail string)) {
-	projectsRoot := filepath.Join(p.Home, ".lightcode", "projects")
-	current, err := project.FindByPath(projectsRoot, p.WorkDir)
-	switch {
-	case err != nil:
-		add("daemon", "project", StatusWarn, err.Error())
-	case current == nil:
-		add("daemon", "project", StatusOK, "no project record yet")
-	default:
-		add("daemon", "project", StatusOK, fmt.Sprintf("project %s (%s)", current.Name, current.ID))
-	}
-
-	lockPath := server.Path(p.Home)
-	lf, err := server.Read(p.Home)
-	if os.IsNotExist(err) {
-		add("daemon", "lockfiles", StatusOK, "none")
-		return
-	}
-	if err != nil {
-		add("daemon", "owner", StatusWarn, fmt.Sprintf("malformed lockfile: %v", err))
-		return
-	}
-	if server.IsStale(lf) {
-		add("daemon", "owner", StatusWarn, fmt.Sprintf("stale lockfile (pid %d not running)", lf.PID))
-		return
-	}
-	add("daemon", "owner", StatusOK, fmt.Sprintf("running (pid %d, port %d, lock %s)", lf.PID, lf.Port, lockPath))
 }
 
 func summarize(checks []Check) Report {

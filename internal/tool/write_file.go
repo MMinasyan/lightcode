@@ -1,40 +1,23 @@
 package tool
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 
-	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/safefs"
+	"github.com/MMinasyan/lightcode/internal/snapshot"
 )
 
-// SnapshotStore is the minimum surface WriteFileWithSnapshot and
-// EditFileWithSnapshot need from the snapshot store.
+// SnapshotStore is the complete internal snapshot surface the prepared write,
+// edit and patch mutations require. It is mandatory: mutation never runs
+// against a missing or partial store.
 type SnapshotStore interface {
-	Snapshot(turn int, absPath string) error
-	CurrentTurn() int
-}
-
-type resolvedSnapshotStore interface {
-	SnapshotResolved(turn int, originalPath, canonicalPath string) error
-}
-
-type transactionalSnapshotStore interface {
-	SnapshotResolvedEntry(turn int, originalPath, canonicalPath string) (entryID string, created bool, err error)
-	DiscardSnapshotEntry(turn int, entryID string) error
-	RetainSnapshotEntry(turn int, entryID string)
-}
-
-type snapshotIdentityRecorder interface {
-	RecordSnapshotContent(turn int, entryID string, content []byte) error
-	RecordSnapshotAbsence(turn int, entryID string) error
-}
-
-type snapshotMutationLocker interface {
-	LockSnapshotMutation(turn int, entryID string) (func(), error)
+	SnapshotResolvedEntry(originalPath, canonicalPath string) (entryID string, created bool, err error)
+	DiscardSnapshotEntry(entryID string) error
+	RecordSnapshotContent(entryID string, content []byte) error
+	RecordSnapshotAbsence(entryID string) error
+	ReplaceSnapshotIdentity(entryID string, identity *snapshot.SnapshotContentIdentity) (*snapshot.SnapshotContentIdentity, error)
 }
 
 type mutationFile interface {
@@ -54,341 +37,145 @@ var (
 	}
 )
 
+// snapshotEntry is one captured mutation snapshot: the entry id, whether this
+// call created the preimage, and the LastWrite proof the entry owned before
+// the pre-mutation clear.
 type snapshotEntry struct {
-	turn    int
+	store   SnapshotStore
 	entryID string
-	store   transactionalSnapshotStore
-	release func()
+	created bool
+	prior   *snapshot.SnapshotContentIdentity
 }
 
-func snapshotFile(store SnapshotStore, turn int, originalPath, canonicalPath string) error {
-	if resolved, ok := store.(resolvedSnapshotStore); ok {
-		return resolved.SnapshotResolved(turn, originalPath, canonicalPath)
+// captureSnapshotEntry captures the preimage and persists the cleared
+// LastWrite proof under the existing execution/artifact ownership. A failed
+// clear abandons the capture (a newly created preimage is discarded) and the
+// caller must not mutate.
+func captureSnapshotEntry(store SnapshotStore, originalPath, canonicalPath string) (snapshotEntry, error) {
+	entryID, created, err := store.SnapshotResolvedEntry(originalPath, canonicalPath)
+	if err != nil {
+		return snapshotEntry{}, err
 	}
-	return store.Snapshot(turn, canonicalPath)
-}
-
-func snapshotFileForMutation(store SnapshotStore, turn int, originalPath, canonicalPath string) (snapshotEntry, error) {
-	if transactional, ok := store.(transactionalSnapshotStore); ok {
-		entryID, _, err := transactional.SnapshotResolvedEntry(turn, originalPath, canonicalPath)
-		if err != nil {
-			return snapshotEntry{}, err
-		}
-		entry := snapshotEntry{turn: turn, entryID: entryID, store: transactional}
-		if locker, ok := store.(snapshotMutationLocker); ok {
-			release, err := locker.LockSnapshotMutation(turn, entryID)
-			if err != nil {
-				if discardErr := transactional.DiscardSnapshotEntry(turn, entryID); discardErr != nil {
-					return snapshotEntry{}, fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
-				}
-				return snapshotEntry{}, err
+	prior, err := store.ReplaceSnapshotIdentity(entryID, nil)
+	if err != nil {
+		if created {
+			if discardErr := store.DiscardSnapshotEntry(entryID); discardErr != nil {
+				return snapshotEntry{}, fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
 			}
-			entry.release = release
 		}
-		return entry, nil
+		return snapshotEntry{}, err
 	}
-	return snapshotEntry{}, snapshotFile(store, turn, originalPath, canonicalPath)
+	return snapshotEntry{store: store, entryID: entryID, created: created, prior: prior}, nil
 }
 
-func releaseSnapshotMutation(entry snapshotEntry) {
-	if entry.release != nil {
-		entry.release()
+// abandonUnmutatedSnapshot resolves a proven non-mutation failure: this call's
+// newly created preimage is discarded, and an existing entry gets its owned
+// prior proof restored. A failed restoration leaves the cleared nil proof,
+// reports its error, and preserves the preimage for a later restore skip.
+func abandonUnmutatedSnapshot(entry snapshotEntry) error {
+	if entry.created {
+		return entry.store.DiscardSnapshotEntry(entry.entryID)
 	}
-}
-
-func discardUnmutatedSnapshot(entry snapshotEntry) error {
-	if entry.store == nil || entry.entryID == "" {
+	if entry.prior == nil {
 		return nil
 	}
-	return entry.store.DiscardSnapshotEntry(entry.turn, entry.entryID)
-}
-
-func retainMutatedSnapshot(entry snapshotEntry) {
-	if entry.store == nil || entry.entryID == "" {
-		return
-	}
-	entry.store.RetainSnapshotEntry(entry.turn, entry.entryID)
-}
-
-func recordMutatedSnapshotContent(entry snapshotEntry, content []byte) error {
-	if entry.store == nil || entry.entryID == "" {
-		return nil
-	}
-	recorder, ok := entry.store.(snapshotIdentityRecorder)
-	if !ok {
-		return nil
-	}
-	return recorder.RecordSnapshotContent(entry.turn, entry.entryID, content)
-}
-
-func recordMutatedSnapshotAbsence(entry snapshotEntry) error {
-	if entry.store == nil || entry.entryID == "" {
-		return nil
-	}
-	recorder, ok := entry.store.(snapshotIdentityRecorder)
-	if !ok {
-		return nil
-	}
-	return recorder.RecordSnapshotAbsence(entry.turn, entry.entryID)
-}
-
-func recordCurrentSnapshotContent(entry snapshotEntry, path string) error {
-	if entry.store == nil || entry.entryID == "" {
-		return nil
-	}
-	f, err := safefs.OpenExisting(path, os.O_RDONLY)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	content, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-	return recordMutatedSnapshotContent(entry, content)
-}
-
-func retainFailedMutatedSnapshot(entry snapshotEntry, path string, err error) error {
-	if recordErr := recordCurrentSnapshotContent(entry, path); recordErr != nil {
-		retainMutatedSnapshot(entry)
-		return fmt.Errorf("%w; additionally failed to record snapshot identity: %v", err, recordErr)
-	}
-	retainMutatedSnapshot(entry)
-	return err
-}
-
-// WriteFile implements the write_file tool with pending support.
-type WriteFile struct {
-	tracker       *FileTracker
-	cfg           config.ToolsConfig
-	workspaceRoot string
-}
-
-// NewWriteFile creates a WriteFile tool.
-func NewWriteFile(tracker *FileTracker, cfg config.ToolsConfig) *WriteFile {
-	return &WriteFile{tracker: tracker, cfg: cfg}
-}
-
-func NewWriteFileAtRoot(tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) *WriteFile {
-	return &WriteFile{tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
-}
-
-func (w *WriteFile) SetToolsConfig(cfg config.ToolsConfig) { w.cfg = cfg }
-
-func (w *WriteFile) Name() string { return "write_file" }
-
-func (w *WriteFile) Description() string {
-	return `Writes a file to disk.
-- Creates parent directories if they don't exist. Overwrites the file if it already exists.
-- Use this tool for new files or complete rewrites. For targeted changes to existing files, use edit_file instead. Writing to a path that already exists overwrites it entirely, so when creating a new file, use a path that does not already exist.
-- ALWAYS use pending=true when your task requires multiple edits or writes. Pending calls will be applied AUTOMATICALLY with next tool call or after your response.`
-}
-
-func (w *WriteFile) ParametersSchema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"path": map[string]any{
-				"type":        "string",
-				"description": "Absolute or relative path to the file to write.",
-			},
-			"content": map[string]any{
-				"type":        "string",
-				"description": "Full content to write to the file.",
-			},
-			"pending": map[string]any{
-				"type":        "boolean",
-				"description": "If true, stage this write for batch execution with other pending edits.",
-			},
-		},
-		"required": []string{"path", "content"},
-	}
-}
-
-type writeResult struct {
-	Result string
-}
-
-func (w *WriteFile) Execute(_ context.Context, params map[string]any) (string, error) {
-	res, err := writeFileExecCommon(params, w.tracker, w.cfg, w.workspaceRoot)
-	if err != nil {
-		return "", err
-	}
-	return res.Result, nil
-}
-
-func (w *WriteFile) ValidateStaged(_ context.Context, args json.RawMessage) error {
-	return validateWriteStagedArgs(args)
-}
-
-func (w *WriteFile) StagedResultMessage() string { return "Staged." }
-
-// WriteFileWithSnapshot wraps WriteFile so that every successful write
-// is preceded by a call to the snapshot store.
-type WriteFileWithSnapshot struct {
-	store         SnapshotStore
-	tracker       *FileTracker
-	cfg           config.ToolsConfig
-	workspaceRoot string
-}
-
-// NewWriteFileWithSnapshot returns a snapshot-aware write_file tool.
-func NewWriteFileWithSnapshot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig) *WriteFileWithSnapshot {
-	return &WriteFileWithSnapshot{store: store, tracker: tracker, cfg: cfg}
-}
-
-func NewWriteFileWithSnapshotAtRoot(store SnapshotStore, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) *WriteFileWithSnapshot {
-	return &WriteFileWithSnapshot{store: store, tracker: tracker, cfg: cfg, workspaceRoot: workspaceRoot}
-}
-
-func (w *WriteFileWithSnapshot) SetToolsConfig(cfg config.ToolsConfig) { w.cfg = cfg }
-
-func (*WriteFileWithSnapshot) Name() string        { return "write_file" }
-func (*WriteFileWithSnapshot) Description() string { return (&WriteFile{}).Description() }
-func (*WriteFileWithSnapshot) ParametersSchema() map[string]any {
-	return (&WriteFile{}).ParametersSchema()
-}
-
-func (*WriteFileWithSnapshot) ValidateStaged(_ context.Context, args json.RawMessage) error {
-	return validateWriteStagedArgs(args)
-}
-
-func (*WriteFileWithSnapshot) StagedResultMessage() string { return "Staged." }
-
-func (w *WriteFileWithSnapshot) Execute(_ context.Context, params map[string]any) (string, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return "", fmt.Errorf("write_file: path is required")
-	}
-	displayAbsPath, err := fileDisplayAbsPathAtRoot(w.workspaceRoot, path)
-	if err != nil {
-		return "", fmt.Errorf("write_file: resolve path: %w", err)
-	}
-	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	securityPath, err := fileSecurityPathAtRoot(w.workspaceRoot, params, path)
-	if err != nil {
-		return "", fmt.Errorf("write_file: resolve path: %w", err)
-	}
-	if err := preflightWriteSnapshotTarget(securityPath, w.tracker); err != nil {
-		return "", err
-	}
-	// The write path revalidates the approved target after snapshotting; if
-	// that pre-mutation validation fails, release only this tool's snapshot claim.
-	snapshot, err := snapshotFileForMutation(w.store, w.store.CurrentTurn(), displayAbsPath, securityPath)
-	if err != nil {
-		return "", fmt.Errorf("write_file: snapshot: %w", err)
-	}
-	defer releaseSnapshotMutation(snapshot)
-	res, mutationStarted, err := writeFileExecCommonForSnapshot(params, w.tracker, w.cfg, w.workspaceRoot)
-	if err != nil {
-		if !mutationStarted {
-			if discardErr := discardUnmutatedSnapshot(snapshot); discardErr != nil {
-				return "", fmt.Errorf("%w; additionally failed to discard snapshot: %v", err, discardErr)
-			}
-		} else {
-			err = retainFailedMutatedSnapshot(snapshot, securityPath, err)
-		}
-		return "", err
-	}
-	content, _ := params["content"].(string)
-	if err := recordMutatedSnapshotContent(snapshot, []byte(content)); err != nil {
-		retainMutatedSnapshot(snapshot)
-		return "", fmt.Errorf("write_file: record snapshot identity: %w", err)
-	}
-	retainMutatedSnapshot(snapshot)
-	return res.Result, nil
-}
-
-func validateWriteStagedArgs(args json.RawMessage) error {
-	var params map[string]any
-	if err := json.Unmarshal(args, &params); err != nil {
-		return fmt.Errorf("write_file: invalid staged arguments: %w", err)
-	}
-	path, _ := params["path"].(string)
-	if path == "" {
-		return fmt.Errorf("write_file: path is required")
-	}
-	if _, ok := params["content"].(string); !ok {
-		return fmt.Errorf("write_file: content must be a string")
+	if _, err := entry.store.ReplaceSnapshotIdentity(entry.entryID, entry.prior); err != nil {
+		return fmt.Errorf("restore snapshot proof: %w", err)
 	}
 	return nil
 }
 
-// writeFileExecCommon is the shared implementation.
-func writeFileExecCommon(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*writeResult, error) {
-	res, _, err := writeFileExecCommonForSnapshot(params, tracker, cfg, workspaceRoot)
-	return res, err
-}
-
-func writeFileExecCommonForSnapshot(params map[string]any, tracker *FileTracker, cfg config.ToolsConfig, workspaceRoot string) (*writeResult, bool, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return nil, false, fmt.Errorf("write_file: path is required")
-	}
-	content, _ := params["content"].(string)
-
-	// re-resolve canonical: detects approved-target swap between snapshot and write (see fileSecurityPath)
-	absPath, err := fileSecurityPathAtRoot(workspaceRoot, params, path)
-	if err != nil {
-		return nil, false, fmt.Errorf("write_file: resolve path: %w", err)
-	}
-
-	f, openedExisting, mutationStarted, err := openWriteTargetForMutation(absPath, tracker)
-	if err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: %w", err)
-	}
-	defer f.Close()
-
-	if openedExisting {
-		mutationStarted = true
-	}
+// writeReplacement performs the truncate/seek/write/sync content replacement
+// and reports, independently of the returned error, whether the intended
+// bytes are known to have been fully produced: only a byte count that covers
+// the whole content claims a complete identity. A truncate, seek, or short
+// write leaves the produced state uncertain.
+func writeReplacement(f mutationFile, content []byte) (complete bool, err error) {
 	if err := f.Truncate(0); err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: truncate: %w", err)
+		return false, fmt.Errorf("truncate: %w", err)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: seek: %w", err)
+		return false, fmt.Errorf("seek: %w", err)
 	}
-	if _, err := f.Write([]byte(content)); err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: %w", err)
+	n, writeErr := f.Write(content)
+	if n != len(content) {
+		if writeErr != nil {
+			return false, fmt.Errorf("write: incomplete %d of %d bytes: %w", n, len(content), writeErr)
+		}
+		return false, fmt.Errorf("write: incomplete %d of %d bytes", n, len(content))
+	}
+	if writeErr != nil {
+		return true, fmt.Errorf("write: %w", writeErr)
 	}
 	if err := f.Sync(); err != nil {
-		return nil, mutationStarted, fmt.Errorf("write_file: sync: %w", err)
+		return true, fmt.Errorf("sync: %w", err)
 	}
-
-	return &writeResult{
-		Result: fmt.Sprintf("Wrote %s.", path),
-	}, mutationStarted, nil
+	return true, nil
 }
 
-func openWriteTargetForMutation(absPath string, tracker *FileTracker) (mutationFile, bool, bool, error) {
-	return openWriteTargetForMutationFunc(absPath, tracker)
+// finishMutationFailure resolves a mutation error against the snapshot entry:
+// a proven non-mutation abandons the entry; a mutation whose complete
+// produced content is known records that producer-owned identity; an
+// uncertain started mutation retains the preimage with the cleared nil
+// identity. No post-error filesystem reread establishes output.
+func finishMutationFailure(entry snapshotEntry, started, complete bool, produced []byte, err error) error {
+	if !started {
+		if abandonErr := abandonUnmutatedSnapshot(entry); abandonErr != nil {
+			return fmt.Errorf("%w; additionally failed to abandon snapshot: %v", err, abandonErr)
+		}
+		return err
+	}
+	if complete {
+		if recordErr := entry.store.RecordSnapshotContent(entry.entryID, produced); recordErr != nil {
+			return fmt.Errorf("%w; additionally failed to record snapshot identity: %v", err, recordErr)
+		}
+	}
+	return err
 }
 
-func openWriteTargetForMutationReal(absPath string, _ *FileTracker) (mutationFile, bool, bool, error) {
+// recordProducedSnapshotContent records the identity of content the producer
+// completed. A failure leaves the cleared nil proof and reports its error;
+// the retained preimage serves a later restore skip.
+func recordProducedSnapshotContent(entry snapshotEntry, content []byte) error {
+	return entry.store.RecordSnapshotContent(entry.entryID, content)
+}
+
+func recordProducedSnapshotAbsence(entry snapshotEntry) error {
+	return entry.store.RecordSnapshotAbsence(entry.entryID)
+}
+
+// openWriteTargetForMutation opens the canonical write target through the
+// shared safefs primitives.
+
+func openWriteTargetForMutation(absPath string) (mutationFile, bool, error) {
+	return openWriteTargetForMutationFunc(absPath)
+}
+
+func openWriteTargetForMutationReal(absPath string) (mutationFile, bool, error) {
 	_, err := ensureRegularExistingTarget(absPath)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, err
 	}
 
 	f, openedExisting, err := safefs.OpenForWrite(absPath, 0o644)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, err
 	}
 	if openedExisting {
 		info, err := f.Stat()
 		if err != nil {
 			_ = f.Close()
-			return nil, false, false, fmt.Errorf("stat: %w", err)
+			return nil, false, fmt.Errorf("stat: %w", err)
 		}
 		if err := ensureRegularFileInfo(absPath, info); err != nil {
 			_ = f.Close()
-			return nil, false, false, err
+			return nil, false, err
 		}
 	}
-	return f, openedExisting, !openedExisting, nil
+	return f, openedExisting, nil
 }
 
-func preflightWriteSnapshotTarget(absPath string, _ *FileTracker) error {
+func preflightWriteSnapshotTarget(absPath string) error {
 	existed, err := ensureRegularExistingTarget(absPath)
 	if err != nil {
 		return fmt.Errorf("write_file: %w", err)

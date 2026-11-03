@@ -2,7 +2,7 @@
 
 <p align="center">
   A coding agent that works with any OpenAI-compatible LLM provider.<br>
-  Desktop app · Terminal CLI · HTTP daemon · ACP stdio adapter — one Go binary, four interfaces.
+  Desktop app · Terminal CLI · ACP stdio adapter — one Go binary, three interfaces.
 </p>
 
 <p align="center">
@@ -33,19 +33,15 @@
 
 Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. Provider compatibility still varies: some OpenAI-compatible models stream text correctly but do not reliably support streamed tool calls. Test a new provider/model with a real tool call before relying on it.
 
-**Tools** — `read_file` · `write_file` · `edit_file` · `apply_patch` · `run_command` · `execute_pending` · `process` · `sleep` · `save_memory` · `search_memory` · `search_history` · `diagnostics` · `workspace_symbol` · `task`
+**Tools** — `read_file` · `write_file` · `edit_file` · `apply_patch` · `run_command` · `process` · `sleep` · `task`
 
-**Snapshots** — Every file edit is snapshotted by turn. Revert code, revert history, or fork from any point. Copy-based, no git dependency.
+**Snapshots** — File edits are captured copy-based before they happen, grouped per admitted operation. Revert code at any owned input or fork the conversation from it. No git dependency.
 
-**Permissions** — Glob-based allow/deny/ask rules at global and per-project levels. No bypass, no subagent escapes.
+**Permissions** — One automatic allow/deny policy checked before every tool call: workspace file access, sensitive-file denials, and optional global/per-workspace rule lists. Nothing prompts.
 
-**Context compaction** — Automatic pruning and summarization when approaching the context window limit.
+**Context compaction** — Automatic single-request summarization over the frozen conversation when provider-reported usage would exceed the model's context window; `/compact` triggers it manually.
 
-**LSP** — Diagnostics and symbol search across Go, Python, TypeScript/JS, Rust, C/C++, C#. Auto-detected; servers auto-installed where supported.
-
-**Subagents** — Delegate tasks to concurrent LLM loops with scoped tools and independent context.
-
-**Memory** — Save and search project and global memories across sessions using embedded vector search (no external service).
+**Subagents** — Delegate a task to a background child session with its own context, tool surface, and model; concurrent child sessions are bounded by configuration.
 
 ---
 
@@ -69,7 +65,7 @@ Linux amd64 on Debian/Ubuntu and Fedora is the first supported release target. m
 
 #### Build from source
 
-Source builds are for development. They require Go 1.26+, Node.js, [Wails v2](https://wails.io/docs/gettingstarted/installation), Git LFS, and WebKitGTK development headers.
+Source builds are for development. They require Go 1.26+, Node.js, [Wails v2](https://wails.io/docs/gettingstarted/installation), and WebKitGTK development headers.
 
 ```bash
 # Debian / Ubuntu build dependencies
@@ -78,7 +74,6 @@ sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev
 ```
 
 ```bash
-git lfs pull
 wails build -tags webkit2_41
 ```
 
@@ -147,61 +142,73 @@ Shell-exported environment variables take precedence over values in `~/.lightcod
 
 #### Permissions
 
-Global permissions live in `~/.lightcode/config.json`. Project permissions are saved per project when you choose "Allow for project" in a permission prompt.
+Every tool call is checked before execution against one automatic policy and never prompts. The built-in policy allows file reads and writes inside the workspace and denies sensitive file basenames (`.env`, private keys, credential files) even there. Its target permissions are scoped: `command.run`, `child.launch`, and `process.own` allow any target, and `sleep` only its fixed target; anything undeclared is denied. Child sessions are gated by the same policy. Pair targets are canonical: a resolved file path for the file pairs, one parsed shell segment (or the complete normalized command) for `command.run`, `*` for `sleep`, the resolved Agent-type identity for `child.launch`, and `<session-id>/<job-id>` for `process.own` read/kill (or `*` for its list action).
+
+Optional rule lists refine that policy: global rules live in the `permissions` member of `~/.lightcode/config.json`, per-workspace rules in `~/.lightcode/projects/p-<full SHA-256 of the cleaned absolute workspace path>/permissions.json` (that directory name is a storage key for the permission file, not a durable project record):
 
 ```json
 {
   "permissions": {
-    "allow": ["read_file(/src/**)", "run_command(git status *)"],
-    "deny": ["read_file(**/.env)", "write_file(**/.env)"],
-    "ask": ["run_command(git push *)"]
+    "rules": [
+      { "permission": "command.run", "target": "git *", "access": "allow" },
+      { "permission": "file.write", "target": "**/generated/**", "access": "deny" }
+    ],
+    "default": "deny"
   }
 }
 ```
 
-Path prefixes in permission rules:
-
-- `/foo` — project-relative
-- `~/foo` — home-relative
-- `//foo` — absolute
-- no matching rule — ask
+Rule targets are globs matched against the pair's canonical target — for example a resolved file path, a parsed `command.run` segment or complete command text, an Agent-type identity, a `<session-id>/<job-id>` job reference, or the fixed `*` (the rules above are illustrative). The last matching rule at a level wins, the workspace level decides before the global level, and a level's `default` applies when no rule matches. Permission names are `file.read`, `file.write`, `command.run`, `sleep`, `child.launch`, and `process.own`. A malformed block discards both user levels for that resolution, leaving the built-in policy.
 
 #### Run
 
-Run Lightcode from the project directory you want it to work on:
+Run Lightcode from the workspace directory you want it to work on:
 
 ```bash
 lightcode                       # Desktop GUI
 lightcode cli                   # Terminal REPL
-lightcode serve --port 8080     # HTTP+SSE daemon
 lightcode acp                   # JSON-RPC over stdio
 ```
 
+All three clients share one managed Runtime owner process. The first client starts it
+(`lightcode runtime --data-dir ~/.lightcode --config ~/.lightcode/config.json` under the hood) and
+later clients attach to the same owner. SIGINT or SIGTERM on the Runtime process is the managed
+shutdown — closing the last client is not a shutdown. `lightcode upgrade` replaces the executable,
+not the running Runtime; restart the Runtime to apply backend changes.
+
 Useful CLI commands:
 
-- `/model` — switch model
-- `/session` — list or switch sessions
-- `/project` — switch project
-- `/revert` — revert code, revert history, or fork
-- `/fork` — open the fork/revert menu
-- `/context` — show token usage
-- `/compact` — compact context now
-- `/copy` — copy the last assistant response
-- `/exit` — exit
+- `/help` — command reference
+- `/new`, `/resume`, `/session` — start, resume, or switch sessions
+- `/model`, `/agent` — switch model or agent type
+- `/project` — switch workspace
+- `/revert`, `/fork` — revert code at a turn, or fork from it
+- `/context`, `/compact`, `/warnings` — token usage, manual compaction, current warnings
+- `/children`, `/stop`, `/runtime`, `/copy`, `/clear`, `/exit`
 
-`lightcode serve` writes a daemon lockfile under `~/.lightcode/daemon/` containing the port and token. HTTP clients use Bearer auth; ACP clients use newline-delimited JSON-RPC over stdio.
+ACP clients drive Lightcode over newline-delimited JSON-RPC on stdio.
 
 #### Commands
 
-Beyond the run modes above, the binary ships utility commands: `version`, `doctor` (offline install/config diagnostics), `upgrade` (self-update; verifies the release's SHA-256 checksum before installing), `uninstall`, `completion`, `models`, and `config`. Run `lightcode help` for the full reference.
+Beyond the run modes above, the binary ships utility commands: `runtime` (run the shared Runtime
+owner directly; clients start it automatically), `version`, `doctor` (offline install/config
+diagnostics), `upgrade` (self-update; verifies the release's SHA-256 checksum before installing),
+`uninstall`, `completion`, `models`, and `config`. Run `lightcode help` for the full reference.
 
 #### Data locations
 
-- `~/.lightcode/config.json` — user config
+- `~/.lightcode/config.json` — user config: providers, session policy, plugin sections, and global permission rules
+- `~/.lightcode/agents.json` — agent types and their model selections
 - `~/.lightcode/.env` — local API keys
-- `~/.lightcode/projects/` — project metadata, sessions, snapshots, memories, and project permissions
-- `~/.lightcode/cache/` — discovery and runtime caches
-- `~/.lightcode/daemon/` — localhost daemon lockfiles
+- `~/.lightcode/lightcode.db` — durable session state (SQLite), owned by the Runtime
+- `~/.lightcode/runtime.json` — live Runtime owner record (present only while the owner runs)
+- `~/.lightcode/code/<session-id>/` — per-session code snapshots and command output (internal adjunct)
+- `~/.lightcode/cache/discovery/` — provider discovery responses
+- `~/.lightcode/debug/wire/` — raw request and stream dumps when `LIGHTCODE_DEBUG_WIRE=1`
+
+Filesystem sessions created before the SQLite store stay under `~/.lightcode/projects/`: they are
+not migrated, not loaded, and not deleted. Their code snapshots remain reachable through the
+Runtime's retained snapshot operations, addressed explicitly by workspace and old session id.
 
 ---
 
