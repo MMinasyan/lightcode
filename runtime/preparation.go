@@ -793,7 +793,7 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 			Tool: func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				return table[call.Name].Prepare(ctx, tc, call)
 			},
-			NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
+			NormalizeTool: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
 				return table[call.Name].Normalize(tc, call)
 			},
 			ToolHooks: hooks,

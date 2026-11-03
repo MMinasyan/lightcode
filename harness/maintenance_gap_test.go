@@ -25,15 +25,19 @@ type gapStrategy struct {
 	t              *testing.T
 	noneAfterModel bool
 	consumeErr     error
+	observe        func() // runs at the completed-model folding boundary, before publication
 }
 
-func (s *gapStrategy) Plan(in PlanInput) (PlanOutput, error) {
+func (s *gapStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "gap pass"}}}}},
 	}}, nil
 }
 
-func (s *gapStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
+func (s *gapStrategy) Consume(_ context.Context, in ConsumeInput) (PlanOutput, error) {
+	if s.observe != nil {
+		s.observe()
+	}
 	if s.consumeErr != nil {
 		return PlanOutput{}, s.consumeErr
 	}
@@ -41,6 +45,37 @@ func (s *gapStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
 		return PlanOutput{Kind: PlanNone}, nil
 	}
 	return PlanOutput{Kind: PlanCheckpoint, Checkpoint: summaryCheckpoint(s.t, "gap summary", in.Input.BoundaryEntryID)}, nil
+}
+
+// gapOnceStrategy runs one maintenance model pass on the first request round
+// and plans none on every later round, so the incurred facts stay uncommitted
+// while the conversation continues. The optional callbacks observe the real
+// marker at the folding and next-request boundaries.
+type gapOnceStrategy struct {
+	t            *testing.T
+	plans        int
+	atConsume    func()
+	atSecondPlan func()
+}
+
+func (s *gapOnceStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+	s.plans++
+	if s.plans == 1 {
+		return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
+			Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "gap pass"}}}}},
+		}}, nil
+	}
+	if s.atSecondPlan != nil {
+		s.atSecondPlan()
+	}
+	return PlanOutput{Kind: PlanNone}, nil
+}
+
+func (s *gapOnceStrategy) Consume(context.Context, ConsumeInput) (PlanOutput, error) {
+	if s.atConsume != nil {
+		s.atConsume()
+	}
+	return PlanOutput{Kind: PlanNone}, nil
 }
 
 // gapCapture prices both fixture models so the estimate rows are decidable.
@@ -101,6 +136,15 @@ func gapCompactFn(passes *int, usage *model.Usage) func(context.Context, model.R
 	}
 }
 
+// zeroUsageConversation answers the conversation model with a completed turn
+// that reports an all-zero usage: the provider report is present, so it is a
+// known priced-out zero and never leaves the estimate unknown.
+func zeroUsageConversation() func(context.Context, model.Request) (model.Stream, error) {
+	return func(context.Context, model.Request) (model.Stream, error) {
+		return streamOf(turnDelta("stop", "quiet"), usageDelta(model.Usage{})), nil
+	}
+}
+
 func assertEstimatesUnknown(t *testing.T, h *Harness, sessionID string) {
 	t.Helper()
 	view, err := h.ReadSessionView(context.Background(), sessionID)
@@ -126,48 +170,38 @@ func assertEstimateKnownUSD(t *testing.T, h *Harness, sessionID string, want flo
 func TestMaintenanceCompletedResponseGap(t *testing.T) {
 	factUsage := model.Usage{InputTokens: 1000000} // compact model at the captured input rate 0.5: a 0.5 USD producer
 
-	t.Run("the completed maintenance intent sets the marker and a checkpoint commit clears it", func(t *testing.T) {
+	t.Run("the completed maintenance intent sets the marker and its publication clears it", func(t *testing.T) {
 		h, _, c, sessionID := newGapHarness(t)
-		capture := gapCapture()
 		passes := 0
-		exec := gapExecution(t, &gapStrategy{t: t}, gapCompactFn(&passes, &factUsage), nil, nil)
-		_, _, _, facts, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, compactSnapshotMessages(), nil, nil)
-		defer closeInvocation()
-		testassert.NoError(t, err)
+		strategy := &gapStrategy{t: t}
+		// The folding boundary is the real gap: the completed model effect has
+		// published its marker and no checkpoint exists yet.
+		strategy.observe = func() {
+			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+			testassert.NoError(t, err)
+			testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && rec.State.UnreportedMaintenance,
+				"operation state at the completed maintenance input = %+v, want the running marker set by the empty running result", rec.State)
+			assertEstimatesUnknown(t, h, sessionID)
+		}
+		exec := gapExecution(t, strategy, gapCompactFn(&passes, &factUsage), zeroUsageConversation(), nil)
+		testassert.NoError(t, runAutomaticMaintenance(t, h, c, exec))
 		testassert.Equal(t, passes, 1)
 
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 		testassert.NoError(t, err)
-		testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && rec.State.UnreportedMaintenance,
-			"operation state after the completed maintenance model intent = %+v, want the running marker set by the empty running result", rec.State)
-		assertEstimatesUnknown(t, h, sessionID)
-
-		inputID := fixtureInputEntryID(c)
-		err = h.commitMaintenance(context.Background(), c, testOpID, capture, PlanInput{BoundaryEntryID: inputID}, facts, summaryCheckpoint(t, "gap summary", inputID), false)
-		testassert.NoError(t, err)
-
-		rec, err = h.ReadOperation(context.Background(), sessionID, testOpID)
-		testassert.NoError(t, err)
-		testassert.Require(t, rec.State.Status == OperationRunning && !rec.State.UnreportedMaintenance,
-			"operation state after the committed checkpoint = %+v, want the marker cleared by the publication that recorded the facts", rec.State)
+		testassert.Require(t, rec.State.Status == OperationSuccess && !rec.State.UnreportedMaintenance,
+			"operation state after the committed checkpoint = %+v, want the ordinary terminal with the marker cleared by the publication that recorded the facts", rec.State)
 		want := UsageTotals{ByModel: []ModelUsage{{Model: testCompactCapture().Model, Usage: UsageCount{InputTokens: 1000000}}}}
-		testassert.Require(t, usageTotalsEqual(rec.State.Usage, want), "operation usage = %+v, want the recorded facts charged once", rec.State.Usage)
+		testassert.Require(t, usageTotalsEqual(UsageByModelForTest(rec.State.Usage, testCompactCapture().Model), want), "operation compact usage = %+v, want the recorded facts charged once", rec.State.Usage)
 		// The one reported fact priced by the captured compact input rate.
 		assertEstimateKnownUSD(t, h, sessionID, 0.5)
 	})
 
 	t.Run("a reportless completed pass leaves the estimate unknown even after publication", func(t *testing.T) {
 		h, _, c, sessionID := newGapHarness(t)
-		capture := gapCapture()
 		passes := 0
-		exec := gapExecution(t, &gapStrategy{t: t}, gapCompactFn(&passes, nil), nil, nil)
-		_, _, _, facts, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, compactSnapshotMessages(), nil, nil)
-		defer closeInvocation()
-		testassert.NoError(t, err)
-		testassert.Require(t, len(facts.facts) == 1 && facts.facts[0].Usage == nil, "facts = %+v, want the incurred producer with its usage report absent", facts.facts)
-		inputID := fixtureInputEntryID(c)
-		err = h.commitMaintenance(context.Background(), c, testOpID, capture, PlanInput{BoundaryEntryID: inputID}, facts, summaryCheckpoint(t, "gap summary", inputID), false)
-		testassert.NoError(t, err)
+		exec := gapExecution(t, &gapStrategy{t: t}, gapCompactFn(&passes, nil), zeroUsageConversation(), nil)
+		testassert.NoError(t, runAutomaticMaintenance(t, h, c, exec))
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 		testassert.NoError(t, err)
 		testassert.Require(t, !rec.State.UnreportedMaintenance, "operation state = %+v, want the marker cleared with the facts recorded", rec.State)
@@ -187,59 +221,43 @@ func TestMaintenanceCompletedResponseGap(t *testing.T) {
 func TestMaintenanceGapAcrossTransitionsAndRecovery(t *testing.T) {
 	t.Run("model ending at none preserves the marker through later transitions until the fact publication", func(t *testing.T) {
 		h, store, c, sessionID := newGapHarness(t)
-		capture := gapCapture()
 		passes := 0
-		strategy := &gapStrategy{t: t, noneAfterModel: true}
+		atConsume := func() {
+			// The folding boundary is the real gap: the completed model effect
+			// has published its marker and no checkpoint exists yet.
+			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+			testassert.NoError(t, err)
+			testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil && rec.State.UnreportedMaintenance,
+				"operation state at the completed maintenance input = %+v, want the running marker set by the empty running result", rec.State)
+			assertEstimatesUnknown(t, h, sessionID)
+		}
+		atSecondPlan := func() {
+			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+			testassert.NoError(t, err)
+			testassert.Require(t, rec.State.UnreportedMaintenance && len(rec.State.PendingToolCalls) == 0,
+				"operation state at the next request boundary = %+v, want the marker preserved through the model and tool transitions", rec.State)
+		}
+		strategy := &gapOnceStrategy{t: t, atConsume: atConsume, atSecondPlan: atSecondPlan}
+		rounds := 0
 		conversation := func(context.Context, model.Request) (model.Stream, error) {
-			return completedTurnStream(testToolCall("call-1")), nil
+			rounds++
+			if rounds == 1 {
+				return completedTurnStream(testToolCall("call-1")), nil
+			}
+			return streamOf(turnDelta("stop", "quiet"), usageDelta(model.Usage{})), nil
 		}
-		spy := &hookToolSpy{}
-		exec := gapExecution(t, strategy, gapCompactFn(&passes, &model.Usage{InputTokens: 1000000}), conversation, spy.tool)
-
-		// The procedure runs manual so no conversation request is published
-		// behind it: the ordinary model round below owns its own request.
-		_, frozenCheckpoint, frozenBoundary, err := h.projectCanonical(c, testOpID)
-		testassert.NoError(t, err)
-		input := PlanInput{
-			Trigger:           triggerManual,
-			Messages:          cloneRequestMessages(compactSnapshotMessages()),
-			CheckpointEntryID: frozenCheckpoint,
-			BoundaryEntryID:   frozenBoundary,
-			Instructions:      capture.Compact.SystemPrompt,
-			Tools:             cloneToolDefinitions(capture.Tools),
-			ContextWindow:     capture.ContextWindow,
-			OutputReserve:     capture.OutputReserve,
-		}
-		_, _, closeInvocation, err := h.runContextMaintenance(context.Background(), c, testOpID, exec, capture, input, nil)
-		defer closeInvocation()
-		testassert.NoError(t, err)
-		testassert.Require(t, len(c.pendingFacts) == 1, "pending facts = %+v, want the incurred facts transferred to the active execution", c.pendingFacts)
-
-		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-		testassert.NoError(t, err)
-		testassert.Require(t, rec.State.Status == OperationRunning && rec.State.UnreportedMaintenance, "operation state after model->none = %+v, want the marker preserved", rec.State)
-		assertEstimatesUnknown(t, h, sessionID)
-
-		// The ordinary model transition of the next conversation round.
-		publishCalls(t, h, c, sessionID, testToolCall("call-1"))
-		{
+		tool := func(_ context.Context, call model.ToolCall) PreparedTool {
+			// The ordinary model transition has already committed the call.
 			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 			testassert.NoError(t, err)
-			testassert.Require(t, rec.State.UnreportedMaintenance && len(rec.State.PendingToolCalls) == 1, "operation state after the model transition = %+v, want the marker preserved with the published call", rec.State)
+			testassert.Require(t, rec.State.UnreportedMaintenance && len(rec.State.PendingToolCalls) == 1,
+				"operation state after the model transition = %+v, want the marker preserved with the published call", rec.State)
+			return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
+				return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+			}}
 		}
-
-		// The ordinary tool transition.
-		_, err = h.toolEffect(c, testOpID, exec, openedConversation(t, exec), capture)(context.Background(), testToolCall("call-1"), []string{"echo"})
-		testassert.NoError(t, err)
-		{
-			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-			testassert.NoError(t, err)
-			testassert.Require(t, rec.State.UnreportedMaintenance, "operation state after the tool settlement = %+v, want the marker preserved", rec.State)
-		}
-
-		// The success terminal publishes the accumulated facts once and clears it.
-		_, err = h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess})
-		testassert.NoError(t, err)
+		exec := gapExecution(t, strategy, gapCompactFn(&passes, &model.Usage{InputTokens: 1000000}), conversation, tool)
+		testassert.NoError(t, runAutomaticMaintenance(t, h, c, exec))
 		testassert.Equal(t, passes, 1) // no replay of the maintenance model
 		graph, err := validateFixture(t, store, sessionID)
 		testassert.NoError(t, err)
@@ -247,25 +265,21 @@ func TestMaintenanceGapAcrossTransitionsAndRecovery(t *testing.T) {
 		testassert.Require(t, len(settlement.Facts) == 1 && settlement.Facts[0].Usage != nil && settlement.Facts[0].Usage.InputTokens == 1000000,
 			"settlement = %+v, want the transferred maintenance fact recorded exactly once", settlement)
 		state := operationStateOf(t, graph, testOpID)
-		testassert.Require(t, !state.UnreportedMaintenance, "terminal operation state = %+v, want the marker cleared by the fact publication", state)
-		want := UsageTotals{ByModel: []ModelUsage{
-			{Model: testCompactCapture().Model, Usage: UsageCount{InputTokens: 1000000}},
-			{Model: testModelRef(), Usage: UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}}, // the published round's reported assistant usage
-		}}
-		testassert.Require(t, usageTotalsEqual(state.Usage, want), "operation usage = %+v, want the fact charged once beside the round's own usage", state.Usage)
-		testassert.Require(t, usageTotalsEqual(graph.Session.State.Usage, want), "session usage = %+v, want the fact charged once beside the round's own usage", graph.Session.State.Usage)
+		testassert.Require(t, state.Status == OperationSuccess && !state.UnreportedMaintenance, "terminal operation state = %+v, want the success terminal with the marker cleared by the fact publication", state)
+		roundUsage := UsageTotals{ByModel: []ModelUsage{{Model: testModelRef(), Usage: UsageCount{InputTokens: 3, CachedInputTokens: 1, OutputTokens: 2}}}}
+		testassert.Require(t, usageTotalsEqual(UsageByModelForTest(state.Usage, testCompactCapture().Model), UsageTotals{ByModel: []ModelUsage{{Model: testCompactCapture().Model, Usage: UsageCount{InputTokens: 1000000}}}}), "operation usage = %+v, want the fact charged once", state.Usage)
+		testassert.Require(t, usageTotalsEqual(UsageByModelForTest(state.Usage, testModelRef()), roundUsage), "operation usage = %+v, want the round's own reported usage", state.Usage)
+		testassert.Require(t, usageTotalsEqual(UsageByModelForTest(graph.Session.State.Usage, testModelRef()), roundUsage), "session usage = %+v, want the round's own reported usage", graph.Session.State.Usage)
 		// With the marker retired, the priced-out producers become decidable again.
 		assertEstimateKnownUSD(t, h, sessionID, 0.5+0.000011) // compact 1M input at 0.5/M plus the round's 3/1/2 at 1/4/2 per M
 	})
 
 	t.Run("a failed maintenance settlement records the facts, clears the marker, and charges once", func(t *testing.T) {
 		h, store, c, sessionID := newGapHarness(t)
-		capture := gapCapture()
 		passes := 0
 		strategy := &gapStrategy{t: t, consumeErr: errors.New("folding stage failed")}
-		exec := gapExecution(t, strategy, gapCompactFn(&passes, &model.Usage{InputTokens: 1000000}), nil, nil)
-		_, _, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, compactSnapshotMessages(), nil, nil)
-		defer closeInvocation()
+		exec := gapExecution(t, strategy, gapCompactFn(&passes, &model.Usage{InputTokens: 1000000}), zeroUsageConversation(), nil)
+		err := runAutomaticMaintenance(t, h, c, exec)
 		testassert.Require(t, err != nil, "the procedure settled past the folding failure")
 		graph, err := validateFixture(t, store, sessionID)
 		testassert.NoError(t, err)
@@ -281,18 +295,18 @@ func TestMaintenanceGapAcrossTransitionsAndRecovery(t *testing.T) {
 
 	t.Run("a failed checkpoint publication retains the marker and recovery preserves it", func(t *testing.T) {
 		h, store, c, sessionID := newGapHarness(t)
-		capture := gapCapture()
 		passes := 0
-		exec := gapExecution(t, &gapStrategy{t: t}, gapCompactFn(&passes, &model.Usage{InputTokens: 1000000}), nil, nil)
-		_, _, _, facts, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, compactSnapshotMessages(), nil, nil)
-		defer closeInvocation()
-		testassert.NoError(t, err)
-		store.txHook = func(string) error { return errors.New("injected checkpoint failure") }
-		inputID := fixtureInputEntryID(c)
-		err = h.commitMaintenance(context.Background(), c, testOpID, capture, PlanInput{BoundaryEntryID: inputID}, facts, summaryCheckpoint(t, "gap summary", inputID), false)
+		exec := gapExecution(t, &gapStrategy{t: t}, gapCompactFn(&passes, &model.Usage{InputTokens: 1000000}), zeroUsageConversation(), nil)
+		store.entryHook = func(draft EntryDraft) error {
+			if draft.Kind == EntryCompaction {
+				return errors.New("injected checkpoint failure")
+			}
+			return nil
+		}
+		err := runAutomaticMaintenance(t, h, c, exec)
 		testassert.Require(t, err != nil, "commitCheckpoint succeeded past an injected failure")
 		testassert.Require(t, isPublicationFailure(err), "commitCheckpoint error = %v, want the marked publication failure", err)
-		store.txHook = nil
+		store.entryHook = nil
 		{
 			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 			testassert.NoError(t, err)
@@ -319,15 +333,21 @@ func TestMaintenanceGapAcrossTransitionsAndRecovery(t *testing.T) {
 
 	t.Run("a cold recovery inside the gap leaves both estimates unknown with no replay", func(t *testing.T) {
 		h, store, c, sessionID := newGapHarness(t)
-		capture := gapCapture()
 		passes := 0
-		exec := gapExecution(t, &gapStrategy{t: t}, gapCompactFn(&passes, &model.Usage{InputTokens: 1000000}), nil, nil)
-		_, _, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, capture, compactSnapshotMessages(), nil, nil)
-		defer closeInvocation()
-		testassert.NoError(t, err) // the procedure ends at its uncommitted checkpoint; no commit runs
+		exec := gapExecution(t, &gapStrategy{t: t}, gapCompactFn(&passes, &model.Usage{InputTokens: 1000000}), zeroUsageConversation(), nil)
+		store.entryHook = func(draft EntryDraft) error {
+			if draft.Kind == EntryCompaction { // the checkpoint publication is exactly the gap boundary
+				return errors.New("injected checkpoint failure")
+			}
+			return nil
+		}
+		err := runAutomaticMaintenance(t, h, c, exec)
+		testassert.Require(t, err != nil, "the checkpoint publication succeeded past the injected failure")
+		store.entryHook = nil
 		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 		testassert.NoError(t, err)
 		testassert.Require(t, rec.State.UnreportedMaintenance, "operation state inside the gap = %+v, want the marker set", rec.State)
+		assertEstimatesUnknown(t, h, sessionID)
 
 		testassert.NoError(t, Recover(context.Background(), store))
 		graph, err := validateFixture(t, store, sessionID)

@@ -2443,7 +2443,7 @@ func (connectEnvEchoTool) describe(Invocation, ToolConstraints, harness.SessionI
 }
 
 func (connectEnvEchoTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	return runtimeNormalize(call)
+	return runtimeNormalize(context.Background(), call)
 }
 
 func (connectEnvEchoTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
@@ -2451,17 +2451,17 @@ func (connectEnvEchoTool) Prepare(_ context.Context, tc ToolContext, call model.
 		Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "*"}},
 		Execute: func(ctx context.Context) harness.ToolOutcome {
 			if tc.SubprocessEnv == nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no subprocess environment producer"}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no subprocess environment producer"}}
 			}
 			env := tc.SubprocessEnv()
 			if env == nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no environment"}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no environment"}}
 			}
 			out, err := tool.RunForegroundCommand(ctx, `printf '%s|%s' "$CONNECT_CHAIN_MANAGED" "$CONNECT_CHAIN_EXTERNAL"`, tc.Workspace, 0, 15360, 5000, "", env)
 			if err != nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
 			}
-			return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: out}}
+			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: out}}
 		},
 	}
 }

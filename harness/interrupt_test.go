@@ -79,14 +79,14 @@ func TestInterruptBlockedForegroundToolSettlesRealResult(t *testing.T) {
 			return PreparedTool{Permissions: fixturePermission, Execute: func(ctx context.Context) ToolOutcome {
 				started <- struct{}{}
 				<-ctx.Done() // the foreground tool parks until the interrupt cancels its context
-				return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: "tool canceled"}}
+				return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: "tool canceled"}}
 			}}
 		}
 		return PreparedTool{Permissions: fixturePermission, Execute: func(ctx context.Context) ToolOutcome {
 			mu.Lock()
 			call2Ran = true
 			mu.Unlock()
-			return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "must not run"}}
+			return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "must not run"}}
 		}}
 	}
 	prepared := preparedExecuting(effectExecution(modelFn, toolFn))
@@ -283,14 +283,14 @@ func TestInterruptSteeringPreservesBufferOrder(t *testing.T) {
 		first := toolCalls == 1
 		mu.Unlock()
 		if !first {
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
+			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 		}
 		toolArrived <- struct{}{} // the first batch parks mid-execution: the pre-boundary window
 		select {
 		case <-toolGate:
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
+			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 		case <-ctx.Done(): // the interrupt cancels the execution context inside the batch
-			return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}}}
+			return PreparedTool{Immediate: &ToolOutcome{Evidence: ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}}}
 		}
 	}
 	prepared := preparedExecuting(effectExecution(modelFn, toolFn))

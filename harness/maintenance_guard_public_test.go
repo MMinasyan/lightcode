@@ -10,6 +10,7 @@ package harness_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -32,7 +33,7 @@ type modelFreeStrategy struct {
 	release    chan struct{} // Plan blocks on it when parking
 }
 
-func (s *modelFreeStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
+func (s *modelFreeStrategy) Plan(_ context.Context, in harness.PlanInput) (harness.PlanOutput, error) {
 	if s.parked != nil && s.armed.CompareAndSwap(true, false) {
 		s.parked <- struct{}{}
 		<-s.release
@@ -51,7 +52,7 @@ func (s *modelFreeStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, erro
 	}}, nil
 }
 
-func (s *modelFreeStrategy) Consume(harness.ConsumeInput) (harness.PlanOutput, error) {
+func (s *modelFreeStrategy) Consume(_ context.Context, _ harness.ConsumeInput) (harness.PlanOutput, error) {
 	return harness.PlanOutput{Kind: harness.PlanNone}, nil
 }
 
@@ -64,13 +65,13 @@ type factBearingStrategy struct {
 	planText string
 }
 
-func (s *factBearingStrategy) Plan(harness.PlanInput) (harness.PlanOutput, error) {
+func (s *factBearingStrategy) Plan(_ context.Context, _ harness.PlanInput) (harness.PlanOutput, error) {
 	return harness.PlanOutput{Kind: harness.PlanModel, Model: &harness.ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "maintenance pass"}}}}},
 	}}, nil
 }
 
-func (s *factBearingStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
+func (s *factBearingStrategy) Consume(_ context.Context, in harness.ConsumeInput) (harness.PlanOutput, error) {
 	if s.parked != nil && s.armed.CompareAndSwap(true, false) {
 		s.parked <- struct{}{}
 		<-s.release
@@ -212,6 +213,83 @@ func TestPublicManualCompactParkedPlanInterruptBeforeCommit(t *testing.T) {
 		<-done
 
 		requireInterruptedCompact(t, f, store, session, "c-1", compact)
+	})
+}
+
+// TestPublicManualCompactBlockedPlanSubmitBuffersUntilCompletion proves the
+// real public interval around a blocked maintenance Plan: a Submit while Plan
+// is blocked returns the steering disposition promptly with its pending head
+// visible, no successor Operation or conversation dispatch exists yet, and
+// after Plan releases the compact completes and disposes before the drain
+// admits and dispatches the successor.
+func TestPublicManualCompactBlockedPlanSubmitBuffersUntilCompletion(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		conversation := newScriptModel(publicTurn())
+		compact := newScriptModel(summaryAttempt("unused"))
+		armed := &atomic.Bool{}
+		var f *publicFixture
+		var session string
+		conversationCalls := 0
+		conversationFn := func(ctx context.Context, req model.Request) (model.Stream, error) {
+			conversationCalls++
+			if conversationCalls > 1 { // the successor, after the compacting fixture's own history turn
+				rec, err := f.h.ReadOperation(context.Background(), session, "c-1")
+				testassert.NoError(t, err)
+				testassert.Require(t, rec.State.Status == harness.OperationSuccess && rec.State.Terminal != nil,
+					"successor model dispatch observed before the manual compact completed: %+v", rec.State)
+			}
+			return conversation.effect(ctx, req)
+		}
+		f = newPublicFixtureWithJobs(t, store, nil, conversation, conversationFn, compact.effect)
+		strategy := &modelFreeStrategy{checkpoint: true, armed: armed, parked: make(chan struct{}, 1), release: make(chan struct{})}
+		modelFreePrep(f, strategy, nil, nil)
+		defer f.close()
+		session = createSession(t, f.h)
+		idleHistory(t, f, session)
+		dispatchedBefore := len(conversation.seen())
+		armed.Store(true)
+
+		done := make(chan struct{})
+		compactAsync(t, f.h, session, "c-1", done)
+		select {
+		case <-strategy.parked:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the maintenance Plan never parked")
+		}
+
+		type submitted struct {
+			res harness.SubmitResult
+			err error
+		}
+		submittedCh := make(chan submitted, 1)
+		go func() {
+			res, err := submit(t, f.h, session, "s-1", harness.MessageModeRegular, "steer")
+			submittedCh <- submitted{res: res, err: err}
+		}()
+		var got submitted
+		select {
+		case got = <-submittedCh:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Submit did not return while the maintenance Plan was blocked")
+		}
+		testassert.Require(t, got.err == nil && got.res.Disposition == harness.DispositionSteering,
+			"Submit during the blocked Plan = %+v err %v, want the immediate steering disposition", got.res, got.err)
+		view, err := f.h.ReadSessionView(context.Background(), session)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(view.Steering) == 1 && view.Steering[0].OperationID == "s-1" && view.Steering[0].Origin == harness.InputOriginUser && len(view.Steering[0].Content) == 1 && view.Steering[0].Content[0].Text == "steer",
+			"pending steering = %+v, want the visible buffered head", view.Steering)
+		if _, err := f.h.ReadOperation(context.Background(), session, "s-1"); !errors.Is(err, harness.ErrNotFound) {
+			t.Fatalf("ReadOperation(s-1) = %v, want no durable successor admission while Plan is blocked", err)
+		}
+		testassert.Equal(t, len(conversation.seen()), dispatchedBefore)
+
+		close(strategy.release)
+		<-done
+		awaitTerminal(t, f.h, session, "c-1")
+		awaitSettled(t, f.h, session, "s-1")
+		view, err = f.h.ReadSessionView(context.Background(), session)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(view.Steering) == 0, "pending steering after the successor settled = %+v, want the drain to have consumed it", view.Steering)
 	})
 }
 

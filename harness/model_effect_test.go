@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -87,13 +86,6 @@ func transportExecution(srv *httptest.Server, retry RetryPolicy) Execution {
 	return exec
 }
 
-// modelEffectOver returns the model effect over the given execution and its
-// opened conversation invocation — the direct effect fixtures' shape.
-func modelEffectOver(t *testing.T, h *Harness, c *coordinator, exec Execution, capture ExecutionCapture) agent.ModelEffect {
-	t.Helper()
-	return h.modelEffect(c, testOpID, exec, openedConversation(t, exec), capture, fixtureRound(h, c))
-}
-
 // retrySpy is the fixtures' captured retry policy: up to limit retries of any
 // failure with zero delay, recording every observed failure and 1-based
 // attempt number.
@@ -120,10 +112,10 @@ func statusErrorOf(t *testing.T, cause error) *model.HTTPStatusError {
 	return status
 }
 
-// requireIntentAndResultCounts asserts the durable shape of one settled
-// logical effect: exactly one result entry — the assistant entry consuming the
-// intent when a payload exists, one settlement entry otherwise — with no
-// duplicate intent evidence and the intent cleared.
+// requireIntentAndResultCounts asserts the durable shape of one real settled
+// turn: exactly one terminal settlement and, when the accepted output carries a
+// payload, exactly one assistant entry consuming the intent; the intent is
+// cleared.
 func requireIntentAndResultCounts(t *testing.T, h *Harness, store *graphStorage, sessionID string, assistant bool) {
 	t.Helper()
 	graph, err := validateFixture(t, store, sessionID)
@@ -137,11 +129,14 @@ func requireIntentAndResultCounts(t *testing.T, h *Harness, store *graphStorage,
 			settlements++
 		}
 	}
-	testassert.Require(t, !assistant || assistants == 1 && settlements == 0, "committed %d assistants and %d settlements, want the one intent/result pair riding one assistant entry", assistants, settlements)
-	testassert.Require(t, assistant || assistants == 0 && settlements == 1, "committed %d assistants and %d settlements, want the one intent/result pair riding one settlement entry", assistants, settlements)
+	if assistant {
+		testassert.Require(t, assistants == 1 && settlements == 1, "committed %d assistants and %d settlements, want the one payload entry beside the terminal", assistants, settlements)
+	} else {
+		testassert.Require(t, assistants == 0 && settlements == 1, "committed %d assistants and %d settlements, want the one terminal without a payload entry", assistants, settlements)
+	}
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 	testassert.NoError(t, err)
-	testassert.Require(t, rec.State.ActiveEffect == nil, "settled effect keeps an active intent %+v", rec.State.ActiveEffect)
+	testassert.Require(t, rec.State.Terminal != nil && rec.State.ActiveEffect == nil, "settled run = %+v, want a terminal and no active intent", rec.State)
 }
 
 // TestModelEffectRetriesTransportFailures proves the retry row over the real
@@ -159,27 +154,19 @@ func TestModelEffectRetriesTransportFailures(t *testing.T) {
 	)
 	spy := &retrySpy{limit: 2}
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
-	assemblies := 0
-	set, err := invokeModelEffect(t, me, defaultModelRequest(t), func(source model.ModelRef, stream model.Stream) (model.Output, error) {
-		assemblies++
-		return agent.Assemble(context.Background(), source, stream)
-	})
-	testassert.NoError(t, err)
-	testassert.Equal(t, set.Disposition, agent.DispoReady)
+	exec := transportExecution(srv, spy.retry)
+	testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+		return exec, nil
+	})))
 	if hits.Load() != 3 {
 		t.Fatalf("physical requests = %d, want the two retries plus the accepted attempt", hits.Load())
 	}
-	testassert.Equal(t, assemblies, 1)
 	testassert.Require(t, len(spy.attempts) == 2 && spy.attempts[0] == 1 && spy.attempts[1] == 2, "attempt numbers = %v, want the 1-based failed attempts [1 2]", spy.attempts)
 	statusErrorOf(t, spy.seen[0])
 	statusErrorOf(t, spy.seen[1])
 	requireIntentAndResultCounts(t, h, store, sessionID, true)
 	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
-	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	testassert.NoError(t, err)
-	testassert.Equal(t, rec.State.Status, OperationRunning)
 	var assistant *assistantEntry
 	for i := range graph.Entries {
 		if graph.Entries[i].Assistant != nil {
@@ -197,21 +184,19 @@ func TestModelEffectExhaustedRetriesSettleFailure(t *testing.T) {
 	srv, hits, _ := sseChatServer(t, scriptedResponses{status: http.StatusTooManyRequests})
 	spy := &retrySpy{limit: 2}
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
-	set, err := invokeModelEffect(t, me, defaultModelRequest(t), func(model.ModelRef, model.Stream) (model.Output, error) {
-		t.Fatalf("assembly callback ran for a never-accepted attempt")
-		return model.Output{}, nil
-	})
-	testassert.NoError(t, err)
-	testassert.Require(t, set.Disposition == agent.DispoFailure && set.Output == nil && set.Detail != "" && strings.Contains(set.Detail, "429"), "settlement = %+v, want the committed outputless failure with its diagnostic; failure detail = %q, want the transport's 429 diagnostic", set, set.Detail)
+	exec := transportExecution(srv, spy.retry)
+	testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+		return exec, nil
+	})))
 	if hits.Load() != 3 {
 		t.Fatalf("physical requests = %d, want the initial attempt plus both retries", hits.Load())
 	}
 	testassert.Require(t, len(spy.attempts) == 3 && spy.attempts[2] == 3, "attempt numbers = %v, want the policy consulted through attempt 3", spy.attempts)
 	requireIntentAndResultCounts(t, h, store, sessionID, false)
-	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
-	testassert.Require(t, rec.State.Status == OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == set.Detail, "operation state = %+v, want terminal failure with the settled diagnostic", rec.State)
+	settlement := settlementEntryOf(t, graph)
+	testassert.Require(t, settlement.Status == OperationFailure && strings.Contains(settlement.Detail, "429"), "settlement = %+v, want the committed outputless failure with its 429 diagnostic", settlement)
 }
 
 // TestModelEffectConnectionFailureRetries proves the connection-failure row:
@@ -224,24 +209,28 @@ func TestModelEffectConnectionFailureRetries(t *testing.T) {
 	t.Run("retryable connection failure exhausts through the policy", func(t *testing.T) {
 		spy := &retrySpy{limit: 1}
 		h, store, c, sessionID := newEffectHarness(t, nil)
-		me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
-		set, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
-		testassert.NoError(t, err)
-		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail != "", "settlement = %+v, want the committed failure with its diagnostic", set)
+		exec := transportExecution(srv, spy.retry)
+		testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return exec, nil
+		})))
 		testassert.Require(t, len(spy.attempts) == 2 && spy.attempts[0] == 1 && spy.attempts[1] == 2, "attempt numbers = %v, want the one allowed retry", spy.attempts)
 		var op *net.OpError
 		testassert.Require(t, errors.As(spy.seen[0], &op), "attempt failure %v, want the transport's wrapped net.OpError", spy.seen[0])
 		requireIntentAndResultCounts(t, h, store, sessionID, false)
+		graph, err := validateFixture(t, store, sessionID)
+		testassert.NoError(t, err)
+		testassert.Require(t, settlementEntryOf(t, graph).Status == OperationFailure, "settlement = %+v, want the connection failure terminal", settlementEntryOf(t, graph))
 	})
 
 	t.Run("unretryable connection failure stops at the first attempt", func(t *testing.T) {
 		spy := &retrySpy{limit: 0}
-		h, _, c, _ := newEffectHarness(t, nil)
-		me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
-		set, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
-		testassert.NoError(t, err)
-		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail != "", "settlement = %+v, want the committed failure with its diagnostic", set)
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		exec := transportExecution(srv, spy.retry)
+		testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return exec, nil
+		})))
 		testassert.Require(t, len(spy.attempts) == 1, "attempt numbers = %v, want the false classification to stop at attempt 1", spy.attempts)
+		requireIntentAndResultCounts(t, h, store, sessionID, false)
 	})
 
 	t.Run("a negative delay also means no retry", func(t *testing.T) {
@@ -250,12 +239,13 @@ func TestModelEffectConnectionFailureRetries(t *testing.T) {
 			attempts++
 			return -time.Second, true
 		}
-		h, _, c, _ := newEffectHarness(t, nil)
-		me := modelEffectOver(t, h, c, transportExecution(srv, policy), testCapture())
-		set, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
-		testassert.NoError(t, err)
-		testassert.Require(t, set.Disposition == agent.DispoFailure && set.Detail != "", "settlement = %+v, want the committed failure with its diagnostic", set)
+		h, store, c, sessionID := newEffectHarness(t, nil)
+		exec := transportExecution(srv, policy)
+		testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return exec, nil
+		})))
 		testassert.Equal(t, attempts, 1)
+		requireIntentAndResultCounts(t, h, store, sessionID, false)
 	})
 }
 
@@ -277,18 +267,18 @@ func TestModelEffectAttemptFailureUnderCancellationSettlesInterruption(t *testin
 		cancel()                                   // the execution context dies during the attempt
 		return nil, errors.New("provider dropped") // not cancellation-shaped
 	}
-	h, store, c, sessionID := newEffectHarness(t, modelFn)
+	h, store, c, sessionID := newEffectHarness(t, nil)
 	exec := effectExecution(modelFn, nil)
 	exec.Retry = policy
-	me := modelEffectOver(t, h, c, exec, testCapture())
-	set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
-	testassert.NoError(t, err)
-	testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the committed interruption settlement", set)
+	testassert.NoError(t, executeDirect(h, c, ctx, testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+		return exec, nil
+	})))
 	testassert.Require(t, attempts == 1 && policyCalls == 0, "attempts = %d policy calls = %d, want the done context to settle before any classification or second attempt", attempts, policyCalls)
 	requireIntentAndResultCounts(t, h, store, sessionID, false)
-	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
-	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the fixed detail", rec.State)
+	settlement := settlementEntryOf(t, graph)
+	testassert.Require(t, settlement.Status == OperationInterruption && settlement.Detail == executionInterruptedDetail, "settlement = %+v, want the fixed interruption terminal", settlement)
 }
 
 // TestModelEffectNilRetryCancelsDuringStandardBackoff proves nil Retry selects
@@ -305,20 +295,21 @@ func TestModelEffectNilRetryCancelsDuringStandardBackoff(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		cancel() // observed execution cancellation during the Harness-owned wait
 	}()
-	me := modelEffectOver(t, h, c, transportExecution(srv, nil), testCapture())
+	exec := transportExecution(srv, nil)
 	started := time.Now()
-	set, err := invokeModelEffectCtx(t, me, ctx, defaultModelRequest(t), nil)
+	testassert.NoError(t, executeDirect(h, c, ctx, testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+		return exec, nil
+	})))
 	elapsed := time.Since(started)
-	testassert.NoError(t, err)
-	testassert.Require(t, set.Disposition == agent.DispoInterruption && set.Detail == executionInterruptedDetail, "settlement = %+v, want the committed interruption settlement", set)
 	testassert.Require(t, elapsed < 2*time.Second, "cancellation during the 2s backoff returned after %v, want the wait interrupted promptly", elapsed)
 	if hits.Load() != 1 {
 		t.Fatalf("physical requests = %d, want no second attempt after the cancellation", hits.Load())
 	}
 	requireIntentAndResultCounts(t, h, store, sessionID, false)
-	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
-	testassert.Require(t, rec.State.Status == OperationInterruption && rec.State.Terminal != nil && rec.State.Terminal.Detail == executionInterruptedDetail, "operation state = %+v, want terminal interruption with the fixed detail", rec.State)
+	settlement := settlementEntryOf(t, graph)
+	testassert.Require(t, settlement.Status == OperationInterruption && settlement.Detail == executionInterruptedDetail, "settlement = %+v, want the fixed interruption terminal", settlement)
 }
 
 // TestModelEffectStandardClassifierRows pins the private standard classifier:
@@ -370,7 +361,12 @@ func TestModelEffectStandardClassifierRows(t *testing.T) {
 func TestModelEffectAcceptedStreamNeverRetries(t *testing.T) {
 	srv, hits, _ := sseChatServer(t, scriptedResponses{status: http.StatusOK})
 	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+		if hits.Add(1) > 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"after"},"finish_reason":"stop"}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant","content":"partial"}}]}`+"\n\n")
 		if f, ok := w.(http.Flusher); ok {
@@ -380,13 +376,10 @@ func TestModelEffectAcceptedStreamNeverRetries(t *testing.T) {
 	})
 	spy := &retrySpy{limit: 5}
 	h, store, c, sessionID := newEffectHarness(t, nil)
-	me := modelEffectOver(t, h, c, transportExecution(srv, spy.retry), testCapture())
-	set, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
-	testassert.NoError(t, err)
-	testassert.Equal(t, set.Disposition, agent.DispoContinue)
-	if hits.Load() != 1 {
-		t.Fatalf("physical requests = %d, want the accepted stream to never re-enter retry", hits.Load())
-	}
+	exec := transportExecution(srv, spy.retry)
+	testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+		return exec, nil
+	})))
 	testassert.Equal(t, len(spy.attempts), 0)
 	graph, err := validateFixture(t, store, sessionID)
 	testassert.NoError(t, err)
@@ -400,19 +393,25 @@ func TestModelEffectAcceptedStreamNeverRetries(t *testing.T) {
 			signal = graph.Entries[i].Signal
 		}
 	}
-	testassert.Require(t, assistant != nil && assistant.Status == model.OutputErrored && assistant.Content[0].Text == "partial", "assistant entry = %+v, want the committed partial", assistant)
+	testassert.Require(t, assistant != nil && assistant.Status == model.OutputCompleted && assistant.Content[0].Text == "after", "last assistant entry = %+v, want the next round's completed turn", assistant)
 	testassert.Require(t, signal != nil && signal.Signal == SignalModelFailureContinuation, "signal entry = %+v, want the fixed continuation signal", signal)
-	requireIntentAndResultCounts(t, h, store, sessionID, true)
-	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
-	testassert.NoError(t, err)
-	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.ActiveEffect == nil, "operation state = %+v, want running with the effect cleared", rec.State)
+	graphCount, gerr := validateFixture(t, store, sessionID)
+	testassert.NoError(t, gerr)
+	assistants, settlements := 0, 0
+	for _, entry := range graphCount.Entries {
+		if entry.Assistant != nil {
+			assistants++
+		}
+		if entry.Settlement != nil {
+			settlements++
+		}
+	}
+	testassert.Require(t, assistants == 2 && settlements == 1, "committed %d assistants and %d settlements, want the partial and the next turn beside the terminal", assistants, settlements)
 	// Partial continuation: the next context projection reads the committed
-	// partial from history.
+	// partial from history ahead of the next round's turn.
 	msgs, err := fixtureProjection(h, c)(context.Background())
 	testassert.NoError(t, err)
-	// system, input, committed partial, continuation signal
-	testassert.Equal(t, len(msgs), 4)
-	testassert.Require(t, msgs[2].Role == model.RoleAssistant && msgs[2].TextContent() == "partial", "projected partial = %+v, want the committed errored assistant", msgs[2])
+	testassert.Require(t, len(msgs) >= 4 && msgs[2].Role == model.RoleAssistant && msgs[2].TextContent() == "partial", "projected partial = %+v, want the committed errored assistant", msgs)
 }
 
 // TestModelEffectOneAssemblyAndClose pins the ownership boundary on an
@@ -420,19 +419,17 @@ func TestModelEffectAcceptedStreamNeverRetries(t *testing.T) {
 // closes exactly once, on every classification.
 func TestModelEffectOneAssemblyAndClose(t *testing.T) {
 	stream := completedTurnStream()
-	h, _, c, _ := newEffectHarness(t, nil)
+	h, store, c, sessionID := newEffectHarness(t, nil)
 	exec := effectExecution(func(context.Context, model.Request) (model.Stream, error) {
 		return stream, nil
 	}, nil)
-	assemblies := 0
-	set, err := invokeModelEffect(t, modelEffectOver(t, h, c, exec, testCapture()), defaultModelRequest(t), func(source model.ModelRef, s model.Stream) (model.Output, error) {
-		assemblies++
-		return agent.Assemble(context.Background(), source, s)
-	})
-	testassert.NoError(t, err)
-	testassert.Equal(t, set.Disposition, agent.DispoReady)
-	testassert.Equal(t, assemblies, 1)
+	testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+		return exec, nil
+	})))
 	testassert.Equal(t, stream.closes, 1)
+	requireIntentAndResultCounts(t, h, store, sessionID, true)
+	assistant := compositionAssistant(t, store, sessionID)
+	testassert.Require(t, assistant.Status == model.OutputCompleted && assistant.Content[0].Text == "done", "assistant entry = %+v, want the single assembled payload", assistant)
 }
 
 // TestModelEffectInvalidAttemptOutcomeSettlesBoundaryFailure proves the
@@ -446,14 +443,15 @@ func TestModelEffectInvalidAttemptOutcomeSettlesBoundaryFailure(t *testing.T) {
 		exec := effectExecution(func(context.Context, model.Request) (model.Stream, error) {
 			return stream, errors.New("ambiguous outcome")
 		}, nil)
-		me := modelEffectOver(t, h, c, exec, testCapture())
-		_, boundaryErr := invokeModelEffect(t, me, defaultModelRequest(t), nil)
-		testassert.Require(t, boundaryErr != nil, "model effect settled, want the boundary failure")
+		err := executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return exec, nil
+		}))
+		testassert.Require(t, err != nil, "run = nil, want the physical-request boundary failure")
 		testassert.Equal(t, stream.closes, 1)
 		requireIntentAndResultCounts(t, h, store, sessionID, false)
-		rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
+		graph, err := validateFixture(t, store, sessionID)
 		testassert.NoError(t, err)
-		testassert.Require(t, rec.State.Status == OperationFailure && rec.State.Terminal != nil && rec.State.Terminal.Detail == boundaryErr.Error(), "operation state = %+v, want terminal failure with the boundary diagnostic", rec.State)
+		testassert.Require(t, settlementEntryOf(t, graph).Status == OperationFailure, "settlement = %+v, want the boundary failure terminal", settlementEntryOf(t, graph))
 	})
 
 	t.Run("neither a stream nor an error", func(t *testing.T) {
@@ -461,9 +459,10 @@ func TestModelEffectInvalidAttemptOutcomeSettlesBoundaryFailure(t *testing.T) {
 		exec := effectExecution(func(context.Context, model.Request) (model.Stream, error) {
 			return nil, nil
 		}, nil)
-		me := modelEffectOver(t, h, c, exec, testCapture())
-		_, err := invokeModelEffect(t, me, defaultModelRequest(t), nil)
-		testassert.Require(t, err != nil, "model effect settled, want the boundary failure")
+		err := executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return exec, nil
+		}))
+		testassert.Require(t, err != nil, "run = nil, want the physical-request boundary failure")
 		requireIntentAndResultCounts(t, h, store, sessionID, false)
 	})
 }

@@ -712,7 +712,7 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 							return harness.InvocationExecution{
 								Model: attempt,
 								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 								},
 								NormalizeTool: publicNormalize,
 							}, nil
@@ -781,14 +781,14 @@ type publicFailingStrategy struct {
 	fail  func() error
 }
 
-func (s publicFailingStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
+func (s publicFailingStrategy) Plan(_ context.Context, in harness.PlanInput) (harness.PlanOutput, error) {
 	if s.stage == "plan" {
 		return harness.PlanOutput{}, s.fail()
 	}
-	return (publicReplacementStrategy{}).Plan(in)
+	return (publicReplacementStrategy{}).Plan(context.Background(), in)
 }
 
-func (s publicFailingStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
+func (s publicFailingStrategy) Consume(_ context.Context, in harness.ConsumeInput) (harness.PlanOutput, error) {
 	return harness.PlanOutput{}, s.fail()
 }
 
@@ -860,7 +860,7 @@ func TestPublicManualStrategyExplicitOutcomes(t *testing.T) {
 	}
 }
 
-func (s publicReplacementStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
+func (s publicReplacementStrategy) Plan(_ context.Context, in harness.PlanInput) (harness.PlanOutput, error) {
 	if s.seen != nil {
 		*s.seen = append(*s.seen, in.Measurement)
 	}
@@ -869,7 +869,7 @@ func (s publicReplacementStrategy) Plan(in harness.PlanInput) (harness.PlanOutpu
 	}}, nil
 }
 
-func (s publicReplacementStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
+func (s publicReplacementStrategy) Consume(_ context.Context, in harness.ConsumeInput) (harness.PlanOutput, error) {
 	if s.none {
 		return harness.PlanOutput{Kind: harness.PlanNone}, nil
 	}

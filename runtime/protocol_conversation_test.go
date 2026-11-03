@@ -491,7 +491,7 @@ func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 			case "call-1":
 				return harness.PreparedTool{
 					Permissions: permissions,
-					Immediate: &harness.ToolOutcome{
+					Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionObserved,
 						Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
 						Metadata: json.RawMessage(`{"n":9007199254740993}`),
 					},
@@ -505,7 +505,7 @@ func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 						default:
 						}
 						<-releaseTool
-						return harness.ToolOutcome{
+						return harness.ToolOutcome{Evidence: harness.ExecutionObserved,
 							Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "second"},
 							Metadata: json.RawMessage(`{"late":true}`),
 						}
@@ -514,7 +514,7 @@ func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 			default:
 				return harness.PreparedTool{
 					Permissions: permissions,
-					Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
+					Immediate:   &harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
 				}
 			}
 		})
@@ -621,7 +621,7 @@ func TestConversationProjectionSyntheticToolResult(t *testing.T) {
 		// synthetic error outcome settles the published call.
 		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 			return harness.PreparedTool{
-				Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}},
+				Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}},
 			}
 		})
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
@@ -656,7 +656,7 @@ func parkedReadCallPrepare(releaseTool <-chan struct{}, toolStarted chan<- struc
 		if call.ID != "call-1" {
 			return harness.PreparedTool{
 				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-				Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
+				Immediate:   &harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
 			}
 		}
 		return harness.PreparedTool{
@@ -671,7 +671,7 @@ func parkedReadCallPrepare(releaseTool <-chan struct{}, toolStarted chan<- struc
 				case <-execCtx.Done(): // the interrupt releases the started call
 				}
 				// A returned real outcome wins the cancellation race.
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
 			},
 		}
 	}
@@ -885,7 +885,7 @@ func TestConversationProjectionForkPrefixIsIndependent(t *testing.T) {
 		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 			return harness.PreparedTool{
 				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-				Immediate: &harness.ToolOutcome{
+				Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionObserved,
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
 					Metadata: json.RawMessage(`{"n":9007199254740993}`),
 				},

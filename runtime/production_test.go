@@ -140,7 +140,7 @@ func (t fileWriteTool) describe(_ Invocation, constraints ToolConstraints, _ har
 }
 
 func (t fileWriteTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	return runtimeNormalize(call)
+	return runtimeNormalize(context.Background(), call)
 }
 
 func (t fileWriteTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
@@ -149,7 +149,7 @@ func (t fileWriteTool) Prepare(_ context.Context, tc ToolContext, call model.Too
 		Content string `json:"content"`
 	}
 	if err := json.Unmarshal(call.Arguments, &args); err != nil || args.Path == "" || args.Content == "" {
-		return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "prod_write requires path and content"}}}
+		return harness.PreparedTool{Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "prod_write requires path and content"}}}
 	}
 	target := filepath.Clean(filepath.Join(tc.Workspace, args.Path))
 	return harness.PreparedTool{
@@ -157,15 +157,15 @@ func (t fileWriteTool) Prepare(_ context.Context, tc ToolContext, call model.Too
 		CanonicalWorkspace: filepath.Clean(tc.Workspace),
 		Execute: func(ctx context.Context) harness.ToolOutcome {
 			if err := ctx.Err(); err != nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "interrupted"}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "interrupted"}}
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
 			}
 			if err := os.WriteFile(target, []byte(args.Content), 0o600); err != nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
 			}
-			return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "written"}}
+			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "written"}}
 		},
 	}
 }
@@ -187,7 +187,7 @@ func (t fileReadTool) describe(Invocation, ToolConstraints, harness.SessionIdent
 }
 
 func (t fileReadTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	return runtimeNormalize(call)
+	return runtimeNormalize(context.Background(), call)
 }
 
 func (t fileReadTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
@@ -195,7 +195,7 @@ func (t fileReadTool) Prepare(_ context.Context, tc ToolContext, call model.Tool
 		Path string `json:"path"`
 	}
 	if err := json.Unmarshal(call.Arguments, &args); err != nil || args.Path == "" {
-		return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "prod_read requires path"}}}
+		return harness.PreparedTool{Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "prod_read requires path"}}}
 	}
 	target := filepath.Clean(filepath.Join(tc.Workspace, args.Path))
 	return harness.PreparedTool{
@@ -203,13 +203,13 @@ func (t fileReadTool) Prepare(_ context.Context, tc ToolContext, call model.Tool
 		CanonicalWorkspace: filepath.Clean(tc.Workspace),
 		Execute: func(ctx context.Context) harness.ToolOutcome {
 			if err := ctx.Err(); err != nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "interrupted"}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "interrupted"}}
 			}
 			data, err := os.ReadFile(target)
 			if err != nil {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
 			}
-			return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: string(data)}}
+			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: string(data)}}
 		},
 	}
 }

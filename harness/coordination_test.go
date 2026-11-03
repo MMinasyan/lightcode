@@ -300,7 +300,7 @@ func TestSteeringAdmitsHeadsInFIFOOrder(t *testing.T) {
 	openerGate := make(chan struct{})
 	var once sync.Once
 	exec := effectExecution(script.model, func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
+		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 	})
 	prepared := PreparedExecution{
 		Capture: testCapture(),
@@ -901,7 +901,7 @@ func TestWaitConvergence(t *testing.T) {
 			toolArrived <- struct{}{}
 			<-toolGate
 			return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
-				return ToolOutcome{Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}}
+				return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}}
 			}}
 		})
 		prepared := preparedExecuting(exec)
@@ -1253,10 +1253,7 @@ func TestDrainRetiresItsOwnRunSlot(t *testing.T) {
 			testassert.Equal(t, disposition, DispositionAdmitted)
 		}
 		c := leaseCoordinator(t, h, session.Identity.SessionID)
-		{
-			_, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess})
-			testassert.NoError(t, err)
-		}
+		settleAdmitted(t, h, c, testOpID)
 		return h, c
 	}
 

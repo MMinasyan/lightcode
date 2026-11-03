@@ -258,24 +258,28 @@ func cloneMessageValue(m model.Message) model.Message {
 	return out
 }
 
-// requestSource returns the Agent request boundary of one Operation. Its
-// order is the owning pipeline's: first steering, then the frozen canonical
-// projection and request identity, then the selected request contributions,
-// then the automatic maintenance orchestration over canonical-only input,
-// then — after a checkpoint — the rebuilt projection with the frozen
-// contributions applied exactly once, and finally the model dispatch request.
-// The first call projects the newly admitted input only (first-request
-// protection), and every later call selects the conversation boundary — when
-// steering waits it returns errSteeringBoundary instead of supplying another
-// request, leaving every head buffered for the ordinary post-terminal drain.
-// Selection consumes no head and performs no cancellation or observation.
-// Physical retries and the compact Agent's own request callback never reach
-// this boundary. The supplied round carries the built identity and evidence
-// to the model effect of the same execution.
-func (h *Harness) requestSource(c *coordinator, operationID string, capture ExecutionCapture, exec Execution, inv InvocationExecution, round *conversationRound) agent.RequestSource {
-	firstRequest := true
+// requestSource returns the Agent request boundary of the bound conversation
+// invocation. Its order is the owning pipeline's: first steering, then the
+// frozen canonical projection and request identity, then the selected request
+// contributions, then the complete automatic maintenance procedure over
+// canonical-only input, then — after a published checkpoint — the rebuilt
+// projection with the frozen contributions applied exactly once, and finally
+// the model dispatch request. The first call projects the newly admitted input
+// only (first-request protection), and every later call selects the
+// conversation boundary — when steering waits it returns errSteeringBoundary
+// instead of supplying another request, leaving every head buffered for the
+// ordinary post-terminal drain. Selection consumes no head and performs no
+// cancellation or observation. Physical retries and the compact Agent's own
+// request callback never reach this boundary. The invocation's owned frame
+// carries the built identity and evidence to the model effect of the same
+// execution.
+func (d *executionDriver) requestSource() agent.RequestSource {
+	h := d.harness
+	c := d.coordinator
+	inv := d.conversation
+	capture := d.capture
 	build := func(ctx context.Context) (model.Request, error) {
-		if !firstRequest {
+		if !inv.firstRequest {
 			c.mu.Lock()
 			waiting := len(c.steering) > 0
 			c.mu.Unlock()
@@ -283,11 +287,11 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 				return model.Request{}, errSteeringBoundary
 			}
 		}
-		firstRequest = false
+		inv.firstRequest = false
 		if err := ctx.Err(); err != nil { // the source never starts work under a canceled execution
 			return model.Request{}, errExecutionInterrupted
 		}
-		canonical, checkpointID, boundaryID, err := h.projectCanonical(c, operationID)
+		canonical, checkpointID, boundaryID, err := h.projectCanonical(c, d.operationID)
 		if err != nil {
 			return model.Request{}, err
 		}
@@ -296,7 +300,7 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 			return model.Request{}, fmt.Errorf("%w: %v", ErrStorage, err)
 		}
 		view := newRequestView(capture, checkpointID, boundaryID, canonical)
-		if err := h.runRequestHooks(ctx, c, operationID, inv, requestID, view); err != nil {
+		if err := d.runRequestHooks(ctx, requestID, view); err != nil {
 			return model.Request{}, err
 		}
 		contributions, err := acceptRequestEvidence(view.evidenceFor()) // the maintenance procedure consumes the frozen contribution evidence
@@ -321,29 +325,21 @@ func (h *Harness) requestSource(c *coordinator, operationID string, capture Exec
 			CheckpointEntryID: checkpointID,
 			BoundaryEntryID:   boundaryID,
 		}
-		checkpoint, facts, closeMaintenance, err := h.runContextMaintenance(ctx, c, operationID, exec, capture, planInput, &suspended)
+		changed, err := d.completeMaintenance(ctx, planInput, &suspended, false)
 		if err != nil {
-			_ = closeMaintenance()      // the failure terminal already settled inside the orchestration: dispose now
 			return model.Request{}, err // the original cause stands; the outer settled guard preserves the existing terminal
 		}
-		if checkpoint != nil {
-			if err := h.commitMaintenance(ctx, c, operationID, capture, planInput, facts, checkpoint, false); err != nil {
-				_ = closeMaintenance()
-				return model.Request{}, err // a failed or interrupted publication retains the actual state and error; the waiting conversation never dispatches
-			}
-			_ = closeMaintenance() // the committed checkpoint precedes the maintenance stage's disposal
-			canonical, checkpointID, boundaryID, err = h.projectCanonical(c, operationID)
+		if changed {
+			canonical, checkpointID, boundaryID, err = h.projectCanonical(c, d.operationID)
 			if err != nil {
 				return model.Request{}, err
 			}
 			contributions.CheckpointEntryID, contributions.BoundaryEntryID = checkpointID, boundaryID
-		} else {
-			_ = closeMaintenance() // no checkpoint to precede: dispose the unused maintenance stage
 		}
 		// The frozen contribution view is applied exactly once to the rebuilt
 		// projection; its references now name the new checkpoint and tail.
 		req := buildDispatchRequest(capture, canonical, contributions)
-		*round = conversationRound{
+		inv.round = conversationRound{
 			requestID: requestID,
 			net:       contributions,
 		}

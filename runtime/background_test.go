@@ -95,12 +95,12 @@ func (t backgroundProbeTool) describe(Invocation, ToolConstraints, harness.Sessi
 }
 
 func (t backgroundProbeTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	return runtimeNormalize(call)
+	return runtimeNormalize(context.Background(), call)
 }
 
 func (t backgroundProbeTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
 	t.probe.record(tc)
-	return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "probed"}}}
+	return harness.PreparedTool{Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "probed"}}}
 }
 
 func backgroundProbePlugin(probe *backgroundProbe) Plugin {

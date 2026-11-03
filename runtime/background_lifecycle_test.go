@@ -369,7 +369,7 @@ type lifecycleTools struct {
 }
 
 func (t *lifecycleTools) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	return runtimeNormalize(call)
+	return runtimeNormalize(context.Background(), call)
 }
 
 func (t *lifecycleTools) Prepare(ctx context.Context, _ ToolContext, call model.ToolCall) harness.PreparedTool {
@@ -383,7 +383,7 @@ func (t *lifecycleTools) Prepare(ctx context.Context, _ ToolContext, call model.
 	// command.run pair, the settled result the plain rows expect.
 	return harness.PreparedTool{
 		Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-		Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}},
+		Immediate:   &harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}},
 	}
 }
 

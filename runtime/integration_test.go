@@ -139,12 +139,12 @@ func (t probeTool) describe(Invocation, ToolConstraints, harness.SessionIdentity
 }
 
 func (t probeTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	return runtimeNormalize(call)
+	return runtimeNormalize(context.Background(), call)
 }
 
 func (t probeTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
 	t.events.add("work:" + t.worker.Work(tc.Invocation))
-	return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "probed"}}}
+	return harness.PreparedTool{Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "probed"}}}
 }
 
 // lastMessageRole returns the wire role of the request body's last message.

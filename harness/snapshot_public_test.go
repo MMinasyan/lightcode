@@ -50,7 +50,7 @@ func snapshotTurnPrepared(script *scriptModel) harness.PreparedExecution {
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 			return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionObserved,
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0],"s":"<>&"}`),
 				}}
@@ -1337,7 +1337,7 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 			capture.Pricing = &harness.ModelPricing{Input: &conversationInput, Output: &conversationOutput}
 			capture.Compact.Pricing = &harness.ModelPricing{Input: &compactInput}
 			immediateTool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
+				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionObserved,
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0]}`),
 				}}
@@ -1347,9 +1347,9 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 					close(parkEntered)
 					select {
 					case <-parkRelease:
-						return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran parked"}}
+						return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran parked"}}
 					case <-execCtx.Done():
-						return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: "canceled"}}
+						return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: "canceled"}}
 					}
 				}}
 			}
@@ -1883,5 +1883,143 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 			listed, err := h.ListSessions(context.Background())
 			testassert.Require(t, err == nil && len(listed) == 1 && listed[0].Identity.SessionID == session, "post-rollback listing = %+v err %v", listed, err)
 		})
+	})
+}
+
+// TestPublicManualCompactCloserAndNoBufferFork proves the manual completion
+// row: the final manual maintenance resource disposes while the completion
+// reservation is still held, the settled compact Operation and the empty
+// buffers are readable throughout, Archive and a blocked Fork reach that held
+// reservation, and once the closer releases a valid no-buffer Fork succeeds.
+func TestPublicManualCompactCloserAndNoBufferFork(t *testing.T) {
+	eachStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		conversation := newScriptModel(publicTurn())
+		compact := newScriptModel(summaryAttempt("S1"))
+		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
+		f.defaultPrep.Capture = compactManualCapture()
+		defer f.close()
+		session := createSession(t, f.h)
+		idleHistory(t, f, session)
+
+		closerArrived := make(chan struct{}, 1)
+		closerGate := make(chan struct{})
+		releaseCloser := sync.OnceFunc(func() { close(closerGate) })
+		defer releaseCloser()
+		f.prepareHook = func(_ int, req harness.PreparationRequest) (harness.PreparedExecution, error) {
+			if req.RequestKind != harness.RequestKindCompact {
+				return f.defaultPrep, nil
+			}
+			base := f.defaultPrep
+			return harness.PreparedExecution{
+				Capture: base.Capture,
+				Open: func(ctx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+					exec, err := base.Open(ctx, admission)
+					if err != nil {
+						return exec, err
+					}
+					open := exec.OpenInvocation
+					exec.OpenInvocation = func(ctx context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+						inv, err := open(ctx, request)
+						if err != nil {
+							return inv, err
+						}
+						if request.Purpose == harness.InvocationPurposeMaintenance {
+							inner := inv.Close
+							inv.Close = func() error {
+								closerArrived <- struct{}{}
+								<-closerGate
+								if inner != nil {
+									return inner()
+								}
+								return nil
+							}
+						}
+						return inv, nil
+					}
+					return exec, nil
+				},
+			}, nil
+		}
+		compactWhenIdle(t, f.h, session, "c-1")
+		select {
+		case <-closerArrived: // the manual final maintenance resource is disposing
+		case <-time.After(10 * time.Second):
+			t.Fatal("the manual final maintenance closer never parked")
+		}
+		// Reads stay available while the completion reservation is held: the
+		// compact Operation already settled and both buffers are empty.
+		view, err := f.h.ReadSessionView(ctx, session)
+		testassert.NoError(t, err)
+		testassert.Require(t, view.History.ExecutionBusy, "the completion reservation is not held at the parked manual closer")
+		var settled bool
+		for _, op := range view.Operations {
+			if op.OperationID == "c-1" {
+				settled = op.Status == harness.OperationSuccess
+			}
+		}
+		testassert.Require(t, settled, "compact Operation = %+v, want the settled success readable at the parked closer", view.Operations)
+		testassert.Require(t, len(view.Steering) == 0 && len(view.Queued) == 0, "buffers at the parked manual closer = %+v/%+v, want none", view.Steering, view.Queued)
+
+		// Archive and a valid Fork both reach the held reservation's wait.
+		for _, run := range []struct {
+			name string
+			call func(ctx context.Context) error
+		}{
+			{"archive", func(ctx context.Context) error {
+				_, err := f.h.ArchiveSession(ctx, session)
+				return err
+			}},
+			{"fork", func(ctx context.Context) error {
+				_, err := f.h.Fork(ctx, harness.ForkRequest{
+					SourceSessionID: session, BoundaryEntryID: historyIDsOf(view.History.HistoryHeaders())[0],
+					OperationID: "fork-blocked", Content: []model.ContentPart{{Kind: model.PartText, Text: "fork work"}},
+				})
+				return err
+			}},
+		} {
+			base, cancel := context.WithCancel(ctx)
+			wait := &waitContext{Context: base, consulted: make(chan struct{})}
+			done := make(chan error, 1)
+			go func(call func(context.Context) error) { done <- call(wait) }(run.call)
+			select {
+			case <-wait.consulted:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s never reached the held reservation's wait", run.name)
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("%s returned %v while the completion reservation was held", run.name, err)
+			default:
+			}
+			cancel()
+			select {
+			case err := <-done:
+				testassert.Require(t, errors.Is(err, context.Canceled), "%s at the held reservation = %v, want the canceled wait", run.name, err)
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s never returned after its cancellation", run.name)
+			}
+		}
+
+		releaseCloser()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			view, err = f.h.ReadSessionView(ctx, session)
+			testassert.NoError(t, err)
+			if !view.History.ExecutionBusy {
+				break
+			}
+			testassert.Require(t, !time.Now().After(deadline), "the manual completion never retired")
+			time.Sleep(time.Millisecond)
+		}
+		// No buffers are pending: a valid Fork of the retired compact Operation
+		// succeeds immediately.
+		forked, err := f.h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: session, BoundaryEntryID: historyIDsOf(view.History.HistoryHeaders())[0],
+			OperationID: "fork-after-close", Content: []model.ContentPart{{Kind: model.PartText, Text: "forked"}},
+		})
+		testassert.NoError(t, err)
+		testassert.Require(t, forked.Session.Identity.SessionID != "", "Fork after the manual close returned no destination Session")
+		_ = converge(t, f)
 	})
 }

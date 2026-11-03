@@ -288,10 +288,7 @@ func TestPreparationReservationReleasesOnDiscards(t *testing.T) {
 			testassert.Equal(t, disposition, DispositionAdmitted)
 		}
 		c := cachedCoordinator(t, h, testSessionID)
-		{
-			_, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess})
-			testassert.NoError(t, err) // the idle source the fork reads
-		}
+		settleAdmitted(t, h, c, testOpID) // the idle source the fork reads
 		store.mu.Lock()
 		var boundary string
 		for _, entry := range store.entries[testSessionID] {
@@ -469,10 +466,7 @@ func TestPreparationReservationReleasesOnDiscards(t *testing.T) {
 			testassert.Equal(t, disposition, DispositionAdmitted)
 		}
 		c := cachedCoordinator(t, h, testSessionID)
-		{
-			_, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess})
-			testassert.NoError(t, err) // the committed terminal the drain publishes after
-		}
+		settleAdmitted(t, h, c, testOpID) // the committed terminal the drain publishes after
 		item := &pendingMessage{operationID: "drain-down", origin: InputOriginUser, content: admissionContent("buffered")}
 		c.mu.Lock()
 		c.steering = append(c.steering, item)

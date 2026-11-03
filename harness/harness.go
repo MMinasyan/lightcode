@@ -235,10 +235,11 @@ type InvocationExecution struct {
 	Model func(context.Context, model.Request) (model.Stream, error)
 	Tool  func(context.Context, model.ToolCall) PreparedTool
 	// NormalizeTool is pure, terminating argument validation and defaulting
-	// with no filesystem, service, permission or effect I/O. It receives an
-	// owned call and returns one owned JSON object preserving unrelated
-	// accepted fields; its error is a per-call validation failure.
-	NormalizeTool func(model.ToolCall) (json.RawMessage, error)
+	// with no filesystem, service, permission or effect I/O. It receives the
+	// bound callback context, an owned call, and returns one owned JSON
+	// object preserving unrelated accepted fields; its error is a per-call
+	// validation failure.
+	NormalizeTool func(context.Context, model.ToolCall) (json.RawMessage, error)
 	// ToolHooks are the selected argument hooks in configured order. Each
 	// runs after the advertisement gate and before concrete preparation; the
 	// first receives the original raw call arguments, every later one the
@@ -289,27 +290,39 @@ type Execution struct {
 }
 
 // ToolOutcome is one owned tool plan's complete outcome: the model-visible
-// result returned to the Agent, plus optional raw-JSON metadata whose
-// semantics belong to the producing tool. The Harness validates only
-// well-formedness and the durable size bound and never interprets the value.
+// result returned to the Agent, optional raw-JSON metadata whose semantics
+// belong to the producing tool, and the producer-declared execution knowledge.
+// The Harness validates only well-formedness, the declared knowledge against
+// the producing plan shape, and the durable size bound; it never interprets
+// the value.
 type ToolOutcome struct {
 	Result   model.ToolResult
 	Metadata json.RawMessage // optional, bounded, well-formed; semantics owned by the tool
+	// Evidence is the producer's execution knowledge: an immediate plan's
+	// success is observed and every other immediate status is not_started,
+	// while an executor declares its own observed, not_started or unknown
+	// knowledge.
+	Evidence ExecutionEvidence
 }
 
 // PreparedTool is one immutable prepared call: exactly one immediate outcome
-// or executor, its declared permission/target pairs, and the canonical
-// bindings permission evaluation and concrete I/O consume. Normalized
-// arguments are Harness-supplied input, never a second value the preparer
-// replaces. Execution and immediate-success plans require a nonempty list of
-// nonempty permission/target pairs; immediate error, denied and interrupted
-// outcomes need no successful target declaration.
+// or executor, its declared permission/target pairs, the canonical bindings
+// permission evaluation and concrete I/O consume, and the optional release of
+// the resources the accepted plan reserved. Normalized arguments are
+// Harness-supplied input, never a second value the preparer replaces.
+// Execution and immediate-success plans require a nonempty list of nonempty
+// permission/target pairs; immediate error, denied and interrupted outcomes
+// need no successful target declaration. The Harness registers a non-nil
+// Release immediately after acquiring the plan, before plan validation and
+// permission evaluation, and runs it exactly once after the plan's
+// settlement or discard on a cancellation-free cleanup context.
 type PreparedTool struct {
 	Permissions        []PermissionRequest
 	CanonicalWorkspace string
 	CanonicalWriteDir  string
 	Immediate          *ToolOutcome
 	Execute            func(context.Context) ToolOutcome
+	Release            func(context.Context) error
 }
 
 // CreateSessionRequest is the input of one root Session creation.
@@ -423,13 +436,6 @@ type coordinator struct {
 	steering []*pendingMessage // regular input waiting for the next model boundary
 	queued   []*pendingMessage // queued input waiting for the next Agent turn end
 	run      *activeExecution  // non-nil while one execution is in flight
-
-	// pendingFacts holds the active execution's accumulated uncommitted
-	// maintenance facts — incurred by procedures that settled at none —
-	// until the next successful checkpoint or terminal publication accounts
-	// them exactly once. Process-local only: never durable, never a
-	// crash-survival guarantee.
-	pendingFacts []maintenanceFact
 
 	group             *backgroundGroup // nil until the first member
 	bgState           bgState          // starts as bgOpen at every construction site; the zero value is never observed
@@ -1833,44 +1839,23 @@ func (h *Harness) rematerialize(ctx context.Context, c *coordinator, sessionID s
 }
 
 // startExecution installs the coordinator's active execution with its own
-// execution context — a child of the Harness context — and starts the Agent
-// composition on it after the admission commit. The execution holds its own
-// graph use from here through execute, terminal settlement, disposal, and the
-// post-terminal drain, so the caller's use never has to outlive its call.
-// Interrupt cancels that context; the execution slot releases, and the
-// post-terminal buffer drain completes, before the execution's done channel
-// closes. After execute, the storage failure latch, and the drain have
-// returned, the tail clears the run slot only when it is still this run — a
-// drain-installed successor owns the slot and a distinct context — then
-// cancels the execution context, runs the child completion settlement for this
-// operation, drops its use, and closes done.
+// execution context — a child of the Harness context — and starts the one
+// bound execution owner on it after the admission commit. The execution holds
+// its own graph use from here through its complete retirement, so the caller's
+// use never has to outlive its call. Interrupt cancels that context; the
+// execution slot releases, and the post-terminal buffer drain completes,
+// before the execution's done channel closes.
 func (h *Harness) startExecution(c *coordinator, operationID string, prepared PreparedExecution) {
 	release := h.retainGraph(c)
 	execCtx, cancel := context.WithCancel(h.ctx)
-	run := &activeExecution{done: make(chan struct{}), execCtx: execCtx, cancel: cancel}
+	control := &activeExecution{done: make(chan struct{}), execCtx: execCtx, cancel: cancel}
 	c.mu.Lock()
-	c.run = run
+	c.run = control
 	c.bumpLocalRevision() // the run slot's installation is an ExecutionBusy publication
 	c.mu.Unlock()
 	h.observeInvalidation(c)
 	go func() {
-		res, closeInvocation, closeExecution, err := h.execute(c, operationID, prepared, run.execCtx)
-		_ = h.finishExecution(c, run, operationID, prepared, res, err, closeInvocation, closeExecution)
-		retired := false
-		c.mu.Lock()
-		if c.run == run { // a buffered drain may have installed the next execution already
-			c.run = nil
-			c.bumpLocalRevision()
-			retired = true
-		}
-		c.mu.Unlock()
-		if retired {
-			h.observeInvalidation(c)
-		}
-		cancel() // the context dies only after the drain: a drain-installed successor owns a distinct context
-		h.childCompletionSettled(c, operationID)
-		release()
-		close(run.done)
+		_ = h.runExecution(c, control, operationID, prepared, release)
 	}()
 }
 
@@ -1879,8 +1864,8 @@ func (h *Harness) startExecution(c *coordinator, operationID string, prepared Pr
 // Successful admission starts the successor; failure advances to the next
 // head. Harness loss discards both FIFOs. An empty scan retires only this run
 // under the same hold, never a successor's slot. Its sole production caller,
-// finishExecution, holds the one reservation across this body: the successor
-// installs before that release.
+// the completion owner, holds the one reservation across this body: the
+// successor installs before that release.
 func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 	c.mu.Lock()
 	sessionID := c.graph.Session.Identity.SessionID

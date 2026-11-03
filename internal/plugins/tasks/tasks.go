@@ -143,7 +143,7 @@ func (taskTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.To
 				CallID:  call.ID,
 				Status:  model.ResultSuccess,
 				Content: fmt.Sprintf(taskStartedTemplate, result.ChildSessionID),
-			}}
+			}, Evidence: harness.ExecutionObserved}
 		},
 	}
 }
@@ -168,7 +168,7 @@ func resolveSubagent(name string, roster []harness.AgentType) error {
 // failure — through the uniform tool-error path: the harness's rejection
 // details are model-facing and arrive unwrapped.
 func launchOutcome(callID string, err error) harness.ToolOutcome {
-	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
+	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}, Evidence: harness.ExecutionObserved}
 }
 
 // immediateError is the normalization-class immediate outcome: status error
@@ -176,7 +176,8 @@ func launchOutcome(callID string, err error) harness.ToolOutcome {
 // contract.
 func immediateError(callID string, cause error) harness.PreparedTool {
 	return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-		Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: cause.Error()},
+		Result:   model.ToolResult{CallID: callID, Status: model.ResultError, Content: cause.Error()},
+		Evidence: harness.ExecutionNotStarted,
 	}}
 }
 
