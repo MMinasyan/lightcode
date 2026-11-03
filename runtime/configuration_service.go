@@ -58,9 +58,9 @@ type configurationService struct {
 	capabilityIDs []string
 	toolIDs       []string
 
-	// defaultCapabilityIDs is empty, or the single composed ModelAdaptation
-	// export ID installed on the built-in primary definition before ordinary
-	// inheritance. No plugin callback supplies it.
+	// defaultCapabilityIDs is the application-supplied default capability
+	// selection installed on the built-in primary definition before ordinary
+	// inheritance. No plugin callback supplies it and no type is privileged.
 	defaultCapabilityIDs []string
 
 	owner context.Context
@@ -102,18 +102,15 @@ type configurationCapture struct {
 
 // newConfigurationService binds the service to the composition's owned
 // declarations, the Loader rooted at the home the Runtime resolved once, the
-// Runtime owner context, and the Runtime's passive observation. Neither
-// DataDir nor ConfigPath relocates the home-based discovery cache or its
-// locks and TTL records, and the service reads no dotenv: that belongs to
-// Runtime startup, not to any build or reload.
-func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configPath string, obs *observation) *configurationService {
+// Runtime owner context, the Runtime's passive observation, and the
+// application-selected default capability IDs. Neither DataDir nor ConfigPath
+// relocates the home-based discovery cache or its locks and TTL records, and
+// the service reads no dotenv: that belongs to Runtime startup, not to any
+// build or reload.
+func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configPath string, obs *observation, defaultCapabilityIDs []string) *configurationService {
 	pluginIDs := make(map[string]bool, len(c.plugins))
 	for _, p := range c.plugins {
 		pluginIDs[p.ID] = true
-	}
-	defaultCapabilityIDs := []string(nil)
-	if c.modelAdaptation != "" {
-		defaultCapabilityIDs = []string{c.modelAdaptation}
 	}
 	return &configurationService{
 		loader:               loader,
@@ -123,7 +120,7 @@ func newConfigurationService(owner context.Context, c *composition, loader *cata
 		pluginIDs:            pluginIDs,
 		capabilityIDs:        c.capabilityIDs,
 		toolIDs:              c.toolIDs,
-		defaultCapabilityIDs: defaultCapabilityIDs,
+		defaultCapabilityIDs: append([]string(nil), defaultCapabilityIDs...),
 		owner:                owner,
 		obs:                  obs,
 	}

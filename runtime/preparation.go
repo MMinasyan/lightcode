@@ -100,15 +100,47 @@ func protocolWarnings(sessionID string, warnings []model.ProtocolWarning) []prot
 	return out
 }
 
+// PreparationInput is one selected preparation contribution's complete owned
+// input: the admission identity and hard constraints, the captured baseline
+// assembly inputs, the effective prompt and eligible tool catalog accepted so
+// far, the current visible tool subset, and only the contributing provider's
+// own captured settings section. It carries no authority: the model,
+// constraints, catalog membership and assembly inputs are copies, and the
+// contribution's only output is a closed consequence.
+type PreparationInput struct {
+	Session     harness.SessionIdentity
+	Model       model.ModelRef
+	Constraints ToolConstraints
+	Assembly    prompt.AssemblyInput
+	Prompt      string
+	Catalog     []model.ToolDefinition
+	Tools       []model.ToolDefinition
+	Settings    json.RawMessage
+}
+
+// PreparationConsequence is one contribution's complete accepted effect.
+// Absent Prompt and ToolNames change nothing; a present empty Prompt removes
+// the prompt and a present empty ToolNames advertises no tool. Description
+// keys and selected names must belong to the original eligible catalog;
+// selected names must be unique and are applied in catalog order. Description
+// text may be empty. Parameters, identity and eligibility remain the tool
+// owner's metadata.
+type PreparationConsequence struct {
+	Prompt       *string
+	Descriptions map[string]string
+	ToolNames    []string
+}
+
 // PreparationHook is one pure preparation capability: it may replace the
-// captured system prompt and tool definitions, but never the captured model,
-// revision, capability IDs, or permission capability constraints, and it may
-// not add tool names outside the original capture. Hooks read their own
-// settings through the Invocation, start no effects, and hold no resource: a
-// hook provider must therefore be Runtime- or Workspace-scoped. Harness owns
-// no hook fields and no hook dispatcher.
+// effective system prompt, tool descriptions and advertised subset, but never
+// the captured model, revision, capability IDs, or permission capability
+// constraints, and it may not add tool names outside the original eligible
+// catalog. Hooks read only their own captured settings through the input,
+// start no effects, and hold no resource: a hook provider must therefore be
+// Runtime- or Workspace-scoped. Harness owns no hook fields and no hook
+// dispatcher.
 type PreparationHook interface {
-	Prepare(context.Context, Invocation, harness.ExecutionCapture) (harness.ExecutionCapture, error)
+	Prepare(context.Context, PreparationInput) (PreparationConsequence, error)
 }
 
 // preparationHookType is the declared-type test one selected capability must
@@ -217,6 +249,15 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
+		// Every selected capability must exist in the compiled export table
+		// before admission. A selected binding that belongs to a shorter
+		// lifetime is still compiled here and correctly binds only when its
+		// scope opens; only an ID that no declaration owns is rejected.
+		for _, id := range agent.Capabilities {
+			if _, ok := p.composition.exports[id]; !ok {
+				return harness.PreparedExecution{}, fmt.Errorf("agent type %q selects undeclared capability %q: %w", agent.Name, id, harness.ErrInvalid)
+			}
+		}
 		if err := requireCatalogModel(snapshot, agent.Model); err != nil {
 			return harness.PreparedExecution{}, err
 		}
@@ -239,10 +280,6 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		// publishes its values under the admitted Session identity.
 		sel.warnings = &preparationWarnings{}
 		capture, opener, err := p.concretePrepare(callCtx, req, sel)
-		if err != nil {
-			return harness.PreparedExecution{}, err
-		}
-		capture, err = runPreparationHooks(callCtx, sel, capture)
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
@@ -428,7 +465,7 @@ func requireCatalogModel(snapshot *configuration, ref model.ModelRef) error {
 // configuration reloads and environment changes never reach a prepared
 // execution, and no transport input, secret, or warning is stored beyond the
 // durable capture fields.
-func (p *preparation) concretePrepare(_ context.Context, req harness.PreparationRequest, sel selection) (harness.ExecutionCapture, openInvocation, error) {
+func (p *preparation) concretePrepare(ctx context.Context, req harness.PreparationRequest, sel selection) (harness.ExecutionCapture, openInvocation, error) {
 	snapshot := sel.invocation.snapshot
 	provider, entry, err := snapshot.catalog.Lookup(catalog.ModelRef{Provider: sel.agent.Model.Provider, Model: sel.agent.Model.Model})
 	if err != nil {
@@ -477,15 +514,11 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 			}
 		}
 	}
-	adaptation, err := p.boundAdaptation(sel)
-	if err != nil {
-		return harness.ExecutionCapture{}, nil, err
-	}
 	specs, err := p.toolSpecs(sel.agent.Tools)
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
 	}
-	result, tools, err := composeSurface(surfaceRequest{
+	result, catalog, err := composeSurface(surfaceRequest{
 		hostIdentity:   p.identity,
 		globalRulesDir: p.globalRulesDir,
 		workspace:      req.Session.Identity.Workspace,
@@ -496,10 +529,15 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 		constraints:    ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
 		identity:       req.Session.Identity,
 		toolSpecs:      specs,
-		adaptation:     adaptation,
-		modelRef:       sel.agent.Model,
 	})
 	if err != nil {
+		return harness.ExecutionCapture{}, nil, err
+	}
+	// One local view owns the baseline prompt, the eligible catalog and the
+	// current visible subset while the selected contributions apply their
+	// closed consequences in selected capability order.
+	view := newPreparationView(result.Assembly, result.Prompt, catalog)
+	if err := runPreparationContributions(ctx, req.Session.Identity, sel, view); err != nil {
 		return harness.ExecutionCapture{}, nil, err
 	}
 	// The assembled prompt's diagnostics are this preparation's presentation
@@ -508,12 +546,13 @@ func (p *preparation) concretePrepare(_ context.Context, req harness.Preparation
 	if sel.warnings != nil {
 		sel.warnings.prompt = result.Warnings
 	}
+	tools := view.tools()
 	capture := harness.ExecutionCapture{
 		ConfigurationRevision: sel.invocation.Revision(),
 		Model:                 sel.agent.Model,
 		ContextWindow:         entry.ContextWindow,
 		OutputReserve:         outputReserve(entry.MaxOutputTokens),
-		SystemPrompt:          result.Prompt,
+		SystemPrompt:          view.prompt,
 		Tools:                 tools,
 		Capabilities:          slices.Clone(sel.agent.Capabilities),
 		Readonly:              sel.agent.Readonly,
@@ -571,21 +610,6 @@ func finiteRate(v *float64) *float64 {
 	}
 	copied := *v
 	return &copied
-}
-
-// boundAdaptation binds the composition's single ModelAdaptation export from
-// the selection when the Agent selected it; an unselected adaptation — or a
-// composition declaring none, whose empty ID is never an entry — is nil.
-func (p *preparation) boundAdaptation(sel selection) (ModelAdaptation, error) {
-	id := p.composition.modelAdaptation
-	if _, ok := sel.bindings.entries[id]; !ok {
-		return nil, nil
-	}
-	adaptation, err := Bind[ModelAdaptation](sel.bindings, id)
-	if err != nil {
-		return nil, fmt.Errorf("bind model adaptation %q: %w", id, err)
-	}
-	return adaptation, nil
 }
 
 // toolSpecs resolves the Agent's declared tool names, deduplicated by first
@@ -777,17 +801,123 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 	}
 }
 
-// runPreparationHooks binds and directly invokes, in selected order inside
-// the same preparation guard, every available long-lived selected binding
-// whose declared type satisfies PreparationHook, passing the captured
-// Invocation unchanged and a fresh owned capture copy to each hook. The
-// concrete-owned prepared capture is the comparison baseline and the zero-hook
-// result: it is never handed to a hook and never aliased by one. An invalid
-// result, error or observed cancellation aborts admission before the next hook
-// runs, so no partial hook consequence is published; the retained chain owns
-// its values and never aliases a hook's slice.
-func runPreparationHooks(ctx context.Context, sel selection, prepared harness.ExecutionCapture) (harness.ExecutionCapture, error) {
-	baseline, capture := prepared, prepared
+// preparationView is the one local owner of a preparation's mutable
+// prompt/catalog/visibility state. It starts from the Core-assembled baseline
+// inputs, the eligible catalog of every tool whose owner-declared description
+// is available, and all of those names visible. Every contribution receives
+// owned copies of the current state and may change it only through one closed
+// consequence; the Core-owned capture is constructed from this view after the
+// selected contributions finish.
+type preparationView struct {
+	assembly prompt.AssemblyInput
+	prompt   string
+	catalog  []model.ToolDefinition
+	visible  []string
+}
+
+func newPreparationView(assembly prompt.AssemblyInput, prompt string, catalog []model.ToolDefinition) *preparationView {
+	visible := make([]string, len(catalog))
+	for i := range catalog {
+		visible[i] = catalog[i].Name
+	}
+	return &preparationView{assembly: assembly, prompt: prompt, catalog: catalog, visible: visible}
+}
+
+// tools returns the current visible subset in catalog order.
+func (v *preparationView) tools() []model.ToolDefinition {
+	index := make(map[string]model.ToolDefinition, len(v.catalog))
+	for _, definition := range v.catalog {
+		index[definition.Name] = definition
+	}
+	tools := make([]model.ToolDefinition, 0, len(v.visible))
+	for _, name := range v.visible {
+		tools = append(tools, index[name])
+	}
+	return tools
+}
+
+// input returns one contribution's owned copy of the current view plus the
+// supplying provider's own captured settings section.
+func (v *preparationView) input(session harness.SessionIdentity, ref model.ModelRef, constraints ToolConstraints, settings json.RawMessage) PreparationInput {
+	assembly := v.assembly
+	assembly.Rules.Warnings = slices.Clone(v.assembly.Rules.Warnings)
+	return PreparationInput{
+		Session:     session,
+		Model:       ref,
+		Constraints: constraints,
+		Assembly:    assembly,
+		Prompt:      v.prompt,
+		Catalog:     ownToolDefinitions(v.catalog),
+		Tools:       ownToolDefinitions(v.tools()),
+		Settings:    append(json.RawMessage(nil), settings...),
+	}
+}
+
+// apply accepts one contribution's consequence. Descriptions and selected names
+// must belong to the original eligible catalog; selected names must be unique
+// and are canonicalized into catalog order. A present empty Prompt or
+// ToolNames removes the prompt or advertisement respectively.
+func (v *preparationView) apply(id string, consequence PreparationConsequence) error {
+	if consequence.Prompt != nil {
+		v.prompt = *consequence.Prompt
+	}
+	known := make(map[string]int, len(v.catalog))
+	for i, definition := range v.catalog {
+		known[definition.Name] = i
+	}
+	for name, description := range consequence.Descriptions {
+		index, ok := known[name]
+		if !ok {
+			return fmt.Errorf("preparation hook %q described tool %q outside the original catalog: %w", id, name, harness.ErrInvalid)
+		}
+		v.catalog[index].Description = description
+	}
+	if consequence.ToolNames != nil {
+		selected := make(map[string]bool, len(consequence.ToolNames))
+		for _, name := range consequence.ToolNames {
+			if _, ok := known[name]; !ok {
+				return fmt.Errorf("preparation hook %q selected tool %q outside the original catalog: %w", id, name, harness.ErrInvalid)
+			}
+			if selected[name] {
+				return fmt.Errorf("preparation hook %q selected duplicate tool %q: %w", id, name, harness.ErrInvalid)
+			}
+			selected[name] = true
+		}
+		visible := make([]string, 0, len(selected))
+		for _, definition := range v.catalog {
+			if selected[definition.Name] {
+				visible = append(visible, definition.Name)
+			}
+		}
+		v.visible = visible
+	}
+	return nil
+}
+
+// ownToolDefinitions returns a deep copy of one tool-definition list: the
+// slice, every definition, and its parameter bytes are independent of the
+// caller's storage.
+func ownToolDefinitions(definitions []model.ToolDefinition) []model.ToolDefinition {
+	if definitions == nil {
+		return nil
+	}
+	owned := make([]model.ToolDefinition, len(definitions))
+	for i, definition := range definitions {
+		owned[i] = definition
+		owned[i].Parameters = bytes.Clone(definition.Parameters)
+	}
+	return owned
+}
+
+// runPreparationContributions binds and directly invokes, in selected order
+// inside the same preparation guard, every available long-lived selected
+// binding whose declared type satisfies PreparationHook. Each contribution
+// sees an owned copy of the current view and only the supplying provider's
+// settings, and its accepted consequence is applied before the next runs. An
+// invalid consequence, error or observed cancellation aborts admission before
+// the next contribution runs, so no partial consequence is published.
+func runPreparationContributions(ctx context.Context, session harness.SessionIdentity, sel selection, view *preparationView) error {
+	constraints := ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir}
 	for _, id := range sel.agent.Capabilities {
 		entry, ok := sel.bindings.entries[id]
 		if !ok || !entry.declared.Implements(preparationHookType) {
@@ -795,97 +925,21 @@ func runPreparationHooks(ctx context.Context, sel selection, prepared harness.Ex
 		}
 		hook, err := Bind[PreparationHook](sel.bindings, id)
 		if err != nil {
-			return harness.ExecutionCapture{}, err
+			return err
 		}
-		fresh, err := ownExecutionCapture(capture)
-		if err != nil {
-			return harness.ExecutionCapture{}, err
+		var settings json.RawMessage
+		if entry.plugin != "" {
+			settings = sel.invocation.Config(entry.plugin)
 		}
-		next, err := hook.Prepare(ctx, sel.invocation, fresh)
+		consequence, err := hook.Prepare(ctx, view.input(session, sel.agent.Model, constraints, settings))
 		if err != nil {
-			return harness.ExecutionCapture{}, err
+			return err
 		}
 		if err := ctx.Err(); err != nil {
-			return harness.ExecutionCapture{}, err
+			return err
 		}
-		owned, err := ownExecutionCapture(next)
-		if err != nil {
-			return harness.ExecutionCapture{}, err
-		}
-		if err := validateHookedCapture(baseline, owned); err != nil {
-			return harness.ExecutionCapture{}, err
-		}
-		capture = owned
-	}
-	return capture, nil
-}
-
-// ownExecutionCapture validates and deep-copies one capture: tool definitions
-// pass the request constructor's shape and unique-name rule as an owned
-// copy, and capabilities are cloned (nil stays nil).
-func ownExecutionCapture(capture harness.ExecutionCapture) (harness.ExecutionCapture, error) {
-	owned := capture
-	if capture.Tools != nil {
-		req, err := model.NewRequest(model.Request{Tools: capture.Tools})
-		if err != nil {
-			return harness.ExecutionCapture{}, fmt.Errorf("capture tools are invalid: %w: %w", err, harness.ErrInvalid)
-		}
-		owned.Tools = req.Tools
-	}
-	owned.Capabilities = slices.Clone(capture.Capabilities)
-	owned.Pricing = capture.Pricing.Clone()
-	owned.Compact.Pricing = capture.Compact.Pricing.Clone()
-	return owned, nil
-}
-
-// validateHookedCapture revalidates, after each hook and before the next,
-// that only the system prompt and tool definitions changed: the identity and
-// the permission capability members stay intact and no tool name outside the
-// original capture appears.
-func validateHookedCapture(base, next harness.ExecutionCapture) error {
-	if next.Model != base.Model {
-		return fmt.Errorf("preparation hook changed the captured model: %w", harness.ErrInvalid)
-	}
-	if next.ContextWindow != base.ContextWindow {
-		return fmt.Errorf("preparation hook changed the captured context window: %w", harness.ErrInvalid)
-	}
-	if next.OutputReserve != base.OutputReserve {
-		return fmt.Errorf("preparation hook changed the captured output reserve: %w", harness.ErrInvalid)
-	}
-	if !next.Pricing.Equal(base.Pricing) {
-		return fmt.Errorf("preparation hook changed the captured model pricing: %w", harness.ErrInvalid)
-	}
-	if next.Compact.Model != base.Compact.Model || next.Compact.SystemPrompt != base.Compact.SystemPrompt || !next.Compact.Pricing.Equal(base.Compact.Pricing) {
-		return fmt.Errorf("preparation hook changed the captured compact configuration: %w", harness.ErrInvalid)
-	}
-	if next.ConfigurationRevision != base.ConfigurationRevision {
-		return fmt.Errorf("preparation hook changed the captured revision: %w", harness.ErrInvalid)
-	}
-	if next.Strategy.ID != base.Strategy.ID {
-		return fmt.Errorf("preparation hook changed the captured strategy ID: %w", harness.ErrInvalid)
-	}
-	if next.Strategy.RequiresContextWindow != base.Strategy.RequiresContextWindow {
-		return fmt.Errorf("preparation hook changed the captured strategy requirement: %w", harness.ErrInvalid)
-	}
-	if !bytes.Equal(next.Strategy.Settings, base.Strategy.Settings) {
-		return fmt.Errorf("preparation hook changed the captured strategy settings: %w", harness.ErrInvalid)
-	}
-	if !slices.Equal(next.Capabilities, base.Capabilities) {
-		return fmt.Errorf("preparation hook changed the captured capability IDs: %w", harness.ErrInvalid)
-	}
-	if next.Readonly != base.Readonly {
-		return fmt.Errorf("preparation hook changed the captured readonly constraint: %w", harness.ErrInvalid)
-	}
-	if next.WriteDir != base.WriteDir {
-		return fmt.Errorf("preparation hook changed the captured write dir constraint: %w", harness.ErrInvalid)
-	}
-	original := make(map[string]bool, len(base.Tools))
-	for _, tool := range base.Tools {
-		original[tool.Name] = true
-	}
-	for _, tool := range next.Tools {
-		if !original[tool.Name] {
-			return fmt.Errorf("preparation hook added tool %q outside the original capture: %w", tool.Name, harness.ErrInvalid)
+		if err := view.apply(id, consequence); err != nil {
+			return err
 		}
 	}
 	return nil

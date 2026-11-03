@@ -380,25 +380,23 @@ func compactRawSuccessOperation(t *testing.T, store harness.Storage, sessionID, 
 
 // TestCompactLifecycleCapturedCompactionConfiguration proves the R6 row end
 // to end over the real Open path: the prepared capture carries the compact
-// configuration from one revision — the durable admission records exactly
-// what the hook saw — a preparation hook attempting to change a compact
-// member is rejected at admission, and the prompt and tool-definition
-// replacement freedoms still hold.
+// configuration from one revision, and the prompt and tool-description
+// replacement freedoms still hold through the closed contribution
+// consequence. The compact members are Core-owned capture fields a
+// contribution cannot name at all.
 func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		var seenMu sync.Mutex
-		var seenCompact harness.CompactCapture
-		var seenRevision string
-		hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
+		var seenPrompt string
+		hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in PreparationInput) PreparationConsequence {
 			seenMu.Lock()
-			seenCompact, seenRevision = c.Compact, c.ConfigurationRevision
+			seenPrompt = in.Prompt
 			seenMu.Unlock()
-			return c
+			return PreparationConsequence{}
 		}}
-		// The freed phase runs on its own hook instance: one mutation phase
-		// per instance removes the temporal-assignment race, because the
-		// first instance's COMPACT mutation is never overwritten.
+		// The freed phase runs on its own hook instance, so the first
+		// instance's visible contribution is never overwritten.
 		freedHook := &recordHook{name: "hook.freed", events: &traceLog{}}
 		writeServiceFile(t, agents.PathForConfig(e.configPath), productionAgentsWithFreedHook())
 		r, err := e.openWithPlugins(ctx, hook, &parkingHook{}, freedHookPlugin(freedHook))
@@ -414,50 +412,20 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		awaitIdleSession(t, r, sessionID)
 		durable := readOperation(t, r, sessionID, "op-1").Admission.Execution
 		seenMu.Lock()
-		seen := seenCompact
-		revision := seenRevision
+		seen := seenPrompt
 		seenMu.Unlock()
-		testassert.Equal(t, seen, durable.Compact)
-		testassert.Equal(t, revision, durable.ConfigurationRevision)
-		testassert.Require(t, seen.Model.Provider != "" && seen.Model.Model != "" && seen.SystemPrompt != "", "captured compact configuration incomplete: %+v", seen)
+		testassert.Equal(t, seen, durable.SystemPrompt)
+		testassert.Require(t, durable.Compact.Model.Provider != "" && durable.Compact.Model.Model != "" && durable.Compact.SystemPrompt != "", "captured compact configuration incomplete: %+v", durable.Compact)
 
-		// A hook attempting to change a compact member is rejected. The
-		// mutation stays installed on this session for the phase's whole
-		// life and is never overwritten before op-2's preparation consumes
-		// it — synchronous at the submit, or drain-deferred inside the
-		// retiring run's one delivery — so op-2 is rejected and dropped in
-		// every interleaving and its register never exists.
-		hook.set(nil, func(c harness.ExecutionCapture) harness.ExecutionCapture {
-			c.Compact.SystemPrompt = "changed"
-			return c
-		})
-		// The convergent-outcome tolerance: a direct rejection fails the
-		// Submit, and a submit landing in the retiring-run window is
-		// buffered as steering whose drain re-prepares with the mutated
-		// capture, whose admission rejects and whose item is dropped — the
-		// never-admitted check below pins every path, so only an accepted
-		// admission fails the row.
-		rejected, err := submitRawThroughRuntime(ctx, r, sessionID, "op-2", "please write", harness.MessageModeRegular)
-		testassert.Require(t, err != nil || rejected.Disposition != harness.DispositionAdmitted, "a hook changing the compact system prompt was accepted (disposition %q), want rejection", rejected.Disposition)
-		{
-			_, rerr := e.store.ReadRegister(ctx, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterOperation, OperationID: "op-2"})
-			testassert.Require(t, errors.Is(rerr, harness.ErrNotFound), "the rejected admission left a register (%v), want none", rerr)
-		}
-
-		// The prompt and tool-definition replacement freedoms hold on a
-		// fresh session under the second hook instance: the FREED mutation
-		// is installed on that instance before op-3's submit and never
-		// overwritten, so op-3's preparation — direct, on a fresh session
-		// with no retiring run — always reads it and admits in every
-		// interleaving, while session A's drain-deferred op-2 preparation
-		// keeps reading the first instance's COMPACT mutation.
-		freedHook.set(nil, func(c harness.ExecutionCapture) harness.ExecutionCapture {
-			c.SystemPrompt += "|freed"
-			c.Tools = append([]model.ToolDefinition(nil), c.Tools...)
-			for i := range c.Tools {
-				c.Tools[i].Description = "freed description"
+		// The prompt and tool-description replacement freedoms hold on a
+		// fresh session under the second hook instance.
+		freedHook.set(nil, func(in PreparationInput) PreparationConsequence {
+			prompt := in.Prompt + "|freed"
+			descriptions := make(map[string]string, len(in.Catalog))
+			for _, tool := range in.Catalog {
+				descriptions[tool.Name] = "freed description"
 			}
-			return c
+			return PreparationConsequence{Prompt: &prompt, Descriptions: descriptions}
 		})
 		freedSession, err := r.createSession(ctx, e.workspace("compact-freed"), "freedworker")
 		testassert.NoError(t, err)
@@ -521,7 +489,6 @@ func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 		"(Invocation).AgentTypes":            true,
 		"(Invocation).Config":                true,
 		"(Invocation).Revision":              true,
-		"Adaptation":                         true,
 		"BackgroundServices":                 true,
 		"Bind":                               true,
 		"Bindings":                           true,
@@ -533,11 +500,12 @@ func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 		"Event":                              true,
 		"Instance":                           true,
 		"Invocation":                         true,
-		"ModelAdaptation":                    true,
 		"Open":                               true,
 		"Options":                            true,
 		"Plugin":                             true,
+		"PreparationConsequence":             true,
 		"PreparationHook":                    true,
+		"PreparationInput":                   true,
 		"ProtocolServer":                     true,
 		"Runtime":                            true,
 		"ScopeAgent":                         true,

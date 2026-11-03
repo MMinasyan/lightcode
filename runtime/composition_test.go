@@ -62,14 +62,14 @@ type stubCoreStorage struct{ harness.Storage }
 // its pointer type.
 type hookValue struct{}
 
-func (hookValue) Prepare(context.Context, Invocation, harness.ExecutionCapture) (harness.ExecutionCapture, error) {
-	return harness.ExecutionCapture{}, nil
+func (hookValue) Prepare(context.Context, PreparationInput) (PreparationConsequence, error) {
+	return PreparationConsequence{}, nil
 }
 
 type ptrHookValue struct{}
 
-func (*ptrHookValue) Prepare(context.Context, Invocation, harness.ExecutionCapture) (harness.ExecutionCapture, error) {
-	return harness.ExecutionCapture{}, nil
+func (*ptrHookValue) Prepare(context.Context, PreparationInput) (PreparationConsequence, error) {
+	return PreparationConsequence{}, nil
 }
 
 // tamperScratch rewrites an equal-length substring of one raw JSON buffer in

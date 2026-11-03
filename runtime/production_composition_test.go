@@ -131,34 +131,59 @@ func argumentHookPlugin(id string, hook ToolArgumentsHook) Plugin {
 	}
 }
 
-// bundledAdaptation is the capability-ID row's ModelAdaptation value: the
-// bundled binding table's own resolver body (the shipped adaptation plugin
-// package cannot be imported from in-package tests, so its resolver logic is
-// composed directly over the real bundled matcher).
+// bundledAdaptation is the capability-ID row's preparation contribution: the
+// bundled binding table's own treatment applied through the closed
+// consequence (the shipped adaptation plugin package cannot be imported from
+// in-package tests, so its behavior is composed directly over the real bundled
+// matcher).
 type bundledAdaptation struct{}
 
-func (bundledAdaptation) Resolve(ref model.ModelRef, mode prompt.Mode) (Adaptation, error) {
-	match := modeladapt.Match(ref.Model)
+func (bundledAdaptation) Prepare(_ context.Context, input PreparationInput) (PreparationConsequence, error) {
+	match := modeladapt.Match(input.Model.Model)
 	if match == nil {
-		return Adaptation{}, nil
+		return PreparationConsequence{}, nil
 	}
-	out := Adaptation{
-		ExcludeTools:                match.ExcludeTools,
-		ToolDescriptionReplacements: match.ToolDescriptionReplacements,
+	var consequence PreparationConsequence
+	if len(match.Append) > 0 && input.Assembly.Mode == prompt.ModeFull {
+		prompt := modeladapt.TransformPrompt(input.Prompt, &modeladapt.Adaptation{Append: match.Append})
+		consequence.Prompt = &prompt
 	}
-	if mode == prompt.ModeFull {
-		out.Append = match.Append
+	if len(match.ExcludeTools) > 0 {
+		excluded := make(map[string]bool, len(match.ExcludeTools))
+		for _, name := range match.ExcludeTools {
+			excluded[name] = true
+		}
+		names := make([]string, 0, len(input.Catalog))
+		for _, definition := range input.Catalog {
+			if !excluded[definition.Name] {
+				names = append(names, definition.Name)
+			}
+		}
+		consequence.ToolNames = names
 	}
-	return out, nil
+	if len(match.ToolDescriptionReplacements) > 0 {
+		replacements := &modeladapt.Adaptation{ToolDescriptionReplacements: match.ToolDescriptionReplacements}
+		descriptions := make(map[string]string)
+		for _, definition := range input.Catalog {
+			rendered := modeladapt.RenderToolDescription(definition.Description, replacements)
+			if rendered != definition.Description {
+				descriptions[definition.Name] = rendered
+			}
+		}
+		if len(descriptions) > 0 {
+			consequence.Descriptions = descriptions
+		}
+	}
+	return consequence, nil
 }
 
-// bundledAdaptationPlugin declares the bundled resolver as the composition's
-// single ModelAdaptation export.
+// bundledAdaptationPlugin declares the bundled treatment as one ordinary
+// selected preparation contribution.
 func bundledAdaptationPlugin() Plugin {
 	return Plugin{
 		ID:       "adapt",
 		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[ModelAdaptation]("model_adaptation")},
+		Provides: []CapabilitySpec{Spec[PreparationHook]("model_adaptation")},
 		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"model_adaptation": bundledAdaptation{}}}, nil
 		},
@@ -375,9 +400,9 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "notes.txt"), []byte(originalNotesTxt), 0o600))
 
-		hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
-			c.SystemPrompt += "|hooked"
-			return c
+		hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in PreparationInput) PreparationConsequence {
+			prompt := in.Prompt + "|hooked"
+			return PreparationConsequence{Prompt: &prompt}
 		}}
 		argHook := &rewriteWriteHook{replace: hookRewriteArgs}
 		useFixtureStore(t, e.store)

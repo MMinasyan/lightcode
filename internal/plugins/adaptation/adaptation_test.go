@@ -3,6 +3,7 @@ package adaptation_test
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
@@ -18,93 +19,102 @@ import (
 const bundledGPTGuidanceLine = "- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use edit_file or write_file."
 const bundledGPTGuidanceReplacement = "- Do not use this tool to read file contents — use read_file. Do not use this tool to edit files — use apply_patch."
 
-// resolvePlugin opens the shipped plugin's single export and returns the
-// ModelAdaptation implementation it supplies.
-func resolvePlugin(t *testing.T, ctx context.Context, ref model.ModelRef, mode prompt.Mode) (runtime.Adaptation, error) {
-	t.Helper()
-	instance, err := adaptation.Plugin().Open(ctx, runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
-	testassert.NoError(t, err)
-	testassert.Require(t, instance.Close == nil, "the adaptation plugin declares a Close")
-	resolver, ok := instance.Values["model_adaptation"].(runtime.ModelAdaptation)
-	testassert.Require(t, ok, "open supplied %T, want a runtime.ModelAdaptation", instance.Values["model_adaptation"])
-	return resolver.Resolve(ref, mode)
+// fixtureCatalog is the ordered eligible catalog the plugin tests resolve
+// against: the file tools the GPT rows hide, plus the standard command and an
+// unrelated tool whose prose merely names the same phrase.
+func fixtureCatalog() []model.ToolDefinition {
+	return []model.ToolDefinition{
+		{Name: "read_file", Description: "reads one file"},
+		{Name: "write_file", Description: "writes one file"},
+		{Name: "edit_file", Description: "edits one file"},
+		{Name: "apply_patch", Description: "applies one patch"},
+		{Name: "run_command", Description: bundledGPTGuidanceLine},
+		{Name: "note_editor", Description: "Edit edit_file or write_file via one call."},
+	}
 }
 
-func TestPluginDeclaresOneRuntimeScopedModelAdaptation(t *testing.T) {
+// prepareHook opens the shipped plugin's single contribution and invokes it.
+func prepareHook(t *testing.T, ref model.ModelRef, mode prompt.Mode) runtime.PreparationConsequence {
+	t.Helper()
+	instance, err := adaptation.Plugin().Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
+	testassert.NoError(t, err)
+	testassert.Require(t, instance.Close == nil, "the adaptation plugin declares a Close")
+	hook, ok := instance.Values[adaptation.CapabilityID].(runtime.PreparationHook)
+	testassert.Require(t, ok, "open supplied %T, want a runtime.PreparationHook", instance.Values[adaptation.CapabilityID])
+	consequence, err := hook.Prepare(context.Background(), runtime.PreparationInput{
+		Model:    ref,
+		Assembly: prompt.AssemblyInput{Mode: mode},
+		Prompt:   "BASE_PROMPT",
+		Catalog:  fixtureCatalog(),
+	})
+	testassert.NoError(t, err)
+	return consequence
+}
+
+func TestPluginDeclaresOneRuntimeScopedPreparationHook(t *testing.T) {
 	plugin := adaptation.Plugin()
 	testassert.Require(t, plugin.ID == "adaptation" && plugin.Scope == runtime.ScopeRuntime, "plugin identity = %q/%s, want adaptation/runtime", plugin.ID, plugin.Scope)
 	testassert.Require(t, plugin.ValidateConfig == nil, "the adaptation plugin declares a settings validator")
 	testassert.Equal(t, len(plugin.Provides), 1)
+	instance, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
+	testassert.NoError(t, err)
+	_, ok := instance.Values[adaptation.CapabilityID].(runtime.PreparationHook)
+	testassert.Require(t, ok, "the declared capability = %T, want a runtime.PreparationHook", instance.Values[adaptation.CapabilityID])
 }
 
-func TestResolveShippedBundledRows(t *testing.T) {
-	ctx := context.Background()
+func TestPrepareAppliesShippedBundledRows(t *testing.T) {
 	// The GPT-family row: excluded file tools, the literal description
 	// replacement, and the task-execution append paragraph.
-	got, err := resolvePlugin(t, ctx, model.ModelRef{Provider: "openai", Model: "gpt-5.5-mini"}, prompt.ModeFull)
-	testassert.NoError(t, err)
+	got := prepareHook(t, model.ModelRef{Provider: "openai", Model: "gpt-5.5-mini"}, prompt.ModeFull)
+	testassert.Require(t, reflect.DeepEqual(got.ToolNames, []string{"read_file", "apply_patch", "run_command", "note_editor"}), "selected tools = %q, want the excluded file tools absent in catalog order", got.ToolNames)
 	{
-		want := []string{"edit_file", "write_file"}
-		testassert.Require(t, reflect.DeepEqual(got.ExcludeTools, want), "exclude tools = %q, want %q", got.ExcludeTools, want)
+		want := map[string]string{"run_command": bundledGPTGuidanceReplacement}
+		testassert.Require(t, reflect.DeepEqual(got.Descriptions, want), "tool descriptions = %q, want the one literal guidance-line rule", got.Descriptions)
 	}
-	testassert.Require(t, reflect.DeepEqual(got.ToolDescriptionReplacements, map[string]string{bundledGPTGuidanceLine: bundledGPTGuidanceReplacement}), "tool description replacements = %q, want the one literal guidance-line rule", got.ToolDescriptionReplacements)
-	testassert.Require(t, len(got.Append) != 0, "append = empty, want the shipped guidance paragraph")
+	testassert.Require(t, got.Prompt != nil && strings.HasPrefix(*got.Prompt, "BASE_PROMPT\n\n") && strings.Contains(*got.Prompt, "Use more tool calls when they can improve the response"), "prompt = %v, want the baseline with the shipped guidance paragraph appended", got.Prompt)
 
 	// The grok and gemini rows carry append paragraphs with no tool levers.
 	for _, ref := range []model.ModelRef{{Provider: "xai", Model: "grok-build-0.1"}, {Provider: "google", Model: "gemini-3-pro"}} {
-		got, err = resolvePlugin(t, ctx, ref, prompt.ModeFull)
-		if err != nil {
-			t.Fatalf("Resolve(%s): %v", ref.String(), err)
-		}
-		if got.ExcludeTools != nil || len(got.Append) == 0 {
-			t.Fatalf("%s adaptation = %+v, want append paragraphs only", ref.String(), got)
-		}
+		got := prepareHook(t, ref, prompt.ModeFull)
+		testassert.Require(t, got.ToolNames == nil && len(got.Descriptions) == 0 && got.Prompt != nil && strings.HasPrefix(*got.Prompt, "BASE_PROMPT\n\n"), "%s treatment = %+v, want append paragraphs only", ref.String(), got)
 	}
 }
 
-func TestResolveBundledGuidanceOnlyInFullMode(t *testing.T) {
-	ctx := context.Background()
+func TestPrepareBundledGuidanceOnlyInFullMode(t *testing.T) {
 	ref := model.ModelRef{Provider: "openai", Model: "gpt-5.5"}
-	full, err := resolvePlugin(t, ctx, ref, prompt.ModeFull)
-	testassert.NoError(t, err)
-	testassert.Require(t, len(full.Append) != 0, "full-mode bundled adaptation = %+v, want the guidance append", full)
+	full := prepareHook(t, ref, prompt.ModeFull)
+	testassert.Require(t, full.Prompt != nil && *full.Prompt != "BASE_PROMPT", "full-mode bundled treatment = %+v, want the guidance append", full)
 	for _, mode := range []prompt.Mode{prompt.ModeSimple, prompt.ModeNone} {
-		got, err := resolvePlugin(t, ctx, ref, mode)
-		testassert.NoError(t, err)
-		testassert.Require(t, len(got.Append) == 0, "%s-mode bundled adaptation = %+v, want no automatic bundled guidance", mode, got)
-		testassert.Require(t, reflect.DeepEqual(got.ExcludeTools, full.ExcludeTools) && reflect.DeepEqual(got.ToolDescriptionReplacements, full.ToolDescriptionReplacements), "%s-mode bundled adaptation = %+v, want the same tool exclusions and replacements", mode, got)
+		got := prepareHook(t, ref, mode)
+		testassert.Require(t, got.Prompt == nil, "%s-mode bundled treatment = %+v, want no automatic bundled guidance", mode, got)
+		testassert.Require(t, reflect.DeepEqual(got.ToolNames, full.ToolNames) && reflect.DeepEqual(got.Descriptions, full.Descriptions), "%s-mode bundled treatment = %+v, want the same tool exclusions and replacements", mode, got)
 	}
 }
 
-func TestResolveUnmatchedModelIsBaseline(t *testing.T) {
-	got, err := resolvePlugin(t, context.Background(), model.ModelRef{Provider: "anthropic", Model: "claude-x"}, prompt.ModeFull)
-	testassert.NoError(t, err)
-	testassert.Require(t, got.ExcludeTools == nil && len(got.Append) == 0 && got.ToolDescriptionReplacements == nil, "unmatched model adaptation = %+v, want the zero baseline", got)
+func TestPrepareUnmatchedModelIsBaseline(t *testing.T) {
+	got := prepareHook(t, model.ModelRef{Provider: "anthropic", Model: "claude-x"}, prompt.ModeFull)
+	testassert.Require(t, got.Prompt == nil && got.ToolNames == nil && got.Descriptions == nil, "unmatched model treatment = %+v, want the zero baseline", got)
 }
 
-func TestResolveMatchesTheModelComponentOnly(t *testing.T) {
-	ctx := context.Background()
+func TestPrepareMatchesTheModelComponentOnly(t *testing.T) {
 	// A pattern inside the provider component never matches: the matcher
 	// receives ref.Model alone.
-	got, err := resolvePlugin(t, ctx, model.ModelRef{Provider: "gpt-5", Model: "unrelated"}, prompt.ModeFull)
-	testassert.NoError(t, err)
-	testassert.Require(t, got.ExcludeTools == nil && len(got.Append) == 0, "provider-shaped ref adaptation = %+v, want the zero baseline", got)
+	got := prepareHook(t, model.ModelRef{Provider: "gpt-5", Model: "unrelated"}, prompt.ModeFull)
+	testassert.Require(t, got.Prompt == nil && got.ToolNames == nil, "provider-shaped ref treatment = %+v, want the zero baseline", got)
 	// Matching is case-insensitive over the bare model component.
-	got, err = resolvePlugin(t, ctx, model.ModelRef{Provider: "openai", Model: "GPT-5.4"}, prompt.ModeFull)
-	testassert.NoError(t, err)
-	testassert.Require(t, len(got.ExcludeTools) == 2, "case-insensitive row did not match: %+v", got)
+	got = prepareHook(t, model.ModelRef{Provider: "openai", Model: "GPT-5.4"}, prompt.ModeFull)
+	testassert.Require(t, len(got.ToolNames) == 4, "case-insensitive row did not match: %+v", got)
 }
 
-func TestResolveReturnsIndependentContainers(t *testing.T) {
-	first, err := resolvePlugin(t, context.Background(), model.ModelRef{Provider: "openai", Model: "gpt-5.5"}, prompt.ModeFull)
-	testassert.NoError(t, err)
-	first.ExcludeTools[0] = "tampered"
-	first.Append[0] = "tampered"
-	first.ToolDescriptionReplacements[bundledGPTGuidanceLine] = "tampered"
+func TestPrepareReturnsIndependentContainers(t *testing.T) {
+	first := prepareHook(t, model.ModelRef{Provider: "openai", Model: "gpt-5.5"}, prompt.ModeFull)
+	testassert.Require(t, first.Prompt != nil && len(first.ToolNames) != 0 && len(first.Descriptions) != 0, "shipped row did not resolve: %+v", first)
+	*first.Prompt = "tampered"
+	first.ToolNames[0] = "tampered"
+	first.Descriptions["run_command"] = "tampered"
 
-	second, err := resolvePlugin(t, context.Background(), model.ModelRef{Provider: "openai", Model: "gpt-5.5"}, prompt.ModeFull)
-	testassert.NoError(t, err)
-	testassert.Require(t, second.ExcludeTools[0] == "edit_file" && second.Append[0] != "tampered" && second.ToolDescriptionReplacements[bundledGPTGuidanceLine] == bundledGPTGuidanceReplacement, "a mutated result leaked into the next resolve: %+v", second)
+	second := prepareHook(t, model.ModelRef{Provider: "openai", Model: "gpt-5.5"}, prompt.ModeFull)
+	testassert.Require(t, strings.HasPrefix(*second.Prompt, "BASE_PROMPT\n\n") && second.ToolNames[0] == "read_file" && second.Descriptions["run_command"] == bundledGPTGuidanceReplacement, "a mutated result leaked into the next resolve: %+v", second)
 }
 
 func TestOpenRejectsCanceledScopeContext(t *testing.T) {

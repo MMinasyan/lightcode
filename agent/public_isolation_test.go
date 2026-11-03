@@ -383,9 +383,9 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 			testassert.Check(t, len(problems) == 1, "internal/storage importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
-	// The adaptation plugin declares the single Runtime-scoped ModelAdaptation
-	// export over the public runtime, model, and prompt contracts and the
-	// bundled internal/adaptation binding table it resolves; the legacy owner,
+	// The adaptation plugin declares one Runtime-scoped PreparationHook over
+	// the public runtime, model, and prompt contracts and the bundled
+	// internal/adaptation binding table it resolves; the legacy owner,
 	// storage, the driver, and sibling plugins never enter it.
 	{
 		problems := checkTrackedGoFile("internal/plugins/adaptation/x.go", []string{"context", publicModule + "/model", publicModule + "/runtime", publicModule + "/internal/adaptation", publicModule + "/prompt"}, std)

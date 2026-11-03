@@ -24,7 +24,6 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/prompt"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -65,7 +64,7 @@ func productionConfigDocument(endpoint, tag string) string {
 // discriminates first-occurrence from last-occurrence dedupe, "ro" is the
 // readonly constraint sibling, "runner" exercises the command row, "keyless"
 // rides the credential-free provider, "adapted" selects the custom
-// ModelAdaptation export, "nomodel" has no model at all, and "absent" selects
+// preparation contribution, "nomodel" has no model at all, and "absent" selects
 // a catalog-missing model — the discriminating sibling of the empty identity.
 const productionAgentsDocument = `{
   "worker": {"model": "prov/m", "system_prompt": "simple", "tools": ["prod_write", "prod_read"], "capabilities": ["hook.first", "park.second"]},
@@ -229,23 +228,24 @@ func productionToolsPlugin() Plugin {
 	}
 }
 
-// testAdaptation is the custom test plugin's ModelAdaptation value: one
-// appended paragraph and one excluded tool.
+// testAdaptation is the custom test preparation contribution: one appended
+// paragraph and one excluded tool applied through the closed consequence.
 type testAdaptation struct{}
 
-func (testAdaptation) Resolve(model.ModelRef, prompt.Mode) (Adaptation, error) {
-	return Adaptation{
-		ExcludeTools: []string{"prod_read"},
-		Append:       []string{"  PROD-ADAPTATION-BLOCK\n"},
+func (testAdaptation) Prepare(_ context.Context, input PreparationInput) (PreparationConsequence, error) {
+	prompt := input.Prompt + "\n\n  PROD-ADAPTATION-BLOCK\n"
+	return PreparationConsequence{
+		Prompt:    &prompt,
+		ToolNames: []string{"prod_write"},
 	}, nil
 }
 
-// prodAdaptationPlugin declares the suite's custom ModelAdaptation export.
+// prodAdaptationPlugin declares the suite's custom preparation contribution.
 func prodAdaptationPlugin() Plugin {
 	return Plugin{
 		ID:       "adapt",
 		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[ModelAdaptation]("model_adaptation")},
+		Provides: []CapabilitySpec{Spec[PreparationHook]("model_adaptation")},
 		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"model_adaptation": testAdaptation{}}}, nil
 		},
@@ -304,7 +304,7 @@ func (e *productionEnv) openPlugins(ctx context.Context, plugins ...Plugin) (*Ru
 }
 
 // openWithPlugins composes the suite's base plugin set plus extras — the
-// adaptation row adds its custom ModelAdaptation export this way.
+// adaptation row adds its custom preparation contribution this way.
 func (e *productionEnv) openWithPlugins(ctx context.Context, hook *recordHook, park *parkingHook, extra ...Plugin) (*Runtime, error) {
 	e.t.Helper()
 	plugins := []Plugin{productionToolsPlugin(), hookPlugin(hook), parkPlugin(park)}
@@ -312,9 +312,9 @@ func (e *productionEnv) openWithPlugins(ctx context.Context, hook *recordHook, p
 }
 
 func (e *productionEnv) hookedHook() *recordHook {
-	return &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
-		c.SystemPrompt += "|hooked"
-		return c
+	return &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in PreparationInput) PreparationConsequence {
+		prompt := in.Prompt + "|hooked"
+		return PreparationConsequence{Prompt: &prompt}
 	}}
 }
 
@@ -854,7 +854,7 @@ func TestProductionReloadCapture(t *testing.T) {
 		}
 		{
 			got := hook.calls()
-			testassert.Require(t, slices.Equal(got, []hookCall{{revision: "1", tag: "T1"}, {revision: "2", tag: "T2"}}), "hook calls = %v, want each admission's own revision tag", got)
+			testassert.Require(t, slices.Equal(got, []hookCall{{tag: "T1"}, {tag: "T2"}}), "hook calls = %v, want each admission's own settings tag", got)
 		}
 	})
 }
@@ -922,46 +922,120 @@ func TestProductionHookCapture(t *testing.T) {
 		testassert.NoError(t, err)
 		// The hook's narrowed description survives into the committed
 		// capture.
-		hook.set(nil, func(c harness.ExecutionCapture) harness.ExecutionCapture {
-			c.Tools[0].Description = "narrowed by the hook"
-			return c
+		hook.set(nil, func(PreparationInput) PreparationConsequence {
+			return PreparationConsequence{Descriptions: map[string]string{"prod_write": "narrowed by the hook"}}
 		})
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-narrow", "hello")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-narrow", harness.OperationSuccess)
 		testassert.Equal(t, rec.Admission.Execution.Tools[0].Description, "narrowed by the hook")
 
-		// Capability expansion and constraint changes still reject with no
-		// Operation published. Every rejection runs on its own fresh Session,
-		// so no post-terminal drain can race the submit into a steering
-		// buffer.
+		// Input identity and constraint mutation stays a non-effect: the
+		// committed capture keeps the definition's values and the admission
+		// succeeds. Every row runs on its own fresh Session, so no
+		// post-terminal drain can race the submit into a steering buffer.
 		for _, row := range []struct {
 			name   string
-			mutate func(harness.ExecutionCapture) harness.ExecutionCapture
+			mutate func(in PreparationInput) PreparationConsequence
 		}{
-			{"expansion", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Capabilities = append(c.Capabilities, "hook.second")
-				return c
+			{"model", func(in PreparationInput) PreparationConsequence {
+				in.Model = model.ModelRef{Provider: "prov", Model: "other"}
+				return PreparationConsequence{}
 			}},
-			{"readonly", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Readonly = true
-				return c
-			}},
-			{"writedir", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.WriteDir = "/somewhere-else"
-				return c
+			{"constraints", func(in PreparationInput) PreparationConsequence {
+				in.Constraints = ToolConstraints{Readonly: true, WriteDir: "/somewhere-else"}
+				return PreparationConsequence{}
 			}},
 		} {
 			hook.set(nil, row.mutate)
 			rowSession, err := r.createSession(ctx, e.workspace("hook-"+row.name+"-ws"), "worker")
 			testassert.Require(t, err == nil, "createSession(%s): %v", row.name, err)
-			err = submitExpectFailure(r, rowSession.Identity.SessionID, "op-"+row.name, "hello")
-			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s submit = %v, want the ErrInvalid rejection", row.name, err)
-			{
-				err := readOperationError(ctx, r, rowSession.Identity.SessionID, "op-"+row.name)
-				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "%s rejection left %v, want no Operation", row.name, err)
-			}
+			submitThroughRuntime(t, r, rowSession.Identity.SessionID, "op-"+row.name, "hello")
+			rowRec := awaitOperation(t, r, rowSession.Identity.SessionID, "op-"+row.name, harness.OperationSuccess)
+			testassert.Require(t, rowRec.Admission.Execution.Model == prepModelRef && !rowRec.Admission.Execution.Readonly && rowRec.Admission.Execution.WriteDir == "", "%s capture = (%s, %v, %q), want the definition's untouched identity and constraints", row.name, rowRec.Admission.Execution.Model.String(), rowRec.Admission.Execution.Readonly, rowRec.Admission.Execution.WriteDir)
 		}
 		hook.set(nil, nil)
+	})
+}
+
+// TestProductionHostDefaultCapabilitiesSelectContribution proves the
+// application-supplied default capability IDs travel from public Open through
+// configuration loading: a definition with no explicit selection inherits the
+// host's default and its ordinary preparation contribution runs.
+func TestProductionHostDefaultCapabilitiesSelectContribution(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		writeServiceFile(t, agents.PathForConfig(e.configPath), strings.TrimSuffix(productionAgentsDocument, "}")+`,
+  "defaulted": {"model": "prov/m", "system_prompt": "simple", "tools": ["prod_write"]}}`)
+		useFixtureStore(t, e.store)
+		r, err := Open(ctx, Options{
+			DataDir:              e.dataDir,
+			ConfigPath:           e.configPath,
+			Plugins:              []Plugin{productionToolsPlugin(), hookPlugin(e.hookedHook())},
+			DefaultCapabilityIDs: []string{"hook.first"},
+		})
+		testassert.NoError(t, err)
+		defer r.Close(ctx)
+		session, err := r.createSession(ctx, e.workspace("default-cap-ws"), "defaulted")
+		testassert.NoError(t, err)
+		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "hello")
+		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
+		testassert.Require(t, slices.Equal(rec.Admission.Execution.Capabilities, []string{"hook.first"}), "defaulted capabilities = %v, want the host-selected default", rec.Admission.Execution.Capabilities)
+		testassert.Require(t, strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked"), "defaulted prompt = %.120s, want the selected contribution applied", rec.Admission.Execution.SystemPrompt)
+	})
+}
+
+// countingWorkspacePlugin is one real Workspace-scoped declaration whose
+// factory counts construction, so a preparation test can observe whether
+// admission reached Workspace construction.
+func countingWorkspacePlugin(opens *atomic.Int64) Plugin {
+	return Plugin{
+		ID:       "wsprobe",
+		Scope:    ScopeWorkspace,
+		Provides: []CapabilitySpec{Spec[any]("ws.probe")},
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			opens.Add(1)
+			return Instance{Values: map[string]any{"ws.probe": struct{}{}}}, nil
+		},
+	}
+}
+
+// TestProductionUndeclaredDefaultCapabilityRejectedBeforeAdmission proves the
+// compiled-membership rule over the shared preparation: a built-in default
+// selection naming no compiled export rejects Submit with ErrInvalid before
+// Workspace construction or any preparation contribution, persists no
+// Operation and no input, while a declared contribution in the same default
+// selection would otherwise run. The declared long-lived and declared
+// short-scope positive siblings remain covered by
+// TestProductionHostDefaultCapabilitiesSelectContribution and
+// TestPreparationSelectsShortScopeCapabilitiesAtOpen.
+func TestProductionUndeclaredDefaultCapabilityRejectedBeforeAdmission(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"primary": {"model": "prov/m"}}`)
+		hook := e.hookedHook()
+		var workspaceOpens atomic.Int64
+		useFixtureStore(t, e.store)
+		r, err := Open(ctx, Options{
+			DataDir:              e.dataDir,
+			ConfigPath:           e.configPath,
+			Plugins:              []Plugin{productionToolsPlugin(), hookPlugin(hook), countingWorkspacePlugin(&workspaceOpens)},
+			DefaultCapabilityIDs: []string{"hook.first", "undeclared.capability"},
+		})
+		testassert.NoError(t, err)
+		defer r.Close(ctx)
+		session, err := r.createSession(ctx, e.workspace("undeclared-default-ws"), "primary")
+		testassert.NoError(t, err)
+		sessionID := session.Identity.SessionID
+
+		submitErr := submitExpectFailure(r, sessionID, "op-1", "hello")
+		operationErr := readOperationError(ctx, r, sessionID, "op-1")
+		entries, entriesErr := e.store.ReadEntries(ctx, sessionID, 0)
+		testassert.NoError(t, entriesErr)
+		testassert.Require(t, errors.Is(submitErr, harness.ErrInvalid), "submit error = %v (operation read %v, persisted entries %d, workspace opens %d, hook calls %d), want ErrInvalid", submitErr, operationErr, len(entries), workspaceOpens.Load(), len(hook.calls()))
+		testassert.Require(t, errors.Is(operationErr, harness.ErrNotFound), "failed admission left an Operation: %v", operationErr)
+		testassert.Require(t, len(entries) == 0, "failed admission persisted %d conversation entries, want none", len(entries))
+		testassert.Require(t, workspaceOpens.Load() == 0, "Workspace factory ran %d times before the rejected admission", workspaceOpens.Load())
+		testassert.Require(t, len(hook.calls()) == 0, "preparation contribution ran %d times before the rejected admission", len(hook.calls()))
 	})
 }
 
@@ -1095,7 +1169,7 @@ func TestProductionTransportConversion(t *testing.T) {
 	c := mustComposition(t)
 	runtimeScope := mustOpenScope(t, c, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
 	obs := newObservation()
-	svc := newConfigurationService(owner, c, sh.loader, sh.configPath, obs)
+	svc := newConfigurationService(owner, c, sh.loader, sh.configPath, obs, nil)
 	snapshot, err := svc.publish(owner)
 	testassert.NoError(t, err)
 	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, "", "", nil, nil, nil, nil)
@@ -1464,11 +1538,11 @@ func TestProductionSuppliesExplicitPromptInputs(t *testing.T) {
 	})
 }
 
-// TestProductionAdaptationComposes composes the suite's custom
-// ModelAdaptation export through public Open and proves through one real
-// admitted operation that the selected adaptation reached the composed
-// surface: the append paragraph lands after the assembled baseline and the
-// excluded tool is absent from the advertisement.
+// TestProductionAdaptationComposes composes the suite's custom preparation
+// contribution through public Open and proves through one real admitted
+// operation that the selected adaptation reached the composed surface: the
+// append paragraph lands after the assembled baseline and the hidden tool is
+// absent from the advertisement.
 func TestProductionAdaptationComposes(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
@@ -1531,12 +1605,12 @@ func TestProductionPreparationHookReplacesAndRemovesPromptAfterAssembly(t *testi
 			t.Run(tc.name, func(t *testing.T) {
 				var mu sync.Mutex
 				var preHook string
-				hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
+				hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in PreparationInput) PreparationConsequence {
 					mu.Lock()
-					preHook = c.SystemPrompt
+					preHook = in.Prompt
 					mu.Unlock()
-					c.SystemPrompt = tc.want
-					return c
+					prompt := tc.want
+					return PreparationConsequence{Prompt: &prompt}
 				}}
 				r, err := e.openPlugins(ctx, hookPlugin(hook))
 				testassert.NoError(t, err)

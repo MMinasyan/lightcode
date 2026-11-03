@@ -94,7 +94,7 @@ type parkingHook struct {
 	usedSig chan struct{}
 }
 
-func (h *parkingHook) Prepare(_ context.Context, _ Invocation, capture harness.ExecutionCapture) (harness.ExecutionCapture, error) {
+func (h *parkingHook) Prepare(_ context.Context, _ PreparationInput) (PreparationConsequence, error) {
 	h.mu.Lock()
 	park := h.armed && !h.used
 	h.used = h.used || h.armed
@@ -109,7 +109,7 @@ func (h *parkingHook) Prepare(_ context.Context, _ Invocation, capture harness.E
 		}
 		<-release
 	}
-	return capture, nil
+	return PreparationConsequence{}, nil
 }
 
 func (h *parkingHook) arm(release, used chan struct{}) {
@@ -318,9 +318,9 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		t.Setenv("ASSEMBLED_TEST_KEY", "assembled-key-1")
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T1", "L1"))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), assembledAgentsDocument)
-		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
-			c.SystemPrompt += "|hooked"
-			return c
+		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(in PreparationInput) PreparationConsequence {
+			prompt := in.Prompt + "|hooked"
+			return PreparationConsequence{Prompt: &prompt}
 		}}
 		ws := &workspaceOpens{}
 		plugins := assembledPlugins(e, store, hook, ws)
@@ -444,7 +444,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		testassert.Require(t, recA2.Admission.Execution.ConfigurationRevision == "2", "queued Operation record = %+v, want the revision-2 success", recA2.Admission.Execution)
 		{
 			got := hook.calls()
-			testassert.Require(t, slices.Equal(got, []hookCall{{revision: "1", tag: "T1"}, {revision: "1", tag: "T1"}, {revision: "2", tag: "T2"}}), "hook calls = %v, want the configured tag of each call's own revision", got)
+			testassert.Require(t, slices.Equal(got, []hookCall{{tag: "T1"}, {tag: "T1"}, {tag: "T2"}}), "hook calls = %v, want the configured tag of each call", got)
 		}
 		if n := countEvents(e.events.all(), "work:L2:base"); n != 1 {
 			t.Fatalf("dependency invocations reading revision-2 settings = %d, want 1: %v", n, e.events.all())

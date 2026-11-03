@@ -50,11 +50,16 @@ func newServiceHarness(t *testing.T) *serviceHarness {
 
 func (h *serviceHarness) service(owner context.Context, plugins ...Plugin) *configurationService {
 	h.t.Helper()
+	return h.serviceWithDefaults(owner, nil, plugins...)
+}
+
+func (h *serviceHarness) serviceWithDefaults(owner context.Context, defaults []string, plugins ...Plugin) *configurationService {
+	h.t.Helper()
 	c, err := newComposition(plugins)
 	if err != nil {
 		h.t.Fatalf("newComposition: %v", err)
 	}
-	return newConfigurationService(owner, c, h.loader, h.configPath, newObservation())
+	return newConfigurationService(owner, c, h.loader, h.configPath, newObservation(), defaults)
 }
 
 func staticBundledFS() fstest.MapFS {
@@ -884,5 +889,43 @@ func TestConfigurationServiceToolDeclarationsStayDeclarative(t *testing.T) {
 	testassert.Require(t, !describeCalled, "configuration publication ran the description function")
 	if h.opens.Load() != 0 {
 		t.Fatalf("%d factories ran during configuration publication", h.opens.Load())
+	}
+}
+
+// TestConfigurationServiceProjectsHostSelectedDefaultCapabilities proves the
+// application-supplied default capability IDs install on the built-in
+// definitions before overlays and ordinary inheritance: custom and inherited
+// definitions carry the default, explicit selections override or clear it,
+// and a host supplying no defaults selects none even when a
+// PreparationHook-typed export is registered.
+func TestConfigurationServiceProjectsHostSelectedDefaultCapabilities(t *testing.T) {
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, providerConfigFile("One"))
+	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{
+	  "custom": {},
+	  "clear": {"capabilities": []},
+	  "explicit": {"capabilities": ["capability.alpha"]}
+	}`)
+	svc := h.serviceWithDefaults(context.Background(), []string{"capability.alpha"}, servicePlugin("alpha", &atomic.Int64{}, nil))
+	snapshot, err := svc.publish(context.Background())
+	testassert.NoError(t, err)
+	want := []string{"capability.alpha"}
+	for _, def := range snapshot.snapshot.definitions {
+		switch def.Name {
+		case "clear":
+			testassert.Require(t, def.Capabilities == nil, "%s capabilities = %q, want the explicit empty clear", def.Name, def.Capabilities)
+		default:
+			testassert.Require(t, reflect.DeepEqual(def.Capabilities, want), "%s capabilities = %q, want the projected default %q", def.Name, def.Capabilities, want)
+		}
+	}
+
+	plain := newServiceHarness(t)
+	writeServiceFile(t, plain.configPath, strings.TrimSuffix(providerConfigFile("One"), "}")+`,"plugins":{"hooks":{"tag":"T"}}}`)
+	writeServiceFile(t, filepath.Join(plain.dataDir, "agents.json"), `{}`)
+	noDefaults := plain.service(context.Background(), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
+	snapshot, err = noDefaults.publish(context.Background())
+	testassert.NoError(t, err)
+	for _, def := range snapshot.snapshot.definitions {
+		testassert.Require(t, def.Capabilities == nil, "%s capabilities = %q, want none without host defaults", def.Name, def.Capabilities)
 	}
 }

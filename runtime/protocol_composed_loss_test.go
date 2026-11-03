@@ -42,8 +42,8 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 		t.Setenv("ASSEMBLED_TEST_KEY", "assembled-key-1")
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T1", "L1"))
 		writeServiceFile(t, agents.PathForConfig(e.configPath), assembledAgentsDocument)
-		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
-			return c
+		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(PreparationInput) PreparationConsequence {
+			return PreparationConsequence{}
 		}}
 		ws := &workspaceOpens{}
 		r, err := e.open(ctx, assembledPlugins(e, store, hook, ws)...)

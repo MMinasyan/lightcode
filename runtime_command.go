@@ -34,11 +34,12 @@ func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 		return err
 	}
 	owner, err := runtime.Open(ctx, runtime.Options{
-		DataDir:        absDataDir,
-		ConfigPath:     absConfigPath,
-		Plugins:        builtin.Plugins(),
-		Identity:       runtimeIdentity,
-		GlobalRulesDir: filepath.Join(home, ".lightcode"),
+		DataDir:              absDataDir,
+		ConfigPath:           absConfigPath,
+		Plugins:              builtin.Plugins(),
+		DefaultCapabilityIDs: builtin.DefaultCapabilityIDs(),
+		Identity:             runtimeIdentity,
+		GlobalRulesDir:       filepath.Join(home, ".lightcode"),
 	})
 	if errors.Is(err, runtime.ErrOwned) {
 		// Another process owns the data directory; this contender
