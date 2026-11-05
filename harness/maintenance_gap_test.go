@@ -28,13 +28,13 @@ type gapStrategy struct {
 	observe        func() // runs at the completed-model folding boundary, before publication
 }
 
-func (s *gapStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (s *gapStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "gap pass"}}}}},
 	}}, nil
 }
 
-func (s *gapStrategy) Consume(_ context.Context, in ConsumeInput) (PlanOutput, error) {
+func (s *gapStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
 	if s.observe != nil {
 		s.observe()
 	}
@@ -58,7 +58,7 @@ type gapOnceStrategy struct {
 	atSecondPlan func()
 }
 
-func (s *gapOnceStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (s *gapOnceStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	s.plans++
 	if s.plans == 1 {
 		return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
@@ -71,7 +71,7 @@ func (s *gapOnceStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, err
 	return PlanOutput{Kind: PlanNone}, nil
 }
 
-func (s *gapOnceStrategy) Consume(context.Context, ConsumeInput) (PlanOutput, error) {
+func (s *gapOnceStrategy) Consume(ConsumeInput) (PlanOutput, error) {
 	if s.atConsume != nil {
 		s.atConsume()
 	}

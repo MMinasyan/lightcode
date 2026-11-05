@@ -1113,7 +1113,7 @@ func steeringPrepared(script *modelScript) PreparedExecution {
 	tool := func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{
 			Permissions: fixturePermission,
-			Immediate:   &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}},
+			Immediate:   &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}},
 		}
 	}
 	return preparedExecuting(effectExecution(script.model, tool))

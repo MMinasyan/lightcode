@@ -50,7 +50,7 @@ func snapshotTurnPrepared(script *scriptModel) harness.PreparedExecution {
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
 			return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionObserved,
+				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0],"s":"<>&"}`),
 				}}
@@ -1337,7 +1337,7 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 			capture.Pricing = &harness.ModelPricing{Input: &conversationInput, Output: &conversationOutput}
 			capture.Compact.Pricing = &harness.ModelPricing{Input: &compactInput}
 			immediateTool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionObserved,
+				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0]}`),
 				}}
@@ -1886,12 +1886,13 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 	})
 }
 
-// TestPublicManualCompactCloserAndNoBufferFork proves the manual completion
-// row: the final manual maintenance resource disposes while the completion
+// TestPublicManualCompactExecutionCloserAndNoBufferFork proves the manual
+// completion row: the manual execution's Close disposes while the completion
 // reservation is still held, the settled compact Operation and the empty
 // buffers are readable throughout, Archive and a blocked Fork reach that held
-// reservation, and once the closer releases a valid no-buffer Fork succeeds.
-func TestPublicManualCompactCloserAndNoBufferFork(t *testing.T) {
+// reservation, and once the execution closer releases a valid no-buffer Fork
+// succeeds.
+func TestPublicManualCompactExecutionCloserAndNoBufferFork(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
 		conversation := newScriptModel(publicTurn())
@@ -1918,24 +1919,14 @@ func TestPublicManualCompactCloserAndNoBufferFork(t *testing.T) {
 					if err != nil {
 						return exec, err
 					}
-					open := exec.OpenInvocation
-					exec.OpenInvocation = func(ctx context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
-						inv, err := open(ctx, request)
-						if err != nil {
-							return inv, err
+					inner := exec.Close
+					exec.Close = func() error {
+						closerArrived <- struct{}{}
+						<-closerGate
+						if inner != nil {
+							return inner()
 						}
-						if request.Purpose == harness.InvocationPurposeMaintenance {
-							inner := inv.Close
-							inv.Close = func() error {
-								closerArrived <- struct{}{}
-								<-closerGate
-								if inner != nil {
-									return inner()
-								}
-								return nil
-							}
-						}
-						return inv, nil
+						return nil
 					}
 					return exec, nil
 				},
@@ -1943,15 +1934,15 @@ func TestPublicManualCompactCloserAndNoBufferFork(t *testing.T) {
 		}
 		compactWhenIdle(t, f.h, session, "c-1")
 		select {
-		case <-closerArrived: // the manual final maintenance resource is disposing
+		case <-closerArrived: // the manual execution is disposing
 		case <-time.After(10 * time.Second):
-			t.Fatal("the manual final maintenance closer never parked")
+			t.Fatal("the manual execution closer never parked")
 		}
 		// Reads stay available while the completion reservation is held: the
 		// compact Operation already settled and both buffers are empty.
 		view, err := f.h.ReadSessionView(ctx, session)
 		testassert.NoError(t, err)
-		testassert.Require(t, view.History.ExecutionBusy, "the completion reservation is not held at the parked manual closer")
+		testassert.Require(t, view.History.ExecutionBusy, "the completion reservation is not held at the parked execution closer")
 		var settled bool
 		for _, op := range view.Operations {
 			if op.OperationID == "c-1" {
@@ -1959,7 +1950,7 @@ func TestPublicManualCompactCloserAndNoBufferFork(t *testing.T) {
 			}
 		}
 		testassert.Require(t, settled, "compact Operation = %+v, want the settled success readable at the parked closer", view.Operations)
-		testassert.Require(t, len(view.Steering) == 0 && len(view.Queued) == 0, "buffers at the parked manual closer = %+v/%+v, want none", view.Steering, view.Queued)
+		testassert.Require(t, len(view.Steering) == 0 && len(view.Queued) == 0, "buffers at the parked execution closer = %+v/%+v, want none", view.Steering, view.Queued)
 
 		// Archive and a valid Fork both reach the held reservation's wait.
 		for _, run := range []struct {

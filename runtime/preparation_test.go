@@ -39,7 +39,7 @@ var prepModelRef = model.ModelRef{Provider: "prov", Model: "m"}
 
 // runtimeNormalize is the fixtures' required pure normalizer: it accepts
 // exactly one non-null JSON object and returns its compact encoding.
-func runtimeNormalize(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+func runtimeNormalize(call model.ToolCall) (json.RawMessage, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
 		return nil, errors.New("arguments must be one non-null JSON object")
@@ -263,7 +263,7 @@ func (t *prepTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessag
 	t.mu.Lock()
 	t.normalized++
 	t.mu.Unlock()
-	return runtimeNormalize(context.Background(), call)
+	return runtimeNormalize(call)
 }
 
 func (t *prepTool) Prepare(_ context.Context, _ ToolContext, call model.ToolCall) harness.PreparedTool {

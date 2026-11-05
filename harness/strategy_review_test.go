@@ -27,57 +27,57 @@ type fixedCutStrategy struct {
 	planCall int
 }
 
-func (s *fixedCutStrategy) Plan(_ context.Context, _ PlanInput) (PlanOutput, error) {
+func (s *fixedCutStrategy) Plan(_ PlanInput) (PlanOutput, error) {
 	s.planCall++
 	return PlanOutput{Kind: PlanCheckpoint, Checkpoint: &CheckpointPlan{BoundaryEntryID: s.boundary, Items: authoredItems(s.messages...)}}, nil
 }
 
-func (s *fixedCutStrategy) Consume(_ context.Context, _ ConsumeInput) (PlanOutput, error) {
+func (s *fixedCutStrategy) Consume(_ ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanNone}, nil
 }
 
 // noneStrategy plans nothing at all.
 type noneStrategy struct{ planCall int }
 
-func (s *noneStrategy) Plan(_ context.Context, _ PlanInput) (PlanOutput, error) {
+func (s *noneStrategy) Plan(_ PlanInput) (PlanOutput, error) {
 	s.planCall++
 	return PlanOutput{Kind: PlanNone}, nil
 }
 
-func (s *noneStrategy) Consume(_ context.Context, _ ConsumeInput) (PlanOutput, error) {
+func (s *noneStrategy) Consume(_ ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanNone}, nil
 }
 
 // noneAfterModelStrategy runs one model pass and then folds to none.
 type noneAfterModelStrategy struct{}
 
-func (noneAfterModelStrategy) Plan(_ context.Context, _ PlanInput) (PlanOutput, error) {
+func (noneAfterModelStrategy) Plan(_ PlanInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("one pass")}}},
 	}}, nil
 }
 
-func (noneAfterModelStrategy) Consume(_ context.Context, _ ConsumeInput) (PlanOutput, error) {
+func (noneAfterModelStrategy) Consume(_ ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanNone}, nil
 }
 
 // errStrategy fails its first Plan with the given cause.
 type errStrategy struct{ cause error }
 
-func (s errStrategy) Plan(_ context.Context, _ PlanInput) (PlanOutput, error) {
+func (s errStrategy) Plan(_ PlanInput) (PlanOutput, error) {
 	return PlanOutput{}, s.cause
 }
-func (s errStrategy) Consume(_ context.Context, _ ConsumeInput) (PlanOutput, error) {
+func (s errStrategy) Consume(_ ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{}, s.cause
 }
 
 // malformedStrategy returns a plan outside the closed union.
 type malformedStrategy struct{}
 
-func (malformedStrategy) Plan(_ context.Context, _ PlanInput) (PlanOutput, error) {
+func (malformedStrategy) Plan(_ PlanInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel}, nil // no variants at all
 }
-func (malformedStrategy) Consume(_ context.Context, _ ConsumeInput) (PlanOutput, error) {
+func (malformedStrategy) Consume(_ ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel}, nil
 }
 
@@ -171,7 +171,7 @@ func TestReviewNoneAfterModelWork(t *testing.T) {
 			}
 		}()
 		tool := func(_ context.Context, call model.ToolCall) PreparedTool {
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}
 		exec := purposeExecution(conversation, onePass)
 		opened := exec.OpenInvocation
@@ -221,7 +221,7 @@ func TestReviewNoneAfterModelWork(t *testing.T) {
 // first request round, then proposes the checkpoint on the next round.
 type noneThenCheckpointStrategy struct{ plans int }
 
-func (s *noneThenCheckpointStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (s *noneThenCheckpointStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	s.plans++
 	if s.plans == 1 {
 		return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
@@ -234,7 +234,7 @@ func (s *noneThenCheckpointStrategy) Plan(_ context.Context, in PlanInput) (Plan
 	}}, nil
 }
 
-func (s *noneThenCheckpointStrategy) Consume(context.Context, ConsumeInput) (PlanOutput, error) {
+func (s *noneThenCheckpointStrategy) Consume(ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanNone}, nil
 }
 
@@ -529,7 +529,7 @@ func TestReviewRetainResolution(t *testing.T) {
 // the Harness resolves Retain and persists facts from its own frozen copies.
 type mutatingStrategy struct{ passes int }
 
-func (s *mutatingStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (s *mutatingStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	s.passes++
 	if in.Contributions != nil {
 		in.Contributions.Prompt = "mutated"
@@ -548,6 +548,6 @@ func (s *mutatingStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, er
 	}}, nil
 }
 
-func (s *mutatingStrategy) Consume(_ context.Context, _ ConsumeInput) (PlanOutput, error) {
+func (s *mutatingStrategy) Consume(_ ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanNone}, nil
 }

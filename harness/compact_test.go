@@ -356,13 +356,13 @@ func TestCompactModelEffectSettlements(t *testing.T) {
 // output — including a textless one — into none.
 type acceptAnyStrategy struct{}
 
-func (acceptAnyStrategy) Plan(context.Context, PlanInput) (PlanOutput, error) {
+func (acceptAnyStrategy) Plan(PlanInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}},
 	}}, nil
 }
 
-func (acceptAnyStrategy) Consume(context.Context, ConsumeInput) (PlanOutput, error) {
+func (acceptAnyStrategy) Consume(ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanNone}, nil
 }
 
@@ -734,13 +734,13 @@ type summaryAfterModelStrategy struct {
 	boundary string
 }
 
-func (s summaryAfterModelStrategy) Plan(context.Context, PlanInput) (PlanOutput, error) {
+func (s summaryAfterModelStrategy) Plan(PlanInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("summary")}}},
 	}}, nil
 }
 
-func (s summaryAfterModelStrategy) Consume(_ context.Context, in ConsumeInput) (PlanOutput, error) {
+func (s summaryAfterModelStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
 	msg, err := model.NewMessage(model.Message{
 		Role:    model.RoleAssistant,
 		Source:  in.Output.Source,
@@ -772,7 +772,7 @@ type nonComparableStrategy struct {
 	consumeCause *nonComparableCause
 }
 
-func (s nonComparableStrategy) Plan(context.Context, PlanInput) (PlanOutput, error) {
+func (s nonComparableStrategy) Plan(PlanInput) (PlanOutput, error) {
 	if s.planCause != nil {
 		return PlanOutput{}, *s.planCause
 	}
@@ -781,7 +781,7 @@ func (s nonComparableStrategy) Plan(context.Context, PlanInput) (PlanOutput, err
 	}}, nil
 }
 
-func (s nonComparableStrategy) Consume(context.Context, ConsumeInput) (PlanOutput, error) {
+func (s nonComparableStrategy) Consume(ConsumeInput) (PlanOutput, error) {
 	if s.consumeCause != nil {
 		return PlanOutput{}, *s.consumeCause
 	}

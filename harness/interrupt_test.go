@@ -115,6 +115,18 @@ func TestInterruptBlockedForegroundToolSettlesRealResult(t *testing.T) {
 	ran := call2Ran
 	mu.Unlock()
 	testassert.Require(t, !ran, "the later unstarted call began after the interrupt")
+
+	// The steering buffered while the tool was blocked drains after the
+	// interrupted Operation's terminal into its own admission, whose own
+	// model request carries it: exactly two model effects in total. The cold
+	// graph validation runs only after the successor has settled: it performs
+	// separate public storage reads under its own materialization interval,
+	// which cannot observe a live successor's partially committed turn.
+	watch.next()
+	{
+		rec := settledOperation(t, store, session, "op-2")
+		testassert.Equal(t, rec.State.Status, OperationSuccess)
+	}
 	graph, err := validateFixture(t, store, session)
 	testassert.NoError(t, err)
 	var call1 *toolResultEntry
@@ -124,15 +136,6 @@ func TestInterruptBlockedForegroundToolSettlesRealResult(t *testing.T) {
 		}
 	}
 	testassert.Require(t, call1 != nil && call1.Status == model.ResultInterrupted && call1.Content == "tool canceled", "call-1 result = %+v, want the tool's real interrupted result", call1)
-
-	// The steering buffered while the tool was blocked drains after the
-	// interrupted Operation's terminal into its own admission, whose own
-	// model request carries it: exactly two model effects in total.
-	watch.next()
-	{
-		rec := settledOperation(t, store, session, "op-2")
-		testassert.Equal(t, rec.State.Status, OperationSuccess)
-	}
 	mu.Lock()
 	calls, reqs := calls, append([]model.Request(nil), requests...)
 	mu.Unlock()
@@ -283,14 +286,14 @@ func TestInterruptSteeringPreservesBufferOrder(t *testing.T) {
 		first := toolCalls == 1
 		mu.Unlock()
 		if !first {
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
+			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 		}
 		toolArrived <- struct{}{} // the first batch parks mid-execution: the pre-boundary window
 		select {
 		case <-toolGate:
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
+			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 		case <-ctx.Done(): // the interrupt cancels the execution context inside the batch
-			return PreparedTool{Immediate: &ToolOutcome{Evidence: ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}}}
+			return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}}}
 		}
 	}
 	prepared := preparedExecuting(effectExecution(modelFn, toolFn))

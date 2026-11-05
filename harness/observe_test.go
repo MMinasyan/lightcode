@@ -116,7 +116,7 @@ func TestObserveFactKinds(t *testing.T) {
 		return completedTurnStream(), nil
 	}
 	plan := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	h, _, c, sessionID := newEffectHarness(t, nil)
 	col := observeHarness(h)
@@ -1335,10 +1335,10 @@ func TestObserveToolLifecycle(t *testing.T) {
 		return col, err
 	}
 	successPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	errorPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Immediate: &ToolOutcome{Evidence: ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "boom"}}}
+		return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "boom"}}}
 	}
 	deniedPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Execute: func(context.Context) ToolOutcome {
@@ -1473,7 +1473,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 		h, _, c, _ := newEffectHarness(t, nil)
 		rounds := 0
 		toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}
 		hooks := []ToolArgumentsHook{{ID: "h1", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(context.Context, model.ToolCall) (json.RawMessage, error) {
 			return nil, errors.New("hook boom")

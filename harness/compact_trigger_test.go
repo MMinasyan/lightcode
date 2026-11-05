@@ -628,7 +628,7 @@ func TestModelEffectCompactTriggerSecondOverflowSameOperation(t *testing.T) {
 	var sentTexts [][]string
 	rounds := 0
 	tool := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	exec := purposeExecution(
 		func(ctx context.Context, r model.Request) (model.Stream, error) {
@@ -699,7 +699,7 @@ func TestModelEffectCompactTriggerSummaryUsageStaysTotalsOnly(t *testing.T) {
 	conversationCalls := 0
 	rounds := 0
 	tool := func(_ context.Context, call model.ToolCall) PreparedTool {
-		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	exec := purposeExecution(
 		func(context.Context, model.Request) (model.Stream, error) {
@@ -1058,7 +1058,7 @@ func TestModelEffectCompactTriggerFullInputCommitAttributesUsage(t *testing.T) {
 				return streamOf(refusal), nil
 			},
 			Tool: func(_ context.Context, call model.ToolCall) PreparedTool {
-				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
+				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 			},
 			NormalizeTool: objectNormalize,
 		}, nil

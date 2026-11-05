@@ -26,7 +26,7 @@ type seqNormalizer struct {
 	attempts int
 }
 
-func (n *seqNormalizer) normalize(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+func (n *seqNormalizer) normalize(call model.ToolCall) (json.RawMessage, error) {
 	n.attempts++
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {

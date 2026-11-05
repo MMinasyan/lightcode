@@ -143,7 +143,7 @@ func newTaskHarness(t *testing.T, modelFn func(context.Context, model.Request) (
 						OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
 							return harness.InvocationExecution{
 								Model:         modelFn,
-								NormalizeTool: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) { return task.Normalize(tc, call) },
+								NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) { return task.Normalize(tc, call) },
 								Tool: func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 									return task.Prepare(ctx, tc, call)
 								},

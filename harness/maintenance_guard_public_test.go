@@ -33,7 +33,7 @@ type modelFreeStrategy struct {
 	release    chan struct{} // Plan blocks on it when parking
 }
 
-func (s *modelFreeStrategy) Plan(_ context.Context, in harness.PlanInput) (harness.PlanOutput, error) {
+func (s *modelFreeStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
 	if s.parked != nil && s.armed.CompareAndSwap(true, false) {
 		s.parked <- struct{}{}
 		<-s.release
@@ -52,7 +52,7 @@ func (s *modelFreeStrategy) Plan(_ context.Context, in harness.PlanInput) (harne
 	}}, nil
 }
 
-func (s *modelFreeStrategy) Consume(_ context.Context, _ harness.ConsumeInput) (harness.PlanOutput, error) {
+func (s *modelFreeStrategy) Consume(_ harness.ConsumeInput) (harness.PlanOutput, error) {
 	return harness.PlanOutput{Kind: harness.PlanNone}, nil
 }
 
@@ -65,13 +65,13 @@ type factBearingStrategy struct {
 	planText string
 }
 
-func (s *factBearingStrategy) Plan(_ context.Context, _ harness.PlanInput) (harness.PlanOutput, error) {
+func (s *factBearingStrategy) Plan(_ harness.PlanInput) (harness.PlanOutput, error) {
 	return harness.PlanOutput{Kind: harness.PlanModel, Model: &harness.ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: []model.ContentPart{{Kind: model.PartText, Text: "maintenance pass"}}}}},
 	}}, nil
 }
 
-func (s *factBearingStrategy) Consume(_ context.Context, in harness.ConsumeInput) (harness.PlanOutput, error) {
+func (s *factBearingStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
 	if s.parked != nil && s.armed.CompareAndSwap(true, false) {
 		s.parked <- struct{}{}
 		<-s.release

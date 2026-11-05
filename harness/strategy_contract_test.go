@@ -39,7 +39,7 @@ type fixtureStrategy struct {
 	onFailure  func()
 }
 
-func (s *fixtureStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (s *fixtureStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	s.seenInputs = append(s.seenInputs, in)
 	if s.planErr != nil {
 		if s.onFailure != nil {
@@ -53,7 +53,7 @@ func (s *fixtureStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, err
 	}}, nil
 }
 
-func (s *fixtureStrategy) Consume(_ context.Context, in ConsumeInput) (PlanOutput, error) {
+func (s *fixtureStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
 	s.seenStates = append(s.seenStates, in.State)
 	s.seenOutput++
 	if s.consumeErr != nil {
@@ -171,11 +171,11 @@ type proposalStrategy struct {
 	checkpoint func(PlanInput) *CheckpointPlan
 }
 
-func (s proposalStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (s proposalStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanCheckpoint, Checkpoint: s.checkpoint(in)}, nil
 }
 
-func (s proposalStrategy) Consume(context.Context, ConsumeInput) (PlanOutput, error) {
+func (s proposalStrategy) Consume(ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanNone}, nil
 }
 
@@ -678,13 +678,13 @@ func TestStrategyContractInvocationLifecycle(t *testing.T) {
 // completed output into a successor plan outside the closed union.
 type malformedConsumeStrategy struct{}
 
-func (malformedConsumeStrategy) Plan(_ context.Context, _ PlanInput) (PlanOutput, error) {
+func (malformedConsumeStrategy) Plan(_ PlanInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("one pass")}}},
 	}}, nil
 }
 
-func (malformedConsumeStrategy) Consume(_ context.Context, _ ConsumeInput) (PlanOutput, error) {
+func (malformedConsumeStrategy) Consume(_ ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel}, nil // no variants at all
 }
 
@@ -784,7 +784,7 @@ type ownedValuesStrategy struct {
 	seenTools        []string
 }
 
-func (s *ownedValuesStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (s *ownedValuesStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	s.seenSettings = append(s.seenSettings, string(in.Settings))
 	s.seenMessages = append(s.seenMessages, in.Messages[0].TextContent())
 	s.seenMeasurements = append(s.seenMeasurements, strconv.FormatInt(in.Measurement.InputTokens, 10))
@@ -808,7 +808,7 @@ func (s *ownedValuesStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput,
 	}}, nil
 }
 
-func (s *ownedValuesStrategy) Consume(_ context.Context, in ConsumeInput) (PlanOutput, error) {
+func (s *ownedValuesStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
 	// Rewrite the alias the returned plan still points at before observing
 	// the delivered value: a shared State would surface the rewrite.
 	s.sharedState[2] = 'X'
@@ -1076,12 +1076,12 @@ func TestPublicationHandoffRetainsCheckpointPublicationAcrossDoneContext(t *test
 // boundary with one authored context message.
 type immediateCutStrategy struct{ planCall int }
 
-func (s *immediateCutStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (s *immediateCutStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	s.planCall++
 	return PlanOutput{Kind: PlanCheckpoint, Checkpoint: &CheckpointPlan{BoundaryEntryID: in.BoundaryEntryID, Items: authoredItems(model.Message{Role: model.RoleUser, Content: admissionContent("kept")})}}, nil
 }
 
-func (s *immediateCutStrategy) Consume(_ context.Context, _ ConsumeInput) (PlanOutput, error) {
+func (s *immediateCutStrategy) Consume(_ ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanNone}, nil
 }
 
@@ -1100,11 +1100,11 @@ type requestShapeStrategy struct {
 	outcome string
 }
 
-func (s requestShapeStrategy) Plan(_ context.Context, _ PlanInput) (PlanOutput, error) {
+func (s requestShapeStrategy) Plan(_ PlanInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{Request: model.Request{Messages: s.request}}}, nil
 }
 
-func (s requestShapeStrategy) Consume(_ context.Context, in ConsumeInput) (PlanOutput, error) {
+func (s requestShapeStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
 	switch s.outcome {
 	case "failure":
 		return PlanOutput{}, errors.New("strategy consume failure")
@@ -1639,14 +1639,14 @@ type bindingMutatingStrategy struct {
 	replacement ContextStrategy
 }
 
-func (s *bindingMutatingStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (s *bindingMutatingStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	s.binding.Strategy = s.replacement
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{
 		Request: model.Request{Messages: []model.Message{{Role: model.RoleUser, Content: admissionContent("binding snapshot pass")}}},
 	}}, nil
 }
 
-func (s *bindingMutatingStrategy) Consume(_ context.Context, in ConsumeInput) (PlanOutput, error) {
+func (s *bindingMutatingStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
 	return PlanOutput{Kind: PlanCheckpoint, Checkpoint: &CheckpointPlan{
 		BoundaryEntryID: in.Input.BoundaryEntryID,
 		Items:           authoredItems(model.Message{Role: model.RoleUser, Content: admissionContent("snapshot checkpoint")}),

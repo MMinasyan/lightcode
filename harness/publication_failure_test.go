@@ -194,7 +194,7 @@ func TestImmediateToolResultPublicationFailureRetainsNoActiveEffect(t *testing.T
 				return completedTurnStream(), nil
 			}
 			planFn := func(_ context.Context, call model.ToolCall) PreparedTool {
-				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 			}
 			h, store, c, sessionID, prepared, cancel := newExecutionHarness(t, modelFn, planFn)
 			defer cancel()
@@ -409,7 +409,7 @@ func TestCommitResultNotFoundBoundariesAreMarked(t *testing.T) {
 func TestEffectHookInvalidDeclaredKnowledgeRejects(t *testing.T) {
 	call := model.ToolCall{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{"x":1}`)}
 	exec := hookFixtureExecution(func(context.Context, model.ToolCall) PreparedTool {
-		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "done"}}}
+		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "done"}}}
 	}, objectNormalize, ToolArgumentsHook{ID: "cap.hook.bogus", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(context.Context, model.ToolCall) (json.RawMessage, error) {
 		return nil, &EffectError{Evidence: ExecutionEvidence("bogus"), Err: errors.New("binding down")}
 	}})
@@ -458,7 +458,7 @@ func TestWaitRetainsPublicationFailureAtPendingCallBoundaries(t *testing.T) {
 		}
 		planFn := func(_ context.Context, call model.ToolCall) PreparedTool {
 			preparedCalls++
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}
 		h, store, c, sessionID, prepared, cancel := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
 			return Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {

@@ -18,7 +18,7 @@ import (
 // accepts exactly one non-null JSON object and returns the caller's exact
 // argument bytes, so every difference between consumed and committed bytes is
 // attributable to the durable codec.
-func hookNormalize(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+func hookNormalize(call model.ToolCall) (json.RawMessage, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
 		return nil, errors.New("arguments must be one non-null JSON object")
@@ -75,7 +75,7 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 								mu.Lock()
 								prepared = append(prepared, string(call.Arguments))
 								mu.Unlock()
-								return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionObserved,
+								return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 									Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call-1"},
 								}}
 							},

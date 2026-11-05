@@ -175,8 +175,7 @@ func launchOutcome(callID string, err error) harness.ToolOutcome {
 // contract.
 func immediateError(callID string, cause error) harness.PreparedTool {
 	return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-		Result:   model.ToolResult{CallID: callID, Status: model.ResultError, Content: cause.Error()},
-		Evidence: harness.ExecutionNotStarted,
+		Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: cause.Error()},
 	}}
 }
 

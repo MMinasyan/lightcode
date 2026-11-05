@@ -127,8 +127,7 @@ func (in *standardTools) openCodeGroup(tc ToolContext) (*snapshot.CodeStore, err
 // validation contract.
 func immediateError(callID string, cause error) harness.PreparedTool {
 	return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-		Result:   model.ToolResult{CallID: callID, Status: model.ResultError, Content: boundedDiagnostic(cause)},
-		Evidence: harness.ExecutionNotStarted,
+		Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: boundedDiagnostic(cause)},
 	}}
 }
 
@@ -136,8 +135,7 @@ func immediateError(callID string, cause error) harness.PreparedTool {
 // fixed denial, per the tool-boundary contract.
 func immediateDenied(callID string) harness.PreparedTool {
 	return harness.PreparedTool{Immediate: &harness.ToolOutcome{
-		Result:   model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: harness.PermissionDeniedContent},
-		Evidence: harness.ExecutionNotStarted,
+		Result: model.ToolResult{CallID: callID, Status: model.ResultDenied, Content: harness.PermissionDeniedContent},
 	}}
 }
 

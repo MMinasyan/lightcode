@@ -610,6 +610,35 @@ func TestPublicManualCompactSubmitAfterAdmissionStaysBuffered(t *testing.T) {
 		compact := newScriptModel(summaryAttempt("S1"))
 		f := newPublicFixtureWithJobs(t, store, nil, conversation, nil, compact.effect)
 		f.defaultPrep.Capture = compactManualCapture()
+		maintenanceCloseArrived := make(chan struct{}, 1)
+		maintenanceCloseGate := make(chan struct{})
+		open := f.defaultPrep.Open
+		f.defaultPrep.Open = func(ctx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
+			exec, err := open(ctx, admission)
+			if err != nil {
+				return exec, err
+			}
+			openInvocation := exec.OpenInvocation
+			exec.OpenInvocation = func(ctx context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
+				inv, err := openInvocation(ctx, request)
+				if err != nil {
+					return inv, err
+				}
+				if request.Purpose == harness.InvocationPurposeMaintenance {
+					close := inv.Close
+					inv.Close = func() error {
+						maintenanceCloseArrived <- struct{}{}
+						<-maintenanceCloseGate
+						if close != nil {
+							return close()
+						}
+						return nil
+					}
+				}
+				return inv, nil
+			}
+			return exec, nil
+		}
 		defer f.close()
 		session := createSession(t, f.h)
 		idleHistory(t, f, session)
@@ -656,6 +685,11 @@ func TestPublicManualCompactSubmitAfterAdmissionStaysBuffered(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		awaitSettled(t, f.h, session, "c-1")
+		// The settled c-1 terminal is visible while its manual stage is still
+		// closing; the buffered successor must not start during that close.
+		<-maintenanceCloseArrived
+		testassert.Equal(t, len(conversation.seen()), 1)
+		close(maintenanceCloseGate)
 		// The buffered message is delivered only after the compaction settles.
 		awaitSettled(t, f.h, session, "op-2")
 		reqs := conversation.seen()
@@ -712,7 +746,7 @@ func TestPublicManualCompactInterruptKeepsPriorProjection(t *testing.T) {
 							return harness.InvocationExecution{
 								Model: attempt,
 								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 								},
 								NormalizeTool: publicNormalize,
 							}, nil
@@ -781,14 +815,14 @@ type publicFailingStrategy struct {
 	fail  func() error
 }
 
-func (s publicFailingStrategy) Plan(_ context.Context, in harness.PlanInput) (harness.PlanOutput, error) {
+func (s publicFailingStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
 	if s.stage == "plan" {
 		return harness.PlanOutput{}, s.fail()
 	}
-	return (publicReplacementStrategy{}).Plan(context.Background(), in)
+	return (publicReplacementStrategy{}).Plan(in)
 }
 
-func (s publicFailingStrategy) Consume(_ context.Context, in harness.ConsumeInput) (harness.PlanOutput, error) {
+func (s publicFailingStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
 	return harness.PlanOutput{}, s.fail()
 }
 
@@ -860,7 +894,7 @@ func TestPublicManualStrategyExplicitOutcomes(t *testing.T) {
 	}
 }
 
-func (s publicReplacementStrategy) Plan(_ context.Context, in harness.PlanInput) (harness.PlanOutput, error) {
+func (s publicReplacementStrategy) Plan(in harness.PlanInput) (harness.PlanOutput, error) {
 	if s.seen != nil {
 		*s.seen = append(*s.seen, in.Measurement)
 	}
@@ -869,7 +903,7 @@ func (s publicReplacementStrategy) Plan(_ context.Context, in harness.PlanInput)
 	}}, nil
 }
 
-func (s publicReplacementStrategy) Consume(_ context.Context, in harness.ConsumeInput) (harness.PlanOutput, error) {
+func (s publicReplacementStrategy) Consume(in harness.ConsumeInput) (harness.PlanOutput, error) {
 	if s.none {
 		return harness.PlanOutput{Kind: harness.PlanNone}, nil
 	}

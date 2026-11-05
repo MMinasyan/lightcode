@@ -30,9 +30,10 @@ func preparedExecutionFor(capture ExecutionCapture, open func(context.Context, O
 	return PreparedExecution{Capture: capture, Open: open}
 }
 
-// executionForInvocation wraps one directly supplied invocation contract as
-// the Execution whose production opener returns it.
-func executionForInvocation(inv InvocationExecution) Execution {
+// defaultInvocation fills the fixtures' ordinary opened-invocation defaults: a
+// model that completes without calls, an empty tool plan and the pure
+// normalizer. Deliberately malformed opener values are never defaulted.
+func defaultInvocation(inv InvocationExecution) InvocationExecution {
 	if inv.Model == nil {
 		inv.Model = func(context.Context, model.Request) (model.Stream, error) {
 			return completedTurnStream(), nil
@@ -44,6 +45,13 @@ func executionForInvocation(inv InvocationExecution) Execution {
 	if inv.NormalizeTool == nil {
 		inv.NormalizeTool = objectNormalize
 	}
+	return inv
+}
+
+// executionForInvocation wraps one directly supplied invocation contract as
+// the Execution whose production opener returns it.
+func executionForInvocation(inv InvocationExecution) Execution {
+	inv = defaultInvocation(inv)
 	return Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
 		return inv, nil
 	}}
@@ -70,13 +78,30 @@ func toolCallResults(t *testing.T, store *graphStorage, sessionID string, calls 
 	return out
 }
 
+// firstResponseModel wraps one conversation model function with the fixture's
+// first-response input: the first conversation request answers with the given
+// calls, and the supplied continuation handles every later request. A nil
+// continuation completes later turns without calls.
+func firstResponseModel(continuation func(context.Context, model.Request) (model.Stream, error), calls []model.ToolCall) func(context.Context, model.Request) (model.Stream, error) {
+	first := true
+	return func(ctx context.Context, req model.Request) (model.Stream, error) {
+		if first {
+			first = false
+			return completedTurnStream(calls...), nil
+		}
+		if continuation != nil {
+			return continuation(ctx, req)
+		}
+		return completedTurnStream(), nil
+	}
+}
+
 // runToolCalls drives one real admitted execution whose first conversation
 // turn emits exactly the given calls; later turns complete without calls. It
 // returns the execution error and the canonical settled results.
 func runToolCalls(t *testing.T, h *Harness, c *coordinator, store *graphStorage, sessionID string, execCtx context.Context, operationID string, exec Execution, capture ExecutionCapture, calls []model.ToolCall) ([]toolResultEntry, error) {
 	t.Helper()
 	open := exec.OpenInvocation
-	first := true
 	exec.OpenInvocation = func(ctx context.Context, request InvocationRequest) (InvocationExecution, error) {
 		var inv InvocationExecution
 		var err error
@@ -86,27 +111,10 @@ func runToolCalls(t *testing.T, h *Harness, c *coordinator, store *graphStorage,
 				return inv, err
 			}
 		}
-		if inv.Model == nil {
-			inv.Model = func(context.Context, model.Request) (model.Stream, error) {
-				return completedTurnStream(), nil
-			}
-		}
 		if request.Purpose == InvocationPurposeConversation {
-			inv.Model = func(context.Context, model.Request) (model.Stream, error) {
-				if first {
-					first = false
-					return completedTurnStream(calls...), nil
-				}
-				return completedTurnStream(), nil
-			}
+			inv.Model = firstResponseModel(nil, calls)
 		}
-		if inv.Tool == nil {
-			inv.Tool = func(context.Context, model.ToolCall) PreparedTool { return PreparedTool{} }
-		}
-		if inv.NormalizeTool == nil {
-			inv.NormalizeTool = objectNormalize
-		}
-		return inv, nil
+		return defaultInvocation(inv), nil
 	}
 	prepared := preparedExecutionFor(capture, func(context.Context, OperationAdmission) (Execution, error) {
 		return exec, nil
@@ -142,18 +150,10 @@ func freshToolBoundary(t *testing.T, capture ExecutionCapture, inv InvocationExe
 // freshToolCalls is freshToolBoundary over an ordered call batch.
 func freshToolCalls(t *testing.T, capture ExecutionCapture, inv InvocationExecution, calls ...model.ToolCall) (*Harness, *graphStorage, string, []toolResultEntry, error) {
 	t.Helper()
-	store := emptyStore(t)
 	admission := preparedExecutionFor(capture, func(context.Context, OperationAdmission) (Execution, error) {
 		return Execution{}, nil
 	})
-	h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
-		return admission, nil
-	})
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	testassert.NoError(t, err)
-	c := leaseCoordinator(t, h, session.Identity.SessionID)
-	sessionID := session.Identity.SessionID
-	mustAdmitWithoutExecution(t, h, sessionID, testOpID, admissionContent("hello"))
+	h, store, c, sessionID := newAdmittedHarness(t, context.Background(), admission)
 	results, runErr := runToolCalls(t, h, c, store, sessionID, context.Background(), testOpID, executionForInvocation(inv), capture, calls)
 	return h, store, sessionID, results, runErr
 }
@@ -187,37 +187,21 @@ func freshExecutionToolCallsConfig(t *testing.T, execCtx context.Context, captur
 // canonical result for every call (named intent/result fault rows).
 func freshExecutionRunConfig(t *testing.T, execCtx context.Context, capture ExecutionCapture, exec Execution, configure func(*graphStorage), calls ...model.ToolCall) (*Harness, *graphStorage, *coordinator, string, error) {
 	t.Helper()
-	store := emptyStore(t)
 	admission := preparedExecutionFor(capture, func(context.Context, OperationAdmission) (Execution, error) {
 		return Execution{}, nil
 	})
-	h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
-		return admission, nil
-	})
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
-	testassert.NoError(t, err)
-	c := leaseCoordinator(t, h, session.Identity.SessionID)
-	sessionID := session.Identity.SessionID
-	mustAdmitWithoutExecution(t, h, sessionID, testOpID, admissionContent("hello"))
+	h, store, c, sessionID := newAdmittedHarness(t, context.Background(), admission)
 	if configure != nil {
 		configure(store)
 	}
 	open := exec.OpenInvocation
-	first := true
 	exec.OpenInvocation = func(ctx context.Context, request InvocationRequest) (InvocationExecution, error) {
 		inv, err := open(ctx, request)
 		if err != nil {
 			return inv, err
 		}
 		if request.Purpose == InvocationPurposeConversation {
-			inner := inv.Model
-			inv.Model = func(ctx context.Context, req model.Request) (model.Stream, error) {
-				if first {
-					first = false
-					return completedTurnStream(calls...), nil
-				}
-				return inner(ctx, req)
-			}
+			inv.Model = firstResponseModel(inv.Model, calls)
 		}
 		return inv, nil
 	}

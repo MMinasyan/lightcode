@@ -94,13 +94,16 @@ func (b *boundBackground) enter() (context.Context, func(), error) {
 	return ctx, b.entries.Done, nil
 }
 
-// arm derives this call's context from the Execute context. A fresh unarmed
-// object is armed exactly once by the Runtime's Execute wrapper.
-func (b *boundBackground) arm(ctx context.Context) {
+// arm derives this call's context from the Execute context and returns it:
+// the Runtime passes that same derived context into the original Execute, so
+// the tool and background admission observe one origin. A fresh unarmed object
+// is armed exactly once by the Runtime's Execute wrapper.
+func (b *boundBackground) arm(ctx context.Context) context.Context {
 	derived, cancel := context.WithCancel(ctx)
 	b.mu.Lock()
 	b.ctx, b.cancel = derived, cancel
 	b.mu.Unlock()
+	return derived
 }
 
 // close cancels the derived context before joining entered calls, so an
@@ -188,7 +191,7 @@ func (b *boundBackground) bindPlan(plan harness.PreparedTool) harness.PreparedTo
 	}
 	execute := plan.Execute
 	plan.Execute = func(ctx context.Context) harness.ToolOutcome {
-		b.arm(ctx)
+		ctx = b.arm(ctx)
 		defer b.close()
 		outcome := execute(ctx)
 		outcome.Metadata = bytes.Clone(outcome.Metadata)

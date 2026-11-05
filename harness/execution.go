@@ -10,10 +10,10 @@ import (
 
 // executionDriver is the one owner of one admitted run: the immutable capture,
 // the opened Execution, the conversation invocation with its request frame,
-// the final maintenance stage while it is owned, the execution's uncommitted
-// maintenance facts, and the complete completion/retirement of the run. It
-// supplies the bound callbacks to the unchanged Engine; no caller receives a
-// result/closer tuple or retains a post-call tail.
+// the execution's uncommitted maintenance facts, and the complete
+// completion/retirement of the run. It supplies the bound callbacks to the
+// unchanged Engine; no caller receives a result/closer tuple or retains a
+// post-call tail.
 type executionDriver struct {
 	harness      *Harness
 	coordinator  *coordinator
@@ -23,7 +23,6 @@ type executionDriver struct {
 	capture      ExecutionCapture
 	execution    Execution
 	conversation *openedInvocation
-	maintenance  *openedInvocation
 	pendingFacts []maintenanceFact
 }
 
@@ -78,10 +77,9 @@ func (h *Harness) runExecution(c *coordinator, control *activeExecution, operati
 // complete is the one completion owner of a finished execution: it acquires
 // the Session's admission reservation once, maps the established outcome
 // through the one quiet gate, retains the actual publication/storage cause,
-// then disposes the owned maintenance and conversation invocations, the opened
-// Execution and the preparation reservation, and drains the post-terminal
-// buffers while the reservation is held. A canceled contended acquisition
-// skips only the drain.
+// then disposes the owned conversation invocation, the opened Execution and
+// the preparation reservation, and drains the post-terminal buffers while the
+// reservation is held. A canceled contended acquisition skips only the drain.
 func (d *executionDriver) complete(res agent.TerminalResult, runErr error) error {
 	h := d.harness
 	c := d.coordinator
@@ -90,11 +88,7 @@ func (d *executionDriver) complete(res agent.TerminalResult, runErr error) error
 		defer release()
 	}
 	err := d.settleTerminal(d.control.execCtx, res, runErr)
-	h.recordStorageFailure(err) // the sole storage-class recorder, including zero-terminal outcomes
-	if d.maintenance != nil {
-		h.closeOpenedInvocation(d.maintenance)
-		d.maintenance = nil
-	}
+	h.recordStorageFailure(err) // the established outcome's storage-class cause; maintenance latches its own before disposing
 	if d.conversation != nil {
 		h.closeOpenedInvocation(d.conversation)
 		d.conversation = nil
@@ -201,12 +195,15 @@ func (d *executionDriver) execute(execCtx context.Context) (agent.TerminalResult
 		_, err = d.completeMaintenance(execCtx, planInput, nil, true)
 		return agent.TerminalResult{}, err
 	}
-	if err := d.openConversation(execCtx); err != nil {
+	conversation, err := d.openInvocation(execCtx, InvocationPurposeConversation, d.capture.Model)
+	if err != nil {
 		if res := executionCancellationResult(execCtx, err); res != nil {
 			return *res, nil
 		}
 		return agent.TerminalResult{}, err
 	}
+	conversation.firstRequest = true
+	d.conversation = conversation
 	res, runErr := agent.Run(execCtx, agent.Invocation{
 		ExpectedModel: d.capture.Model,
 		Request:       d.requestSource(),
@@ -218,45 +215,19 @@ func (d *executionDriver) execute(execCtx context.Context) (agent.TerminalResult
 	return res, runErr
 }
 
-// openConversation opens the conversation invocation immediately before the
-// Engine run and publishes it as the driver's owned conversation invocation.
-func (d *executionDriver) openConversation(ctx context.Context) error {
+// openInvocation opens one Engine invocation with a fresh per-call identity
+// over the given purpose and model. The caller owns the returned invocation
+// through its consumption; an invocation the opener rejects cleans its own
+// provisional resources.
+func (d *executionDriver) openInvocation(ctx context.Context, purpose InvocationPurpose, modelRef model.ModelRef) (*openedInvocation, error) {
 	invocationID, err := newHexID() // the Engine call's fresh per-invocation identity
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrStorage, err)
-	}
-	request := InvocationRequest{
-		ID:      invocationID,
-		Purpose: InvocationPurposeConversation,
-		Model:   d.capture.Model,
-	}
-	inv, err := d.execution.OpenInvocation(ctx, request)
-	if err != nil {
-		return err
-	}
-	ownOpenedInvocationDeclarations(&inv) // the accepted invocation owns its declarations before anything else consumes them
-	if err := validateOpenedInvocation(inv); err != nil {
-		if inv.Close != nil {
-			d.harness.recordCleanupFailure(inv.Close())
-		}
-		return err
-	}
-	d.conversation = &openedInvocation{request: request, callbacks: inv, firstRequest: true}
-	return nil
-}
-
-// openMaintenance opens one maintenance model invocation with a fresh
-// per-plan producer identity over the captured compact model, before its
-// effect runs. The caller owns the returned stage through its consumption.
-func (d *executionDriver) openMaintenance(ctx context.Context) (*openedInvocation, error) {
-	maintenanceID, err := newHexID() // the maintenance Engine call's fresh producer identity
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrStorage, err)
 	}
 	request := InvocationRequest{
-		ID:      maintenanceID,
-		Purpose: InvocationPurposeMaintenance,
-		Model:   d.capture.Compact.Model,
+		ID:      invocationID,
+		Purpose: purpose,
+		Model:   modelRef,
 	}
 	inv, err := d.execution.OpenInvocation(ctx, request)
 	if err != nil {
@@ -327,9 +298,6 @@ func (d *executionDriver) publishQuiet(runErr error, proposed modelResult) error
 	}
 	if settled || !quiet { // an authoritative terminal or a committed intent state left for recovery
 		return nil
-	}
-	if proposed.terminal == "" {
-		return nil // no proposed outcome: zero terminal with no cause
 	}
 	if _, err := d.commitEffectResult(context.WithoutCancel(d.harness.ctx), nil, proposed); err != nil {
 		return err

@@ -1,7 +1,6 @@
 package harness
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -12,9 +11,9 @@ import (
 
 // The context strategy contract: one pure algorithm deciding the context
 // maintenance of a conversation. Plan and Consume are pure — no I/O, no
-// dispatch, no canonical mutation — but each receives the bound maintenance
-// context carrying its own producer identity. The selected strategy's identity
-// and declared requirements are resolved execution inputs captured on the
+// dispatch, no canonical mutation, and no context — and hold no state beyond
+// what their inputs carry. The selected strategy's identity and declared
+// requirements are resolved execution inputs captured on the
 // ExecutionCapture; its implementation is an owned execution resource on the
 // opened Execution.
 
@@ -99,13 +98,13 @@ type PlanOutput struct {
 	Checkpoint *CheckpointPlan
 }
 
-// ContextStrategy is the pure context-maintenance algorithm. Plan decides the
-// next step over the frozen input; Consume folds one completed model output
-// back into the plan stream. Neither callback may dispatch effects or mutate
-// canonical state.
+// ContextStrategy is the pure, stateless context-maintenance algorithm. Plan
+// decides the next step over the frozen input; Consume folds one completed
+// model output back into the plan stream. Neither callback may dispatch
+// effects or mutate canonical state.
 type ContextStrategy interface {
-	Plan(context.Context, PlanInput) (PlanOutput, error)
-	Consume(context.Context, ConsumeInput) (PlanOutput, error)
+	Plan(PlanInput) (PlanOutput, error)
+	Consume(ConsumeInput) (PlanOutput, error)
 }
 
 // StrategyBinding is one selected context strategy binding: its stable
@@ -185,7 +184,7 @@ func validatePlanOutput(plan PlanOutput) error {
 // checkpoint message. It is pure and holds no state.
 type summaryStrategy struct{}
 
-func (summaryStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error) {
+func (summaryStrategy) Plan(in PlanInput) (PlanOutput, error) {
 	if in.Trigger == triggerAutomatic {
 		if in.Measurement == nil { // a missing report never overflows
 			return PlanOutput{Kind: PlanNone}, nil
@@ -205,7 +204,7 @@ func (summaryStrategy) Plan(_ context.Context, in PlanInput) (PlanOutput, error)
 	return PlanOutput{Kind: PlanModel, Model: &ModelPlan{Request: request}}, nil
 }
 
-func (summaryStrategy) Consume(_ context.Context, in ConsumeInput) (PlanOutput, error) {
+func (summaryStrategy) Consume(in ConsumeInput) (PlanOutput, error) {
 	summary := ""
 	if in.Output.Message != nil {
 		summary = in.Output.Message.TextContent()

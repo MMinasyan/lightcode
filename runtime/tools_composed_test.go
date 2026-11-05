@@ -463,7 +463,7 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 						OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
 							return harness.InvocationExecution{
 								Model: modelFn,
-								NormalizeTool: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+								NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
 									tool, ok := byID[call.Name]
 									if !ok {
 										return nil, fmt.Errorf("unknown tool %q", call.Name)

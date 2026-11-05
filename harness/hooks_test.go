@@ -41,7 +41,7 @@ func (s *hookToolSpy) tool(_ context.Context, call model.ToolCall) PreparedTool 
 	if s.plan != nil {
 		return s.plan(call)
 	}
-	return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+	return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 }
 
 func (s *hookToolSpy) received() []model.ToolCall {
@@ -74,7 +74,7 @@ func newHookHarness(t *testing.T, exec Execution) (*Harness, *graphStorage, *coo
 // hookFixtureExecution returns the hook fixtures' execution: its opener answers
 // every Engine request with an invocation carrying the given preparation
 // callback, normalizer, and selected argument hooks.
-func hookFixtureExecution(toolFn func(context.Context, model.ToolCall) PreparedTool, normalize func(context.Context, model.ToolCall) (json.RawMessage, error), hooks ...ToolArgumentsHook) Execution {
+func hookFixtureExecution(toolFn func(context.Context, model.ToolCall) PreparedTool, normalize func(model.ToolCall) (json.RawMessage, error), hooks ...ToolArgumentsHook) Execution {
 	return Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
 		return InvocationExecution{
 			Model: func(context.Context, model.Request) (model.Stream, error) {
@@ -114,7 +114,7 @@ func TestToolArgumentHookChainSettlement(t *testing.T) {
 		normalizations int
 		received       []string // hook-received argument bytes in chain order
 	)
-	normalize := func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
+	normalize := func(call model.ToolCall) (json.RawMessage, error) {
 		mu.Lock()
 		normalizations++
 		mu.Unlock()
@@ -311,7 +311,7 @@ func TestToolArgumentHookFailureRules(t *testing.T) {
 	cases := []struct {
 		name       string
 		run        func(context.Context, model.ToolCall) (json.RawMessage, error)
-		normalize  func(context.Context, model.ToolCall) (json.RawMessage, error)
+		normalize  func(model.ToolCall) (json.RawMessage, error)
 		want       model.ToolResult
 		wantStatus hookResultStatus
 		wantError  string // the hook_result error member; empty asserts only a non-empty diagnostic
@@ -352,7 +352,7 @@ func TestToolArgumentHookFailureRules(t *testing.T) {
 		{
 			name: "normalizer rejection keeps its useful diagnostic",
 			run:  func(context.Context, model.ToolCall) (json.RawMessage, error) { return json.RawMessage(`{"a":1}`), nil },
-			normalize: func(context.Context, model.ToolCall) (json.RawMessage, error) {
+			normalize: func(model.ToolCall) (json.RawMessage, error) {
 				return nil, errors.New("no default for a")
 			},
 			want:       model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: "no default for a"},
@@ -362,7 +362,7 @@ func TestToolArgumentHookFailureRules(t *testing.T) {
 		{
 			name:       "malformed normalizer outcome is the internal-validation error",
 			run:        func(context.Context, model.ToolCall) (json.RawMessage, error) { return json.RawMessage(`{"a":1}`), nil },
-			normalize:  func(context.Context, model.ToolCall) (json.RawMessage, error) { return json.RawMessage(`[1,2]`), nil },
+			normalize:  func(model.ToolCall) (json.RawMessage, error) { return json.RawMessage(`[1,2]`), nil },
 			want:       model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: invalidToolResultContent},
 			wantStatus: hookFailed,
 		},
@@ -386,11 +386,11 @@ func TestToolArgumentHookFailureRules(t *testing.T) {
 			}
 			spy := &hookToolSpy{}
 			normalize := tc.normalize
-			normalizeFor := func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) { // the case's normalizer only ever judges the failing call
+			normalizeFor := func(call model.ToolCall) (json.RawMessage, error) { // the case's normalizer only ever judges the failing call
 				if call.ID == "call-1" {
-					return normalize(ctx, call)
+					return normalize(call)
 				}
-				return objectNormalize(ctx, call)
+				return objectNormalize(call)
 			}
 			exec := hookFixtureExecution(spy.tool, normalizeFor, hooks...)
 			_, store, _, sessionID, results, err := freshExecutionToolCalls(t, testCapture(), exec, testToolCall("call-1"), testToolCall("call-2"))
@@ -563,7 +563,7 @@ func TestToolArgumentHookAdvertisementGate(t *testing.T) {
 	prepared := 0
 	exec := hookFixtureExecution(func(_ context.Context, call model.ToolCall) PreparedTool {
 		prepared++
-		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}}
+		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}}
 	}, objectNormalize, hook)
 	ghost := model.ToolCall{ID: "call-1", Name: "ghost", Arguments: json.RawMessage(`{}`)}
 
@@ -1096,8 +1096,8 @@ func TestArgumentHookPureChainRepairRestoreAndRefusal(t *testing.T) {
 			repairSteps   int
 			hooklessSteps int
 		)
-		normalize := func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
-			normalized, err := objectNormalize(ctx, call)
+		normalize := func(call model.ToolCall) (json.RawMessage, error) {
+			normalized, err := objectNormalize(call)
 			mu.Lock()
 			attempts = append(attempts, string(call.Arguments))
 			if err != nil {
@@ -1115,7 +1115,7 @@ func TestArgumentHookPureChainRepairRestoreAndRefusal(t *testing.T) {
 			preparedCalls = append(preparedCalls, call)
 			prepareArrived <- struct{}{}
 			<-prepareGate
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}
 		exec := hookFixtureExecution(plan, normalize,
 			ToolArgumentsHook{ID: "cap.pure.repair", ExtensionID: "cap-a", Mode: HookModePure, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {

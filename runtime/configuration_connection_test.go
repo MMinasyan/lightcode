@@ -2443,7 +2443,7 @@ func (connectEnvEchoTool) describe(Invocation, ToolConstraints, harness.SessionI
 }
 
 func (connectEnvEchoTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	return runtimeNormalize(context.Background(), call)
+	return runtimeNormalize(call)
 }
 
 func (connectEnvEchoTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {

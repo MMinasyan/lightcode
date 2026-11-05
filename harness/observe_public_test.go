@@ -66,7 +66,7 @@ func publicChildLaunch(root string) harness.LaunchChildRequest {
 func publicImmediateTool(_ context.Context, call model.ToolCall) harness.PreparedTool {
 	return harness.PreparedTool{
 		Permissions: publicPermission,
-		Immediate:   &harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}},
+		Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}},
 	}
 }
 

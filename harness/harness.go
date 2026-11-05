@@ -235,11 +235,10 @@ type InvocationExecution struct {
 	Model func(context.Context, model.Request) (model.Stream, error)
 	Tool  func(context.Context, model.ToolCall) PreparedTool
 	// NormalizeTool is pure, terminating argument validation and defaulting
-	// with no filesystem, service, permission or effect I/O. It receives the
-	// bound callback context, an owned call, and returns one owned JSON
-	// object preserving unrelated accepted fields; its error is a per-call
-	// validation failure.
-	NormalizeTool func(context.Context, model.ToolCall) (json.RawMessage, error)
+	// with no filesystem, service, permission or effect I/O. It receives an
+	// owned call and returns one owned JSON object preserving unrelated
+	// accepted fields; its error is a per-call validation failure.
+	NormalizeTool func(model.ToolCall) (json.RawMessage, error)
 	// ToolHooks are the selected argument hooks in configured order. Each
 	// runs after the advertisement gate and before concrete preparation; the
 	// first receives the original raw call arguments, every later one the
@@ -298,31 +297,26 @@ type Execution struct {
 type ToolOutcome struct {
 	Result   model.ToolResult
 	Metadata json.RawMessage // optional, bounded, well-formed; semantics owned by the tool
-	// Evidence is the producer's execution knowledge: an immediate plan's
-	// success is observed and every other immediate status is not_started,
-	// while an executor declares its own observed, not_started or unknown
-	// knowledge.
+	// Evidence is the producing plan's execution knowledge. It is read only
+	// from executor outcomes: an immediate plan's success is observed and
+	// every other immediate status is not_started, whatever value the
+	// producer supplied.
 	Evidence ExecutionEvidence
 }
 
 // PreparedTool is one immutable prepared call: exactly one immediate outcome
-// or executor, its declared permission/target pairs, the canonical bindings
-// permission evaluation and concrete I/O consume, and the optional release of
-// the resources the accepted plan reserved. Normalized arguments are
-// Harness-supplied input, never a second value the preparer replaces.
-// Execution and immediate-success plans require a nonempty list of nonempty
-// permission/target pairs; immediate error, denied and interrupted outcomes
-// need no successful target declaration. The Harness registers a non-nil
-// Release immediately after acquiring the plan, before plan validation and
-// permission evaluation, and runs it exactly once after the plan's
-// settlement or discard on a cancellation-free cleanup context.
+// or executor, its declared permission/target pairs, and the canonical
+// bindings permission evaluation and concrete I/O consume. Normalized
+// arguments are Harness-supplied input, never a second value the preparer
+// replaces. Execution and immediate-success plans require a nonempty list of
+// nonempty permission/target pairs; immediate error, denied and interrupted
+// outcomes need no successful target declaration.
 type PreparedTool struct {
 	Permissions        []PermissionRequest
 	CanonicalWorkspace string
 	CanonicalWriteDir  string
 	Immediate          *ToolOutcome
 	Execute            func(context.Context) ToolOutcome
-	Release            func(context.Context) error
 }
 
 // CreateSessionRequest is the input of one root Session creation.

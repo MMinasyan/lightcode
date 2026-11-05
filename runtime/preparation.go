@@ -801,7 +801,7 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 				callTC.Background = background
 				return background.bindPlan(table[call.Name].Prepare(ctx, callTC, call))
 			},
-			NormalizeTool: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+			NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
 				return table[call.Name].Normalize(tc, call)
 			},
 			ToolHooks: hooks,

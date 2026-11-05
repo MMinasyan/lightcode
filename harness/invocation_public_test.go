@@ -74,7 +74,7 @@ func newInvocationRecordingFixture(t *testing.T, store harness.Storage, script *
 						},
 						NormalizeTool: publicNormalize,
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Evidence: harness.ExecutionNotStarted, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
+							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 						},
 						Close: func() error {
 							// The closer reads the durable state: the

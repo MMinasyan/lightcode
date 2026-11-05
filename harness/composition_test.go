@@ -352,7 +352,7 @@ func TestMaintenanceFactsSettleOnce(t *testing.T) {
 			}
 			if request.Purpose == InvocationPurposeConversation {
 				inv.Tool = func(_ context.Context, call model.ToolCall) PreparedTool {
-					return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+					return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 				}
 			}
 			return inv, nil
@@ -431,14 +431,10 @@ func TestRunningRequestSuspendAndClear(t *testing.T) {
 				}
 				return completedTurnStream(), nil
 			},
-			Tool: func(ctx context.Context, call model.ToolCall) PreparedTool {
+			Tool: func(_ context.Context, call model.ToolCall) PreparedTool {
 				saw := observe()
 				toolSaw = append(toolSaw, saw)
-				info, ok := CallbackInfoFor(ctx)
-				testassert.Require(t, ok && info.Kind == CallbackToolPrepare && info.RequestID != "" && info.ToolCallID == call.ID,
-					"tool prepare callback identity = %+v (present %v), want the producing request and call identity", info, ok)
-				testassert.Require(t, saw.requestID == info.RequestID,
-					"stored running request = %q, want the producing tool-prepare request %q", saw.requestID, info.RequestID)
+				testassert.Require(t, saw.requestID != "", "tool prepare observed no producing request")
 				rec, rerr := h.ReadOperation(context.Background(), sessionID, testOpID)
 				testassert.NoError(t, rerr)
 				testassert.Require(t, len(rec.State.PendingToolCalls) == 1 && rec.State.PendingToolCalls[0].AssistantEntry.SessionID == sessionID && rec.State.PendingToolCalls[0].AssistantEntry.EntryID != "",
@@ -458,7 +454,7 @@ func TestRunningRequestSuspendAndClear(t *testing.T) {
 					}
 				}
 				testassert.Require(t, found, "no committed assistant carries the preparing call %q", call.ID)
-				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 			},
 			NormalizeTool: objectNormalize,
 			RequestHooks: []RequestHook{{ID: "req.observe", ExtensionID: "req-ext", Mode: HookModePure, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
@@ -583,9 +579,9 @@ func TestUnadvertisedCallSettlesUnavailable(t *testing.T) {
 		}
 		return completedTurnStream(), nil
 	}
-	normalize := func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
+	normalize := func(call model.ToolCall) (json.RawMessage, error) {
 		normalizeCalls++
-		return objectNormalize(ctx, call)
+		return objectNormalize(call)
 	}
 	prepare := func(context.Context, model.ToolCall) PreparedTool { prepareCalls++; return PreparedTool{} }
 	exec := executionForInvocation(InvocationExecution{Model: modelFn, NormalizeTool: normalize, Tool: prepare})
@@ -682,11 +678,11 @@ func TestAcceptedPureRequestIdentitiesRecordInOrder(t *testing.T) {
 
 func TestArgumentRefusalDoesNotAcceptInvalidOriginal(t *testing.T) {
 	spy := &hookToolSpy{}
-	normalize := func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
+	normalize := func(call model.ToolCall) (json.RawMessage, error) {
 		if string(call.Arguments) == "not json" {
 			return nil, errors.New("invalid original")
 		}
-		return objectNormalize(ctx, call)
+		return objectNormalize(call)
 	}
 	hook := ToolArgumentsHook{ID: "pure.refuse", ExtensionID: "ext.test", Mode: HookModePure, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
 		if call.ID == "call-1" {
@@ -846,7 +842,7 @@ func TestRequestHookHistoricalToolCallMutationStaysLocal(t *testing.T) {
 		return InvocationExecution{
 			Model: func(context.Context, model.Request) (model.Stream, error) { return pairStream, nil },
 			Tool: func(_ context.Context, call model.ToolCall) PreparedTool {
-				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "tool done"}}}
+				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "tool done"}}}
 			},
 			NormalizeTool: objectNormalize,
 		}, nil

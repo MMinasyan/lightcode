@@ -469,16 +469,8 @@ func (d *executionDriver) compactModelEffect(inv *openedInvocation, facts *maint
 		// identical to the conversation model effect's but running through the
 		// compact transport. The physical attempt carries the opened
 		// maintenance invocation and this producer's own reserved identity.
-		attemptWithInfo := func(ctx context.Context, req model.Request) (model.Stream, error) {
-			attemptCtx := withCallbackInfo(ctx, d.callbackInfo(inv, CallbackInfo{
-				Kind:      CallbackModelAttempt,
-				RequestID: maintenanceID,
-				EffectID:  intent.resultID,
-			}))
-			return attempt(attemptCtx, req)
-		}
 		var output model.Output
-		switch res := runModelAttempts(ctx, req, attemptWithInfo, d.execution.Retry); res.kind {
+		switch res := runModelAttempts(ctx, req, attempt, d.execution.Retry); res.kind {
 		case attemptAccepted:
 			out, attemptErr := assemble(intent.expected, h.observeStream(intent.sessionID, operationID, res.stream)) // exactly one assembly after acceptance; the enclosing Operation owns the deltas
 			if attemptErr != nil {
@@ -552,23 +544,20 @@ func (d *executionDriver) compactModelEffect(inv *openedInvocation, facts *maint
 // so a mutating strategy can never rewrite the Harness's frozen source copy.
 // The selected binding is accepted and frozen once here — before any Plan
 // callback, for model-free and model-producing procedures alike — requiring
-// a nonnil implementation and the captured identity and requirement; a nil
-// binding still selects the included strategy. A returned plan is validated
-// against the closed union before anything runs; a malformed union, a
-// strategy error, or a model failure settles the quiet running Operation
-// through the direct terminal settlement carrying the retained maintenance
-// facts, while an actual publication failure propagates with the running
-// state retained and no guessed follow-up write. A procedure that ends at
-// none after model work transfers its uncommitted ordered facts to the
-// execution owner before the completed invocation disposes; they stay
+// a nonnil implementation and the captured identity and requirement. A
+// returned plan is validated against the closed union before anything runs; a
+// malformed union, a strategy error, or a model failure settles the quiet
+// running Operation through the direct terminal settlement carrying the
+// retained maintenance facts, while an actual publication failure propagates
+// with the running state retained and no guessed follow-up write. A procedure
+// that ends at none after model work transfers its uncommitted ordered facts
+// to the execution owner before the completed invocation disposes; they stay
 // process-local until the next successful checkpoint or terminal publication
 // accounts them once. It returns only whether a checkpoint was published and
 // the procedure's error: intermediate stages close after a valid successor
-// plan and before its opening, an automatic procedure's final stage closes
-// before continuation, and a manual procedure's final stage stays owned by
-// the execution until the enclosing completion has retained the failure and
-// disposed.
-func (d *executionDriver) completeMaintenance(execCtx context.Context, input PlanInput, suspended *RunningRequest, manual bool) (bool, error) {
+// plan and before its opening, and on return the procedure's failure is
+// latched before its final stage closes.
+func (d *executionDriver) completeMaintenance(execCtx context.Context, input PlanInput, suspended *RunningRequest, manual bool) (changed bool, err error) {
 	h := d.harness
 	c := d.coordinator
 	operationID := d.operationID
@@ -595,12 +584,11 @@ func (d *executionDriver) completeMaintenance(execCtx context.Context, input Pla
 		facts.sourceRequestID = suspended.RequestID
 	}
 	// The StrategyBinding is accepted and frozen once, before any Plan
-	// callback, as a local value copy: nil still selects the included
-	// strategy, the accepted binding must provide its implementation and match
-	// the captured strategy inputs exactly, and a caller that mutates its own
-	// supplied binding afterwards can never re-point this procedure's Plan or
-	// Consume.
-	binding := *resolveStrategyBinding(d.execution.Strategy)
+	// callback, as a local value copy: the accepted binding must provide its
+	// implementation and match the captured strategy inputs exactly, and a
+	// caller that mutates its own supplied binding afterwards can never
+	// re-point this procedure's Plan or Consume.
+	binding := *d.execution.Strategy
 	if binding.Strategy == nil {
 		return false, d.settleMaintenance(OperationFailure, invalidInput("opened strategy binding %q carries no implementation", binding.ID), facts)
 	}
@@ -616,13 +604,7 @@ func (d *executionDriver) completeMaintenance(execCtx context.Context, input Pla
 	}
 	// The initial Plan carries the procedure's own producer identity, the
 	// maintenance purpose, and no invocation or effect yet.
-	planCtx := withCallbackInfo(execCtx, d.callbackInfo(nil, CallbackInfo{
-		Kind:         CallbackStrategyPlan,
-		Purpose:      InvocationPurposeMaintenance,
-		RequestID:    maintenanceID,
-		CapabilityID: binding.ID,
-	}))
-	plan, err := binding.Strategy.Plan(planCtx, clonePlanInput(input))
+	plan, err := binding.Strategy.Plan(clonePlanInput(input))
 	if err != nil {
 		terminal := OperationFailure
 		if effectInterrupted(err) {
@@ -634,23 +616,17 @@ func (d *executionDriver) completeMaintenance(execCtx context.Context, input Pla
 	stage := (*openedInvocation)(nil)
 	closeStage := func() {
 		h.closeOpenedInvocation(stage)
-		if stage != nil && d.maintenance == stage {
-			d.maintenance = nil
-		}
 		stage = nil
 	}
-	// fail settles one procedure failure and only then disposes the final
-	// automatic stage; a manual stage stays owned until completion.
-	fail := func(terminal OperationState, cause error) (bool, error) {
-		err := d.settleMaintenance(terminal, cause, facts)
-		if !manual {
-			closeStage()
-		}
-		return false, err
-	}
+	// The procedure owns its stage on every return: the failure is latched
+	// first, then the final stage closes.
+	defer func() {
+		h.recordStorageFailure(err)
+		closeStage()
+	}()
 	for {
 		if err := validatePlanOutput(plan); err != nil {
-			return fail(OperationFailure, err)
+			return false, d.settleMaintenance(OperationFailure, err, facts)
 		}
 		switch plan.Kind {
 		case PlanNone:
@@ -663,15 +639,11 @@ func (d *executionDriver) completeMaintenance(execCtx context.Context, input Pla
 				d.transferPending(facts)
 			}
 			if !manual {
-				closeStage() // no checkpoint to precede: dispose the unused maintenance stage
 				return false, nil
 			}
 			return false, d.commitMaintenance(execCtx, input, facts, nil, true)
 		case PlanCheckpoint:
 			err := d.commitMaintenance(execCtx, input, facts, plan.Checkpoint, manual)
-			if !manual {
-				closeStage() // the committed checkpoint precedes the maintenance stage's disposal
-			}
 			return err == nil, err
 		}
 		// The successor Model plan is validated: the completed invocation's
@@ -682,35 +654,22 @@ func (d *executionDriver) completeMaintenance(execCtx context.Context, input Pla
 		closeStage()
 		nextStage, output, err := d.runMaintenanceModel(execCtx, plan.Model, suspended, facts)
 		stage = nextStage
-		if manual {
-			// A manual procedure's final stage stays owned by the execution
-			// until completion has retained the failure and disposed.
-			d.maintenance = stage
-		}
 		if err != nil {
-			if !manual {
-				closeStage()
-			}
 			return false, err
 		}
 		if observeMaintenanceInterrupt(execCtx, c, operationID) {
 			// The unstarted pure folding stage observes the same cancellation
 			// and marker before it begins: the accepted model usage and facts
 			// settle on the ordinary interruption.
-			return fail(OperationInterruption, errors.New(executionInterruptedDetail))
+			return false, d.settleMaintenance(OperationInterruption, errors.New(executionInterruptedDetail), facts)
 		}
-		consumeCtx := withCallbackInfo(execCtx, d.callbackInfo(stage, CallbackInfo{
-			Kind:         CallbackStrategyConsume,
-			RequestID:    stage.request.ID,
-			CapabilityID: binding.ID,
-		}))
-		next, err := binding.Strategy.Consume(consumeCtx, ConsumeInput{Input: clonePlanInput(input), State: plan.Model.State, Output: output})
+		next, err := binding.Strategy.Consume(ConsumeInput{Input: clonePlanInput(input), State: plan.Model.State, Output: output})
 		if err != nil {
 			terminal := OperationFailure
 			if effectInterrupted(err) {
 				terminal = OperationInterruption
 			}
-			return fail(terminal, err)
+			return false, d.settleMaintenance(terminal, err, facts)
 		}
 		next.Model, next.Checkpoint = ownModelPlan(next.Model), ownCheckpointPlan(next.Checkpoint)
 		plan = next
@@ -726,7 +685,7 @@ func (d *executionDriver) completeMaintenance(execCtx context.Context, input Pla
 // direct terminal settlement — and returns the original cause with the
 // invocation it left owned.
 func (d *executionDriver) runMaintenanceModel(execCtx context.Context, plan *ModelPlan, suspended *RunningRequest, facts *maintenanceFacts) (*openedInvocation, model.Output, error) {
-	stage, err := d.openMaintenance(execCtx)
+	stage, err := d.openInvocation(execCtx, InvocationPurposeMaintenance, d.capture.Compact.Model)
 	if err != nil {
 		// An opener failure observed under a genuinely canceled execution is
 		// deliberate control cancellation and settles interruption with the
