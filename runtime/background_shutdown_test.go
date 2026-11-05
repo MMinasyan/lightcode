@@ -73,7 +73,7 @@ func jobStopperExportPlugin(id string, value harness.JobStopper) Plugin {
 		ID:       id,
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[harness.JobStopper](id + ".stopper")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		Open: func(context.Context, ScopeInfo) (Instance, error) {
 			return Instance{Values: map[string]any{id + ".stopper": value}}, nil
 		},
 	}

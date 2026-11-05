@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
@@ -15,57 +14,7 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// TestBackgroundBridgeMethodsForward drives each bridge method against the
-// live Harness it carries: a launch returns the durable child identity, a job
-// start hands its spawn the reserved completion identity, and the completion
-// delivery admits the delivered content on the owning Session.
-func TestBackgroundBridgeMethodsForward(t *testing.T) {
-	ctx := context.Background()
-	e := newOwnerEnv(t)
-	store := storage.NewMemory()
-	stopper := &stubStopper{events: e.events}
-	e.fixtureStore(store)
-	e.fixtureJobs(stopper)
-	r, err := e.open(ctx)
-	testassert.NoError(t, err)
-	bridge := &backgroundBridge{h: r.harness}
-
-	parent, err := r.createSession(ctx, filepath.Join(e.home, "forward-parent"), "solo")
-	testassert.NoError(t, err)
-	res, err := bridge.LaunchChild(ctx, harness.LaunchChildRequest{
-		ParentSessionID: parent.Identity.SessionID,
-		AgentType:       "solo",
-		Content:         []model.ContentPart{{Kind: model.PartText, Text: "child task"}},
-		OperationID:     "op-child-launch",
-		MaxConcurrent:   5,
-		OutputLimit:     4096,
-	})
-	testassert.NoError(t, err)
-	testassert.Require(t, res.ChildSessionID != "", "LaunchChild returned no child session id")
-
-	jobSession, err := r.createSession(ctx, filepath.Join(e.home, "forward-job"), "solo")
-	testassert.NoError(t, err)
-	var completionID string
-	testassert.NoError(t, bridge.StartJob(ctx, jobSession.Identity.SessionID, "0a1b2c3d", func(_ context.Context, id string) error {
-		completionID = id
-		return nil
-	}))
-
-	testassert.NoError(t, bridge.DeliverCompletion(ctx, jobSession.Identity.SessionID, completionID, "job report"))
-	entries, err := store.ReadEntries(ctx, jobSession.Identity.SessionID, 0)
-	testassert.NoError(t, err)
-	admitted := false
-	for _, entry := range entries {
-		if entry.Kind == harness.EntryInput && strings.Contains(string(entry.Payload), "job report") {
-			admitted = true
-		}
-	}
-	testassert.Require(t, admitted, "the forwarded completion delivery left no admitted input entry")
-
-	testassert.NoError(t, r.Close(ctx))
-}
-
-// backgroundProbe records the background services bridge of every prepared
+// backgroundProbe records the background services object of every prepared
 // call the production opener builds. The probe is sequential: the test reads
 // the slice only after the admitted call it observed has settled.
 type backgroundProbe struct {
@@ -108,7 +57,7 @@ func backgroundProbePlugin(probe *backgroundProbe) Plugin {
 		ID:       "bgprobe",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("bg_probe", backgroundProbeTool{probe: probe}.describe)},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		Open: func(context.Context, ScopeInfo) (Instance, error) {
 			return Instance{Values: map[string]any{"bg_probe": backgroundProbeTool{probe: probe}}}, nil
 		},
 	}
@@ -150,12 +99,9 @@ func TestBackgroundBridgeArmingAcrossPublication(t *testing.T) {
 	submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "probe")
 	awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 
-	testassert.Require(t, len(probe.seen) != 0, "no prepared call observed the bridge")
+	testassert.Require(t, len(probe.seen) != 0, "no prepared call observed the background services object")
 	for i, background := range probe.seen {
-		testassert.Require(t, background != nil, "prepared call %d carried no background services bridge", i)
-		// Complete after publication: the production-armed instance
-		// reaches the Harness (an unknown completion is not new work).
-		testassert.NoError(t, background.DeliverCompletion(ctx, session.Identity.SessionID, "00000000000000000000000000000000", "ignored"))
+		testassert.Require(t, background != nil, "prepared call %d carried no background services object", i)
 	}
 
 	testassert.NoError(t, r.Close(ctx))

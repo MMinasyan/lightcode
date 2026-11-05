@@ -114,7 +114,7 @@ func servicePlugin(id string, opens *atomic.Int64, validate func(json.RawMessage
 		ID:       id,
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[any]("capability." + id)},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		Open: func(context.Context, ScopeInfo) (Instance, error) {
 			opens.Add(1)
 			return Instance{Values: map[string]any{"capability." + id: id}}, nil
 		},
@@ -865,7 +865,7 @@ func TestConfigurationServiceToolDeclarationsStayDeclarative(t *testing.T) {
 			describeCalled = true
 			return ToolDescription{Definition: model.ToolDefinition{Name: "tool.x", Parameters: json.RawMessage(`{}`)}}, nil
 		})},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		Open: func(context.Context, ScopeInfo) (Instance, error) {
 			h.opens.Add(1)
 			return Instance{Values: map[string]any{"tool.x": noopTool{}}}, nil
 		},

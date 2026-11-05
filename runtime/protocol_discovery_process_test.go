@@ -253,7 +253,7 @@ func discoveryMarkerPlugin(markerPath string) Plugin {
 		ID:       "discovery-marker",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[any]("discovery.marker")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		Open: func(context.Context, ScopeInfo) (Instance, error) {
 			if err := os.WriteFile(markerPath, []byte("open"), 0o600); err != nil {
 				return Instance{}, err
 			}

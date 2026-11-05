@@ -579,7 +579,7 @@ func commandEnvironmentFailure(callID string, cause error) harness.ToolOutcome {
 // reservation when the bridge or the start rejects, and returns the retained
 // immediate template on success. Every start failure — reserve, handoff, or
 // spawn — renders through the one legacy wrapper.
-func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command string, timeoutSec int, tc ToolContext) harness.ToolOutcome {
+func (t runCommandTool) backgroundOutcome(_ context.Context, callID, command string, timeoutSec int, tc ToolContext) harness.ToolOutcome {
 	if tc.SubprocessEnv == nil {
 		return commandEnvironmentFailure(callID, errNoSubprocessEnv)
 	}
@@ -589,7 +589,7 @@ func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command s
 	if err != nil {
 		return backgroundStartOutcome(callID, err)
 	}
-	err = tc.Background.StartJob(ctx, sessionID, jobID, func(_ context.Context, completionID string) error {
+	err = tc.Background.StartJob(jobID, func(_ context.Context, deliver func(string) error) error {
 		// The environment resolves at the admitted start handoff — never at
 		// Prepare — and the exact slice is the job process's environment; a
 		// nil snapshot fails the start instead of inheriting ambient secrets.
@@ -606,7 +606,7 @@ func (t runCommandTool) backgroundOutcome(ctx context.Context, callID, command s
 			Env:        env,
 			Config:     tc.Invocation.jobsSettings(),
 			OnExit: func(er jobs.ExitResult) {
-				_ = tc.Background.DeliverCompletion(context.Background(), sessionID, completionID, legacyCompletionText(er)) // terminal for the job's completion; the exit callback has nowhere to propagate
+				_ = deliver(legacyCompletionText(er)) // terminal for the job's completion; the exit callback has nowhere to propagate
 			},
 		})
 	})

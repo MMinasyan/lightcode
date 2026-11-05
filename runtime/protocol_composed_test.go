@@ -94,7 +94,7 @@ func composedCustomPlugin() runtime.Plugin {
 			}
 			return nil
 		},
-		Open: func(_ context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+		Open: func(_ context.Context, info runtime.ScopeInfo) (runtime.Instance, error) {
 			if info.ReportWarning != nil {
 				info.ReportWarning("notice", "custom plugin scope opened")
 			}

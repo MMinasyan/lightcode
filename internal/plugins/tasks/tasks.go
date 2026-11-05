@@ -123,18 +123,17 @@ func (taskTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.To
 	}
 	return harness.PreparedTool{
 		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: subagentType}},
-		Execute: func(ctx context.Context) harness.ToolOutcome {
+		Execute: func(_ context.Context) harness.ToolOutcome {
 			operationID, err := newOperationID()
 			if err != nil {
 				return launchOutcome(call.ID, err)
 			}
-			result, err := tc.Background.LaunchChild(ctx, harness.LaunchChildRequest{
-				ParentSessionID: tc.AdmittedEntry.SessionID,
-				AgentType:       subagentType,
-				Content:         []model.ContentPart{{Kind: model.PartText, Text: prompt}},
-				OperationID:     operationID,
-				MaxConcurrent:   s.MaxConcurrent,
-				OutputLimit:     s.MaxOutputBytes,
+			result, err := tc.Background.LaunchChild(runtime.ChildRequest{
+				AgentType:     subagentType,
+				Content:       []model.ContentPart{{Kind: model.PartText, Text: prompt}},
+				OperationID:   operationID,
+				MaxConcurrent: s.MaxConcurrent,
+				OutputLimit:   s.MaxOutputBytes,
 			})
 			if err != nil {
 				return launchOutcome(call.ID, err)
@@ -142,7 +141,7 @@ func (taskTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.To
 			return harness.ToolOutcome{Result: model.ToolResult{
 				CallID:  call.ID,
 				Status:  model.ResultSuccess,
-				Content: fmt.Sprintf(taskStartedTemplate, result.ChildSessionID),
+				Content: fmt.Sprintf(taskStartedTemplate, result),
 			}, Evidence: harness.ExecutionObserved}
 		},
 	}
@@ -248,7 +247,7 @@ func Plugin() runtime.Plugin {
 
 // open checks the scope context and publishes the stateless tool value; no
 // per-Session state is created here.
-func open(ctx context.Context, _ runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+func open(ctx context.Context, _ runtime.ScopeInfo) (runtime.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.Instance{}, err
 	}

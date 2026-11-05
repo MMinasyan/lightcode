@@ -88,8 +88,7 @@ type CapabilitySpec struct {
 	describe func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error)
 }
 
-// Spec declares the capability contract named id for the Go type T. It serves
-// both Plugin.Provides and Plugin.Requires.
+// Spec declares the capability contract named id for the Go type T.
 func Spec[T any](id string) CapabilitySpec {
 	return CapabilitySpec{id: id, typ: reflect.TypeFor[T]()}
 }
@@ -105,27 +104,24 @@ type Instance struct {
 }
 
 // Plugin is one statically registered composition unit. Open receives the
-// scope context, the scope identity, and immutable Bindings of exactly its
-// declared dependencies, already resolved from the same or an ancestor
-// scope; it wires native dependencies and stable scope resources without
-// configuration. ValidateConfig is synchronous, pure, terminating validation
-// of its owned input: no I/O, background work, waits, or retained input. A
-// nil ValidateConfig means the plugin has no settings, so only absent
+// scope context and the scope identity; it wires stable scope resources
+// without configuration. ValidateConfig is synchronous, pure, terminating
+// validation of its owned input: no I/O, background work, waits, or retained
+// input. A nil ValidateConfig means the plugin has no settings, so only absent
 // configuration or the empty object is accepted, never arbitrary ignored
 // JSON.
 type Plugin struct {
 	ID             string
 	Scope          ScopeKind
 	Provides       []CapabilitySpec
-	Requires       []CapabilitySpec
 	ValidateConfig func(json.RawMessage) error
-	Open           func(context.Context, ScopeInfo, Bindings) (Instance, error)
+	Open           func(context.Context, ScopeInfo) (Instance, error)
 }
 
-// Bindings is an immutable resolved dependency set; the zero value is empty.
+// bindings is an immutable resolved capability set; the zero value is empty.
 // Each entry carries its declared type, the native value, and the supplying
-// scope. Copying a Bindings copies the map, never the shared implementations.
-type Bindings struct {
+// scope. Copying a bindings copies the map, never the shared implementations.
+type bindings struct {
 	entries map[string]bindingEntry
 }
 
@@ -136,15 +132,15 @@ type bindingEntry struct {
 	plugin   string // the supplying plugin's identity: the extension identity durable hook evidence records
 }
 
-// Bind returns the native value bound to id, checking that it is assignable
+// bind returns the native value bound to id, checking that it is assignable
 // to T. A missing or wrongly typed entry reports ErrComposition; a supplying
 // scope that has closed or whose context the owner canceled reports
 // ErrClosed.
-func Bind[T any](bindings Bindings, id string) (T, error) {
+func bind[T any](set bindings, id string) (T, error) {
 	var zero T
-	entry, ok := bindings.entries[id]
+	entry, ok := set.entries[id]
 	if !ok {
-		return zero, fmt.Errorf("capability %q is not a declared dependency: %w", id, ErrComposition)
+		return zero, fmt.Errorf("capability %q is not a bound capability: %w", id, ErrComposition)
 	}
 	if entry.from.unavailable() {
 		return zero, fmt.Errorf("capability %q: %w", id, ErrClosed)
@@ -162,9 +158,7 @@ func Bind[T any](bindings Bindings, id string) (T, error) {
 // Invocation is immutable configuration data for one Core call tree, never a
 // lifetime or capability handle. It holds one captured snapshot; a plugin
 // knows its own registered ID and reads its settings from this explicit
-// argument, and native dependency calls receive the same Invocation so a
-// dependency reads its own settings from the revision its caller used. The
-// zero Invocation returns empty values.
+// argument. The zero Invocation returns empty values.
 type Invocation struct {
 	snapshot *configuration
 }
@@ -265,23 +259,13 @@ func providerLabel(owned []Plugin, p provider) string {
 	return owned[p.plugin].ID
 }
 
-// providerScope is the lifetime a supplier provides: the owner-provided
-// standard tools are Runtime-lifetime capabilities.
-func providerScope(owned []Plugin, p provider) ScopeKind {
-	if p.owner() {
-		return ScopeRuntime
-	}
-	return owned[p.plugin].Scope
-}
-
 // composition is the validated static plugin set: an owned declaration copy,
-// per-scope construction plans in stable topological order (registration
-// order breaks ties), and the one export table every capability ID resolves
-// through — the seven standard tool declarations seeded as owner-provided
-// Runtime-lifetime providers first, then the optional plugins' exports. The
-// owner installs the directly constructed standard tool values into the
-// Runtime scope's bindings, so every capability — a standard tool or a plugin
-// export — travels the same selectCapabilities and Bind path.
+// per-scope construction plans in registration order, and the one export table
+// every capability ID resolves through — the seven standard tool declarations
+// seeded as owner-provided Runtime-lifetime providers first, then the optional
+// plugins' exports. The owner installs the directly constructed standard tool
+// values into the Runtime scope's bindings, so every capability — a standard
+// tool or a plugin export — travels the same selectCapabilities and bind path.
 type composition struct {
 	plugins       []Plugin
 	plan          map[ScopeKind][]Plugin
@@ -308,20 +292,17 @@ type composition struct {
 
 // newComposition validates the complete selected plugin set before any
 // factory can run: unique nonempty plugin IDs, valid scopes, non-nil Open, at
-// least one provider, unique nonempty export IDs globally and unique nonempty
-// dependency IDs per plugin, assignable provider types, lifetime-compatible
-// PreparationHook declarations (Runtime or Workspace scope only), Tool
-// declarations carrying their description functions, and same-or-longer-lived
-// dependency scopes and an acyclic dependency graph. The seven standard tool
-// declarations are seeded into the same export table as owner-provided
-// Runtime-lifetime capabilities, so an optional export naming one collides as
-// a duplicate provider and an ordinary dependency on one resolves through the
-// same type and lifetime rules as any other capability.
+// least one provider, unique nonempty export IDs globally,
+// lifetime-compatible PreparationHook declarations (Runtime or Workspace
+// scope only), and Tool declarations carrying their description functions.
+// The seven standard tool declarations are seeded into the same export table
+// as owner-provided Runtime-lifetime capabilities, so an optional export
+// naming one collides as a duplicate provider. Construction within a scope
+// follows registration order.
 func newComposition(plugins []Plugin) (*composition, error) {
 	owned := make([]Plugin, len(plugins))
 	for i, p := range plugins {
 		p.Provides = append([]CapabilitySpec(nil), p.Provides...)
-		p.Requires = append([]CapabilitySpec(nil), p.Requires...)
 		owned[i] = p
 	}
 
@@ -351,16 +332,6 @@ func newComposition(plugins []Plugin) (*composition, error) {
 		if len(p.Provides) == 0 {
 			return nil, fmt.Errorf("plugin %q: missing providers: %w", p.ID, ErrComposition)
 		}
-		seenRequires := make(map[string]bool, len(p.Requires))
-		for _, req := range p.Requires {
-			if req.id == "" {
-				return nil, fmt.Errorf("plugin %q: empty required capability ID: %w", p.ID, ErrComposition)
-			}
-			if seenRequires[req.id] {
-				return nil, fmt.Errorf("plugin %q: duplicate required capability %q: %w", p.ID, req.id, ErrComposition)
-			}
-			seenRequires[req.id] = true
-		}
 		for _, prov := range p.Provides {
 			if prov.id == "" {
 				return nil, fmt.Errorf("plugin %q: empty provided capability ID: %w", p.ID, ErrComposition)
@@ -381,68 +352,9 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			}
 		}
 	}
-	for _, p := range owned {
-		for _, req := range p.Requires {
-			src, ok := exports[req.id]
-			if !ok {
-				return nil, fmt.Errorf("plugin %q: required capability %q has no provider: %w", p.ID, req.id, ErrComposition)
-			}
-			if !src.spec.typ.AssignableTo(req.typ) {
-				return nil, fmt.Errorf("plugin %q: capability %q declared as %s is not assignable to required %s: %w", p.ID, req.id, src.spec.typ, req.typ, ErrComposition)
-			}
-			if providerScope(owned, src).rank() > p.Scope.rank() {
-				return nil, fmt.Errorf("plugin %q (%s) requires %q from shorter-lived %s provider %s: %w", p.ID, p.Scope, req.id, providerScope(owned, src), providerLabel(owned, src), ErrComposition)
-			}
-		}
-	}
-
-	// Stable topological order over the whole plugin set: dependencies are
-	// emitted before consumers and ties keep registration order. Edges only
-	// point to same-or-longer-lived scopes, so only same-scope cycles are
-	// possible; any cycle is rejected before factories run.
-	consumedBy := make([][]int, len(owned))
-	indegree := make([]int, len(owned))
-	edges := make([]map[int]bool, len(owned))
-	for i := range edges {
-		edges[i] = make(map[int]bool)
-	}
-	for i, p := range owned {
-		for _, req := range p.Requires {
-			src := exports[req.id]
-			if src.owner() { // the owner supplies it; no plugin edge exists
-				continue
-			}
-			if edges[i][src.plugin] {
-				continue
-			}
-			edges[i][src.plugin] = true
-			consumedBy[src.plugin] = append(consumedBy[src.plugin], i)
-			indegree[i]++
-		}
-	}
-	ordered := make([]int, 0, len(owned))
-	emitted := make([]bool, len(owned))
-	for len(ordered) < len(owned) {
-		next := -1
-		for i := range owned {
-			if !emitted[i] && indegree[i] == 0 {
-				next = i
-				break
-			}
-		}
-		if next < 0 {
-			return nil, fmt.Errorf("dependency cycle among plugins: %w", ErrComposition)
-		}
-		emitted[next] = true
-		ordered = append(ordered, next)
-		for _, consumer := range consumedBy[next] {
-			indegree[consumer]--
-		}
-	}
 
 	plan := make(map[ScopeKind][]Plugin)
-	for _, i := range ordered {
-		p := owned[i]
+	for _, p := range owned {
 		plan[p.Scope] = append(plan[p.Scope], p)
 	}
 	return &composition{
@@ -498,12 +410,10 @@ func (c *composition) bindReportWarning(scopeCtx context.Context, info ScopeInfo
 	}
 }
 
-// openScope constructs the plugins planned for info.Kind in topological
-// order, seeding ordinary dependencies from the supplied ancestor scopes in
-// longer-to-shorter order. The Runtime scope binds the owner's directly
-// constructed standard tool values as its own provided capabilities before any
-// planned factory runs, so a factory's declared dependency on a standard tool
-// resolves through the same Bind path as any other capability. The failing
+// openScope constructs the plugins planned for info.Kind in registration
+// order. Ancestors supply only the inherited observation publisher. The
+// Runtime scope binds the owner's directly constructed standard tool values as
+// its own provided capabilities before any planned factory runs. The failing
 // factory owns its provisional resources; every other failure runs the common
 // scope cleanup — cancel, join admitted work, dispose constructed instances in
 // reverse construction order attempting all and joining errors — and publishes
@@ -521,12 +431,6 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 	if len(ancestors) > 0 {
 		sc.obs = ancestors[0].obs
 	}
-	resolved := make(map[string]bindingEntry)
-	for _, ancestor := range ancestors {
-		for id, entry := range ancestor.bindings.entries {
-			resolved[id] = entry
-		}
-	}
 	own := make(map[string]bindingEntry)
 	if info.Kind == ScopeRuntime {
 		for id, src := range c.exports {
@@ -534,9 +438,7 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 			if !src.owner() || !supplied {
 				continue
 			}
-			entry := bindingEntry{declared: src.spec.typ, value: value, from: sc}
-			resolved[id] = entry
-			own[id] = entry
+			own[id] = bindingEntry{declared: src.spec.typ, value: value, from: sc}
 		}
 	}
 	fail := func(err error) (*scope, error) {
@@ -546,32 +448,24 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 		if err := scopeCtx.Err(); err != nil {
 			return fail(err)
 		}
-		deps := make(map[string]bindingEntry, len(p.Requires))
-		for _, req := range p.Requires {
-			source, ok := resolved[req.id]
-			if !ok {
-				return fail(fmt.Errorf("plugin %q: dependency %q unresolved in scope %s: %w", p.ID, req.id, info.Kind, ErrComposition))
-			}
-			deps[req.id] = bindingEntry{declared: req.typ, value: source.value, from: source.from, plugin: source.plugin}
-		}
 		// Every factory receives its own copied ScopeInfo. Only a
 		// Runtime-scoped factory receives the existing warning ingress, bound
 		// here to its registered ID and to this scope's cancellation; an
 		// isolated composition without a reporter supplies nil.
 		pluginInfo := info
 		pluginInfo.ReportWarning = c.bindReportWarning(scopeCtx, info, p)
-		instance, err := p.Open(scopeCtx, pluginInfo, Bindings{entries: deps})
+		instance, err := p.Open(scopeCtx, pluginInfo)
 		if err != nil {
 			return fail(fmt.Errorf("plugin %q: open: %w", p.ID, err))
 		}
 		if instance.Close != nil {
 			sc.closers = append(sc.closers, instance.Close)
 		}
-		if err := registerInstance(p, instance.Values, sc, resolved, own); err != nil {
+		if err := registerInstance(p, instance.Values, sc, own); err != nil {
 			return fail(fmt.Errorf("plugin %q: %w", p.ID, err))
 		}
 	}
-	commit := func() { sc.bindings = Bindings{entries: own} }
+	commit := func() { sc.bindings = bindings{entries: own} }
 	if sc.obs != nil && info.Kind != ScopeWorkspace {
 		// Construction completion is this scope's publication; a Workspace
 		// scope publishes later, at the registry commit in build.
@@ -588,9 +482,9 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 // registerInstance validates one factory output — exactly the declared IDs,
 // each with a dynamic Go type assignable to its declaration, untyped nil
 // supplying no verifiable type — and copies the returned map into the scope's
-// resolved ordinary bindings. Typed nils and zero concrete values follow the
-// ordinary assignability rule.
-func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own map[string]bindingEntry) error {
+// own bindings. Typed nils and zero concrete values follow the ordinary
+// assignability rule.
+func registerInstance(p Plugin, values map[string]any, sc *scope, own map[string]bindingEntry) error {
 	declared := make(map[string]CapabilitySpec, len(p.Provides))
 	for _, spec := range p.Provides {
 		declared[spec.id] = spec
@@ -611,9 +505,7 @@ func registerInstance(p Plugin, values map[string]any, sc *scope, resolved, own 
 		if !reflect.TypeOf(value).AssignableTo(spec.typ) {
 			return fmt.Errorf("capability %q supplied as %T is not assignable to declared %s: %w", id, value, spec.typ, ErrComposition)
 		}
-		entry := bindingEntry{declared: spec.typ, value: value, from: sc, plugin: p.ID}
-		own[id] = entry
-		resolved[id] = entry
+		own[id] = bindingEntry{declared: spec.typ, value: value, from: sc, plugin: p.ID}
 	}
 	return nil
 }
@@ -634,7 +526,7 @@ func (c *composition) toolSpec(id string) (CapabilitySpec, bool) {
 // scope instances, containing only the selected capability IDs. Unknown IDs are
 // not in the capability universe and are rejected; the selected view never
 // rebinds.
-func selectCapabilities(scopes []*scope, selected []string) (Bindings, error) {
+func selectCapabilities(scopes []*scope, selected []string) (bindings, error) {
 	entries := make(map[string]bindingEntry, len(selected))
 	for _, id := range selected {
 		found := false
@@ -646,10 +538,10 @@ func selectCapabilities(scopes []*scope, selected []string) (Bindings, error) {
 			}
 		}
 		if !found {
-			return Bindings{}, fmt.Errorf("capability %q is not a bound capability of the supplied scopes: %w", id, ErrComposition)
+			return bindings{}, fmt.Errorf("capability %q is not a bound capability of the supplied scopes: %w", id, ErrComposition)
 		}
 	}
-	return Bindings{entries: entries}, nil
+	return bindings{entries: entries}, nil
 }
 
 // scope is one constructed instance set with its guard state. The complete
@@ -669,7 +561,7 @@ type scope struct {
 	// ancestor; scopes constructed before the owner exists keep it nil.
 	obs *observation
 
-	bindings Bindings
+	bindings bindings
 	closers  []func() error
 
 	mu     sync.Mutex

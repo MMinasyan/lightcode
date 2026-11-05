@@ -402,7 +402,7 @@ func lifecycleToolsPlugin(tools *lifecycleTools) Plugin {
 		ID:       "bgtools",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("read", availableToolDescription("read")), ToolSpec("grep", availableToolDescription("grep"))},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		Open: func(context.Context, ScopeInfo) (Instance, error) {
 			return Instance{Values: map[string]any{"read": tools, "grep": tools}}, nil
 		},
 	}

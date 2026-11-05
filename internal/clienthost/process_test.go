@@ -175,7 +175,7 @@ func attemptMarkerPlugin() runtime.Plugin {
 		ID:       "attempt",
 		Scope:    runtime.ScopeRuntime,
 		Provides: []runtime.CapabilitySpec{runtime.Spec[attemptCloser]("attempt.closer")},
-		Open: func(context.Context, runtime.ScopeInfo, runtime.Bindings) (runtime.Instance, error) {
+		Open: func(context.Context, runtime.ScopeInfo) (runtime.Instance, error) {
 			markFactory("attempt")
 			return runtime.Instance{Values: map[string]any{"attempt.closer": attemptCloser{}}}, nil
 		},

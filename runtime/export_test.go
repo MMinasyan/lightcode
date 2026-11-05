@@ -52,7 +52,7 @@ func EqualEventForTest(a, b Event) bool {
 }
 
 // ComposeScopeForTest opens the given plugins as one Runtime scope through
-// the composition machinery — every dependency binding is constructed
+// the composition machinery — every capability binding is constructed
 // in-package — and returns the bound capability values by ID together with
 // the scope disposal. It is absent from production builds.
 func ComposeScopeForTest(ctx context.Context, info ScopeInfo, plugins []Plugin) (map[string]any, func() error, error) {

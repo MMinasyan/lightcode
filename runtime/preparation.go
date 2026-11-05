@@ -38,7 +38,7 @@ type openInvocation func(context.Context, harness.OperationAdmission, selection,
 // and present in the execution view; neither selection is ever rebound.
 type selection struct {
 	agent      harness.AgentType
-	bindings   Bindings
+	bindings   bindings
 	invocation Invocation
 
 	// credentials is the preparation's one captured credential observation
@@ -183,7 +183,7 @@ type preparation struct {
 	// fallback.
 	identity       string
 	globalRulesDir string
-	background     BackgroundServices
+	background     *backgroundBridge
 	passive        *observationAdapter
 
 	// artifacts is the Runtime's private per-Session artifact interval
@@ -211,7 +211,7 @@ type preparation struct {
 // private artifact interval registry (nil without a Runtime), and the
 // Runtime's live managed-environment producer (nil without a retained
 // manager). One concrete preparation path serves every admission.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home, identity, globalRulesDir string, background BackgroundServices, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
+func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home, identity, globalRulesDir string, background *backgroundBridge, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
 	return &preparation{
 		config:         config,
 		composition:    c,
@@ -301,7 +301,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 // selected capability provided only by an Operation or Agent scope is valid
 // but not constructed yet, so it stays absent until Open rather than rejecting
 // the admission.
-func (p *preparation) preparationBindings(workspaceScope *scope, selected []string) Bindings {
+func (p *preparation) preparationBindings(workspaceScope *scope, selected []string) bindings {
 	entries := make(map[string]bindingEntry, len(selected))
 	for _, id := range selected {
 		for _, source := range []*scope{p.runtime, workspaceScope} {
@@ -311,7 +311,7 @@ func (p *preparation) preparationBindings(workspaceScope *scope, selected []stri
 			}
 		}
 	}
-	return Bindings{entries: entries}
+	return bindings{entries: entries}
 }
 
 // open turns the committed admission into the execution: it first acquires
@@ -410,14 +410,14 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 // are the capability IDs, each hook's extension identity is the supplying
 // plugin's, and every Runtime-declared argument hook participates as an
 // effectful boundary. Each hook receives the same captured Invocation.
-func bindToolArgumentHooks(selected []string, bindings Bindings, invocation Invocation) ([]harness.ToolArgumentsHook, error) {
+func bindToolArgumentHooks(selected []string, bindings bindings, invocation Invocation) ([]harness.ToolArgumentsHook, error) {
 	var hooks []harness.ToolArgumentsHook
 	for _, id := range selected {
 		entry, ok := bindings.entries[id]
 		if !ok || !entry.declared.Implements(toolArgumentsHookType) {
 			continue
 		}
-		hook, err := Bind[ToolArgumentsHook](bindings, id)
+		hook, err := bind[ToolArgumentsHook](bindings, id)
 		if err != nil {
 			return nil, err
 		}
@@ -732,23 +732,27 @@ func wireDebugDir(home string) string {
 // it binds every advertised tool name from that invocation's view over all
 // four scopes, binds the selected argument hooks, owns one ToolContext
 // carrying the prepare-time Workspace, the calling Operation's admitted-input
-// identity, the captured Invocation and the validated hard constraints, and
-// answers with the invocation whose model callback makes exactly one physical
-// attempt over the transport its request purpose selects — the conversation
-// transport for a conversation request and the effective compact transport for
-// a maintenance request, the same construction over the one shared transport
-// when the compact model is the conversation model. The ToolContext's
-// environment callback is the preparation's fixed wrapper over the Runtime's
-// live producer: it filters the captured credential names from every snapshot
-// it returns, never rereads the selected execution policy, and keeps the nil
-// producer and nil snapshot fail-closed shapes unchanged. The shared
-// advertisement gate rejects unknown names before dispatch; retry
-// classification and scope disposal belong to the shared machinery.
+// identity, the captured Invocation, the validated hard constraints and a
+// never-armed background object for normalization, and answers with the
+// invocation whose model callback makes exactly one physical attempt over the
+// transport its request purpose selects — the conversation transport for a
+// conversation request and the effective compact transport for a maintenance
+// request, the same construction over the one shared transport when the
+// compact model is the conversation model. Each tool dispatch copies that
+// context with a fresh background object, prepares, freezes the plan's
+// permissions and wraps its executor, so the plugin holds no background
+// authority outside Execute. The ToolContext's environment callback is the
+// preparation's fixed wrapper over the Runtime's live producer: it filters the
+// captured credential names from every snapshot it returns, never rereads the
+// selected execution policy, and keeps the nil producer and nil snapshot
+// fail-closed shapes unchanged. The shared advertisement gate rejects unknown
+// names before dispatch; retry classification and scope disposal belong to the
+// shared machinery.
 func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, workspace string, advertised []model.ToolDefinition, credentialNames []string) openInvocation {
 	return func(_ context.Context, admission harness.OperationAdmission, sel selection, request harness.InvocationRequest) (harness.InvocationExecution, error) {
 		table := make(map[string]Tool, len(advertised))
 		for _, definition := range advertised {
-			tool, err := Bind[Tool](sel.bindings, definition.Name)
+			tool, err := bind[Tool](sel.bindings, definition.Name)
 			if err != nil {
 				return harness.InvocationExecution{}, err
 			}
@@ -769,12 +773,13 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 				return config.EnvWithoutKeys(env, credentialNames)
 			}
 		}
+		sessionID := admission.AdmittedEntry.SessionID
 		tc := ToolContext{
 			Workspace:     workspace,
 			AdmittedEntry: admission.AdmittedEntry,
 			Invocation:    sel.invocation,
 			Constraints:   ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
-			Background:    p.background,
+			Background:    &boundBackground{bridge: p.background, sessionID: sessionID},
 			SubprocessEnv: subprocessEnv,
 		}
 		attemptTransport := transport
@@ -791,7 +796,10 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 				return stream, err
 			},
 			Tool: func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
-				return table[call.Name].Prepare(ctx, tc, call)
+				callTC := tc
+				background := &boundBackground{bridge: p.background, sessionID: sessionID}
+				callTC.Background = background
+				return background.bindPlan(table[call.Name].Prepare(ctx, callTC, call))
 			},
 			NormalizeTool: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
 				return table[call.Name].Normalize(tc, call)
@@ -923,7 +931,7 @@ func runPreparationContributions(ctx context.Context, session harness.SessionIde
 		if !ok || !entry.declared.Implements(preparationHookType) {
 			continue
 		}
-		hook, err := Bind[PreparationHook](sel.bindings, id)
+		hook, err := bind[PreparationHook](sel.bindings, id)
 		if err != nil {
 			return err
 		}

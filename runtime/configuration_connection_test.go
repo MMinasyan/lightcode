@@ -2472,7 +2472,7 @@ func connectEnvEchoPlugin() Plugin {
 		ID:       "envecho",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("env_echo", connectEnvEchoTool{}.describe)},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		Open: func(context.Context, ScopeInfo) (Instance, error) {
 			return Instance{Values: map[string]any{"env_echo": connectEnvEchoTool{}}}, nil
 		},
 	}

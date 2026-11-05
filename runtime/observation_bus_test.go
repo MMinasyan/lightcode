@@ -424,7 +424,7 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 				ID:       id,
 				Scope:    ScopeRuntime,
 				Provides: []CapabilitySpec{Spec[any]("reporter." + id)},
-				Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
+				Open: func(_ context.Context, info ScopeInfo) (Instance, error) {
 					reports[id] = info.ReportWarning
 					e.events.add("open:" + id)
 					return Instance{Values: map[string]any{"reporter." + id: id}}, nil

@@ -125,7 +125,7 @@ func argumentHookPlugin(id string, hook ToolArgumentsHook) Plugin {
 		ID:       "arghooks",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[ToolArgumentsHook](id)},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		Open: func(context.Context, ScopeInfo) (Instance, error) {
 			return Instance{Values: map[string]any{id: hook}}, nil
 		},
 	}
@@ -184,7 +184,7 @@ func bundledAdaptationPlugin() Plugin {
 		ID:       "adapt",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[PreparationHook]("model_adaptation")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		Open: func(context.Context, ScopeInfo) (Instance, error) {
 			return Instance{Values: map[string]any{"model_adaptation": bundledAdaptation{}}}, nil
 		},
 	}
