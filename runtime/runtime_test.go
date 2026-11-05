@@ -1432,11 +1432,76 @@ func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
 // through Bind and can run it, and the nearest forbidden siblings — a duplicate
 // export, a wrongly typed dependency — reject before any factory dispatches.
 func TestRuntimeStandardToolsAreOwnerProvidedCapabilities(t *testing.T) {
-	t.Run("a dependency on a standard tool rejects before any factory", func(t *testing.T) {
+	t.Run("the owner's Runtime factory binds the actual read_file value", func(t *testing.T) {
 		e := newOwnerEnv(t)
+		workspace := filepath.Join(e.home, "owner-tool-ws")
+		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "held.txt"), []byte("owner provided\n"), 0o600))
+		var bound Tool
 		consumer := e.ordinaryPlugin("consumer", ScopeRuntime, "consumer.cap", Spec[Tool]("read_file"))
-		wantFailedOpen(t, e, []Plugin{consumer}, ErrComposition)
-		e.assertNoOwnershipSideEffects(t)
+		consumer.Open = func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
+			tool, err := Bind[Tool](deps, "read_file")
+			if err != nil {
+				return Instance{}, err
+			}
+			bound = tool
+			e.events.add("open:consumer")
+			return Instance{Values: map[string]any{"consumer.cap": "consumer"}}, nil
+		}
+		e.fixtureStore(storage.NewMemory())
+		r, err := e.open(context.Background(), consumer)
+		testassert.NoError(t, err)
+		testassert.NoError(t, r.Close(context.Background()))
+		testassert.Require(t, bound != nil, "the Runtime factory never bound the owner-provided read_file value")
+		// The bound value is the owner's real tool: it reads one Workspace
+		// file through its own preparation and execution.
+		tc := ToolContext{
+			Workspace:     workspace,
+			AdmittedEntry: harness.EntryRef{SessionID: testSessionID, EntryID: testEntryID},
+		}
+		arguments, err := bound.Normalize(tc, model.ToolCall{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"held.txt"}`)})
+		testassert.NoError(t, err)
+		prepared := bound.Prepare(context.Background(), tc, model.ToolCall{ID: "call-1", Name: "read_file", Arguments: arguments})
+		testassert.Require(t, prepared.Execute != nil, "prepared tool = %+v, want an executable plan", prepared)
+		outcome := prepared.Execute(context.Background())
+		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.Contains(outcome.Result.Content, "owner provided"), "bound tool read = %+v, want the file content", outcome.Result)
+	})
+
+	t.Run("Workspace, Operation and Agent consumers bind the owner-provided value", func(t *testing.T) {
+		var bound []string
+		consumer := func(id string, kind ScopeKind) Plugin {
+			return Plugin{
+				ID:       id,
+				Scope:    kind,
+				Provides: []CapabilitySpec{Spec[any](id + ".cap")},
+				Requires: []CapabilitySpec{Spec[Tool]("read_file")},
+				Open: func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
+					tool, err := Bind[Tool](deps, "read_file")
+					if err != nil {
+						return Instance{}, err
+					}
+					if tool == nil {
+						return Instance{}, errors.New("the standard tool binding supplied no value")
+					}
+					bound = append(bound, string(kind))
+					return Instance{Values: map[string]any{id + ".cap": id}}, nil
+				},
+			}
+		}
+		c := mustComposition(t,
+			consumer("rt", ScopeRuntime),
+			consumer("ws", ScopeWorkspace),
+			consumer("op", ScopeOperation),
+			consumer("ag", ScopeAgent))
+		c.standardValues = newStandardTools(t.TempDir(), &fakeJobs{})
+		rt := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
+		ws := mustOpenScope(t, c, context.Background(), workspaceScopeInfo("/ws/one"), []*scope{rt})
+		op := mustOpenScope(t, c, context.Background(), ScopeInfo{Kind: ScopeOperation, DataDir: "/owner/data", Workspace: "/ws/one", SessionID: "s", OperationID: "o"}, []*scope{rt, ws})
+		ag := mustOpenScope(t, c, context.Background(), ScopeInfo{Kind: ScopeAgent, DataDir: "/owner/data", Workspace: "/ws/one", SessionID: "s", OperationID: "o"}, []*scope{rt, ws, op})
+		for _, sc := range []*scope{rt, ws, op, ag} {
+			defer func() { _ = sc.close() }()
+		}
+		testassert.Require(t, slices.Equal(bound, []string{"runtime", "workspace", "operation", "agent"}), "standard tool bindings = %q, want every lifetime's factory to receive the owner-provided value", bound)
 	})
 
 	t.Run("a wrongly typed dependency on a standard tool rejects before any factory", func(t *testing.T) {

@@ -1011,7 +1011,7 @@ func TestPreparationPreparationHookErrorOnDrainedAndForkDelivery(t *testing.T) {
 // consequence rules: nil members change nothing, present empty Prompt and
 // ToolNames remove the prompt and advertisement, descriptions may be empty and
 // belong to the original catalog even while hidden, selected names restore
-// hidden tools in catalog order, and foreign or duplicate names are rejected.
+// hidden tools in their given order, and foreign or duplicate names are rejected.
 func TestPreparationViewClosedConsequenceSemantics(t *testing.T) {
 	catalog := []model.ToolDefinition{
 		{Name: "read_file", Description: "reads one file", Parameters: json.RawMessage(`{}`)},
@@ -1033,13 +1033,13 @@ func TestPreparationViewClosedConsequenceSemantics(t *testing.T) {
 	testassert.Require(t, len(view.tools()) == 0, "empty name consequence = %v, want no advertisement", toolNames(view.tools()))
 
 	// A hidden tool's accepted description remains in the catalog and is seen
-	// when a later contribution restores it, in catalog order.
+	// when a later contribution restores it, in the order that contribution gives.
 	testassert.NoError(t, view.apply("hook", PreparationConsequence{Descriptions: map[string]string{"write_file": ""}}))
 	testassert.NoError(t, view.apply("hook", PreparationConsequence{ToolNames: []string{"apply_patch"}}))
 	testassert.Require(t, slices.Equal(toolNames(view.tools()), []string{"apply_patch"}), "selected names = %v, want only apply_patch", toolNames(view.tools()))
 	testassert.NoError(t, view.apply("hook", PreparationConsequence{ToolNames: []string{"apply_patch", "write_file"}}))
-	testassert.Require(t, slices.Equal(toolNames(view.tools()), []string{"write_file", "apply_patch"}), "restored names = %v, want catalog order", toolNames(view.tools()))
-	testassert.Require(t, view.tools()[0].Description == "", "restored description = %q, want the earlier accepted empty text", view.tools()[0].Description)
+	testassert.Require(t, slices.Equal(toolNames(view.tools()), []string{"apply_patch", "write_file"}), "restored names = %v, want the given order", toolNames(view.tools()))
+	testassert.Require(t, view.tools()[1].Description == "", "restored description = %q, want the earlier accepted empty text", view.tools()[1].Description)
 
 	for _, row := range []struct {
 		name        string

@@ -312,12 +312,11 @@ type composition struct {
 // dependency IDs per plugin, assignable provider types, lifetime-compatible
 // PreparationHook declarations (Runtime or Workspace scope only), Tool
 // declarations carrying their description functions, and same-or-longer-lived
-// dependency scopes and an acyclic dependency graph. A capability the Core
-// dispatches is not a dependency target, whatever type the requirement names.
-// The seven standard tool declarations are seeded into the same export table
-// as owner-provided Runtime-lifetime capabilities, so an optional export
-// naming one collides as a duplicate provider and a dependency on one rejects
-// like a dependency on any other tool.
+// dependency scopes and an acyclic dependency graph. The seven standard tool
+// declarations are seeded into the same export table as owner-provided
+// Runtime-lifetime capabilities, so an optional export naming one collides as
+// a duplicate provider and an ordinary dependency on one resolves through the
+// same type and lifetime rules as any other capability.
 func newComposition(plugins []Plugin) (*composition, error) {
 	owned := make([]Plugin, len(plugins))
 	for i, p := range plugins {
@@ -387,9 +386,6 @@ func newComposition(plugins []Plugin) (*composition, error) {
 			src, ok := exports[req.id]
 			if !ok {
 				return nil, fmt.Errorf("plugin %q: required capability %q has no provider: %w", p.ID, req.id, ErrComposition)
-			}
-			if coreDispatched(src.spec.typ) {
-				return nil, fmt.Errorf("plugin %q: capability %q declared as %s is dispatched by the Core and is not a dependency target: %w", p.ID, req.id, src.spec.typ, ErrComposition)
 			}
 			if !src.spec.typ.AssignableTo(req.typ) {
 				return nil, fmt.Errorf("plugin %q: capability %q declared as %s is not assignable to required %s: %w", p.ID, req.id, src.spec.typ, req.typ, ErrComposition)
@@ -506,8 +502,8 @@ func (c *composition) bindReportWarning(scopeCtx context.Context, info ScopeInfo
 // order, seeding ordinary dependencies from the supplied ancestor scopes in
 // longer-to-shorter order. The Runtime scope binds the owner's directly
 // constructed standard tool values as its own provided capabilities before any
-// planned factory runs, so Core selection resolves them through the same Bind
-// path as any other capability. The failing
+// planned factory runs, so a factory's declared dependency on a standard tool
+// resolves through the same Bind path as any other capability. The failing
 // factory owns its provisional resources; every other failure runs the common
 // scope cleanup — cancel, join admitted work, dispose constructed instances in
 // reverse construction order attempting all and joining errors — and publishes
@@ -894,11 +890,4 @@ func (w *workspaceScopes) shutdown() error {
 		errs = append(errs, sc.close())
 	}
 	return errors.Join(errs...)
-}
-
-// coreDispatched reports whether a declared capability type reaches its
-// consumer only through the Core: tools and hooks cross the Harness effect
-// boundary, so no plugin may hold one as a dependency.
-func coreDispatched(typ reflect.Type) bool {
-	return typ == toolType || typ.Implements(preparationHookType) || typ.Implements(toolArgumentsHookType)
 }

@@ -174,24 +174,6 @@ func TestCompositionRejectsInvalidDeclarations(t *testing.T) {
 			declares("a", ScopeRuntime, "a.n"),
 			requires("b", ScopeRuntime, Spec[greeter]("a.n"), Spec[greeter]("a.n")),
 		}},
-		{"dependency on a tool", []Plugin{requires("a", ScopeRuntime, Spec[Tool]("read_file"))}},
-		{"dependency on a preparation hook", []Plugin{
-			provides("a", ScopeRuntime, Spec[PreparationHook]("a.hook")),
-			requires("b", ScopeRuntime, Spec[PreparationHook]("a.hook")),
-		}},
-		{"dependency on an argument hook", []Plugin{
-			provides("a", ScopeRuntime, Spec[ToolArgumentsHook]("a.args")),
-			requires("b", ScopeRuntime, Spec[ToolArgumentsHook]("a.args")),
-		}},
-		{"broad dependency on a tool", []Plugin{requires("a", ScopeRuntime, Spec[any]("read_file"))}},
-		{"broad dependency on a preparation hook", []Plugin{
-			provides("a", ScopeRuntime, Spec[PreparationHook]("a.hook")),
-			requires("b", ScopeRuntime, Spec[any]("a.hook")),
-		}},
-		{"broad dependency on an argument hook", []Plugin{
-			provides("a", ScopeRuntime, Spec[ToolArgumentsHook]("a.args")),
-			requires("b", ScopeRuntime, Spec[any]("a.args")),
-		}},
 		{"export ID collision across plugins", []Plugin{declares("a", ScopeRuntime, "dup"), declares("b", ScopeRuntime, "dup")}},
 		{"export ID collision within one plugin", []Plugin{declares("a", ScopeRuntime, "dup", "dup")}},
 		{"export ID collision across declaration types", []Plugin{
@@ -1110,12 +1092,53 @@ func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
 			}
 		})
 	}
-	// The ordinary sibling: the same declaration with its description composes.
+	// The ordinary sibling: requiring the Tool interface is the ordinary
+	// Requires declaration. The consumer's own export is a non-tool type, so
+	// the missing-description guard stays isolated to the rejection rows.
+	consumer := Plugin{ID: "consumer", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("consumer.greet")},
+		Requires: []CapabilitySpec{Spec[Tool]("tool.x")},
+		Open: func(_ context.Context, _ ScopeInfo, bindings Bindings) (Instance, error) {
+			if _, err := Bind[Tool](bindings, "tool.x"); err != nil {
+				return Instance{}, err
+			}
+			return Instance{Values: map[string]any{"consumer.greet": loudGreeter{word: "hi"}}}, nil
+		}}
 	provider := Plugin{ID: "toolprov", Scope: ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("tool.x", staticToolDescription("tool.x"))}, Open: noop}
 	{
-		_, err := newComposition([]Plugin{provider})
+		_, err := newComposition([]Plugin{provider, consumer})
 		testassert.NoError(t, err)
+	}
+}
+
+// TestDependencyOnToolsAndHooksUsesOrdinaryValidation proves tools and both
+// hook kinds compose like any other capability, whether the requirement names
+// the exact contract or a broader type, and that a wrongly typed requirement on
+// the same export is still rejected.
+func TestDependencyOnToolsAndHooksUsesOrdinaryValidation(t *testing.T) {
+	noop := func(context.Context, ScopeInfo, Bindings) (Instance, error) { return Instance{}, nil }
+	for _, row := range []struct {
+		name     string
+		provided CapabilitySpec
+		exact    CapabilitySpec
+	}{
+		{"tool", ToolSpec("x", staticToolDescription("x")), Spec[Tool]("x")},
+		{"preparation hook", Spec[PreparationHook]("x"), Spec[PreparationHook]("x")},
+		{"argument hook", Spec[ToolArgumentsHook]("x"), Spec[ToolArgumentsHook]("x")},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			compose := func(required CapabilitySpec) error {
+				_, err := newComposition([]Plugin{
+					{ID: "provider", Scope: ScopeRuntime, Provides: []CapabilitySpec{row.provided}, Open: noop},
+					{ID: "consumer", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[any]("consumer.cap")}, Requires: []CapabilitySpec{required}, Open: noop},
+				})
+				return err
+			}
+			testassert.NoError(t, compose(row.exact))
+			testassert.NoError(t, compose(Spec[any]("x")))
+			err := compose(Spec[greeter]("x"))
+			testassert.Require(t, errors.Is(err, ErrComposition), "wrongly typed requirement = %v, want ErrComposition", err)
+		})
 	}
 }
 

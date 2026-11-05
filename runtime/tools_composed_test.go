@@ -204,6 +204,30 @@ func TestStandardToolsCompiledIntoComposition(t *testing.T) {
 		}})
 		testassert.Require(t, err != nil && errors.Is(err, ErrComposition) && strings.Contains(err.Error(), `capability "run_command" already exported by the owner's standard tools`), "plugin exporting a standard tool name = %v, want the duplicate-provider collision", err)
 	}
+	{
+		_, err := newComposition([]Plugin{{
+			ID:       "dependent",
+			Scope:    ScopeWorkspace,
+			Provides: []CapabilitySpec{Spec[any]("marker")},
+			Requires: []CapabilitySpec{Spec[Tool]("write_file")},
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+				return Instance{Values: map[string]any{"marker": ""}}, nil
+			},
+		}})
+		testassert.Require(t, err == nil, "plugin depending on a standard tool name = %v, want the ordinary provider resolution", err)
+	}
+	{
+		_, err := newComposition([]Plugin{{
+			ID:       "dependent",
+			Scope:    ScopeRuntime,
+			Provides: []CapabilitySpec{Spec[any]("marker")},
+			Requires: []CapabilitySpec{Spec[greeter]("write_file")},
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+				return Instance{Values: map[string]any{"marker": ""}}, nil
+			},
+		}})
+		testassert.Require(t, err != nil && errors.Is(err, ErrComposition) && strings.Contains(err.Error(), "is not assignable to required"), "plugin depending on a standard tool name with the wrong type = %v, want the ordinary type rule", err)
+	}
 	byID, _ := openToolsComposed(t, t.TempDir(), &fakeJobs{}, Plugin{})
 	testassert.Equal(t, len(byID), 7)
 }

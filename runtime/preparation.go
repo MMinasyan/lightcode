@@ -122,7 +122,7 @@ type PreparationInput struct {
 // Absent Prompt and ToolNames change nothing; a present empty Prompt removes
 // the prompt and a present empty ToolNames advertises no tool. Description
 // keys and selected names must belong to the original eligible catalog;
-// selected names must be unique and are applied in catalog order. Description
+// selected names must be unique and keep their given order. Description
 // text may be empty. Parameters, identity and eligibility remain the tool
 // owner's metadata.
 type PreparationConsequence struct {
@@ -831,7 +831,7 @@ func newPreparationView(assembly prompt.AssemblyInput, prompt string, catalog []
 	return &preparationView{assembly: assembly, prompt: prompt, catalog: catalog, visible: visible}
 }
 
-// tools returns the current visible subset in catalog order.
+// tools returns the current visible subset in its visible order.
 func (v *preparationView) tools() []model.ToolDefinition {
 	index := make(map[string]model.ToolDefinition, len(v.catalog))
 	for _, definition := range v.catalog {
@@ -863,7 +863,7 @@ func (v *preparationView) input(session harness.SessionIdentity, ref model.Model
 
 // apply accepts one contribution's consequence. Descriptions and selected names
 // must belong to the original eligible catalog; selected names must be unique
-// and are canonicalized into catalog order. A present empty Prompt or
+// and keep their given order. A present empty Prompt or
 // ToolNames removes the prompt or advertisement respectively.
 func (v *preparationView) apply(id string, consequence PreparationConsequence) error {
 	if consequence.Prompt != nil {
@@ -891,13 +891,7 @@ func (v *preparationView) apply(id string, consequence PreparationConsequence) e
 			}
 			selected[name] = true
 		}
-		visible := make([]string, 0, len(selected))
-		for _, definition := range v.catalog {
-			if selected[definition.Name] {
-				visible = append(visible, definition.Name)
-			}
-		}
-		v.visible = visible
+		v.visible = slices.Clone(consequence.ToolNames)
 	}
 	return nil
 }
