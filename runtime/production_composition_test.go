@@ -26,11 +26,9 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	modeladapt "github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/prompt"
 )
 
 // chainAgentsDocument builds the combined scenario's agents document with the
@@ -125,67 +123,8 @@ func argumentHookPlugin(id string, hook ToolArgumentsHook) Plugin {
 		ID:       "arghooks",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[ToolArgumentsHook](id)},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{id: hook}}, nil
-		},
-	}
-}
-
-// bundledAdaptation is the capability-ID row's preparation contribution: the
-// bundled binding table's own treatment applied through the closed
-// consequence (the shipped adaptation plugin package cannot be imported from
-// in-package tests, so its behavior is composed directly over the real bundled
-// matcher).
-type bundledAdaptation struct{}
-
-func (bundledAdaptation) Prepare(_ context.Context, input PreparationInput) (PreparationConsequence, error) {
-	match := modeladapt.Match(input.Model.Model)
-	if match == nil {
-		return PreparationConsequence{}, nil
-	}
-	var consequence PreparationConsequence
-	if len(match.Append) > 0 && input.Assembly.Mode == prompt.ModeFull {
-		prompt := modeladapt.TransformPrompt(input.Prompt, &modeladapt.Adaptation{Append: match.Append})
-		consequence.Prompt = &prompt
-	}
-	if len(match.ExcludeTools) > 0 {
-		excluded := make(map[string]bool, len(match.ExcludeTools))
-		for _, name := range match.ExcludeTools {
-			excluded[name] = true
-		}
-		names := make([]string, 0, len(input.Catalog))
-		for _, definition := range input.Catalog {
-			if !excluded[definition.Name] {
-				names = append(names, definition.Name)
-			}
-		}
-		consequence.ToolNames = names
-	}
-	if len(match.ToolDescriptionReplacements) > 0 {
-		replacements := &modeladapt.Adaptation{ToolDescriptionReplacements: match.ToolDescriptionReplacements}
-		descriptions := make(map[string]string)
-		for _, definition := range input.Catalog {
-			rendered := modeladapt.RenderToolDescription(definition.Description, replacements)
-			if rendered != definition.Description {
-				descriptions[definition.Name] = rendered
-			}
-		}
-		if len(descriptions) > 0 {
-			consequence.Descriptions = descriptions
-		}
-	}
-	return consequence, nil
-}
-
-// bundledAdaptationPlugin declares the bundled treatment as one ordinary
-// selected preparation contribution.
-func bundledAdaptationPlugin() Plugin {
-	return Plugin{
-		ID:       "adapt",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[PreparationHook]("model_adaptation")},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
-			return Instance{Values: map[string]any{"model_adaptation": bundledAdaptation{}}}, nil
 		},
 	}
 }
@@ -409,7 +348,7 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		openChained := func(ctx context.Context, hook *recordHook, argHook *rewriteWriteHook) (*Runtime, error) {
 			return Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []Plugin{
 				hookPlugin(hook),
-				argumentHookPlugin("arg.rewrite", argHook), bundledAdaptationPlugin(),
+				argumentHookPlugin("arg.rewrite", argHook), ShippedAdaptationPlugin(),
 			}})
 		}
 		owner, ownerCancel := context.WithCancel(ctx)
@@ -705,7 +644,7 @@ func TestProductionCapabilityIDsModelIndependent(t *testing.T) {
   "vanillaagent": {"model": "prov/vanilla", "system_prompt": "full", "tools": ["read_file", "write_file", "edit_file", "apply_patch"], "capabilities": ["model_adaptation"]}
 }`)
 
-		r, err := e.openPlugins(ctx, bundledAdaptationPlugin())
+		r, err := e.openPlugins(ctx, ShippedAdaptationPlugin())
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 

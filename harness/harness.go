@@ -298,9 +298,10 @@ type ToolOutcome struct {
 	Result   model.ToolResult
 	Metadata json.RawMessage // optional, bounded, well-formed; semantics owned by the tool
 	// Evidence is the producing plan's execution knowledge. It is read only
-	// from executor outcomes: an immediate plan's success is observed and
-	// every other immediate status is not_started, whatever value the
-	// producer supplied.
+	// from executor outcomes, and an executor sets it only when it cannot
+	// report an observed result: empty means the valid returned result is the
+	// observation. An immediate plan's success is observed and every other
+	// immediate status is not_started, whatever value the producer supplied.
 	Evidence ExecutionEvidence
 }
 

@@ -178,7 +178,7 @@ func (e *ownerEnv) corePlugin(id, exportID string, value any, closeFn func() err
 		ID:       id,
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[harness.Storage](exportID)},
-		Open: func(_ context.Context, info ScopeInfo) (Instance, error) {
+		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
 			e.scopeDataDir.Store(info.DataDir)
 			e.events.add("open:" + id)
 			return Instance{Values: map[string]any{exportID: value}, Close: closeFn}, nil
@@ -188,12 +188,13 @@ func (e *ownerEnv) corePlugin(id, exportID string, value any, closeFn func() err
 
 // ordinaryPlugin provides one value capability and records its construction
 // and disposal order.
-func (e *ownerEnv) ordinaryPlugin(id string, scope ScopeKind, providesID string) Plugin {
+func (e *ownerEnv) ordinaryPlugin(id string, scope ScopeKind, providesID string, requires ...CapabilitySpec) Plugin {
 	return Plugin{
 		ID:       id,
 		Scope:    scope,
 		Provides: []CapabilitySpec{Spec[any](providesID)},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Requires: requires,
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			e.events.add("open:" + id)
 			return Instance{
 				Values: map[string]any{providesID: id},
@@ -211,7 +212,7 @@ func (e *ownerEnv) countedPlugin(id string, scope ScopeKind, providesID string, 
 		ID:       id,
 		Scope:    scope,
 		Provides: []CapabilitySpec{Spec[any](providesID)},
-		Open: func(_ context.Context, info ScopeInfo) (Instance, error) {
+		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
 			e.scopeWorkspace.Store(info.Workspace)
 			e.events.add("open:" + id)
 			opens <- count.Add(1)
@@ -227,7 +228,7 @@ func (e *ownerEnv) sqliteDerivationPlugin() Plugin {
 		ID:       "db",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[harness.Storage]("session_store")},
-		Open: func(_ context.Context, info ScopeInfo) (Instance, error) {
+		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
 			e.scopeDataDir.Store(info.DataDir)
 			e.events.add("open:db")
 			store, err := storage.OpenSQLite(filepath.Join(info.DataDir, "lightcode.db"))
@@ -717,7 +718,7 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 	t.Run("factory failure disposes the constructed prefix", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		failing := e.ordinaryPlugin("failing", ScopeRuntime, "failing.cap")
-		failing.Open = func(context.Context, ScopeInfo) (Instance, error) {
+		failing.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			e.events.add("open:failing")
 			return Instance{}, errFactory
 		}
@@ -764,7 +765,7 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		defer cancel()
 		arrive := make(chan struct{}, 1)
 		first := e.ordinaryPlugin("signalled", ScopeRuntime, "signalled.cap")
-		first.Open = func(context.Context, ScopeInfo) (Instance, error) {
+		first.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			e.events.add("open:signalled")
 			select {
 			case arrive <- struct{}{}:
@@ -773,7 +774,7 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 			return Instance{Values: map[string]any{"signalled.cap": "signalled"}, Close: func() error { e.events.add("close:signalled"); return nil }}, nil
 		}
 		second := e.ordinaryPlugin("waiting", ScopeRuntime, "waiting.cap")
-		second.Open = func(ctx context.Context, _ ScopeInfo) (Instance, error) {
+		second.Open = func(ctx context.Context, _ ScopeInfo, _ Bindings) (Instance, error) {
 			<-ctx.Done()
 			e.events.add("open:waiting")
 			return Instance{}, ctx.Err()
@@ -904,24 +905,25 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 			e.events.add("close:core")
 			return errStorageClose
 		})
-		// Construction follows registration order.
-		y := e.ordinaryPlugin("y", ScopeRuntime, "y.cap")
-		y.Open = func(context.Context, ScopeInfo) (Instance, error) {
+		// The consumer is registered before its provider: construction must still
+		// follow the composition's stable topological order.
+		y := e.ordinaryPlugin("y", ScopeRuntime, "y.cap", Spec[any]("x.cap"))
+		y.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			e.events.add("open:y")
 			return Instance{Values: map[string]any{"y.cap": "y"}, Close: func() error { e.events.add("close:y"); return nil }}, nil
 		}
 		x := e.ordinaryPlugin("x", ScopeRuntime, "x.cap")
-		x.Open = func(context.Context, ScopeInfo) (Instance, error) {
+		x.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			e.events.add("open:x")
 			return Instance{Values: map[string]any{"x.cap": "x"}, Close: func() error { e.events.add("close:x"); return errXClose }}, nil
 		}
 		w := e.ordinaryPlugin("w", ScopeWorkspace, "w.cap")
 
-		r, err := e.open(context.Background(), x, y, w)
+		r, err := e.open(context.Background(), y, x, w)
 		testassert.NoError(t, err)
 		{
 			events := eventNames(e.events.all())
-			testassert.Require(t, orderedSubset(events, "open:x", "open:y"), "factory events = %v, want registration order", events)
+			testassert.Require(t, orderedSubset(events, "open:x", "open:y"), "factory events = %v, want dependencies constructed before consumers in stable topological order", events)
 		}
 		{
 			_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws"})
@@ -967,7 +969,7 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 		wantClose := []string{"close:w", "close:y", "close:x", "close:core"}
 		{
 			got := eventsNamedList(e.events.all(), "close")
-			testassert.Require(t, slices.Equal(got, wantClose), "close events = %v, want Workspace scopes before the Runtime scope and reverse registration order inside it", got)
+			testassert.Require(t, slices.Equal(got, wantClose), "close events = %v, want Workspace scopes before the Runtime scope and reverse dependency order inside it", got)
 		}
 	})
 }
@@ -1414,7 +1416,7 @@ func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
 			Provides: []CapabilitySpec{ToolSpec("write_file", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 				return ToolDescription{}, nil
 			})},
-			Open: func(context.Context, ScopeInfo) (Instance, error) {
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				return Instance{Values: map[string]any{"write_file": nil}}, nil
 			},
 		}
@@ -1424,10 +1426,26 @@ func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
 }
 
 // TestRuntimeStandardToolsAreOwnerProvidedCapabilities proves the one
-// capability path for the directly constructed baseline tools: the owner
-// installs them in the Runtime scope's bindings, and a duplicate export of a
-// standard tool rejects before any factory dispatches.
+// capability and binding path for the directly constructed baseline tools: the
+// owner installs them in the Runtime scope's bindings before any optional
+// factory runs, a plugin at every shorter lifetime binds the actual value
+// through Bind and can run it, and the nearest forbidden siblings — a duplicate
+// export, a wrongly typed dependency — reject before any factory dispatches.
 func TestRuntimeStandardToolsAreOwnerProvidedCapabilities(t *testing.T) {
+	t.Run("a dependency on a standard tool rejects before any factory", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		consumer := e.ordinaryPlugin("consumer", ScopeRuntime, "consumer.cap", Spec[Tool]("read_file"))
+		wantFailedOpen(t, e, []Plugin{consumer}, ErrComposition)
+		e.assertNoOwnershipSideEffects(t)
+	})
+
+	t.Run("a wrongly typed dependency on a standard tool rejects before any factory", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		consumer := e.ordinaryPlugin("consumer", ScopeRuntime, "consumer.cap", Spec[greeter]("read_file"))
+		wantFailedOpen(t, e, []Plugin{consumer}, ErrComposition)
+		e.assertNoOwnershipSideEffects(t)
+	})
+
 	t.Run("a duplicate export of a standard tool rejects before any factory", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		shadow := Plugin{
@@ -1436,7 +1454,7 @@ func TestRuntimeStandardToolsAreOwnerProvidedCapabilities(t *testing.T) {
 			Provides: []CapabilitySpec{ToolSpec("read_file", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 				return ToolDescription{Definition: model.ToolDefinition{Name: "read_file", Parameters: json.RawMessage(`{}`)}}, nil
 			})},
-			Open: func(context.Context, ScopeInfo) (Instance, error) {
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				return Instance{Values: map[string]any{"read_file": readTool{}}}, nil
 			},
 		}
@@ -1499,7 +1517,7 @@ func shortScopeProbe(id string, scope ScopeKind, opens *atomic.Int64) Plugin {
 		ID:       id,
 		Scope:    scope,
 		Provides: []CapabilitySpec{Spec[any](id + ".cap")},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			opens.Add(1)
 			return Instance{Values: map[string]any{id + ".cap": id}}, nil
 		},

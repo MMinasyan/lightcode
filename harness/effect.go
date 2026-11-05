@@ -1678,6 +1678,9 @@ func (d *executionDriver) toolEffect() agent.ToolEffect {
 		// Execute receives the committed concrete-tool reservation's context;
 		// this is the only callback with action authority.
 		outcome := ownToolOutcome(plan.Execute(ctx))
+		if outcome.Evidence == "" { // a valid returned result is itself the observation
+			outcome.Evidence = ExecutionObserved
+		}
 		if _, err := model.NewToolResult(outcome.Result); err != nil || outcome.Result.CallID != call.ID ||
 			!validExecutionEvidence(outcome.Evidence) ||
 			(outcome.Result.Status == model.ResultSuccess && outcome.Evidence != ExecutionObserved) {

@@ -142,7 +142,7 @@ func (taskTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.To
 				CallID:  call.ID,
 				Status:  model.ResultSuccess,
 				Content: fmt.Sprintf(taskStartedTemplate, result),
-			}, Evidence: harness.ExecutionObserved}
+			}}
 		},
 	}
 }
@@ -167,7 +167,7 @@ func resolveSubagent(name string, roster []harness.AgentType) error {
 // failure — through the uniform tool-error path: the harness's rejection
 // details are model-facing and arrive unwrapped.
 func launchOutcome(callID string, err error) harness.ToolOutcome {
-	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}, Evidence: harness.ExecutionObserved}
+	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
 }
 
 // immediateError is the normalization-class immediate outcome: status error
@@ -246,7 +246,7 @@ func Plugin() runtime.Plugin {
 
 // open checks the scope context and publishes the stateless tool value; no
 // per-Session state is created here.
-func open(ctx context.Context, _ runtime.ScopeInfo) (runtime.Instance, error) {
+func open(ctx context.Context, _ runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.Instance{}, err
 	}

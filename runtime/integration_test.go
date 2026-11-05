@@ -30,16 +30,39 @@ import (
 
 func assembledConfigDocument(endpoint, tag, label string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "ASSEMBLED_TEST_KEY",
-		`{"m":{"name":"M","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `},"probe":{"label":` + fixtureString(label) + `}}}`
+		`{"m":{"name":"M","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `},"depper":{"label":` + fixtureString(label) + `}}}`
 }
 
 // The "leaky" definition selects the Core storage export by ID: raw storage
 // is not in the ordinary capability universe, so the definition drops and the
 // type is unknown at admission — raw storage is never exported into execution.
 const assembledAgentsDocument = `{
-  "integrated": {"model": "prov/m", "system_prompt": "simple", "tools": ["probe"], "capabilities": ["hook.first"]},
+  "integrated": {"model": "prov/m", "system_prompt": "simple", "tools": ["probe"], "capabilities": ["hook.first", "dep.worker"]},
   "leaky": {"model": "prov/m", "system_prompt": "simple", "capabilities": ["session_store"]}
 }`
+
+type combinedBase struct{}
+
+func (combinedBase) Base() string { return "base" }
+
+// combinedWorker is one dependent capability: its factory receives its
+// declared dependency, and every call reads its own settings from the
+// Invocation the caller passed, never from ambient state.
+type combinedWorker struct{ base combinedBase }
+
+func (w combinedWorker) Work(inv Invocation) string {
+	label := ""
+	if raw := inv.Config("depper"); len(raw) > 0 {
+		var settings struct {
+			Label string `json:"label"`
+		}
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			return "undecodable:" + err.Error()
+		}
+		label = settings.Label
+	}
+	return label + ":" + w.base.Base()
+}
 
 // workspaceOpens records the Workspace identity of every Workspace scope
 // construction, in construction order.
@@ -95,17 +118,18 @@ func (h *parkingHook) arm(release, used chan struct{}) {
 	h.mu.Unlock()
 }
 
-// probeTool is the concrete tool capability of the assembled scenario: every
-// real tool dispatch records the revision-scoped label from its own captured
-// Invocation.
+// probeTool is the concrete tool capability of the assembled scenario: its
+// preparation invokes the dependent capability it was constructed with, so
+// every real tool dispatch records one revision-scoped dependency invocation.
 type probeTool struct {
+	worker combinedWorker
 	events *traceLog
 }
 
 func (t probeTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "probe",
-		Description: "records the revision-scoped label",
+		Description: "records one dependency invocation",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
 	})
 	if err != nil {
@@ -119,11 +143,7 @@ func (t probeTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessag
 }
 
 func (t probeTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
-	var settings struct {
-		Label string `json:"label"`
-	}
-	_ = json.Unmarshal(tc.Invocation.Config("probe"), &settings) // absent settings record the empty label
-	t.events.add("work:" + settings.Label)
+	t.events.add("work:" + t.worker.Work(tc.Invocation))
 	return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "probed"}}}
 }
 
@@ -187,21 +207,47 @@ func assembledPlugins(e *ownerEnv, store harness.Storage, hook *recordHook, ws *
 	return []Plugin{
 		hookPlugin(hook),
 		{
-			ID:       "probe",
+			ID:       "base",
 			Scope:    ScopeWorkspace,
-			Provides: []CapabilitySpec{ToolSpec("probe", probeTool{}.describe)},
+			Provides: []CapabilitySpec{Spec[combinedBase]("dep.base")},
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+				return Instance{Values: map[string]any{"dep.base": combinedBase{}}}, nil
+			},
+		},
+		{
+			ID:       "depper",
+			Scope:    ScopeWorkspace,
+			Provides: []CapabilitySpec{Spec[combinedWorker]("dep.worker")},
+			Requires: []CapabilitySpec{Spec[combinedBase]("dep.base")},
 			ValidateConfig: func(raw json.RawMessage) error {
 				var settings struct {
 					Label string `json:"label"`
 				}
 				if err := json.Unmarshal(raw, &settings); err != nil || settings.Label == "" {
-					return errors.New("probe requires a non-empty label")
+					return errors.New("depper requires a non-empty label")
 				}
 				return nil
 			},
-			Open: func(_ context.Context, info ScopeInfo) (Instance, error) {
+			Open: func(_ context.Context, info ScopeInfo, bindings Bindings) (Instance, error) {
 				ws.opened(info.Workspace)
-				return Instance{Values: map[string]any{"probe": probeTool{events: e.events}}}, nil
+				base, err := Bind[combinedBase](bindings, "dep.base")
+				if err != nil {
+					return Instance{}, err
+				}
+				return Instance{Values: map[string]any{"dep.worker": combinedWorker{base: base}}}, nil
+			},
+		},
+		{
+			ID:       "probe",
+			Scope:    ScopeWorkspace,
+			Provides: []CapabilitySpec{ToolSpec("probe", probeTool{}.describe)},
+			Requires: []CapabilitySpec{Spec[combinedWorker]("dep.worker")},
+			Open: func(_ context.Context, _ ScopeInfo, bindings Bindings) (Instance, error) {
+				worker, err := Bind[combinedWorker](bindings, "dep.worker")
+				if err != nil {
+					return Instance{}, err
+				}
+				return Instance{Values: map[string]any{"probe": probeTool{worker: worker, events: e.events}}}, nil
 			},
 		},
 	}
@@ -325,8 +371,8 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		if !slices.Equal(toolNames(rec.Admission.Execution.Tools), []string{"probe"}) {
 			t.Fatalf("first turn advertisement = %v, want the composed probe tool", toolNames(rec.Admission.Execution.Tools))
 		}
-		if n := countEvents(e.events.all(), "work:L1"); n != 1 {
-			t.Fatalf("probe invocations reading revision-1 settings = %d, want 1: %v", n, e.events.all())
+		if n := countEvents(e.events.all(), "work:L1:base"); n != 1 {
+			t.Fatalf("dependency invocations reading revision-1 settings = %d, want 1: %v", n, e.events.all())
 		}
 		if server.requests() != 2 {
 			t.Fatalf("model requests = %d, want the tool-call turn and the follow-up", server.requests())
@@ -400,8 +446,8 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			got := hook.calls()
 			testassert.Require(t, slices.Equal(got, []hookCall{{tag: "T1"}, {tag: "T1"}, {tag: "T2"}}), "hook calls = %v, want the configured tag of each call", got)
 		}
-		if n := countEvents(e.events.all(), "work:L2"); n != 1 {
-			t.Fatalf("probe invocations reading revision-2 settings = %d, want 1: %v", n, e.events.all())
+		if n := countEvents(e.events.all(), "work:L2:base"); n != 1 {
+			t.Fatalf("dependency invocations reading revision-2 settings = %d, want 1: %v", n, e.events.all())
 		}
 		// Consume the healthy subscription through op-a2's Operation-close
 		// publication so the remaining sequence is deterministic.

@@ -198,7 +198,7 @@ func TestStandardToolsCompiledIntoComposition(t *testing.T) {
 			Provides: []CapabilitySpec{ToolSpec("run_command", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 				return ToolDescription{}, nil
 			})},
-			Open: func(context.Context, ScopeInfo) (Instance, error) {
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				return Instance{Values: map[string]any{"run_command": nil}}, nil
 			},
 		}})

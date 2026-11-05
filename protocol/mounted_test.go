@@ -81,7 +81,7 @@ func mountedReporterPlugin() runtime.Plugin {
 		ID:       "mounted_reporter",
 		Scope:    runtime.ScopeRuntime,
 		Provides: []runtime.CapabilitySpec{runtime.Spec[any]("mounted.reporter")},
-		Open: func(_ context.Context, info runtime.ScopeInfo) (runtime.Instance, error) {
+		Open: func(_ context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
 			if info.ReportWarning != nil {
 				info.ReportWarning("mounted_notice", "mounted plugin warning")
 			}

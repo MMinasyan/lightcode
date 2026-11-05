@@ -105,7 +105,7 @@ func hookPlugin(hook *recordHook) Plugin {
 			}
 			return nil
 		},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"hook.first": hook}}, nil
 		},
 	}
@@ -116,7 +116,7 @@ func parkPlugin(park *parkingHook) Plugin {
 		ID:       "park",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[PreparationHook]("park.second")},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"park.second": park}}, nil
 		},
 	}
@@ -222,7 +222,7 @@ func productionToolsPlugin() Plugin {
 		ID:       "prodtools",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("prod_write", fileWriteTool{}.describe), ToolSpec("prod_read", fileReadTool{}.describe)},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"prod_write": fileWriteTool{}, "prod_read": fileReadTool{}}}, nil
 		},
 	}
@@ -246,7 +246,7 @@ func prodAdaptationPlugin() Plugin {
 		ID:       "adapt",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[PreparationHook]("model_adaptation")},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"model_adaptation": testAdaptation{}}}, nil
 		},
 	}
@@ -992,7 +992,7 @@ func countingWorkspacePlugin(opens *atomic.Int64) Plugin {
 		ID:       "wsprobe",
 		Scope:    ScopeWorkspace,
 		Provides: []CapabilitySpec{Spec[any]("ws.probe")},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			opens.Add(1)
 			return Instance{Values: map[string]any{"ws.probe": struct{}{}}}, nil
 		},

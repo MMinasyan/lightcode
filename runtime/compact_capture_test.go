@@ -105,7 +105,7 @@ func compactToolsPlugin() Plugin {
 		ID:       "compacttools",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("echo", staticToolDescription("echo")), ToolSpec("read", staticToolDescription("read"))},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"echo": noopTool{}, "read": noopTool{}}}, nil
 		},
 	}
@@ -125,7 +125,7 @@ func compactPrepSelection(t *testing.T, captured configurationCapture, agentName
 	t.Helper()
 	agent, err := harness.ResolveAgentType(agentName, captured.snapshot.agentTypes())
 	testassert.Require(t, err == nil, "ResolveAgentType(%q): %v", agentName, err)
-	return selection{agent: agent, bindings: bindings{}, invocation: Invocation{snapshot: captured.snapshot}, credentials: captured.credentials}
+	return selection{agent: agent, bindings: Bindings{}, invocation: Invocation{snapshot: captured.snapshot}, credentials: captured.credentials}
 }
 
 // TestConcretePrepareCompactCapture pins every capture field the compaction

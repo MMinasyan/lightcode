@@ -449,7 +449,7 @@ func freedHookPlugin(hook *recordHook) Plugin {
 		ID:       "freedhooks",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{Spec[PreparationHook]("hook.freed")},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"hook.freed": hook}}, nil
 		},
 	}
@@ -491,6 +491,8 @@ func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 		"(Invocation).Revision":              true,
 		"BackgroundServices":                 true,
 		"CapabilitySpec":                     true,
+		"Bind":                               true,
+		"Bindings":                           true,
 		"ChildRequest":                       true,
 		"ErrClosed":                          true,
 		"ErrComposition":                     true,

@@ -270,6 +270,9 @@ func TestPreparationContributionBundledDescriptionReplacementIsLiteral(t *testin
 		}
 		return out
 	}
+	instance, err := ShippedAdaptationPlugin().Open(context.Background(), ScopeInfo{}, Bindings{})
+	testassert.NoError(t, err)
+	adaptationHook := instance.Values["model_adaptation"].(PreparationHook)
 	req := baseSurfaceRequest(t)
 	req.toolSpecs = []CapabilitySpec{
 		ToolSpec("run_command", runCommandTool{}.describe),
@@ -282,7 +285,7 @@ func TestPreparationContributionBundledDescriptionReplacementIsLiteral(t *testin
 		_, catalog, err := composeSurface(r)
 		testassert.NoError(t, err)
 		view := newPreparationView(prompt.AssemblyInput{Mode: prompt.ModeFull}, "BASE", catalog)
-		consequence, err := bundledAdaptation{}.Prepare(context.Background(), view.input(harness.SessionIdentity{}, model.ModelRef{Provider: "prov", Model: "gpt-5.5"}, constraints, nil))
+		consequence, err := adaptationHook.Prepare(context.Background(), view.input(harness.SessionIdentity{}, model.ModelRef{Provider: "prov", Model: "gpt-5.5"}, constraints, nil))
 		testassert.NoError(t, err)
 		testassert.NoError(t, view.apply("adapt", consequence))
 		return descriptions(view.tools())

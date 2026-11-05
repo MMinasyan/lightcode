@@ -38,7 +38,7 @@ type openInvocation func(context.Context, harness.OperationAdmission, selection,
 // and present in the execution view; neither selection is ever rebound.
 type selection struct {
 	agent      harness.AgentType
-	bindings   bindings
+	bindings   Bindings
 	invocation Invocation
 
 	// credentials is the preparation's one captured credential observation
@@ -301,7 +301,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 // selected capability provided only by an Operation or Agent scope is valid
 // but not constructed yet, so it stays absent until Open rather than rejecting
 // the admission.
-func (p *preparation) preparationBindings(workspaceScope *scope, selected []string) bindings {
+func (p *preparation) preparationBindings(workspaceScope *scope, selected []string) Bindings {
 	entries := make(map[string]bindingEntry, len(selected))
 	for _, id := range selected {
 		for _, source := range []*scope{p.runtime, workspaceScope} {
@@ -311,7 +311,7 @@ func (p *preparation) preparationBindings(workspaceScope *scope, selected []stri
 			}
 		}
 	}
-	return bindings{entries: entries}
+	return Bindings{entries: entries}
 }
 
 // open turns the committed admission into the execution: it first acquires
@@ -410,14 +410,14 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 // are the capability IDs, each hook's extension identity is the supplying
 // plugin's, and every Runtime-declared argument hook participates as an
 // effectful boundary. Each hook receives the same captured Invocation.
-func bindToolArgumentHooks(selected []string, bindings bindings, invocation Invocation) ([]harness.ToolArgumentsHook, error) {
+func bindToolArgumentHooks(selected []string, bindings Bindings, invocation Invocation) ([]harness.ToolArgumentsHook, error) {
 	var hooks []harness.ToolArgumentsHook
 	for _, id := range selected {
 		entry, ok := bindings.entries[id]
 		if !ok || !entry.declared.Implements(toolArgumentsHookType) {
 			continue
 		}
-		hook, err := bind[ToolArgumentsHook](bindings, id)
+		hook, err := Bind[ToolArgumentsHook](bindings, id)
 		if err != nil {
 			return nil, err
 		}
@@ -752,7 +752,7 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 	return func(_ context.Context, admission harness.OperationAdmission, sel selection, request harness.InvocationRequest) (harness.InvocationExecution, error) {
 		table := make(map[string]Tool, len(advertised))
 		for _, definition := range advertised {
-			tool, err := bind[Tool](sel.bindings, definition.Name)
+			tool, err := Bind[Tool](sel.bindings, definition.Name)
 			if err != nil {
 				return harness.InvocationExecution{}, err
 			}
@@ -931,7 +931,7 @@ func runPreparationContributions(ctx context.Context, session harness.SessionIde
 		if !ok || !entry.declared.Implements(preparationHookType) {
 			continue
 		}
-		hook, err := bind[PreparationHook](sel.bindings, id)
+		hook, err := Bind[PreparationHook](sel.bindings, id)
 		if err != nil {
 			return err
 		}

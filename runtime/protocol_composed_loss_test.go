@@ -66,7 +66,7 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 		// real trace is spelled out: one invocation during recovery fails this
 		// oracle even while the model counter still reads zero.
 		testassert.Equal(t, server.requests(), 0)
-		testassert.Equal(t, countEvents(e.events.all(), "work:L1"), 0)
+		testassert.Equal(t, countEvents(e.events.all(), "work:L1:base"), 0)
 
 		// Durable interruption through the mounted read: the seeded running
 		// root settled as the runtime-loss interruption with no live member.

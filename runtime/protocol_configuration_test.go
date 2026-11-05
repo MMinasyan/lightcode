@@ -82,7 +82,7 @@ func rosterToolPlugin() Plugin {
 		ID:       "prodtools",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("prod_read", fileReadTool{}.describe)},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"prod_read": fileReadTool{}}}, nil
 		},
 	}

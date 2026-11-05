@@ -135,7 +135,7 @@ func mustOpenScope(t *testing.T, c *composition, ctx context.Context, info Scope
 func TestCompositionRejectsInvalidDeclarations(t *testing.T) {
 	var opened int
 	provides := func(id string, scope ScopeKind, specs ...CapabilitySpec) Plugin {
-		return Plugin{ID: id, Scope: scope, Provides: specs, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		return Plugin{ID: id, Scope: scope, Provides: specs, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			opened++
 			values := make(map[string]any, len(specs))
 			for _, spec := range specs {
@@ -151,6 +151,11 @@ func TestCompositionRejectsInvalidDeclarations(t *testing.T) {
 		}
 		return provides(id, scope, specs...)
 	}
+	requires := func(id string, scope ScopeKind, reqs ...CapabilitySpec) Plugin {
+		p := provides(id, scope, Spec[greeter](id+".own"))
+		p.Requires = reqs
+		return p
+	}
 	for _, row := range []struct {
 		name    string
 		plugins []Plugin
@@ -159,17 +164,62 @@ func TestCompositionRejectsInvalidDeclarations(t *testing.T) {
 		{"duplicate plugin ID", []Plugin{declares("a", ScopeRuntime, "a.g"), declares("a", ScopeWorkspace, "b.g")}},
 		{"invalid scope kind", []Plugin{declares("a", ScopeKind("session"), "a.g")}},
 		{"missing Open", []Plugin{{ID: "a", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("a.g")}}}},
-		{"missing providers", []Plugin{{ID: "a", Scope: ScopeRuntime, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		{"missing providers", []Plugin{{ID: "a", Scope: ScopeRuntime, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			opened++
 			return Instance{}, nil
 		}}}},
 		{"empty export ID", []Plugin{provides("a", ScopeRuntime, Spec[greeter](""))}},
+		{"empty dependency ID", []Plugin{requires("a", ScopeRuntime, Spec[greeter](""))}},
+		{"duplicate dependency ID", []Plugin{
+			declares("a", ScopeRuntime, "a.n"),
+			requires("b", ScopeRuntime, Spec[greeter]("a.n"), Spec[greeter]("a.n")),
+		}},
+		{"dependency on a tool", []Plugin{requires("a", ScopeRuntime, Spec[Tool]("read_file"))}},
+		{"dependency on a preparation hook", []Plugin{
+			provides("a", ScopeRuntime, Spec[PreparationHook]("a.hook")),
+			requires("b", ScopeRuntime, Spec[PreparationHook]("a.hook")),
+		}},
+		{"dependency on an argument hook", []Plugin{
+			provides("a", ScopeRuntime, Spec[ToolArgumentsHook]("a.args")),
+			requires("b", ScopeRuntime, Spec[ToolArgumentsHook]("a.args")),
+		}},
+		{"broad dependency on a tool", []Plugin{requires("a", ScopeRuntime, Spec[any]("read_file"))}},
+		{"broad dependency on a preparation hook", []Plugin{
+			provides("a", ScopeRuntime, Spec[PreparationHook]("a.hook")),
+			requires("b", ScopeRuntime, Spec[any]("a.hook")),
+		}},
+		{"broad dependency on an argument hook", []Plugin{
+			provides("a", ScopeRuntime, Spec[ToolArgumentsHook]("a.args")),
+			requires("b", ScopeRuntime, Spec[any]("a.args")),
+		}},
 		{"export ID collision across plugins", []Plugin{declares("a", ScopeRuntime, "dup"), declares("b", ScopeRuntime, "dup")}},
 		{"export ID collision within one plugin", []Plugin{declares("a", ScopeRuntime, "dup", "dup")}},
 		{"export ID collision across declaration types", []Plugin{
 			provides("a", ScopeRuntime, Spec[harness.Storage]("core")),
 			declares("b", ScopeRuntime, "core"),
 		}},
+		{"missing binding", []Plugin{requires("a", ScopeRuntime, Spec[greeter]("nobody"))}},
+		{"provider type not assignable to requested type", []Plugin{
+			provides("a", ScopeRuntime, Spec[greeter]("g")),
+			requires("b", ScopeRuntime, Spec[loudGreeter]("g")),
+		}},
+		{"incompatible value export", []Plugin{
+			provides("a", ScopeRuntime, Spec[int]("n")),
+			requires("b", ScopeRuntime, Spec[string]("n")),
+		}},
+		{"Runtime scope requiring a Workspace export", []Plugin{
+			declares("w", ScopeWorkspace, "w.g"),
+			requires("r", ScopeRuntime, Spec[greeter]("w.g")),
+		}},
+		{"Workspace scope requiring an Agent export", []Plugin{
+			declares("ag", ScopeAgent, "ag.g"),
+			requires("w", ScopeWorkspace, Spec[greeter]("ag.g")),
+		}},
+		{"dependency cycle within one scope", []Plugin{
+			requires("a", ScopeWorkspace, Spec[greeter]("b.own")),
+			requires("b", ScopeWorkspace, Spec[greeter]("a.own")),
+		}},
+		{"self dependency", []Plugin{requires("a", ScopeWorkspace, Spec[greeter]("a.own"))}},
 		{"Operation-scoped PreparationHook interface export", []Plugin{provides("a", ScopeOperation, Spec[PreparationHook]("hook"))}},
 		{"Agent-scoped PreparationHook interface export", []Plugin{provides("a", ScopeAgent, Spec[PreparationHook]("hook"))}},
 		{"Operation-scoped concrete hook export", []Plugin{provides("a", ScopeOperation, Spec[hookValue]("hook"))}},
@@ -191,7 +241,7 @@ func TestCompositionRejectsInvalidDeclarations(t *testing.T) {
 // export at Operation scope — rejects the whole set before any factory.
 func TestCompositionAcceptsLongLivedHookDeclarations(t *testing.T) {
 	hookPlugin := func(id string, scope ScopeKind, specs ...CapabilitySpec) Plugin {
-		return Plugin{ID: id, Scope: scope, Provides: specs, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		return Plugin{ID: id, Scope: scope, Provides: specs, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{}}, nil
 		}}
 	}
@@ -221,10 +271,31 @@ func TestCompositionAcceptsLongLivedHookDeclarations(t *testing.T) {
 	}
 }
 
-func TestCompositionConstructsInRegistrationOrder(t *testing.T) {
+func TestCompositionAcceptsLongerLivedAndSameScopeDependencies(t *testing.T) {
+	c := mustComposition(t,
+		Plugin{ID: "rt", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("rt.n")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			return Instance{Values: map[string]any{"rt.n": 1}}, nil
+		}},
+		Plugin{ID: "wa", Scope: ScopeWorkspace, Requires: []CapabilitySpec{Spec[int]("rt.n")}, Provides: []CapabilitySpec{Spec[greeter]("wa.g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			return Instance{Values: map[string]any{"wa.g": loudGreeter{}}}, nil
+		}},
+		Plugin{ID: "wb", Scope: ScopeWorkspace, Requires: []CapabilitySpec{Spec[greeter]("wa.g")}, Provides: []CapabilitySpec{Spec[greeter]("wb.g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			return Instance{Values: map[string]any{"wb.g": loudGreeter{}}}, nil
+		}},
+		Plugin{ID: "ag", Scope: ScopeAgent, Requires: []CapabilitySpec{Spec[greeter]("wa.g"), Spec[greeter]("wb.g"), Spec[int]("rt.n")}, Provides: []CapabilitySpec{Spec[greeter]("ag.g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			return Instance{Values: map[string]any{"ag.g": loudGreeter{}}}, nil
+		}},
+	)
+	testassert.Equal(t, len(c.plan[ScopeWorkspace]), 2)
+	if c.plan[ScopeWorkspace][0].ID != "wa" || c.plan[ScopeWorkspace][1].ID != "wb" {
+		t.Fatalf("workspace plan = %s before %s, want the provider first", c.plan[ScopeWorkspace][0].ID, c.plan[ScopeWorkspace][1].ID)
+	}
+}
+
+func TestCompositionConstructsDependenciesFirstInStableOrder(t *testing.T) {
 	trace := &traceLog{}
-	rec := func(id string, providesID string) Plugin {
-		return Plugin{ID: id, Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter](providesID)}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+	rec := func(id string, requires []CapabilitySpec, providesID string) Plugin {
+		return Plugin{ID: id, Scope: ScopeRuntime, Requires: requires, Provides: []CapabilitySpec{Spec[greeter](providesID)}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			trace.add("open:" + id)
 			return Instance{Values: map[string]any{providesID: loudGreeter{word: id}}, Close: func() error {
 				trace.add("close:" + id)
@@ -232,73 +303,82 @@ func TestCompositionConstructsInRegistrationOrder(t *testing.T) {
 			}}, nil
 		}}
 	}
-	// Registration order late, early, ties is the construction order: no
-	// dependency edges reorder the set.
+	// Registration order late, early, ties: the topological order must move
+	// the provider first while ties keep registration order.
 	c := mustComposition(t,
-		rec("late", "late.out"),
-		rec("early", "early.shared"),
-		rec("ties", "ties.out"),
+		rec("late", []CapabilitySpec{Spec[greeter]("early.shared")}, "late.out"),
+		rec("early", nil, "early.shared"),
+		rec("ties", []CapabilitySpec{Spec[greeter]("early.shared")}, "ties.out"),
 	)
 	sc := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
-	want := []string{"open:late", "open:early", "open:ties"}
+	want := []string{"open:early", "open:late", "open:ties"}
 	{
 		got := trace.all()
 		testassert.Require(t, reflect.DeepEqual(got, want), "construction order = %q, want %q", got, want)
 	}
 	testassert.NoError(t, sc.close())
-	want = append(want, "close:ties", "close:early", "close:late")
+	want = append(want, "close:ties", "close:late", "close:early")
 	{
 		got := trace.all()
 		testassert.Require(t, reflect.DeepEqual(got, want), "close order = %q, want reverse of construction %q", got, want)
 	}
 }
 
-func TestScopeBindingsCheckExports(t *testing.T) {
+func TestScopeBindingsCarryOnlyDeclaredDependencies(t *testing.T) {
+	var captured Bindings
 	c := mustComposition(t,
-		Plugin{ID: "rt", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("rt.g"), Spec[int]("rt.n"), Spec[counted]("rt.c")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Plugin{ID: "rt", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("rt.g"), Spec[int]("rt.n"), Spec[counted]("rt.c")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{
 				"rt.g": loudGreeter{word: "hi"},
 				"rt.n": 0,
 				"rt.c": (*counterService)(nil),
 			}}, nil
 		}},
-		Plugin{ID: "cons", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[greeter]("cons.out")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Plugin{ID: "unneeded", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("unneeded.g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			return Instance{Values: map[string]any{"unneeded.g": loudGreeter{}}}, nil
+		}},
+		Plugin{ID: "cons", Scope: ScopeWorkspace, Requires: []CapabilitySpec{Spec[greeter]("rt.g"), Spec[int]("rt.n"), Spec[counted]("rt.c")}, Provides: []CapabilitySpec{Spec[greeter]("cons.out")}, Open: func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
+			captured = deps
 			return Instance{Values: map[string]any{"cons.out": loudGreeter{}}}, nil
 		}},
 	)
 	rt := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
 	ws := mustOpenScope(t, c, context.Background(), workspaceScopeInfo("/ws/one"), []*scope{rt})
 
-	testassert.Require(t, len(ws.bindings.entries) == 1, "scope exports %d (want its 1)", len(ws.bindings.entries))
+	testassert.Require(t, len(captured.entries) == 3 && len(ws.bindings.entries) == 1, "consumer received %d entries (want its 3 declared), scope exports %d (want its 1)", len(captured.entries), len(ws.bindings.entries))
 	{
-		g, err := bind[greeter](rt.bindings, "rt.g")
-		testassert.Require(t, err == nil && g.Greet() == "HI", "bind assignable export: err = %v, value = %v", err, g)
+		g, err := Bind[greeter](captured, "rt.g")
+		testassert.Require(t, err == nil && g.Greet() == "HI", "Bind assignable dependency: err = %v, value = %v", err, g)
 	}
 	{
-		n, err := bind[int](rt.bindings, "rt.n")
-		testassert.Require(t, err == nil && n == 0, "bind zero concrete value: err = %v, value = %d, want the ordinary zero value accepted", err, n)
+		n, err := Bind[int](captured, "rt.n")
+		testassert.Require(t, err == nil && n == 0, "Bind zero concrete value: err = %v, value = %d, want the ordinary zero value accepted", err, n)
 	}
 	{
-		_, err := bind[counted](rt.bindings, "rt.c")
+		_, err := Bind[counted](captured, "rt.c")
 		testassert.NoError(t, err)
 	}
 	{
-		_, err := bind[greeter](rt.bindings, "rt.hidden")
-		testassert.Check(t, errors.Is(err, ErrComposition), "bind unknown ID: %v, want ErrComposition (no ambient lookup)", err)
+		_, err := Bind[greeter](captured, "rt.hidden")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind undeclared capability: %v, want ErrComposition (no ambient lookup)", err)
 	}
 	{
-		_, err := bind[counted](rt.bindings, "rt.g")
-		testassert.Check(t, errors.Is(err, ErrComposition), "bind wrong requested type: %v, want ErrComposition", err)
+		_, err := Bind[greeter](captured, "unneeded.g")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind another plugin's export: %v, want ErrComposition (binding isolation)", err)
 	}
 	{
-		_, err := bind[greeter](bindings{}, "rt.g")
-		testassert.Check(t, errors.Is(err, ErrComposition), "bind on zero bindings: %v, want ErrComposition", err)
+		_, err := Bind[counted](captured, "rt.g")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind wrong requested type: %v, want ErrComposition", err)
+	}
+	{
+		_, err := Bind[greeter](Bindings{}, "rt.g")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind on zero Bindings: %v, want ErrComposition", err)
 	}
 }
 
 func TestScopeConstructionFailuresRollBackWithoutPublishing(t *testing.T) {
 	good := func(trace *traceLog, id string, closeErr error) Plugin {
-		return Plugin{ID: id, Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter](id + ".g")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		return Plugin{ID: id, Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter](id + ".g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			trace.add("open:" + id)
 			return Instance{Values: map[string]any{id + ".g": loudGreeter{word: id}}, Close: func() error {
 				trace.add("close:" + id)
@@ -307,19 +387,19 @@ func TestScopeConstructionFailuresRollBackWithoutPublishing(t *testing.T) {
 		}}
 	}
 	plain := func(trace *traceLog, id string) Plugin {
-		return Plugin{ID: id, Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter](id + ".g")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		return Plugin{ID: id, Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter](id + ".g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			trace.add("open:" + id)
 			return Instance{Values: map[string]any{id + ".g": loudGreeter{word: id}}}, nil
 		}}
 	}
 	failing := func(trace *traceLog, id string) Plugin {
-		return Plugin{ID: id, Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter](id + ".g")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		return Plugin{ID: id, Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter](id + ".g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			trace.add("open:" + id)
 			return Instance{}, errFactory
 		}}
 	}
 	invalid := func(trace *traceLog, id string, values map[string]any) Plugin {
-		return Plugin{ID: id, Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter](id + ".g")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		return Plugin{ID: id, Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter](id + ".g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			trace.add("open:" + id)
 			return Instance{Values: values, Close: func() error { trace.add("close:" + id); return nil }}, nil
 		}}
@@ -351,7 +431,7 @@ func TestScopeConstructionFailuresRollBackWithoutPublishing(t *testing.T) {
 		}, false, []string{"open:one", "open:bad", "close:bad", "close:one"}, []error{ErrComposition}},
 		{"cancellation observed between factories aborts later opens", func(trace *traceLog, cancelOwner context.CancelFunc) []Plugin {
 			return []Plugin{
-				Plugin{ID: "one", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("one.g")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+				Plugin{ID: "one", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("one.g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 					trace.add("open:one")
 					cancelOwner()
 					return Instance{Values: map[string]any{"one.g": loudGreeter{}}, Close: func() error { trace.add("close:one"); return nil }}, nil
@@ -391,7 +471,7 @@ func TestScopeConstructionFailuresRollBackWithoutPublishing(t *testing.T) {
 // no storage or job-stopper seam.
 func TestScopeAcceptsZeroTypedValues(t *testing.T) {
 	c := mustComposition(t,
-		Plugin{ID: "ok", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("ok.n"), Spec[counted]("ok.c"), Spec[harness.Storage]("ok.store"), Spec[harness.JobStopper]("ok.stop")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Plugin{ID: "ok", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("ok.n"), Spec[counted]("ok.c"), Spec[harness.Storage]("ok.store"), Spec[harness.JobStopper]("ok.stop")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"ok.n": 0, "ok.c": (*counterService)(nil), "ok.store": stubCoreStorage{}, "ok.stop": (*stubStopper)(nil)}}, nil
 		}},
 	)
@@ -414,7 +494,7 @@ func TestScopeAcceptsZeroTypedValues(t *testing.T) {
 
 func TestCompositionRejectsScopeInfoShapes(t *testing.T) {
 	c := mustComposition(t,
-		Plugin{ID: "ok", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("ok.n")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Plugin{ID: "ok", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("ok.n")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"ok.n": 1}}, nil
 		}},
 	)
@@ -450,19 +530,21 @@ func TestCompositionRejectsScopeInfoShapes(t *testing.T) {
 }
 
 type guardFixture struct {
-	rt    *scope
-	ws    *scope
-	trace *traceLog
+	rt       *scope
+	ws       *scope
+	trace    *traceLog
+	consDeps Bindings
 }
 
 func openGuardFixture(t *testing.T, owner context.Context) *guardFixture {
 	t.Helper()
 	f := &guardFixture{trace: &traceLog{}}
 	c := mustComposition(t,
-		Plugin{ID: "dep", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("dep.g")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Plugin{ID: "dep", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[greeter]("dep.g")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"dep.g": loudGreeter{word: "hi"}}}, nil
 		}},
-		Plugin{ID: "cons", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[int]("cons.out")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Plugin{ID: "cons", Scope: ScopeWorkspace, Requires: []CapabilitySpec{Spec[greeter]("dep.g")}, Provides: []CapabilitySpec{Spec[int]("cons.out")}, Open: func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
+			f.consDeps = deps
 			return Instance{Values: map[string]any{"cons.out": 7}, Close: func() error { f.trace.add("close:cons"); return errCloser }}, nil
 		}},
 	)
@@ -485,7 +567,7 @@ func startBlockedCall(t *testing.T, f *guardFixture) (gctx context.Context, rele
 		f.trace.add("call-start")
 		close(started)
 		<-released
-		if v, err := bind[greeter](f.rt.bindings, "dep.g"); err != nil {
+		if v, err := Bind[greeter](f.consDeps, "dep.g"); err != nil {
 			f.trace.add("bind-failed")
 		} else {
 			f.trace.add("greet:" + v.Greet())
@@ -537,11 +619,11 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 				testassert.Check(t, errors.Is(err, ErrClosed), "enter after closure: %v, want ErrClosed", err)
 			}
 			{
-				_, err := bind[int](f.ws.bindings, "cons.out")
+				_, err := Bind[int](f.ws.bindings, "cons.out")
 				testassert.Check(t, errors.Is(err, ErrClosed), "binding from the closed supplying scope: %v, want ErrClosed", err)
 			}
 			{
-				_, err := bind[greeter](f.rt.bindings, "dep.g")
+				_, err := Bind[greeter](f.rt.bindings, "dep.g")
 				testassert.Check(t, err == nil, "binding from the still-open supplying scope: %v", err)
 			}
 			{
@@ -564,11 +646,11 @@ func TestScopeGuardOwnsAdmittedCallsThroughClose(t *testing.T) {
 			testassert.Check(t, errors.Is(err, ErrClosed), "enter on an owner-canceled ancestor scope: %v, want ErrClosed", err)
 		}
 		{
-			_, err := bind[int](f.ws.bindings, "cons.out")
+			_, err := Bind[int](f.ws.bindings, "cons.out")
 			testassert.Check(t, errors.Is(err, ErrClosed), "Bind from an owner-canceled supplying scope: %v, want ErrClosed", err)
 		}
 		{
-			_, err := bind[greeter](f.rt.bindings, "dep.g")
+			_, err := Bind[greeter](f.consDeps, "dep.g")
 			testassert.Check(t, errors.Is(err, ErrClosed), "Bind from an owner-canceled ancestor supplying scope: %v, want ErrClosed", err)
 		}
 		// Rejected admissions registered no work, so closure joins and
@@ -660,10 +742,14 @@ func newWorkspaceFixture(t *testing.T) *workspaceFixture {
 		opens:   make(map[string]int),
 	}
 	c := mustComposition(t,
-		Plugin{ID: "rt", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("rt.n")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Plugin{ID: "rt", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[int]("rt.n")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"rt.n": 42}}, nil
 		}},
-		Plugin{ID: "ws", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[greeter]("ws.g")}, Open: func(ctx context.Context, info ScopeInfo) (Instance, error) {
+		Plugin{ID: "ws", Scope: ScopeWorkspace, Requires: []CapabilitySpec{Spec[int]("rt.n")}, Provides: []CapabilitySpec{Spec[greeter]("ws.g")}, Open: func(ctx context.Context, info ScopeInfo, deps Bindings) (Instance, error) {
+			n, err := Bind[int](deps, "rt.n")
+			if err != nil || n != 42 {
+				return Instance{}, fmt.Errorf("ancestor dependency: %v %d", err, n)
+			}
 			f.mu.Lock()
 			f.opens[info.Workspace]++
 			gate := f.gates[info.Workspace]
@@ -870,28 +956,32 @@ func TestWorkspaceScopesShutdownJoinsConstructionAndDisposesSorted(t *testing.T)
 	})
 }
 
-func TestInvocationCarriesOneRevisionAcrossCalls(t *testing.T) {
+func TestInvocationCarriesOneRevisionAcrossNestedDependencyCalls(t *testing.T) {
 	c := mustComposition(t,
-		Plugin{ID: "beta", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[worker]("beta.work")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Plugin{ID: "beta", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[worker]("beta.work")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"beta.work": betaWorker{}}}, nil
 		}},
-		Plugin{ID: "alpha", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[worker]("alpha.work")}, Open: func(context.Context, ScopeInfo) (Instance, error) {
-			return Instance{Values: map[string]any{"alpha.work": alphaWorker{dep: betaWorker{}}}}, nil
+		Plugin{ID: "alpha", Scope: ScopeWorkspace, Requires: []CapabilitySpec{Spec[worker]("beta.work")}, Provides: []CapabilitySpec{Spec[worker]("alpha.work")}, Open: func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
+			dep, err := Bind[worker](deps, "beta.work")
+			if err != nil {
+				return Instance{}, err
+			}
+			return Instance{Values: map[string]any{"alpha.work": alphaWorker{dep: dep}}}, nil
 		}},
 	)
 	ws := mustOpenScope(t, c, context.Background(), workspaceScopeInfo("/ws/config"), nil)
 	view, err := selectCapabilities([]*scope{ws}, []string{"alpha.work"})
 	testassert.NoError(t, err)
-	a, err := bind[worker](view, "alpha.work")
+	a, err := Bind[worker](view, "alpha.work")
 	testassert.NoError(t, err)
 	second, err := selectCapabilities([]*scope{ws}, []string{"alpha.work"})
 	testassert.NoError(t, err)
-	a2, err := bind[worker](second, "alpha.work")
+	a2, err := Bind[worker](second, "alpha.work")
 	testassert.NoError(t, err)
 	testassert.Equal(t, a, a2)
 	{
-		_, err := bind[worker](view, "beta.work")
-		testassert.Check(t, errors.Is(err, ErrComposition), "bind unselected capability: %v, want ErrComposition", err)
+		_, err := Bind[worker](view, "beta.work")
+		testassert.Check(t, errors.Is(err, ErrComposition), "Bind unselected dependency: %v, want ErrComposition", err)
 	}
 	{
 		_, err := selectCapabilities([]*scope{ws}, []string{"nope.work"})
@@ -991,8 +1081,8 @@ func staticToolDescription(id string) func(Invocation, ToolConstraints, harness.
 }
 
 // countingOpen returns a plugin Open that counts factory runs.
-func countingOpen(counter *int) func(context.Context, ScopeInfo) (Instance, error) {
-	return func(context.Context, ScopeInfo) (Instance, error) {
+func countingOpen(counter *int) func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+	return func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 		*counter++
 		return Instance{}, nil
 	}
@@ -1001,10 +1091,11 @@ func countingOpen(counter *int) func(context.Context, ScopeInfo) (Instance, erro
 // TestCompositionRejectsToolDeclarationWithoutDescription proves the Tool
 // Provides row: a declaration carrying the Tool interface type without its
 // pure description function — via the bare Spec[Tool] provides form or a nil
-// ToolSpec function — rejects the whole set before any factory runs, while a
-// valid ToolSpec provider composes.
+// ToolSpec function — rejects the whole set before any factory runs, while
+// the same interface stays an ordinary Requires declaration: with a valid
+// ToolSpec provider the Requires-only set composes.
 func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
-	noop := func(context.Context, ScopeInfo) (Instance, error) { return Instance{}, nil }
+	noop := func(context.Context, ScopeInfo, Bindings) (Instance, error) { return Instance{}, nil }
 	for _, row := range []struct {
 		name    string
 		plugins []Plugin
@@ -1019,7 +1110,7 @@ func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
 			}
 		})
 	}
-	// The ordinary sibling: a valid ToolSpec provider composes.
+	// The ordinary sibling: the same declaration with its description composes.
 	provider := Plugin{ID: "toolprov", Scope: ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("tool.x", staticToolDescription("tool.x"))}, Open: noop}
 	{
@@ -1135,7 +1226,7 @@ func TestCompositionBindsReportWarningPerRuntimeFactory(t *testing.T) {
 			ID:       id,
 			Scope:    scope,
 			Provides: []CapabilitySpec{Spec[any](id + ".cap")},
-			Open: func(_ context.Context, info ScopeInfo) (Instance, error) {
+			Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
 				captures[id] = info.ReportWarning
 				return Instance{Values: map[string]any{id + ".cap": id}}, nil
 			},

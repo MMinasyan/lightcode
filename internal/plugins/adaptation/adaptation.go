@@ -75,7 +75,7 @@ func (hook) Prepare(_ context.Context, input runtime.PreparationInput) (runtime.
 	return consequence, nil
 }
 
-func open(ctx context.Context, _ runtime.ScopeInfo) (runtime.Instance, error) {
+func open(ctx context.Context, _ runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.Instance{}, err
 	}

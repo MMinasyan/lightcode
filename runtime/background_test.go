@@ -57,7 +57,7 @@ func backgroundProbePlugin(probe *backgroundProbe) Plugin {
 		ID:       "bgprobe",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("bg_probe", backgroundProbeTool{probe: probe}.describe)},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"bg_probe": backgroundProbeTool{probe: probe}}}, nil
 		},
 	}

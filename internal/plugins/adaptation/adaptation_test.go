@@ -36,7 +36,7 @@ func fixtureCatalog() []model.ToolDefinition {
 // prepareHook opens the shipped plugin's single contribution and invokes it.
 func prepareHook(t *testing.T, ref model.ModelRef, mode prompt.Mode) runtime.PreparationConsequence {
 	t.Helper()
-	instance, err := adaptation.Plugin().Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()})
+	instance, err := adaptation.Plugin().Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
 	testassert.NoError(t, err)
 	testassert.Require(t, instance.Close == nil, "the adaptation plugin declares a Close")
 	hook, ok := instance.Values[adaptation.CapabilityID].(runtime.PreparationHook)
@@ -56,7 +56,7 @@ func TestPluginDeclaresOneRuntimeScopedPreparationHook(t *testing.T) {
 	testassert.Require(t, plugin.ID == "adaptation" && plugin.Scope == runtime.ScopeRuntime, "plugin identity = %q/%s, want adaptation/runtime", plugin.ID, plugin.Scope)
 	testassert.Require(t, plugin.ValidateConfig == nil, "the adaptation plugin declares a settings validator")
 	testassert.Equal(t, len(plugin.Provides), 1)
-	instance, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()})
+	instance, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
 	testassert.NoError(t, err)
 	_, ok := instance.Values[adaptation.CapabilityID].(runtime.PreparationHook)
 	testassert.Require(t, ok, "the declared capability = %T, want a runtime.PreparationHook", instance.Values[adaptation.CapabilityID])
@@ -121,7 +121,7 @@ func TestOpenRejectsCanceledScopeContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	{
-		_, err := adaptation.Plugin().Open(ctx, runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()})
+		_, err := adaptation.Plugin().Open(ctx, runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
 		testassert.Require(t, err != nil, "Open with a canceled scope context succeeded")
 	}
 }

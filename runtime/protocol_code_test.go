@@ -1449,7 +1449,7 @@ func failingAgentFactoryPlugin(fail *atomic.Bool) Plugin {
 		ID:       "failing-agent",
 		Scope:    ScopeAgent,
 		Provides: []CapabilitySpec{Spec[any]("failing.agent.cap")},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			if fail.Load() {
 				return Instance{}, errors.New("boom")
 			}
@@ -1499,7 +1499,7 @@ func parkingAgentClosePlugin(started chan struct{}, gate chan struct{}) Plugin {
 		ID:       "parking-agent",
 		Scope:    ScopeAgent,
 		Provides: []CapabilitySpec{Spec[any]("parking.agent.cap")},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"parking.agent.cap": "ok"}, Close: func() error {
 				select {
 				case started <- struct{}{}:

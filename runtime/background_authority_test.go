@@ -149,6 +149,15 @@ func (p *childProbe) Prepare(_ context.Context, tc ToolContext, call model.ToolC
 			switch phase {
 			case "execute":
 				p.recordLaunch(probeLaunch(tc.Background, "child_agent"))
+				if p.done != nil {
+					close(p.done)
+				}
+			case "execute_return":
+				go func() {
+					p.recordLaunch(probeLaunch(tc.Background, "child_agent"))
+					close(p.done)
+				}()
+				<-p.started
 			case "other_target":
 				p.recordLaunch(probeLaunch(tc.Background, "other_agent"))
 			case "changed_data":
@@ -180,7 +189,7 @@ func childProbePlugin(probe *childProbe) Plugin {
 		ID:       "probe",
 		Scope:    ScopeRuntime,
 		Provides: []CapabilitySpec{ToolSpec("probe", probe.describe)},
-		Open: func(context.Context, ScopeInfo) (Instance, error) {
+		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{"probe": probe}}, nil
 		},
 	}
@@ -204,8 +213,8 @@ func childSessionCount(t *testing.T, r *Runtime, store harness.Storage) int {
 	return children
 }
 
-// childParent reads the one child Session header's parent identity.
-func childParent(t *testing.T, r *Runtime, store harness.Storage) string {
+// childIdentity reads the one child Session header's identity.
+func childIdentity(t *testing.T, r *Runtime, store harness.Storage) harness.SessionIdentity {
 	t.Helper()
 	ids, err := store.ListSessionIDs(context.Background())
 	testassert.NoError(t, err)
@@ -215,10 +224,10 @@ func childParent(t *testing.T, r *Runtime, store harness.Storage) string {
 			continue
 		}
 		if header.Identity.ParentSessionID != "" {
-			return header.Identity.ParentSessionID
+			return header.Identity
 		}
 	}
-	return ""
+	return harness.SessionIdentity{}
 }
 
 // TestBackgroundAuthorityThroughComposedRuntime exercises the bound object
@@ -290,7 +299,7 @@ func TestBackgroundAuthorityThroughComposedRuntime(t *testing.T) {
 			}
 			testassert.Require(t, !probe.spawnRan.Load(), "a refused start ran the spawn callback")
 			if row.name == "execute" {
-				parent := childParent(t, r, store)
+				parent := childIdentity(t, r, store).ParentSessionID
 				testassert.Require(t, parent == sessionID, "child parent = %q, want the calling Session %q", parent, sessionID)
 			}
 
@@ -355,6 +364,112 @@ func TestBackgroundAuthorityRefusesCanceledOrigin(t *testing.T) {
 	testassert.NoError(t, otherErr)
 	testassert.Require(t, !probe.spawnRan.Load(), "a canceled-origin job start ran the spawn callback")
 	testassert.Equal(t, childSessionCount(t, r, store), 0)
+}
+
+// launchCommitStore opens one window after the first committed transaction
+// that inserted a Session register: it runs committed, then holds that
+// transaction's return until its context ends, so the caller's cancellation
+// lands between the launch commit and child materialization.
+type launchCommitStore struct {
+	harness.Storage
+	armed     atomic.Bool
+	committed func()
+}
+
+func (s *launchCommitStore) Transact(ctx context.Context, fn func(harness.Transaction) error) error {
+	var inserted atomic.Bool
+	err := s.Storage.Transact(ctx, func(tx harness.Transaction) error {
+		return fn(sessionInsertTx{Transaction: tx, inserted: &inserted})
+	})
+	if err == nil && inserted.Load() && s.armed.CompareAndSwap(true, false) {
+		s.committed()
+		<-ctx.Done()
+	}
+	return err
+}
+
+// sessionInsertTx reports one transaction's Session register insert.
+type sessionInsertTx struct {
+	harness.Transaction
+	inserted *atomic.Bool
+}
+
+func (tx sessionInsertTx) InsertRegister(draft harness.RegisterDraft) (harness.Register, error) {
+	if draft.Key.Kind == harness.RegisterSession {
+		tx.inserted.Store(true)
+	}
+	return tx.Transaction.InsertRegister(draft)
+}
+
+// TestBackgroundLaunchKeepsCommittedChild proves the launch transaction is the
+// caller's last say: cancellation arriving after the child committed, from
+// Interrupt or from Execute returning with a launch in flight, leaves the
+// launch successful and the child running to completion. It runs on SQLite
+// because that store refuses reads under a canceled context.
+func TestBackgroundLaunchKeepsCommittedChild(t *testing.T) {
+	rows := []struct {
+		name       string
+		phase      string
+		interrupt  bool
+		wantParent harness.OperationState
+	}{
+		{name: "interrupt", phase: "execute", interrupt: true, wantParent: harness.OperationInterruption},
+		{name: "execute return", phase: "execute_return", wantParent: harness.OperationSuccess},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			ctx := context.Background()
+			e := newOwnerEnv(t)
+			inner, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+			testassert.NoError(t, err)
+			t.Cleanup(func() { _ = inner.Close() })
+			store := &launchCommitStore{Storage: inner}
+			probe := &childProbe{phase: row.phase, started: make(chan struct{}), done: make(chan struct{})}
+			var called atomic.Bool
+			e.server.setScript(func(context.Context, string) []string {
+				if called.Swap(true) {
+					return nil
+				}
+				return toolCallTurnEvents("probe-call", "probe", `{}`)
+			})
+			writeServiceFile(t, e.configPath, childLaunchConfig(e.server.URL, false))
+			writeServiceFile(t, agents.PathForConfig(e.configPath), childLaunchAgents)
+			e.fixtureStore(store)
+			r, err := e.open(ctx, childProbePlugin(probe))
+			testassert.NoError(t, err)
+			defer func() { testassert.NoError(t, r.Close(context.Background())) }()
+
+			session, err := r.createSession(ctx, filepath.Join(e.home, "probe-ws"), "prober")
+			testassert.NoError(t, err)
+			sessionID := session.Identity.SessionID
+			store.committed = func() {
+				if !row.interrupt {
+					close(probe.started)
+					return
+				}
+				err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+					return h.Interrupt(ctx, sessionID)
+				})
+				if err != nil {
+					t.Errorf("Interrupt: %v", err)
+				}
+			}
+			store.armed.Store(true)
+			submitThroughRuntime(t, r, sessionID, "probe-parent-op", "run probe")
+			select {
+			case <-probe.done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the launch never returned")
+			}
+
+			launchErr, _, _, _ := probe.recorded()
+			testassert.NoError(t, launchErr)
+			awaitOperation(t, r, sessionID, "probe-parent-op", row.wantParent)
+			child := childIdentity(t, r, store)
+			testassert.Equal(t, child.ParentSessionID, sessionID)
+			awaitOperation(t, r, child.SessionID, "probe-child-op", harness.OperationSuccess)
+		})
+	}
 }
 
 // TestBoundCallLifetime drives the bound object directly, without a Harness:

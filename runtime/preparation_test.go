@@ -389,7 +389,7 @@ func (e *prepEnv) plugins() []Plugin {
 				}
 				return nil
 			},
-			Open: func(context.Context, ScopeInfo) (Instance, error) {
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				e.hookOpens.Add(1)
 				return Instance{Values: map[string]any{"hook.first": e.hooks[0], "hook.second": e.hooks[1], "arg.runtime": e.argHooks[0], "echo": e.echo, "read": noopTool{}}}, nil
 			},
@@ -398,7 +398,7 @@ func (e *prepEnv) plugins() []Plugin {
 			ID:       "caps",
 			Scope:    ScopeWorkspace,
 			Provides: []CapabilitySpec{Spec[greeter]("cap.shared"), Spec[greeter]("cap.other"), Spec[ToolArgumentsHook]("arg.workspace")},
-			Open: func(context.Context, ScopeInfo) (Instance, error) {
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				e.capOpens.Add(1)
 				return Instance{Values: map[string]any{
 					"cap.shared":    loudGreeter{word: "shared"},
@@ -411,7 +411,7 @@ func (e *prepEnv) plugins() []Plugin {
 			ID:       "ops",
 			Scope:    ScopeOperation,
 			Provides: []CapabilitySpec{Spec[greeter]("op.native"), Spec[ToolArgumentsHook]("arg.operation")},
-			Open: func(_ context.Context, info ScopeInfo) (Instance, error) {
+			Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
 				e.opOpens.Add(1)
 				e.events.add("op-open:" + info.OperationID)
 				return Instance{
@@ -427,7 +427,7 @@ func (e *prepEnv) plugins() []Plugin {
 			ID:       "ags",
 			Scope:    ScopeAgent,
 			Provides: []CapabilitySpec{Spec[greeter]("ag.native"), Spec[ToolArgumentsHook]("arg.agent")},
-			Open: func(context.Context, ScopeInfo) (Instance, error) {
+			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 				if e.failAgentFactory {
 					return Instance{}, errOpen
 				}

@@ -208,11 +208,18 @@ func TestToolPlanEvidence(t *testing.T) {
 			wantStatus: model.ResultError, wantContent: unknownToolResultPrefix + "\n\n" + invalidToolResultContent, wantEvid: ExecutionUnknown, wantExecute: true,
 		},
 		{
-			name: "missing executor knowledge is unknown",
+			name: "undeclared executor knowledge is observed",
 			plan: PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
 				return ToolOutcome{Result: model.ToolResult{CallID: "call-1", Status: model.ResultSuccess, Content: "ran"}}
 			}},
-			wantStatus: model.ResultError, wantContent: unknownToolResultPrefix + "\n\n" + invalidToolResultContent, wantEvid: ExecutionUnknown, wantExecute: true,
+			wantStatus: model.ResultSuccess, wantContent: "ran", wantEvid: ExecutionObserved, wantExecute: true,
+		},
+		{
+			name: "undeclared executor error is observed",
+			plan: PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
+				return ToolOutcome{Result: model.ToolResult{CallID: "call-1", Status: model.ResultError, Content: "boom"}}
+			}},
+			wantStatus: model.ResultError, wantContent: "boom", wantEvid: ExecutionObserved, wantExecute: true,
 		},
 		{
 			name:       "success with not_started knowledge is the invalid replacement",

@@ -198,9 +198,9 @@ func permissionPairs(permission string, targets []tool.PreparedTarget) []harness
 func stringOutcome(ctx context.Context, callID string, call *tool.PreparedCall, args string, metadata func(args, result string) map[string]any) harness.ToolOutcome {
 	result, err := call.Execute(ctx)
 	if err != nil {
-		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
+		return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
 	}
-	outcome := harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: callID, Status: model.ResultSuccess, Content: result}}
+	outcome := harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultSuccess, Content: result}}
 	if metadata != nil {
 		if m := metadata(args, result); m != nil {
 			if raw, err := json.Marshal(m); err == nil {
@@ -218,9 +218,9 @@ func stringOutcome(ctx context.Context, callID string, call *tool.PreparedCall, 
 func patchOutcome(ctx context.Context, callID string, call *tool.PreparedPatchCall) harness.ToolOutcome {
 	result, err := call.Execute(ctx)
 	if err != nil {
-		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
+		return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
 	}
-	outcome := harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: callID, Status: model.ResultSuccess, Content: result.Result}}
+	outcome := harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultSuccess, Content: result.Result}}
 	if m := tool.ApplyPatchPreviewMetadata(result.Previews); m != nil {
 		if raw, err := json.Marshal(m); err == nil {
 			outcome.Metadata = raw
@@ -567,7 +567,7 @@ func commandEnvironment(tc ToolContext) ([]string, error) {
 // commandEnvironmentFailure renders one environment-resolution failure as the
 // ordinary model-visible error outcome.
 func commandEnvironmentFailure(callID string, cause error) harness.ToolOutcome {
-	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: boundedDiagnostic(cause)}}
+	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: boundedDiagnostic(cause)}}
 }
 
 // backgroundOutcome starts one background job for the prepared call: it
@@ -612,7 +612,7 @@ func (t runCommandTool) backgroundOutcome(_ context.Context, callID, command str
 		jobsInst.Abort(jobID) // idempotent: removes the reservation if it still exists
 		return backgroundStartOutcome(callID, err)
 	}
-	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{
+	return harness.ToolOutcome{Result: model.ToolResult{
 		CallID: callID,
 		Status: model.ResultSuccess,
 		Content: fmt.Sprintf("Command running in the background with ID: `%s`. You will be notified when it finishes. If your next steps do not depend on its output, continue with them; otherwise use sleep to wait and process to read the output.\nRunning in the background: `%s`.",
@@ -623,7 +623,7 @@ func (t runCommandTool) backgroundOutcome(_ context.Context, callID, command str
 // backgroundStartOutcome renders one background start failure through the
 // single legacy wrapper.
 func backgroundStartOutcome(callID string, err error) harness.ToolOutcome {
-	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{
+	return harness.ToolOutcome{Result: model.ToolResult{
 		CallID:  callID,
 		Status:  model.ResultError,
 		Content: fmt.Errorf("run_command: background start: %w", err).Error(),
@@ -685,12 +685,12 @@ func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec
 		if exitErr.Cancelled {
 			status = model.ResultInterrupted
 		}
-		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: callID, Status: status, Content: exitErr.Output}}
+		return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: status, Content: exitErr.Output}}
 	}
 	if err != nil {
-		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
+		return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
 	}
-	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: callID, Status: model.ResultSuccess, Content: result}}
+	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultSuccess, Content: result}}
 }
 
 // sleepTool is the sleep tool: normalization clamps to integer seconds
@@ -733,9 +733,9 @@ func (sleepTool) Prepare(_ context.Context, _ ToolContext, call model.ToolCall) 
 				if ctx.Err() != nil {
 					status = model.ResultInterrupted
 				}
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: status, Content: err.Error()}}
+				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: status, Content: err.Error()}}
 			}
-			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: result}}
+			return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: result}}
 		},
 	}
 }
@@ -784,21 +784,21 @@ func (t processTool) Prepare(_ context.Context, tc ToolContext, call model.ToolC
 				if action == "read" {
 					output, err := t.jobs.Read(sessionID, id)
 					if err != nil {
-						return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
+						return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
 					}
-					return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: output}}
+					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: output}}
 				}
 				if err := t.jobs.Kill(sessionID, id); err != nil {
-					return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
+					return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
 				}
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: fmt.Sprintf("Process %s terminated.", id)}}
+				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: fmt.Sprintf("Process %s terminated.", id)}}
 			},
 		}
 	case "list":
 		return harness.PreparedTool{
 			Permissions: []harness.PermissionRequest{{Permission: harness.PermissionProcessOwn, Target: "*"}},
 			Execute: func(_ context.Context) harness.ToolOutcome {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: t.jobs.List(sessionID)}}
+				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: t.jobs.List(sessionID)}}
 			},
 		}
 	default:

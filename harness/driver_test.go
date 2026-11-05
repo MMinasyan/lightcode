@@ -1,6 +1,5 @@
 // Real execution fixtures: behavioral rows drive the actual runExecution
-// owner over an admitted Operation and observe durable state. No fixture
-// constructs the private execution owner or calls one of its effects alone.
+// owner over an admitted Operation and observe durable state.
 package harness
 
 import (
