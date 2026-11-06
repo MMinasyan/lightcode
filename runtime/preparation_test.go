@@ -1324,7 +1324,7 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 				done <- err
 			}()
 			<-arrived
-			testassert.NoError(t, e.r.runtimeScope.close())
+			testassert.NoError(t, e.r.config.current().resources.runtime.close())
 			close(release)
 			{
 				err := <-done

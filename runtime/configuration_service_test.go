@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -20,8 +21,10 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // serviceHarness roots one configurationService test at a scratch HOME and a
@@ -120,6 +123,386 @@ func servicePlugin(id string, opens *atomic.Int64, validate func(json.RawMessage
 		},
 		ValidateConfig: validate,
 	}
+}
+
+func TestRuntimeConfigurationResourceReplacement(t *testing.T) {
+	e := newOwnerEnv(t)
+	e.fixtureStore(storage.NewMemory())
+	var opens, closes atomic.Int64
+	p := servicePlugin("alpha", &opens, func(json.RawMessage) error { return nil })
+	p.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		id := opens.Add(1)
+		return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error { closes.Add(1); return nil }}, nil
+	}
+	writeServiceFile(t, e.configPath, pluginsConfigFile(`{ "value" : 1 }`))
+	plugins := []Plugin{p}
+	r, err := e.open(context.Background(), plugins...)
+	testassert.NoError(t, err)
+	defer r.Close(context.Background())
+	plugins[0].Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) { return Instance{}, errFactory }
+	testassert.Equal(t, opens.Load(), int64(1))
+	_, err = r.Reload(context.Background())
+	testassert.NoError(t, err)
+	testassert.Equal(t, opens.Load(), int64(1))
+	view, err := r.getConfiguration(context.Background())
+	testassert.NoError(t, err)
+	view.Settings.Sessions.ArchiveAfterDays++
+	_, err = r.updateSettings(context.Background(), view.Settings)
+	testassert.NoError(t, err)
+	testassert.Equal(t, opens.Load(), int64(1))
+	testassert.Equal(t, string(r.config.current().plugins["alpha"]), `{ "value" : 1 }`)
+	_, err = r.updateProvider(context.Background(), "prov", protocol.ProviderEdit{})
+	testassert.NoError(t, err)
+	testassert.Equal(t, opens.Load(), int64(1))
+	testassert.Equal(t, string(r.config.current().plugins["alpha"]), `{ "value" : 1 }`)
+	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"value":2}`))
+	_, err = r.Reload(context.Background())
+	testassert.NoError(t, err)
+	testassert.Equal(t, opens.Load(), int64(2))
+	testassert.Equal(t, closes.Load(), int64(1))
+	for i, document := range []string{pluginsConfigFile(`{ "value":2}`), providerConfigFile("One"), pluginsConfigFile(`{}`)} {
+		writeServiceFile(t, e.configPath, document)
+		_, err := r.Reload(context.Background())
+		testassert.NoError(t, err)
+		testassert.Equal(t, opens.Load(), int64(i+3))
+		testassert.Equal(t, closes.Load(), int64(i+2))
+	}
+}
+
+func TestResourceFactoryWithoutWarningSink(t *testing.T) {
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, `{}`)
+	p := servicePlugin("alpha", &h.opens, nil)
+	p.Open = func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
+		if info.ReportWarning != nil {
+			return Instance{}, errors.New("unexpected warning callback")
+		}
+		return Instance{Values: map[string]any{"capability.alpha": 1}}, nil
+	}
+	c := mustComposition(t, p)
+	s := newConfigurationService(context.Background(), c, h.loader, h.configPath, newObservation(), nil)
+	s.composition, s.dataDir = c, h.dataDir
+	_, err := s.publish(context.Background())
+	testassert.NoError(t, err)
+	testassert.NoError(t, s.current().resources.release())
+}
+
+func TestRuntimeConfigurationCandidateResources(t *testing.T) {
+	e := newOwnerEnv(t)
+	e.fixtureStore(storage.NewMemory())
+	var opens, closes atomic.Int64
+	var fail atomic.Bool
+	first := servicePlugin("alpha", &opens, acceptValidator)
+	first.Open = func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
+		id := opens.Add(1)
+		info.ReportWarning("factory", fmt.Sprintf("instance-%d", id))
+		return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error {
+			closes.Add(1)
+			if id == 1 {
+				return errCloser
+			}
+			return nil
+		}}, nil
+	}
+	second := servicePlugin("beta", &atomic.Int64{}, acceptValidator)
+	second.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		if fail.Load() {
+			return Instance{}, errFactory
+		}
+		return Instance{Values: map[string]any{"capability.beta": "ok"}}, nil
+	}
+	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"value":1}`))
+	r, err := e.open(context.Background(), first, second)
+	testassert.NoError(t, err)
+	defer r.Close(context.Background())
+	before := mustRead(t, e.configPath)
+	previous := r.config.current()
+	warnRevision, _ := r.warnings.snapshot()
+	sub, err := r.Subscribe(32)
+	testassert.NoError(t, err)
+	defer sub.Close()
+	settings := projectSettings(previous.sessions, previous.tools, previous.jobs, previous.compaction, previous.plugins)
+	settings.Plugins["alpha"] = `{"value":2}`
+	fail.Store(true)
+	_, err = r.updateSettings(context.Background(), settings)
+	testassert.Require(t, errors.Is(err, errFactory), "failed candidate = %v", err)
+	testassert.Require(t, r.config.current() == previous && string(mustRead(t, e.configPath)) == string(before), "failed candidate changed publication or owning bytes")
+	testassert.Equal(t, opens.Load(), int64(2))
+	testassert.Equal(t, closes.Load(), int64(1))
+	gotRevision, _ := r.warnings.snapshot()
+	testassert.Equal(t, gotRevision, warnRevision)
+	assertNoEvent(t, sub)
+	fail.Store(false)
+	result, err := r.updateSettings(context.Background(), settings)
+	testassert.NoError(t, err)
+	testassert.Equal(t, result.ConfigurationRevision.Generation, "2")
+	testassert.Equal(t, opens.Load(), int64(3))
+	testassert.Equal(t, closes.Load(), int64(2))
+	_, warnings := r.warnings.snapshot()
+	var seen bool
+	for _, w := range warnings {
+		if w.Source == "plugin:alpha" && w.Message == "instance-3" {
+			seen = true
+		}
+		if w.Message == "instance-2" {
+			t.Fatal("failed candidate warning published")
+		}
+	}
+	testassert.Require(t, seen, "successful candidate warning was not published: %v", warnings)
+	_, err = r.updateSettings(context.Background(), result.Result)
+	testassert.NoError(t, err)
+	testassert.Equal(t, opens.Load(), int64(3))
+	err = r.Close(context.Background())
+	testassert.Require(t, errors.Is(err, errCloser), "retirement cleanup failure did not reach Close: %v", err)
+	testassert.Equal(t, closes.Load(), int64(3))
+}
+
+func TestRuntimeCanceledCandidateDisposesOnlyItsPrefix(t *testing.T) {
+	e := newOwnerEnv(t)
+	e.fixtureStore(storage.NewMemory())
+	var opens, closes atomic.Int64
+	var park atomic.Bool
+	entered := make(chan struct{})
+	first := servicePlugin("alpha", &opens, acceptValidator)
+	first.Open = func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
+		id := opens.Add(1)
+		info.ReportWarning("factory", fmt.Sprintf("instance-%d", id))
+		return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error { closes.Add(1); return nil }}, nil
+	}
+	second := servicePlugin("beta", &atomic.Int64{}, acceptValidator)
+	second.Open = func(ctx context.Context, _ ScopeInfo, _ Bindings) (Instance, error) {
+		if park.Load() {
+			close(entered)
+			<-ctx.Done()
+			return Instance{}, ctx.Err()
+		}
+		return Instance{Values: map[string]any{"capability.beta": 1}}, nil
+	}
+	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"v":1}`))
+	r, err := e.open(context.Background(), first, second)
+	testassert.NoError(t, err)
+	defer r.Close(context.Background())
+	previous := r.config.current()
+	warnRevision, _ := r.warnings.snapshot()
+	sub, err := r.Subscribe(16)
+	testassert.NoError(t, err)
+	defer sub.Close()
+	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"v":2}`))
+	park.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := r.Reload(ctx); done <- err }()
+	<-entered
+	cancel()
+	testassert.Require(t, errors.Is(<-done, context.Canceled), "canceled candidate did not return cancellation")
+	testassert.Require(t, r.config.current() == previous, "canceled candidate replaced publication")
+	testassert.Equal(t, opens.Load(), int64(2))
+	testassert.Equal(t, closes.Load(), int64(1))
+	gotRevision, _ := r.warnings.snapshot()
+	testassert.Equal(t, gotRevision, warnRevision)
+	assertNoEvent(t, sub)
+}
+
+func TestRuntimeRetirementDoesNotHoldPublicationLocks(t *testing.T) {
+	e := newOwnerEnv(t)
+	e.fixtureStore(storage.NewMemory())
+	var opens atomic.Int64
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	p := servicePlugin("alpha", &opens, acceptValidator)
+	p.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		id := opens.Add(1)
+		return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error {
+			if id == 1 {
+				close(entered)
+				<-release
+			}
+			return nil
+		}}, nil
+	}
+	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"v":1}`))
+	r, err := e.open(context.Background(), p)
+	testassert.NoError(t, err)
+	defer func() { releaseOnce.Do(func() { close(release) }); _ = r.Close(context.Background()) }()
+	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"v":2}`))
+	first := make(chan error, 1)
+	go func() { _, err := r.Reload(context.Background()); first <- err }()
+	<-entered
+	second := make(chan error, 1)
+	go func() { _, err := r.Reload(context.Background()); second <- err }()
+	select {
+	case err := <-second:
+		testassert.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("retirement blocked the next publication")
+	}
+	testassert.Equal(t, opens.Load(), int64(2))
+	testassert.Equal(t, r.config.current().generation, uint64(3))
+	releaseOnce.Do(func() { close(release) })
+	testassert.NoError(t, <-first)
+}
+
+func TestRuntimeRetiredResourcesReleaseBeforeArtifactInterval(t *testing.T) {
+	e := newOwnerEnv(t)
+	e.fixtureStore(storage.NewMemory())
+	modelStarted, modelRelease := make(chan struct{}), make(chan struct{})
+	closeStarted, closeRelease := make(chan struct{}), make(chan struct{})
+	var modelOnce, closeOnce sync.Once
+	defer modelOnce.Do(func() { close(modelRelease) })
+	defer closeOnce.Do(func() { close(closeRelease) })
+	e.server.setScript(func(context.Context, string) []string {
+		close(modelStarted)
+		<-modelRelease
+		return textTurnEvents("done")
+	})
+	var opens atomic.Int64
+	p := servicePlugin("alpha", &opens, acceptValidator)
+	p.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		id := opens.Add(1)
+		return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error {
+			if id == 1 {
+				close(closeStarted)
+				<-closeRelease
+			}
+			return nil
+		}}, nil
+	}
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":1}}}`)
+	r, err := e.open(context.Background(), p)
+	testassert.NoError(t, err)
+	defer func() {
+		modelOnce.Do(func() { close(modelRelease) })
+		closeOnce.Do(func() { close(closeRelease) })
+		_ = r.Close(context.Background())
+	}()
+	session, err := r.createSession(context.Background(), e.dataDir, "solo")
+	testassert.NoError(t, err)
+	submitThroughRuntime(t, r, session.Identity.SessionID, "op-owned", "work")
+	<-modelStarted
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":2}}}`)
+	_, err = r.Reload(context.Background())
+	testassert.NoError(t, err)
+	modelOnce.Do(func() { close(modelRelease) })
+	<-closeStarted
+	_, err = r.artifacts.acquireTry(sessionArtifactDir(r.dataDir, session.Identity.SessionID))
+	testassert.Require(t, errors.Is(err, errArtifactBusy), "artifact interval released during retired resource cleanup: %v", err)
+	closeOnce.Do(func() { close(closeRelease) })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	release, err := r.artifacts.acquireExecution(ctx, sessionArtifactDir(r.dataDir, session.Identity.SessionID))
+	testassert.NoError(t, err)
+	release()
+}
+
+func TestRuntimePreparedReservationSurvivesUntilOpening(t *testing.T) {
+	e := newOwnerEnv(t)
+	store := newGatedStore(storage.NewMemory())
+	e.fixtureStore(store)
+	var opens, closes atomic.Int64
+	alpha := servicePlugin("alpha", &opens, acceptValidator)
+	alpha.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		id := opens.Add(1)
+		return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error { closes.Add(1); return nil }}, nil
+	}
+	bound := make(chan any, 1)
+	operation := Plugin{ID: "operation", Scope: ScopeOperation, Requires: []CapabilitySpec{Spec[any]("capability.alpha")}, Provides: []CapabilitySpec{Spec[int]("operation.value")}, Open: func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
+		value, err := Bind[any](deps, "capability.alpha")
+		if err != nil {
+			return Instance{}, err
+		}
+		bound <- value
+		return Instance{Values: map[string]any{"operation.value": 1}}, nil
+	}}
+	modelStarted, modelRelease := make(chan struct{}), make(chan struct{})
+	var modelOnce sync.Once
+	e.server.setScript(func(context.Context, string) []string {
+		close(modelStarted)
+		<-modelRelease
+		return textTurnEvents("done")
+	})
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":1}}}`)
+	r, err := e.open(context.Background(), alpha, operation)
+	testassert.NoError(t, err)
+	defer func() {
+		store.releaseAll()
+		modelOnce.Do(func() { close(modelRelease) })
+		_ = r.Close(context.Background())
+	}()
+	session, err := r.createSession(context.Background(), e.dataDir, "solo")
+	testassert.NoError(t, err)
+	store.armPostCommit(1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := submitRawThroughRuntime(context.Background(), r, session.Identity.SessionID, "op-held", "work", harness.MessageModeRegular)
+		done <- err
+	}()
+	<-store.parked
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":2}}}`)
+	_, err = r.Reload(context.Background())
+	testassert.NoError(t, err)
+	testassert.Equal(t, opens.Load(), int64(2))
+	testassert.Equal(t, closes.Load(), int64(0))
+	store.releaseGate()
+	testassert.NoError(t, <-done)
+	testassert.Equal(t, (<-bound).(int64), int64(1))
+	<-modelStarted
+	testassert.Equal(t, closes.Load(), int64(0))
+	modelOnce.Do(func() { close(modelRelease) })
+	awaitOperation(t, r, session.Identity.SessionID, "op-held", harness.OperationSuccess)
+	testassert.NoError(t, r.Close(context.Background()))
+	testassert.Equal(t, closes.Load(), int64(2))
+}
+
+type rejectingAdmissionStore struct {
+	harness.Storage
+	armed   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *rejectingAdmissionStore) Transact(ctx context.Context, fn func(harness.Transaction) error) error {
+	if s.armed.CompareAndSwap(true, false) {
+		close(s.entered)
+		<-s.release
+		return harness.ErrStorage
+	}
+	return s.Storage.Transact(ctx, fn)
+}
+
+func TestRuntimeDiscardedPreparationReleasesRetiredResources(t *testing.T) {
+	e := newOwnerEnv(t)
+	store := &rejectingAdmissionStore{Storage: storage.NewMemory(), entered: make(chan struct{}), release: make(chan struct{})}
+	e.fixtureStore(store)
+	var opens, closes atomic.Int64
+	p := servicePlugin("alpha", &opens, acceptValidator)
+	p.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		id := opens.Add(1)
+		return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error { closes.Add(1); return nil }}, nil
+	}
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"value":1}}}`)
+	r, err := e.open(context.Background(), p)
+	testassert.NoError(t, err)
+	defer r.Close(context.Background())
+	session, err := r.createSession(context.Background(), e.dataDir, "solo")
+	testassert.NoError(t, err)
+	store.armed.Store(true)
+	done := make(chan error, 1)
+	go func() {
+		_, err := submitRawThroughRuntime(context.Background(), r, session.Identity.SessionID, "discarded", "test", harness.MessageModeRegular)
+		done <- err
+	}()
+	<-store.entered
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"value":2}}}`)
+	_, err = r.Reload(context.Background())
+	testassert.NoError(t, err)
+	testassert.Equal(t, closes.Load(), int64(0))
+	close(store.release)
+	err = <-done
+	testassert.Require(t, errors.Is(err, harness.ErrStorage), "admission failure = %v", err)
+	testassert.Equal(t, closes.Load(), int64(1))
+	testassert.Equal(t, opens.Load(), int64(2))
 }
 
 func snapshotModelName(cfg *configuration, providerID, modelID string) string {

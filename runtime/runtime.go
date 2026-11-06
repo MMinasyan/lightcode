@@ -84,19 +84,17 @@ type options struct {
 // The constructor context is the managed Runtime process lifetime; its
 // cancellation requests the same joined shutdown that Close starts.
 type Runtime struct {
-	lock         *atomicfs.Lock
-	work         context.Context
-	cancelWork   context.CancelFunc
-	config       *configurationService
-	obs          *observation
-	warnings     *warningStore
-	passive      *observationAdapter
-	managedEnv   *config.ManagedEnv
-	runtimeScope *scope
-	workspaces   *workspaceScopes
-	harness      *harness.Harness
-	artifacts    *artifactIntervals
-	dataDir      string
+	lock       *atomicfs.Lock
+	work       context.Context
+	cancelWork context.CancelFunc
+	config     *configurationService
+	obs        *observation
+	warnings   *warningStore
+	passive    *observationAdapter
+	managedEnv *config.ManagedEnv
+	harness    *harness.Harness
+	artifacts  *artifactIntervals
+	dataDir    string
 
 	// jobs and closeStore are the directly constructed baseline services:
 	// the jobs service (also the Harness job-stop seam) and the included
@@ -125,11 +123,9 @@ type Runtime struct {
 // initialization. Startup order is fixed: validate declarations (definitions
 // and plugin capability declarations, all before any factory), acquire the
 // process-lifetime lock at <DataDir>/runtime.lock, load the managed dotenv and
-// publish the initial configuration snapshot, directly construct the included
-// SQLite store and the jobs service under the held ownership and the standard
-// tool values over them, construct the complete Runtime scope in the
-// composition's stable topological order with those values bound as its own
-// provided capabilities, run restart recovery against the storage, and
+// validate the initial configuration, directly construct the included SQLite
+// store and jobs service, then prepare and publish the initial resource set
+// with the standard tools bound before running restart recovery, and
 // construct the Harness with the bound preparation and the jobs stop seam.
 // Other factories receive no canonical Storage.
 // The automatic sweep's owned ticker loop is then registered as Runtime work
@@ -178,10 +174,6 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return nil, fmt.Errorf("data directory %s: %w", dataDir, ErrOwned)
 	}
 	work, cancelWork := context.WithCancel(ctx)
-	unlock := func(cause error) (*Runtime, error) {
-		cancelWork()
-		return nil, errors.Join(cause, lock.Release())
-	}
 
 	managedEnv, err := config.LoadDotEnv()
 	if err != nil {
@@ -202,13 +194,14 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	configService := newConfigurationService(work, c, loader, configPath, obs, options.DefaultCapabilityIDs)
 	configService.attachWarnings(warnings)
 	configService.attachEnv(managedEnv)
-	if _, err := configService.publish(work); err != nil {
-		// Initial publication supplies the owned context as both caller and
-		// owner, so its caller-first checkpoints report a canceled
-		// constructor's own context error directly, while every independent
-		// failure — including a source error that wraps ErrClosed — keeps
-		// its identity unchanged.
-		return unlock(err)
+	initial, err := configService.build(work, 1)
+	if err != nil {
+		cancelWork()
+		return nil, errors.Join(err, lock.Release())
+	}
+	if err := configService.canceled(work); err != nil {
+		cancelWork()
+		return nil, errors.Join(err, lock.Release())
 	}
 
 	// unwind releases the acquired prefix in reverse acquisition order: each
@@ -238,20 +231,23 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	jobsService := newJobs(dataDir)
 	acquired = append(acquired, jobsService.Close)
 	c.standardValues = newStandardTools(dataDir, jobsService)
-	runtimeScope, err := c.openScope(work, ScopeInfo{Kind: ScopeRuntime, DataDir: dataDir}, nil)
-	if err != nil {
+	configService.composition = c
+	configService.dataDir = dataDir
+	if err := configService.prepareResources(work, initial); err != nil {
 		return unwind(err)
 	}
-	acquired = append(acquired, runtimeScope.cleanup)
-	// The observation is attached after construction: no subscriber can
-	// exist before the owner is published, so the Runtime scope announces
-	// only its closure, and descendant scopes inherit the publisher from it.
-	runtimeScope.obs = obs
+	resources := initial.resources
+	acquired = append(acquired, resources.release)
+	if err := configService.canceled(work); err != nil {
+		return unwind(err)
+	}
+	configService.buildMu.Lock()
+	configService.captureMu.Lock()
+	configService.commit(initial)
 	if err := harness.Recover(work, store); err != nil {
 		return unwind(err)
 	}
 
-	workspaces := newWorkspaceScopes(work, c, []*scope{runtimeScope}, obs)
 	background := &backgroundBridge{}
 	// The private per-Session artifact interval registry initializes before
 	// the Harness: every committed opener, restore, committed deletion and
@@ -281,7 +277,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: store,
 		Jobs:    jobsService,
-		Prepare: newPreparation(configService, c, runtimeScope, workspaces, home, options.Identity, options.GlobalRulesDir, background, adapter, artifacts, subprocessEnv).bind(),
+		Prepare: newPreparation(configService, c, home, options.Identity, options.GlobalRulesDir, background, adapter, artifacts, subprocessEnv).bind(),
 		Observe: adapter.observe,
 	})
 	if err != nil {
@@ -302,8 +298,6 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		warnings:     warnings,
 		passive:      adapter,
 		managedEnv:   managedEnv,
-		runtimeScope: runtimeScope,
-		workspaces:   workspaces,
 		harness:      h,
 		artifacts:    artifacts,
 		dataDir:      dataDir,
@@ -515,9 +509,8 @@ func (r *Runtime) beginShutdown() {
 // every background ownership group so live members deliver and finish while
 // the capabilities and storage are still open, then joins the Harness after
 // its context cancellation has settled every in-flight preparation,
-// execution, and required terminal commit, then closes every
-// live Workspace scope in sorted path order and the Runtime scope in reverse
-// dependency order, closes the jobs service — joining every monitor and
+// execution, and required terminal commit, then releases the published
+// resource set and closes the jobs service — joining every monitor and
 // completion callback — before closing the included store, which closes last
 // among the owned resources, closes every passive subscription once those
 // cleanup events have been published, withdraws the attached protocol server's
@@ -533,12 +526,12 @@ func (r *Runtime) joinShutdown() error {
 	if err := r.harness.Wait(context.Background()); err != nil {
 		errs = append(errs, err)
 	}
-	if err := r.workspaces.shutdown(); err != nil {
-		errs = append(errs, err)
+	if current := r.config.current(); current != nil && current.resources != nil {
+		_ = current.resources.release()
 	}
-	if err := r.runtimeScope.close(); err != nil {
-		errs = append(errs, err)
-	}
+	r.config.cleanupMu.Lock()
+	errs = append(errs, r.config.cleanupErr)
+	r.config.cleanupMu.Unlock()
 	if err := r.jobs.Close(); err != nil {
 		errs = append(errs, err)
 	}

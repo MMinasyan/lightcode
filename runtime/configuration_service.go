@@ -14,6 +14,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // ErrConfiguration reports a complete candidate failure: nothing was
@@ -45,8 +46,8 @@ const (
 // reads through publication. The current snapshot is one atomic pointer that
 // readers Load once without a lock. A failed or canceled build publishes
 // nothing: initial publication uses generation 1, only a success increments
-// it, and the increment happens under the build mutex. Builds run outside any
-// Runtime-wide lock and start no plugin or other service work. Each
+// it, and the increment happens under the build mutex. Builds prepare the
+// candidate's long-lived plugin scope before publication. Each
 // publication carries its passive configuration event inside the same
 // observation section as its atomic Store.
 type configurationService struct {
@@ -63,8 +64,12 @@ type configurationService struct {
 	// inheritance. No plugin callback supplies it and no type is privileged.
 	defaultCapabilityIDs []string
 
-	owner context.Context
-	obs   *observation
+	owner       context.Context
+	obs         *observation
+	composition *composition
+	dataDir     string
+	cleanupMu   sync.Mutex
+	cleanupErr  error
 
 	// warnings is the Runtime-owned presentation store every successful
 	// publication's global setup/catalog/agents refresh reports into; nil
@@ -139,6 +144,10 @@ func (s *configurationService) current() *configuration {
 // callers hold one owned observation and never a lock. A nil pointer (no
 // publication yet) yields the zero capture, matching current()'s contract.
 func (s *configurationService) capture(ctx context.Context) (configurationCapture, error) {
+	return s.captureFor(ctx, false)
+}
+
+func (s *configurationService) captureFor(ctx context.Context, reserve bool) (configurationCapture, error) {
 	s.captureMu.Lock()
 	defer s.captureMu.Unlock()
 	if err := s.canceled(ctx); err != nil {
@@ -147,6 +156,9 @@ func (s *configurationService) capture(ctx context.Context) (configurationCaptur
 	snapshot := s.published.Load()
 	if snapshot == nil {
 		return configurationCapture{}, nil
+	}
+	if reserve && snapshot.resources != nil {
+		snapshot.resources.retain()
 	}
 	return configurationCapture{snapshot: snapshot, credentials: s.captureCredentials(snapshot.catalog)}, nil
 }
@@ -209,7 +221,11 @@ func (s *configurationService) publish(ctx context.Context) (configurationCaptur
 	// checked once more under the caller-first rule. A publication that wins
 	// this check may finish despite later cancellation; shutdown joins it.
 	if err := s.canceled(ctx); err != nil {
+		fresh := s.freshResources(candidate)
 		s.buildMu.Unlock()
+		if fresh != nil {
+			_ = fresh.release()
+		}
 		return configurationCapture{}, err
 	}
 	s.captureMu.Lock()
@@ -245,6 +261,7 @@ func (s *configurationService) nextGeneration() (uint64, error) {
 func (s *configurationService) commit(candidate *configuration) configurationCapture {
 	credentials := s.captureCredentials(candidate.catalog)
 	captured := configurationCapture{snapshot: candidate, credentials: credentials}
+	previous := s.published.Load()
 	s.obs.publish(func() []Event {
 		warningChanged := false
 		if s.warnings != nil {
@@ -252,17 +269,36 @@ func (s *configurationService) commit(candidate *configuration) configurationCap
 			warningChanged = s.warnings.setGlobal(catalogSource, catalogWarnings(candidate.catalogWarnings)) || warningChanged
 			warningChanged = s.warnings.setGlobal(agentsSource, agentWarnings(candidate.agentWarnings)) || warningChanged
 		}
+		var events []Event
+		if candidate.resources != nil && (previous == nil || previous.resources != candidate.resources) {
+			candidate.resources.runtime.obs = s.obs
+			warningChanged = candidate.resources.commitWarnings() || warningChanged
+			events = append(events, scopeEvent(protocol.ScopeOpened, candidate.resources.runtime.info))
+		}
 		revision := s.warnings.storeRevision()
 		s.published.Store(candidate)
 		s.captureMu.Unlock()
 		s.buildMu.Unlock()
-		events := []Event{configurationChangedEvent(candidate.generation)}
+		events = append(events, configurationChangedEvent(candidate.generation))
 		if warningChanged {
 			events = append(events, warningChangedEvent(runtimeEventScope(), revision))
 		}
 		return events
 	})
+	if previous != nil && previous.resources != nil && previous.resources != candidate.resources {
+		_ = previous.resources.release()
+	}
 	return captured
+}
+
+func (s *configurationService) freshResources(candidate *configuration) *resourceSet {
+	if candidate != nil && candidate.resources != nil {
+		previous := s.current()
+		if previous == nil || previous.resources != candidate.resources {
+			return candidate.resources
+		}
+	}
+	return nil
 }
 
 // canceled applies the caller-first cancellation rule: a done caller context
@@ -300,8 +336,8 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 // and agent definitions are parsed against the ordinary visible export IDs
 // and the compiled tool universe, the Workspace permission inventory is
 // enumerated once into the candidate, and the plugin section is validated
-// against the owned declarations. Nothing is returned until the complete
-// candidate survives all of it. A nil conn builds over the ordinary
+// against the owned declarations and its resource set is prepared or reused.
+// Nothing is returned until the complete candidate survives all of it. A nil conn builds over the ordinary
 // LoadCaptured inputs (which may refresh due providers and write their
 // cache); a connection candidate instead selects the non-refreshing
 // LoadCapturedConnection entry, optionally overlaying the fetched discovery
@@ -329,6 +365,9 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 		return nil, configurationFailure(err)
 	}
 	if err := s.validatePlugins(ctx, doc.Plugins); err != nil {
+		return nil, err
+	}
+	if err := s.prepareResources(ctx, snapshot); err != nil {
 		return nil, err
 	}
 	return snapshot, nil

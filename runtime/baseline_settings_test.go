@@ -38,13 +38,11 @@ func baselineSettingsPrep(t *testing.T, agentsDoc, endpoint string) (configurati
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	comp := mustComposition(t, compactToolsPlugin())
-	runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
 	obs := newObservation()
-	ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs, nil)
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, "", "", nil, nil, nil, nil)
+	return captured, newPreparation(svc, comp, sh.home, "", "", nil, nil, nil, nil)
 }
 
 // TestBaselineSettingsDriveToolsJobsAndCompaction proves the top-level
@@ -183,13 +181,11 @@ func TestCompactionSettingsResetRestoresFallbackDefaults(t *testing.T) {
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	comp := mustComposition(t, compactToolsPlugin())
-	runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
 	obs := newObservation()
-	ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs, nil)
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	prep := newPreparation(svc, comp, runtimeScope, ws, sh.home, "", "", nil, nil, nil, nil)
+	prep := newPreparation(svc, comp, sh.home, "", "", nil, nil, nil, nil)
 
 	prepare := func(t *testing.T, captured configurationCapture) harness.ExecutionCapture {
 		t.Helper()
@@ -227,13 +223,11 @@ func newBaselineSettingsService(t *testing.T, configDoc string) (*serviceHarness
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	comp := mustComposition(t, compactToolsPlugin())
-	runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
 	obs := newObservation()
-	ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs, nil)
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return sh, svc, newPreparation(svc, comp, runtimeScope, ws, sh.home, "", "", nil, nil, nil, nil), captured
+	return sh, svc, newPreparation(svc, comp, sh.home, "", "", nil, nil, nil, nil), captured
 }
 
 // prepareCompactCapture runs one concrete preparation over a selection built

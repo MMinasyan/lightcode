@@ -926,7 +926,7 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 			testassert.Require(t, orderedSubset(events, "open:x", "open:y"), "factory events = %v, want dependencies constructed before consumers in stable topological order", events)
 		}
 		{
-			_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws"})
+			_, err := r.config.current().resources.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws"})
 			testassert.NoError(t, err)
 		}
 

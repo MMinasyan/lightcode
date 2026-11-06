@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
@@ -209,6 +210,12 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 		s.buildMu.Unlock()
 		return configurationCapture{}, err
 	}
+	fresh := s.freshResources(candidate)
+	defer func() {
+		if fresh != nil {
+			_ = fresh.release()
+		}
+	}()
 	// The edit's pure edited-subject check runs once over the built
 	// candidate and the mutation's capture, before the write: a touched
 	// subject the shared catalog validation dropped — or a connection
@@ -239,6 +246,7 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 			s.buildMu.Unlock()
 			return configurationCapture{}, err
 		}
+		fresh = nil
 		return s.commit(candidate), nil
 	}
 	if err := atomicfs.Write(owningPath, complete, 0o600); err != nil {
@@ -262,11 +270,13 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 			s.buildMu.Unlock()
 			return configurationCapture{}, configurationFailure(errors.Join(fmt.Errorf("persist API key %s: %w", conn.keyEnv, err), restoreErr))
 		}
+		fresh = nil
 		return s.commit(candidate), nil
 	}
 	// A metadata-only write has no credential effect: capture ownership is
 	// needed only for the publication itself.
 	s.captureMu.Lock()
+	fresh = nil
 	return s.commit(candidate), nil
 }
 
@@ -342,7 +352,7 @@ func editSettings(settings protocol.Settings) configurationEdit {
 		for id, document := range settings.Plugins {
 			plugins[id] = json.RawMessage(document) // string→[]byte conversion owns the bytes
 		}
-		pluginsRaw, err := json.Marshal(plugins)
+		pluginsRaw, err := marshalRawObject(plugins, true)
 		if err != nil {
 			return 0, configurationFailure(fmt.Errorf("encode plugins documents: %w", err))
 		}
@@ -449,13 +459,47 @@ func decodeRoot(data []byte) (map[string]json.RawMessage, error) {
 }
 
 // marshalRoot serializes one edited root map as the owning file's complete
-// bytes: sorted members, unowned JSON values preserved verbatim so numeric
-// lexemes survive, one trailing newline like the retained writers. Strings
-// may be HTML-escaped by the encoder; values and number tokens are retained.
+// bytes: sorted members, plugin sections retained verbatim, and other JSON
+// values indented without changing numeric lexemes. A trailing newline matches
+// the retained writers.
 func marshalRoot(root map[string]json.RawMessage) ([]byte, error) {
-	data, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("encode edited configuration: %w", err)
+	return marshalRawObject(root, false)
+}
+
+func marshalRawObject(root map[string]json.RawMessage, preserveAll bool) ([]byte, error) {
+	keys := make([]string, 0, len(root))
+	for key := range root {
+		keys = append(keys, key)
 	}
-	return append(data, '\n'), nil
+	slices.Sort(keys)
+	var out bytes.Buffer
+	out.WriteByte('{')
+	for i, key := range keys {
+		value := root[key]
+		if !json.Valid(value) {
+			return nil, fmt.Errorf("encode edited configuration: invalid JSON for %q", key)
+		}
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		name, _ := json.Marshal(key)
+		out.WriteByte('\n')
+		out.WriteString("  ")
+		out.Write(name)
+		out.WriteString(": ")
+		if preserveAll || key == "plugins" {
+			out.Write(value)
+		} else {
+			var indented bytes.Buffer
+			if err := json.Indent(&indented, value, "  ", "  "); err != nil {
+				return nil, fmt.Errorf("encode edited configuration: %w", err)
+			}
+			out.Write(bytes.TrimSpace(indented.Bytes()))
+		}
+	}
+	if len(keys) > 0 {
+		out.WriteByte('\n')
+	}
+	out.WriteString("}\n")
+	return out.Bytes(), nil
 }

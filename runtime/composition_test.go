@@ -14,6 +14,7 @@ import (
 	"testing/synctest"
 
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -803,6 +804,70 @@ func (f *workspaceFixture) getAsync(ctx context.Context, key string) chan getOut
 }
 
 func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
+	t.Run("retirement cancels and joins an abandoned builder", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		e.fixtureStore(storage.NewMemory())
+		var opened, closed, workspaceClosed atomic.Int64
+		runtimePlugin := servicePlugin("alpha", &opened, acceptValidator)
+		runtimePlugin.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+			id := opened.Add(1)
+			return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error { closed.Add(1); return nil }}, nil
+		}
+		started, canceled := make(chan struct{}), make(chan struct{})
+		ws := Plugin{ID: "waiter", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[int]("waiter.value")}, Open: func(ctx context.Context, _ ScopeInfo, _ Bindings) (Instance, error) {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			return Instance{Values: map[string]any{"waiter.value": 1}, Close: func() error { workspaceClosed.Add(1); return nil }}, nil
+		}}
+		writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":1}}}`)
+		r, err := e.open(context.Background(), runtimePlugin, ws)
+		testassert.NoError(t, err)
+		defer r.Close(context.Background())
+		session, err := r.createSession(context.Background(), e.dataDir, "solo")
+		testassert.NoError(t, err)
+		sub, err := r.Subscribe(32)
+		testassert.NoError(t, err)
+		defer sub.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := submitRawThroughRuntime(ctx, r, session.Identity.SessionID, "abandoned", "test", harness.MessageModeRegular)
+			done <- err
+		}()
+		<-started
+		cancel()
+		testassert.Require(t, errors.Is(<-done, context.Canceled), "canceled waiter did not return its cancellation")
+		select {
+		case <-canceled:
+			t.Fatal("waiter cancellation canceled the shared builder")
+		default:
+		}
+		writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":2}}}`)
+		_, err = r.Reload(context.Background())
+		testassert.NoError(t, err)
+		select {
+		case <-canceled:
+		default:
+			t.Fatal("retirement did not join the canceled builder")
+		}
+		testassert.Equal(t, closed.Load(), int64(1))
+		testassert.Equal(t, workspaceClosed.Load(), int64(1))
+		for {
+			select {
+			case event := <-sub.Events():
+				if eventKind(t, event) == "scope_opened" || eventKind(t, event) == "scope_closed" {
+					body, err := event.AsScopeEvent()
+					testassert.NoError(t, err)
+					if scopeKind(t, body.Scope) == "workspace" {
+						t.Fatalf("canceled builder published scope event: %s", eventJSON(t, event))
+					}
+				}
+			default:
+				return
+			}
+		}
+	})
 	t.Run("same key joins one construction", func(t *testing.T) {
 		f := newWorkspaceFixture(t)
 		release, entered := f.hold("/ws/x")
@@ -936,6 +1001,157 @@ func TestWorkspaceScopesShutdownJoinsConstructionAndDisposesSorted(t *testing.T)
 			testassert.Require(t, errors.Is(err, ErrClosed), "get after shutdown: %v, want ErrClosed", err)
 		}
 	})
+}
+
+type workspaceFactoryError struct{}
+
+func (*workspaceFactoryError) Error() string { return "workspace factory failed" }
+
+type workspaceCleanupError struct{}
+
+func (*workspaceCleanupError) Error() string { return "workspace cleanup failed" }
+
+func TestWorkspaceConstructionCleanupRetained(t *testing.T) {
+	for _, rejected := range []bool{false, true} {
+		for _, abandoned := range []bool{false, true} {
+			for _, cleanupFails := range []bool{false, true} {
+				name := fmt.Sprintf("rejected=%v/abandoned=%v/cleanup=%v", rejected, abandoned, cleanupFails)
+				t.Run(name, func(t *testing.T) {
+					owner, cancelOwner := context.WithCancel(context.Background())
+					defer cancelOwner()
+					entered, gate := make(chan struct{}), make(chan struct{})
+					var gateOnce sync.Once
+					defer gateOnce.Do(func() { close(gate) })
+					factoryErr, cleanupErr := &workspaceFactoryError{}, &workspaceCleanupError{}
+					var prefixOpens, prefixCloses atomic.Int64
+					var retry atomic.Bool
+					c := mustComposition(t,
+						Plugin{ID: "prefix", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[int]("prefix")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+							id := prefixOpens.Add(1)
+							return Instance{Values: map[string]any{"prefix": 1}, Close: func() error {
+								prefixCloses.Add(1)
+								if cleanupFails && id == 1 {
+									return cleanupErr
+								}
+								return nil
+							}}, nil
+						}},
+						Plugin{ID: "later", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[int]("later")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+							if retry.Load() {
+								return Instance{Values: map[string]any{"later": 1}}, nil
+							}
+							close(entered)
+							<-gate
+							if !rejected {
+								return Instance{}, factoryErr
+							}
+							return Instance{Values: map[string]any{"later": 1}}, nil
+						}},
+					)
+					w := newWorkspaceScopes(owner, c, nil, newObservation())
+					caller, cancelCaller := context.WithCancel(context.Background())
+					defer cancelCaller()
+					result := make(chan error, 1)
+					go func() { _, err := w.get(caller, workspaceScopeInfo("/ws/test")); result <- err }()
+					<-entered // the later factory is parked after the prefix opened
+					testassert.Equal(t, prefixOpens.Load(), int64(1))
+					if abandoned {
+						cancelCaller()
+						testassert.Require(t, errors.Is(<-result, context.Canceled), "abandoned waiter did not return cancellation")
+					}
+					if rejected {
+						cancelOwner()
+					}
+					gateOnce.Do(func() { close(gate) })
+					if !abandoned {
+						err := <-result
+						if rejected {
+							testassert.Require(t, errors.Is(err, context.Canceled), "rejected construction = %v", err)
+						} else {
+							var gotFactory *workspaceFactoryError
+							testassert.Require(t, errors.Is(err, factoryErr) && errors.As(err, &gotFactory), "construction cause lost: %v", err)
+						}
+						var gotCleanup *workspaceCleanupError
+						testassert.Require(t, errors.Is(err, cleanupErr) == cleanupFails && errors.As(err, &gotCleanup) == cleanupFails, "cleanup cause in construction result = %v", err)
+					}
+					if !rejected && !abandoned {
+						retry.Store(true)
+						_, err := w.get(context.Background(), workspaceScopeInfo("/ws/test"))
+						testassert.NoError(t, err)
+					}
+					err := w.shutdown()
+					testassert.Require(t, errors.Is(err, cleanupErr) == cleanupFails, "shutdown = %v, cleanup failure wanted %v", err, cleanupFails)
+					var retainedCleanup *workspaceCleanupError
+					testassert.Require(t, errors.As(err, &retainedCleanup) == cleanupFails, "shutdown cleanup type = %v", err)
+					testassert.Require(t, !errors.Is(err, factoryErr) && !errors.Is(err, context.Canceled), "shutdown retained a construction cause: %v", err)
+					testassert.Require(t, prefixCloses.Load() == prefixOpens.Load(), "prefix cleanup count = %d for %d opens", prefixCloses.Load(), prefixOpens.Load())
+				})
+			}
+		}
+	}
+}
+
+func TestRuntimeRetirementRetainsAbandonedWorkspaceCleanup(t *testing.T) {
+	e := newOwnerEnv(t)
+	e.fixtureStore(storage.NewMemory())
+	var opens atomic.Int64
+	runtimePlugin := servicePlugin("alpha", &opens, acceptValidator)
+	entered := make(chan struct{})
+	prefix := Plugin{ID: "prefix", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[int]("prefix")}, Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		return Instance{Values: map[string]any{"prefix": 1}, Close: func() error { return errCloser }}, nil
+	}}
+	later := Plugin{ID: "later", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[int]("later")}, Open: func(ctx context.Context, _ ScopeInfo, _ Bindings) (Instance, error) {
+		close(entered)
+		<-ctx.Done()
+		return Instance{}, errFactory
+	}}
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":1}}}`)
+	r, err := e.open(context.Background(), runtimePlugin, prefix, later)
+	testassert.NoError(t, err)
+	defer r.Close(context.Background())
+	session, err := r.createSession(context.Background(), e.dataDir, "solo")
+	testassert.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := submitRawThroughRuntime(ctx, r, session.Identity.SessionID, "abandoned-cleanup", "test", harness.MessageModeRegular)
+		done <- err
+	}()
+	<-entered
+	cancel()
+	testassert.Require(t, errors.Is(<-done, context.Canceled), "waiter did not cancel")
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":2}}}`)
+	_, err = r.Reload(context.Background())
+	testassert.NoError(t, err)
+	err = r.Close(context.Background())
+	testassert.Require(t, errors.Is(err, errCloser), "Close lost failed-prefix cleanup: %v", err)
+	testassert.Require(t, !errors.Is(err, errFactory), "Close retained ordinary factory failure: %v", err)
+}
+
+func TestWorkspaceShutdownJoinsConstructionAndLiveCleanupErrors(t *testing.T) {
+	c := mustComposition(t,
+		Plugin{ID: "prefix", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[int]("prefix")}, Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
+			return Instance{Values: map[string]any{"prefix": 1}, Close: func() error {
+				if info.Workspace == "/live" {
+					return errWorkspaceClo
+				}
+				return errCloser
+			}}, nil
+		}},
+		Plugin{ID: "later", Scope: ScopeWorkspace, Provides: []CapabilitySpec{Spec[int]("later")}, Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
+			if info.Workspace == "/failed" {
+				return Instance{}, errFactory
+			}
+			return Instance{Values: map[string]any{"later": 1}}, nil
+		}},
+	)
+	w := newWorkspaceScopes(context.Background(), c, nil, newObservation())
+	_, err := w.get(context.Background(), workspaceScopeInfo("/live"))
+	testassert.NoError(t, err)
+	_, err = w.get(context.Background(), workspaceScopeInfo("/failed"))
+	testassert.Require(t, errors.Is(err, errFactory) && errors.Is(err, errCloser), "construction failure = %v", err)
+	err = w.shutdown()
+	testassert.Require(t, errors.Is(err, errCloser) && errors.Is(err, errWorkspaceClo) && !errors.Is(err, errFactory), "shutdown did not join only the cleanup errors: %v", err)
 }
 
 func TestInvocationCarriesOneRevisionAcrossNestedDependencyCalls(t *testing.T) {

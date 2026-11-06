@@ -31,6 +31,7 @@ import (
 // consumers add their own fields when they land.
 type configuration struct {
 	generation           uint64
+	resources            *resourceSet
 	catalog              *catalog.Catalog
 	catalogWarnings      []catalog.Warning
 	definitions          []agents.Resolved

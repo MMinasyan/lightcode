@@ -811,9 +811,9 @@ func TestProductionModelSelectionRejection(t *testing.T) {
 		}
 
 		// Both rejections happened before any scope opened.
-		r.workspaces.mu.Lock()
-		live := len(r.workspaces.live)
-		r.workspaces.mu.Unlock()
+		r.config.current().resources.workspaces.mu.Lock()
+		live := len(r.config.current().resources.workspaces.live)
+		r.config.current().resources.workspaces.mu.Unlock()
 		testassert.Equal(t, live, 0)
 	})
 }
@@ -1167,12 +1167,11 @@ func TestProductionTransportConversion(t *testing.T) {
 	owner, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := mustComposition(t)
-	runtimeScope := mustOpenScope(t, c, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
 	obs := newObservation()
 	svc := newConfigurationService(owner, c, sh.loader, sh.configPath, obs, nil)
 	snapshot, err := svc.publish(owner)
 	testassert.NoError(t, err)
-	p := newPreparation(svc, c, runtimeScope, newWorkspaceScopes(owner, c, []*scope{runtimeScope}, obs), sh.home, "", "", nil, nil, nil, nil)
+	p := newPreparation(svc, c, sh.home, "", "", nil, nil, nil, nil)
 	ref := model.ModelRef{Provider: "prov", Model: "m"}
 	provider, entry, err := snapshot.snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
 	testassert.NoError(t, err)

@@ -438,22 +438,23 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		owner, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		comp := mustComposition(t, compactToolsPlugin())
-		runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
 		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs, nil)
+		svc.composition, svc.dataDir = comp, sh.dataDir
 		svc.attachWarnings(r.warnings)
 		{
 			_, err := svc.publish(context.Background())
 			testassert.NoError(t, err)
 		}
-		ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, r.obs)
+		defer svc.current().resources.release()
 		adapter := newObservationAdapter(r.obs, r.warnings)
 		adapter.h = r.harness
-		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, "", "", nil, adapter, nil, nil)
+		p := newPreparation(svc, comp, sh.home, "", "", nil, adapter, nil, nil)
 
 		request := compactPrepRequest()
 		request.Session.Identity.SessionID = sessionID
 		prepared, err := p.bind()(context.Background(), request)
 		testassert.NoError(t, err)
+		defer prepared.Release()
 		execution, err := prepared.Open(context.Background(), harness.OperationAdmission{
 			SessionID:   sessionID,
 			OperationID: "op-compact",

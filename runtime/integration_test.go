@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,16 +42,27 @@ const assembledAgentsDocument = `{
   "leaky": {"model": "prov/m", "system_prompt": "simple", "capabilities": ["session_store"]}
 }`
 
-type combinedBase struct{}
+type combinedBase struct{ closed *atomic.Bool }
 
-func (combinedBase) Base() string { return "base" }
+func (b combinedBase) Base() string {
+	if b.closed != nil && b.closed.Load() {
+		return "closed"
+	}
+	return "base"
+}
 
 // combinedWorker is one dependent capability: its factory receives its
 // declared dependency, and every call reads its own settings from the
 // Invocation the caller passed, never from ambient state.
-type combinedWorker struct{ base combinedBase }
+type combinedWorker struct {
+	base combinedBase
+	ws   *workspaceOpens
+}
 
 func (w combinedWorker) Work(inv Invocation) string {
+	if w.ws != nil {
+		w.ws.park()
+	}
 	label := ""
 	if raw := inv.Config("depper"); len(raw) > 0 {
 		var settings struct {
@@ -67,8 +79,21 @@ func (w combinedWorker) Work(inv Invocation) string {
 // workspaceOpens records the Workspace identity of every Workspace scope
 // construction, in construction order.
 type workspaceOpens struct {
-	mu   sync.Mutex
-	keys []string
+	mu      sync.Mutex
+	keys    []string
+	gate    chan struct{}
+	arrived chan struct{}
+}
+
+func (w *workspaceOpens) park() {
+	w.mu.Lock()
+	gate, arrived := w.gate, w.arrived
+	w.gate = nil
+	w.mu.Unlock()
+	if gate != nil {
+		close(arrived)
+		<-gate
+	}
 }
 
 func (w *workspaceOpens) opened(key string) {
@@ -211,7 +236,8 @@ func assembledPlugins(e *ownerEnv, store harness.Storage, hook *recordHook, ws *
 			Scope:    ScopeWorkspace,
 			Provides: []CapabilitySpec{Spec[combinedBase]("dep.base")},
 			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				return Instance{Values: map[string]any{"dep.base": combinedBase{}}}, nil
+				closed := &atomic.Bool{}
+				return Instance{Values: map[string]any{"dep.base": combinedBase{closed: closed}}, Close: func() error { closed.Store(true); e.events.add("close:base"); return nil }}, nil
 			},
 		},
 		{
@@ -234,7 +260,7 @@ func assembledPlugins(e *ownerEnv, store harness.Storage, hook *recordHook, ws *
 				if err != nil {
 					return Instance{}, err
 				}
-				return Instance{Values: map[string]any{"dep.worker": combinedWorker{base: base}}}, nil
+				return Instance{Values: map[string]any{"dep.worker": combinedWorker{base: base, ws: ws}}, Close: func() error { e.events.add("close:depper"); return nil }}, nil
 			},
 		},
 		{
@@ -394,11 +420,14 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
 		}
 
-		// Blocked Operation on A: the production model request parks at the
-		// test server until the gate releases.
-		server.armGate()
-		submitThroughRuntime(t, r, sessionA.Identity.SessionID, "op-a1", "parked")
+		// Park the actual dependency call, not its model request.
+		ws.mu.Lock()
+		ws.gate, ws.arrived = make(chan struct{}), make(chan struct{})
+		gate, arrived := ws.gate, ws.arrived
+		ws.mu.Unlock()
+		submitThroughRuntime(t, r, sessionA.Identity.SessionID, "op-a1", "nested")
 		server.awaitRequests(3)
+		<-arrived
 		{
 			got := ws.constructed()
 			testassert.Require(t, slices.Equal(got, []string{wsB, wsA}), "Workspace scope constructions = %v, want one per distinct key in first-use order", got)
@@ -428,9 +457,25 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			revision, err := r.Reload(ctx)
 			testassert.Require(t, err == nil && revision == "2", "Reload over the blocked Operation = (%q, %v), want 2", revision, err)
 		}
+		testassert.Require(t, countEvents(e.events.all(), "close:depper") == 0 && countEvents(e.events.all(), "close:base") == 0, "retired bindings closed while the nested call was parked: %v", e.events.all())
+		fresh, err := r.createSession(ctx, wsA, "integrated")
+		testassert.NoError(t, err)
+		submitThroughRuntime(t, r, fresh.Identity.SessionID, "op-fresh", "fresh")
+		freshRec := awaitOperation(t, r, fresh.Identity.SessionID, "op-fresh", harness.OperationSuccess)
+		testassert.Equal(t, freshRec.Admission.Execution.ConfigurationRevision, "2")
+		testassert.Require(t, slices.Equal(ws.constructed(), []string{wsB, wsA, wsA}), "resource sets did not construct independent bindings for the same Workspace: %v", ws.constructed())
+		testassert.Require(t, countEvents(e.events.all(), "work:L2:base") == 1 && countEvents(e.events.all(), "close:depper") == 0, "new work did not coexist with parked old work: %v", e.events.all())
+		for {
+			event, ok := nextEvent(t, healthy)
+			testassert.Require(t, ok, "subscription closed before fresh execution cleanup")
+			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID, fresh.Identity.SessionID)
+			if body, closed := scopeClosedEvent(t, event); closed && operationScopeWorkspace(t, body.Scope) == wsA {
+				break
+			}
+		}
 
 		// Release: the blocked Operation completes on its captured revision 1.
-		server.releaseGate()
+		close(gate)
 		awaitOperation(t, r, sessionA.Identity.SessionID, "op-a1", harness.OperationSuccess)
 		{
 			rec := readOperation(t, r, sessionA.Identity.SessionID, "op-a1")
@@ -441,13 +486,14 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		// and the dependency's own settings from the same revision, while the
 		// old capture keeps its content.
 		recA2 := awaitOperation(t, r, sessionA.Identity.SessionID, "op-a2", harness.OperationSuccess)
+		testassert.Require(t, countEvents(e.events.all(), "work:L1:base") == 2 && orderedSubset(e.events.all(), "work:L1:base", "close:depper", "close:base"), "nested call and dependency closure order = %v", e.events.all())
 		testassert.Require(t, recA2.Admission.Execution.ConfigurationRevision == "2", "queued Operation record = %+v, want the revision-2 success", recA2.Admission.Execution)
 		{
 			got := hook.calls()
-			testassert.Require(t, slices.Equal(got, []hookCall{{tag: "T1"}, {tag: "T1"}, {tag: "T2"}}), "hook calls = %v, want the configured tag of each call", got)
+			testassert.Require(t, slices.Equal(got, []hookCall{{tag: "T1"}, {tag: "T1"}, {tag: "T2"}, {tag: "T2"}}), "hook calls = %v, want the configured tag of each call", got)
 		}
-		if n := countEvents(e.events.all(), "work:L2:base"); n != 1 {
-			t.Fatalf("dependency invocations reading revision-2 settings = %d, want 1: %v", n, e.events.all())
+		if n := countEvents(e.events.all(), "work:L2:base"); n != 2 {
+			t.Fatalf("dependency invocations reading revision-2 settings = %d, want 2: %v", n, e.events.all())
 		}
 		// Consume the healthy subscription through op-a2's Operation-close
 		// publication so the remaining sequence is deterministic.
@@ -458,7 +504,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			if body, closed := scopeClosedEvent(t, event); closed && operationScopeWorkspace(t, body.Scope) == wsA {
 				closedOps++
 			}
-			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
+			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID, fresh.Identity.SessionID)
 		}
 
 		// Shutdown joins the parked execution: the third admission's model
@@ -507,9 +553,18 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			committedScope(protocol.ScopeOpened, ScopeWorkspace, wsA, "", ""),
 			committedScope(protocol.ScopeOpened, ScopeOperation, wsA, sessionAID, "op-a1"),
 			committedScope(protocol.ScopeOpened, ScopeAgent, wsA, sessionAID, "op-a1"),
+			committedScope(protocol.ScopeOpened, ScopeRuntime, "", "", ""),
 			configurationChangedEvent(2),
+			committedScope(protocol.ScopeOpened, ScopeWorkspace, wsA, "", ""),
+			committedScope(protocol.ScopeOpened, ScopeOperation, wsA, fresh.Identity.SessionID, "op-fresh"),
+			committedScope(protocol.ScopeOpened, ScopeAgent, wsA, fresh.Identity.SessionID, "op-fresh"),
+			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, fresh.Identity.SessionID, "op-fresh"),
+			committedScope(protocol.ScopeClosed, ScopeOperation, wsA, fresh.Identity.SessionID, "op-fresh"),
 			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, sessionAID, "op-a1"),
 			committedScope(protocol.ScopeClosed, ScopeOperation, wsA, sessionAID, "op-a1"),
+			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsA, "", ""),
+			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsB, "", ""),
+			committedScope(protocol.ScopeClosed, ScopeRuntime, "", "", ""),
 			committedScope(protocol.ScopeOpened, ScopeOperation, wsA, sessionAID, "op-a2"),
 			committedScope(protocol.ScopeOpened, ScopeAgent, wsA, sessionAID, "op-a2"),
 			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, sessionAID, "op-a2"),
@@ -519,10 +574,9 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, sessionAID, "op-a3"),
 			committedScope(protocol.ScopeClosed, ScopeOperation, wsA, sessionAID, "op-a3"),
 			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsA, "", ""),
-			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsB, "", ""),
 			committedScope(protocol.ScopeClosed, ScopeRuntime, "", "", ""),
 		}
-		got := append(observed, committedTail(t, healthy, sessionAID, sessionBID)...)
+		got := append(observed, committedTail(t, healthy, sessionAID, sessionBID, fresh.Identity.SessionID)...)
 		if !slices.EqualFunc(got, want, equalEvent) {
 			t.Fatalf("healthy subscriber committed events = %s, want the complete committed sequence %s", eventsJSON(t, got), eventsJSON(t, want))
 		}

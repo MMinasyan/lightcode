@@ -194,7 +194,7 @@ func TestRuntimeObservationPublishesCommittedTransitionsInOrder(t *testing.T) {
 		testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
 	}
 	{
-		_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
+		_, err := r.config.current().resources.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
 		testassert.NoError(t, err)
 	}
 	{
@@ -268,7 +268,7 @@ func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 		defer release()
 		getDone := make(chan error, 1)
 		go func() {
-			_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws-paused"})
+			_, err := r.config.current().resources.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws-paused"})
 			getDone <- err
 		}()
 		select {
@@ -472,7 +472,7 @@ func TestRuntimeShutdownDoesNotWaitForUndrainedObservers(t *testing.T) {
 		}
 	}
 	{
-		_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
+		_, err := r.config.current().resources.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
 		testassert.NoError(t, err)
 	}
 	closeDone := make(chan error, 1)

@@ -173,8 +173,6 @@ var toolArgumentsHookType = reflect.TypeFor[ToolArgumentsHook]()
 type preparation struct {
 	config      *configurationService
 	composition *composition
-	runtime     *scope
-	workspaces  *workspaceScopes
 	home        string
 
 	// identity and globalRulesDir are the host-supplied prompt inputs: the
@@ -203,7 +201,7 @@ type preparation struct {
 }
 
 // newPreparation wires the binder to the published configuration, the
-// composition with its constructed Runtime scope and Workspace registry, the
+// composition whose scopes are owned by each configuration resource set, the
 // once-resolved home, the host-supplied prompt identity and global rules
 // directory, the background services bridge armed after harness.New
 // returns, the Runtime's passive publication adapter (nil in isolated
@@ -211,12 +209,10 @@ type preparation struct {
 // private artifact interval registry (nil without a Runtime), and the
 // Runtime's live managed-environment producer (nil without a retained
 // manager). One concrete preparation path serves every admission.
-func newPreparation(config *configurationService, c *composition, runtime *scope, workspaces *workspaceScopes, home, identity, globalRulesDir string, background *backgroundBridge, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
+func newPreparation(config *configurationService, c *composition, home, identity, globalRulesDir string, background *backgroundBridge, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
 	return &preparation{
 		config:         config,
 		composition:    c,
-		runtime:        runtime,
-		workspaces:     workspaces,
 		home:           home,
 		identity:       identity,
 		globalRulesDir: globalRulesDir,
@@ -233,15 +229,23 @@ func newPreparation(config *configurationService, c *composition, runtime *scope
 // configuration publication; preparation errors and cancellation abort
 // admission with no partial consequence published.
 func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (harness.PreparedExecution, error) {
-	return func(ctx context.Context, req harness.PreparationRequest) (harness.PreparedExecution, error) {
+	return func(ctx context.Context, req harness.PreparationRequest) (prepared harness.PreparedExecution, resultErr error) {
 		// Configuration and the credentials its catalog references are one
 		// owner-coherent capture: the selected model, its transport secret,
 		// and the revision all belong to the same ready pair.
-		captured, err := p.config.capture(ctx)
+		captured, err := p.config.captureFor(ctx, true)
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
 		snapshot := captured.snapshot
+		var releaseArtifacts func()
+		if snapshot != nil {
+			defer func() {
+				if resultErr != nil {
+					resultErr = errors.Join(resultErr, snapshot.resources.release())
+				}
+			}()
+		}
 		if snapshot == nil {
 			return harness.PreparedExecution{}, fmt.Errorf("agent type %q has no published configuration: %w", req.Session.AgentType, harness.ErrInvalid)
 		}
@@ -262,11 +266,12 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 			return harness.PreparedExecution{}, err
 		}
 		workspace := req.Session.Identity.Workspace
-		workspaceScope, err := p.workspaces.get(ctx, ScopeInfo{Kind: ScopeWorkspace, DataDir: p.runtime.info.DataDir, Workspace: workspace})
+		runtimeScope, workspaces := snapshot.resources.runtime, snapshot.resources.workspaces
+		workspaceScope, err := workspaces.get(ctx, ScopeInfo{Kind: ScopeWorkspace, DataDir: runtimeScope.info.DataDir, Workspace: workspace})
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
-		bindings := p.preparationBindings(workspaceScope, agent.Capabilities)
+		bindings := p.preparationBindings(runtimeScope, workspaceScope, agent.Capabilities)
 		sel := selection{agent: agent, bindings: bindings, invocation: Invocation{snapshot: snapshot}, credentials: captured.credentials}
 
 		callCtx, release, err := workspaceScope.enter(ctx)
@@ -287,12 +292,20 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		// committed admission's opener publishes it, so a failed fork or
 		// admission never creates warnings for an unpublished Session.
 		warnings := sel.warnings
-		return harness.PreparedExecution{
+		prepared = harness.PreparedExecution{
 			Capture: capture,
 			Open: func(openCtx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
-				return p.open(openCtx, admission, workspace, workspaceScope, agent, snapshot, warnings, opener)
+				return p.open(openCtx, admission, workspace, runtimeScope, workspaceScope, agent, snapshot, warnings, opener, &releaseArtifacts)
 			},
-		}, nil
+		}
+		prepared.Release = func() error {
+			err := snapshot.resources.release()
+			if releaseArtifacts != nil {
+				releaseArtifacts()
+			}
+			return err
+		}
+		return prepared, nil
 	}
 }
 
@@ -301,10 +314,10 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 // selected capability provided only by an Operation or Agent scope is valid
 // but not constructed yet, so it stays absent until Open rather than rejecting
 // the admission.
-func (p *preparation) preparationBindings(workspaceScope *scope, selected []string) Bindings {
+func (p *preparation) preparationBindings(runtimeScope, workspaceScope *scope, selected []string) Bindings {
 	entries := make(map[string]bindingEntry, len(selected))
 	for _, id := range selected {
-		for _, source := range []*scope{p.runtime, workspaceScope} {
+		for _, source := range []*scope{runtimeScope, workspaceScope} {
 			if entry, ok := source.bindings.entries[id]; ok {
 				entries[id] = entry
 				break
@@ -326,20 +339,20 @@ func (p *preparation) preparationBindings(workspaceScope *scope, selected []stri
 // by stale pre-hook values. The Operation guard covers opening and every
 // nested invocation until the returned Close releases it and closes the
 // Operation scope; each invocation's own Close releases its guard and closes
-// its Agent scope before that; the artifact token releases last, after all
-// scoped cleanup, and an opening failure releases it before returning. Only
+// its Agent scope before that; the prepared reservation releases the artifact
+// token after the resource-set hold, and an opening failure releases it before returning. Only
 // after the opening succeeds does the collected prompt presentation publish,
 // so a failed fork or admission never creates warnings for an unpublished
 // Session and a successful opener publishes before any progress.
-func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, warnings *preparationWarnings, opener openInvocation) (harness.Execution, error) {
-	releaseArtifacts, err := p.artifacts.acquireExecution(ctx, sessionArtifactDir(p.runtime.info.DataDir, admission.SessionID))
+func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, runtimeScope, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, warnings *preparationWarnings, opener openInvocation, artifactRelease *func()) (harness.Execution, error) {
+	releaseArtifacts, err := p.artifacts.acquireExecution(ctx, sessionArtifactDir(runtimeScope.info.DataDir, admission.SessionID))
 	if err != nil {
 		return harness.Execution{}, err
 	}
-	base := ScopeInfo{DataDir: p.runtime.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID}
+	base := ScopeInfo{DataDir: runtimeScope.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID}
 	operationInfo := base
 	operationInfo.Kind = ScopeOperation
-	operation, err := p.composition.openScope(ctx, operationInfo, []*scope{p.runtime, workspaceScope})
+	operation, err := p.composition.openScope(ctx, operationInfo, []*scope{runtimeScope, workspaceScope})
 	if err != nil {
 		releaseArtifacts()
 		return harness.Execution{}, err
@@ -353,7 +366,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	agentInfo := base
 	agentInfo.Kind = ScopeAgent
 	openInvocation := func(ctx context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
-		agentScope, err := p.composition.openScope(ctx, agentInfo, []*scope{p.runtime, workspaceScope, operation})
+		agentScope, err := p.composition.openScope(ctx, agentInfo, []*scope{runtimeScope, workspaceScope, operation})
 		if err != nil {
 			return harness.InvocationExecution{}, err
 		}
@@ -373,7 +386,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		selected := make([]string, 0, len(agent.Capabilities)+len(agent.Tools))
 		selected = append(selected, agent.Capabilities...)
 		selected = append(selected, agent.Tools...)
-		bindings, err := selectCapabilities([]*scope{p.runtime, workspaceScope, operation, agentScope}, selected)
+		bindings, err := selectCapabilities([]*scope{runtimeScope, workspaceScope, operation, agentScope}, selected)
 		if err != nil {
 			return unwind(err, releaseAgent)
 		}
@@ -391,6 +404,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	// execution publishes its Session's prompt group before any model or tool
 	// progress.
 	warnings.publish(p.passive, admission.SessionID)
+	*artifactRelease = releaseArtifacts
 	return harness.Execution{
 		OpenInvocation: openInvocation,
 		Permissions:    snapshot.permissionPolicy(workspace),
@@ -398,7 +412,6 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		Close: func() error {
 			releaseOperation()
 			err := operation.close()
-			releaseArtifacts() // the token releases last, after the scoped cleanup
 			return err
 		},
 	}, nil

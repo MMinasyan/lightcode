@@ -486,15 +486,15 @@ func validateScopeInfo(info ScopeInfo) error {
 // neutral reporter: the callback fixes the attribution from the factory's own
 // registered ID, drops reports after this scope's cancellation, and delegates
 // the presentation publication. It cannot veto work, wait, or perform I/O.
-func (c *composition) bindReportWarning(scopeCtx context.Context, info ScopeInfo, p Plugin) func(kind, message string) {
-	if info.Kind != ScopeRuntime || c.reportWarning == nil {
+func (c *composition) bindReportWarning(scopeCtx context.Context, info ScopeInfo, p Plugin, report func(string, string, string)) func(kind, message string) {
+	if info.Kind != ScopeRuntime || report == nil {
 		return nil
 	}
 	return func(kind, message string) {
 		if scopeCtx.Err() != nil {
 			return
 		}
-		c.reportWarning(p.ID, kind, message)
+		report(p.ID, kind, message)
 	}
 }
 
@@ -509,6 +509,26 @@ func (c *composition) bindReportWarning(scopeCtx context.Context, info ScopeInfo
 // reverse construction order attempting all and joining errors — and publishes
 // nothing.
 func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors []*scope) (*scope, error) {
+	return c.openScopeReporting(ctx, info, ancestors, c.reportWarning)
+}
+
+// scopeConstructionError keeps rollback failures distinct while exposing both
+// causes to callers through the ordinary error chain.
+type scopeConstructionError struct {
+	cause   error
+	cleanup error
+}
+
+func (e *scopeConstructionError) Error() string { return errors.Join(e.cause, e.cleanup).Error() }
+
+func (e *scopeConstructionError) Unwrap() []error {
+	if e.cleanup == nil {
+		return []error{e.cause}
+	}
+	return []error{e.cause, e.cleanup}
+}
+
+func (c *composition) openScopeReporting(ctx context.Context, info ScopeInfo, ancestors []*scope, report func(string, string, string)) (*scope, error) {
 	if err := validateScopeInfo(info); err != nil {
 		return nil, err
 	}
@@ -540,7 +560,7 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 		}
 	}
 	fail := func(err error) (*scope, error) {
-		return nil, errors.Join(err, sc.cleanup())
+		return nil, &scopeConstructionError{cause: err, cleanup: sc.cleanup()}
 	}
 	for _, p := range c.plan[info.Kind] {
 		if err := scopeCtx.Err(); err != nil {
@@ -559,7 +579,7 @@ func (c *composition) openScope(ctx context.Context, info ScopeInfo, ancestors [
 		// here to its registered ID and to this scope's cancellation; an
 		// isolated composition without a reporter supplies nil.
 		pluginInfo := info
-		pluginInfo.ReportWarning = c.bindReportWarning(scopeCtx, info, p)
+		pluginInfo.ReportWarning = c.bindReportWarning(scopeCtx, info, p, report)
 		instance, err := p.Open(scopeCtx, pluginInfo, Bindings{entries: deps})
 		if err != nil {
 			return fail(fmt.Errorf("plugin %q: open: %w", p.ID, err))
@@ -787,11 +807,12 @@ type workspaceScopes struct {
 	ancestors []*scope
 	obs       *observation
 
-	mu       sync.Mutex
-	closed   bool
-	live     map[string]*scope
-	attempts map[string]*workspaceAttempt
-	building sync.WaitGroup
+	mu         sync.Mutex
+	closed     bool
+	live       map[string]*scope
+	attempts   map[string]*workspaceAttempt
+	building   sync.WaitGroup
+	cleanupErr error
 }
 
 func newWorkspaceScopes(owner context.Context, c *composition, ancestors []*scope, obs *observation) *workspaceScopes {
@@ -850,25 +871,47 @@ func (w *workspaceScopes) build(key string, info ScopeInfo, attempt *workspaceAt
 	if err != nil {
 		w.mu.Lock()
 		delete(w.attempts, key)
+		var construction *scopeConstructionError
+		if errors.As(err, &construction) {
+			w.cleanupErr = errors.Join(w.cleanupErr, construction.cleanup)
+		}
 		w.mu.Unlock()
 		attempt.sc, attempt.err = sc, err
 		close(attempt.done)
 		return
 	}
+	var rejected error
 	w.obs.publish(func() []Event {
 		sc.obs = w.obs
 		w.mu.Lock()
 		delete(w.attempts, key)
+		if w.closed || w.owner.Err() != nil {
+			rejected = w.owner.Err()
+			if rejected == nil {
+				rejected = ErrClosed
+			}
+			w.mu.Unlock()
+			return nil
+		}
 		w.live[key] = sc
 		w.mu.Unlock()
 		attempt.sc, attempt.err = sc, nil
 		close(attempt.done)
 		return []Event{scopeEvent(protocol.ScopeOpened, info)}
 	})
+	if rejected != nil {
+		cleanup := sc.cleanup()
+		w.mu.Lock()
+		w.cleanupErr = errors.Join(w.cleanupErr, cleanup)
+		w.mu.Unlock()
+		attempt.err = &scopeConstructionError{cause: rejected, cleanup: cleanup}
+		close(attempt.done)
+	}
 }
 
 // shutdown is called once by the Runtime owner. It closes registry admission,
-// joins construction, and closes live Workspace scopes in sorted path order.
+// joins construction, then returns failed-construction cleanup errors and
+// closes live Workspace scopes in sorted path order.
 func (w *workspaceScopes) shutdown() error {
 	w.mu.Lock()
 	w.closed = true
@@ -884,8 +927,9 @@ func (w *workspaceScopes) shutdown() error {
 	for i, key := range keys {
 		live[i] = w.live[key]
 	}
+	cleanupErr := w.cleanupErr
 	w.mu.Unlock()
-	var errs []error
+	errs := []error{cleanupErr}
 	for _, sc := range live {
 		errs = append(errs, sc.close())
 	}
