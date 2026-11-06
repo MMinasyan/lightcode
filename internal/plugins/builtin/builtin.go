@@ -17,3 +17,10 @@ import (
 func Plugins() []runtime.Plugin {
 	return []runtime.Plugin{adaptation.Plugin(), tasks.Plugin()}
 }
+
+// DefaultCapabilityIDs returns the shipped application's default capability
+// selection: the bundled model adaptation contribution. A custom host supplies
+// its own ordinary selection through runtime.Options.
+func DefaultCapabilityIDs() []string {
+	return []string{adaptation.CapabilityID}
+}

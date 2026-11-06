@@ -93,10 +93,7 @@ func warmCorruptFixture(t *testing.T) (*Harness, *graphStorage, *prepareStub, *c
 	sibling := createSession(t, h)
 	c := cachedCoordinator(t, h, testSessionID)
 	mustAdmitWithoutExecution(t, h, testSessionID, testOpID, admissionContent("hello"))
-	{
-		_, err := h.commitEffectResult(ctx, c, testOpID, nil, modelResult{terminal: OperationSuccess})
-		testassert.NoError(t, err)
-	}
+	settleAdmitted(t, h, c, testOpID)
 	{
 		header, err := h.ReadSessionHeader(ctx, testSessionID)
 		testassert.Require(t, err == nil && header.CurrentOperationID == "", "post-settlement header = %+v (%v), want an idle Session", header, err)

@@ -94,7 +94,7 @@ func compactPrepWith(t *testing.T, agentsDoc, configDoc, endpoint string) (confi
 	runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
 	obs := newObservation()
 	ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
-	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs)
+	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs, nil)
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, "", "", nil, nil, nil, nil)
@@ -126,28 +126,6 @@ func compactPrepSelection(t *testing.T, captured configurationCapture, agentName
 	agent, err := harness.ResolveAgentType(agentName, captured.snapshot.agentTypes())
 	testassert.Require(t, err == nil, "ResolveAgentType(%q): %v", agentName, err)
 	return selection{agent: agent, bindings: Bindings{}, invocation: Invocation{snapshot: captured.snapshot}, credentials: captured.credentials}
-}
-
-// compactBaseCapture is the valid capture baseline of the hook-protection
-// fixture.
-func compactBaseCapture() harness.ExecutionCapture {
-	return harness.ExecutionCapture{
-		ConfigurationRevision: "rev-1",
-		Model:                 model.ModelRef{Provider: "prov", Model: "m"},
-		SystemPrompt:          "system",
-		Tools:                 []model.ToolDefinition{testToolDefinitionRuntime()},
-		ContextWindow:         4096,
-		OutputReserve:         131072,
-		Compact: harness.CompactCapture{
-			Model:        model.ModelRef{Provider: "prov", Model: "m2"},
-			SystemPrompt: "summarize",
-		},
-		Strategy: harness.StrategyCapture{ID: harness.IncludedStrategyID, RequiresContextWindow: true},
-	}
-}
-
-func testToolDefinitionRuntime() model.ToolDefinition {
-	return model.ToolDefinition{Name: "echo", Description: "echoes", Parameters: []byte(`{"type":"object"}`)}
 }
 
 // TestConcretePrepareCompactCapture pins every capture field the compaction
@@ -389,44 +367,6 @@ func TestConcreteOpenerCompactModel(t *testing.T) {
 			stream.Close()
 			testassert.Require(t, len(server.models) == 2 && server.models[1] == "m", "conversation Model wire models = %v, want the conversation model second", server.models)
 			testassert.Require(t, capture.Compact.Model != conversationRef || server.auths[1] == server.auths[0], "conversation authorization = %q differs from the compact one %q on the shared-model case", server.auths[1], server.auths[0])
-		})
-	}
-}
-
-// TestValidateHookedCaptureProtectsCompaction proves a preparation hook
-// cannot change the compact members or the window and reserve: the three new
-// members join the same prohibition family as model and revision, while the
-// prompt and tool-definition replacement freedoms still hold.
-func TestValidateHookedCaptureProtectsCompaction(t *testing.T) {
-	base := compactBaseCapture()
-
-	// The prompt freedom still holds.
-	prompted := base
-	prompted.SystemPrompt = "replaced prompt"
-	testassert.NoError(t, validateHookedCapture(base, prompted))
-	// The tool-definition replacement freedom still holds: same names, new
-	// description.
-	tooled := base
-	tooled.Tools = append([]model.ToolDefinition(nil), base.Tools...)
-	tooled.Tools[0].Description = "replaced description"
-	testassert.NoError(t, validateHookedCapture(base, tooled))
-
-	for _, mutation := range []struct {
-		name   string
-		mutate func(*harness.ExecutionCapture)
-	}{
-		{"context window", func(c *harness.ExecutionCapture) { c.ContextWindow++ }},
-		{"output reserve", func(c *harness.ExecutionCapture) { c.OutputReserve++ }},
-		{"compact model", func(c *harness.ExecutionCapture) { c.Compact.Model = model.ModelRef{Provider: "other", Model: "m"} }},
-		{"compact system prompt", func(c *harness.ExecutionCapture) { c.Compact.SystemPrompt = "changed" }},
-	} {
-		t.Run(mutation.name, func(t *testing.T) {
-			next := base
-			mutation.mutate(&next)
-			{
-				err := validateHookedCapture(base, next)
-				testassert.Require(t, err != nil, "hook changing the %s accepted, want rejection", mutation.name)
-			}
 		})
 	}
 }

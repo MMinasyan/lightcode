@@ -26,11 +26,9 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	modeladapt "github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/prompt"
 )
 
 // chainAgentsDocument builds the combined scenario's agents document with the
@@ -127,40 +125,6 @@ func argumentHookPlugin(id string, hook ToolArgumentsHook) Plugin {
 		Provides: []CapabilitySpec{Spec[ToolArgumentsHook](id)},
 		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			return Instance{Values: map[string]any{id: hook}}, nil
-		},
-	}
-}
-
-// bundledAdaptation is the capability-ID row's ModelAdaptation value: the
-// bundled binding table's own resolver body (the shipped adaptation plugin
-// package cannot be imported from in-package tests, so its resolver logic is
-// composed directly over the real bundled matcher).
-type bundledAdaptation struct{}
-
-func (bundledAdaptation) Resolve(ref model.ModelRef, mode prompt.Mode) (Adaptation, error) {
-	match := modeladapt.Match(ref.Model)
-	if match == nil {
-		return Adaptation{}, nil
-	}
-	out := Adaptation{
-		ExcludeTools:                match.ExcludeTools,
-		ToolDescriptionReplacements: match.ToolDescriptionReplacements,
-	}
-	if mode == prompt.ModeFull {
-		out.Append = match.Append
-	}
-	return out, nil
-}
-
-// bundledAdaptationPlugin declares the bundled resolver as the composition's
-// single ModelAdaptation export.
-func bundledAdaptationPlugin() Plugin {
-	return Plugin{
-		ID:       "adapt",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[ModelAdaptation]("model_adaptation")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"model_adaptation": bundledAdaptation{}}}, nil
 		},
 	}
 }
@@ -375,16 +339,16 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "notes.txt"), []byte(originalNotesTxt), 0o600))
 
-		hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
-			c.SystemPrompt += "|hooked"
-			return c
+		hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in PreparationInput) PreparationConsequence {
+			prompt := in.Prompt + "|hooked"
+			return PreparationConsequence{Prompt: &prompt}
 		}}
 		argHook := &rewriteWriteHook{replace: hookRewriteArgs}
 		useFixtureStore(t, e.store)
 		openChained := func(ctx context.Context, hook *recordHook, argHook *rewriteWriteHook) (*Runtime, error) {
 			return Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []Plugin{
 				hookPlugin(hook),
-				argumentHookPlugin("arg.rewrite", argHook), bundledAdaptationPlugin(),
+				argumentHookPlugin("arg.rewrite", argHook), ShippedAdaptationPlugin(),
 			}})
 		}
 		owner, ownerCancel := context.WithCancel(ctx)
@@ -680,7 +644,7 @@ func TestProductionCapabilityIDsModelIndependent(t *testing.T) {
   "vanillaagent": {"model": "prov/vanilla", "system_prompt": "full", "tools": ["read_file", "write_file", "edit_file", "apply_patch"], "capabilities": ["model_adaptation"]}
 }`)
 
-		r, err := e.openPlugins(ctx, bundledAdaptationPlugin())
+		r, err := e.openPlugins(ctx, ShippedAdaptationPlugin())
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 

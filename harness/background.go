@@ -772,7 +772,9 @@ func (h *Harness) StopAll(ctx context.Context) error {
 // spawn owns the concrete start: an error means it did not transfer a live
 // completion obligation — the member claim-finishes and the error returns
 // unchanged; success means it arranged terminal delivery through
-// DeliverBackgroundCompletion using the supplied identity.
+// DeliverBackgroundCompletion using the supplied identity. The caller's
+// context covers startup only: a context already done before the spawn refuses
+// the start, and a spawn that returned success no longer depends on it.
 func (h *Harness) StartJob(ctx context.Context, sessionID, jobID string, spawn func(ctx context.Context, completionID string) error) error {
 	if err := validateJobID(jobID, "job id"); err != nil {
 		return invalidInput("job id: %v", err)
@@ -796,6 +798,10 @@ func (h *Harness) StartJob(ctx context.Context, sessionID, jobID string, spawn f
 	}
 	h.observeMemberInvalidation(c, jobID) // the job member admission
 	if err := h.backgroundHandoffFailure(c, member); err != nil {
+		h.claimFinishBackgroundMember(c, member.completionID)
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		h.claimFinishBackgroundMember(c, member.completionID)
 		return err
 	}
@@ -832,7 +838,10 @@ type LaunchChildResult struct {
 // publishes child and admission in one transaction against the re-read
 // parent register, performs the common handoff, materializes the child,
 // installs the pending completion under the reserved identity, and starts the
-// child execution. A rejected handoff or failed start settles its member — a
+// child execution. The caller's context ends at the launch transaction: a
+// caller canceled before it publishes nothing, and after it the Harness owns
+// the child, so materialization and settlement run under the Harness context.
+// A rejected handoff or failed start settles its member — a
 // committed child first attempts its durable Operation's terminal
 // interruption, a materialization or settlement failure leaves the durable
 // running Operation for recovery — and the launch never retries nor publishes
@@ -920,12 +929,12 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 
 	if err := h.backgroundHandoffFailure(c, member); err != nil {
 		h.releasePrepared(&prepared) // the rejected handoff settles its member and drops the prepared execution
-		return LaunchChildResult{}, h.settleRejectedChildLaunch(ctx, c, member, childID, req.OperationID, err)
+		return LaunchChildResult{}, h.settleRejectedChildLaunch(c, member, childID, req.OperationID, err)
 	}
 	// The committed child installs as a stable cell with its validated durable
 	// graph and a call-owned pin, so the pending completion and the execution
 	// are installed on the real child rather than on a failed-load placeholder.
-	childCoordinator, childRelease, err := h.acquireCoordinator(ctx, childID)
+	childCoordinator, childRelease, err := h.acquireCoordinator(context.WithoutCancel(h.ctx), childID)
 	if err != nil {
 		// the durable running Operation stays for recovery; no delivery
 		h.releasePrepared(&prepared) // the child materialization failed: the launch never adopts
@@ -995,8 +1004,8 @@ func (h *Harness) launchTransaction(tx Transaction, view SessionRecord, req Laun
 // through recordStorageFailure, and claim-finishes the parent member without
 // delivery — and otherwise returns the handoff failure after the
 // interruption and the finish.
-func (h *Harness) settleRejectedChildLaunch(ctx context.Context, c *coordinator, member *backgroundMember, childID, operationID string, handoffErr error) error {
-	child, childRelease, err := h.acquireCoordinator(ctx, childID)
+func (h *Harness) settleRejectedChildLaunch(c *coordinator, member *backgroundMember, childID, operationID string, handoffErr error) error {
+	child, childRelease, err := h.acquireCoordinator(context.WithoutCancel(h.ctx), childID)
 	if err == nil {
 		defer childRelease()
 		settleCtx := context.WithoutCancel(h.ctx)

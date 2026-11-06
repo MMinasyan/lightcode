@@ -1,15 +1,12 @@
 package runtime
 
 import (
-	"maps"
 	"os"
 	goruntime "runtime"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/prompt"
 )
@@ -18,9 +15,8 @@ import (
 // surface: the host-supplied identity and global rules directory, the
 // preparation's Workspace and session-start environment, the selected
 // definition's prompt fields, the captured Invocation, hard constraints, and
-// session identity, the compiled tool specs in the agent's selection order
-// after first-occurrence dedupe, the bound ModelAdaptation (nil when
-// unselected), and the active model ref.
+// session identity, and the compiled tool specs in the agent's selection
+// order after first-occurrence dedupe.
 type surfaceRequest struct {
 	hostIdentity   string
 	globalRulesDir string
@@ -32,44 +28,25 @@ type surfaceRequest struct {
 	constraints    ToolConstraints
 	identity       harness.SessionIdentity
 	toolSpecs      []CapabilitySpec
-	adaptation     ModelAdaptation
-	modelRef       model.ModelRef
 }
 
-// surfaceResult is one composed prompt with its captured rule diagnostics.
+// surfaceResult is one composed prompt with its captured rule diagnostics and
+// the exact baseline assembly inputs the prompt was rendered from.
 type surfaceResult struct {
 	Prompt   string
+	Assembly prompt.AssemblyInput
 	Warnings []prompt.Warning
 }
 
 // composeSurface converts the captured inputs into one final owned prompt and
-// advertised tool surface, with no harness or storage I/O. A non-nil
-// adaptation resolves exactly once for the model ref and prompt mode; its
-// error aborts preparation. The prompt reads the explicitly supplied global
-// and Workspace rules, assembles the baseline through the public pure
-// assembler, then appends the resolved adaptation's ordered paragraphs last.
-// The advertised surface walks the tool specs in the agent's selection order
-// after first-occurrence dedupe: every selected eligible tool is advertised
-// minus the excluded names — an exclusion can never revive a tool the hard
-// constraints made ineligible. Every advertised description renders through
-// the existing adaptation rendering helper. A zero session start samples the
-// compose time once, so the resulting prompt is captured once.
+// the eligible tool catalog, with no harness or storage I/O. The prompt reads
+// the explicitly supplied global and Workspace rules and assembles the
+// baseline through the public pure assembler. The catalog walks the tool specs
+// in the agent's selection order after first-occurrence dedupe: every selected
+// eligible tool is included — an exclusion can never revive a tool the hard
+// constraints made ineligible. A zero session start samples the compose time
+// once, so the resulting prompt is captured once.
 func composeSurface(req surfaceRequest) (surfaceResult, []model.ToolDefinition, error) {
-	var resolved Adaptation
-	var conv *adaptation.Adaptation
-	if req.adaptation != nil {
-		value, err := req.adaptation.Resolve(req.modelRef, req.promptSize)
-		if err != nil {
-			return surfaceResult{}, nil, err
-		}
-		resolved = value
-		conv = &adaptation.Adaptation{
-			ExcludeTools:                slices.Clone(resolved.ExcludeTools),
-			Append:                      slices.Clone(resolved.Append),
-			ToolDescriptionReplacements: maps.Clone(resolved.ToolDescriptionReplacements),
-		}
-	}
-
 	sessionStart := req.sessionStart
 	if sessionStart.IsZero() {
 		sessionStart = time.Now()
@@ -95,9 +72,9 @@ func composeSurface(req surfaceRequest) (surfaceResult, []model.ToolDefinition, 
 	if err != nil {
 		return surfaceResult{}, nil, err
 	}
-	result := surfaceResult{Prompt: adaptation.TransformPrompt(assembled, conv), Warnings: rules.Warnings}
+	result := surfaceResult{Prompt: assembled, Assembly: input, Warnings: rules.Warnings}
 
-	advertised := make([]model.ToolDefinition, 0, len(req.toolSpecs))
+	catalog := make([]model.ToolDefinition, 0, len(req.toolSpecs))
 	for _, spec := range req.toolSpecs {
 		description, err := spec.describe(req.invocation, req.constraints, req.identity)
 		if err != nil {
@@ -106,15 +83,9 @@ func composeSurface(req surfaceRequest) (surfaceResult, []model.ToolDefinition, 
 		if !description.Available {
 			continue
 		}
-		name := description.Definition.Name
-		if slices.Contains(resolved.ExcludeTools, name) {
-			continue
-		}
-		definition := description.Definition
-		definition.Description = adaptation.RenderToolDescription(definition.Description, conv)
-		advertised = append(advertised, definition)
+		catalog = append(catalog, description.Definition)
 	}
-	return result, advertised, nil
+	return result, catalog, nil
 }
 
 // captureShell samples the process shell once per composed surface.

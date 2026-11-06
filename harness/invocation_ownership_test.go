@@ -174,6 +174,9 @@ func TestMaintenanceOpenedInvocationDeclarationsArePreserved(t *testing.T) {
 	exec := Execution{
 		Strategy: &StrategyBinding{ID: gapStrategyID, Strategy: &gapStrategy{t: t}},
 		OpenInvocation: func(_ context.Context, request InvocationRequest) (InvocationExecution, error) {
+			if request.Purpose == InvocationPurposeConversation {
+				return invocationExecution(quietConversation(), noopTool), nil
+			}
 			sharedRequest = []RequestHook{{ID: "own.req", ExtensionID: "own-ext", Mode: HookModePure, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
 				t.Errorf("a maintenance invocation request hook ran")
 				return RequestConsequence{}, nil
@@ -194,16 +197,17 @@ func TestMaintenanceOpenedInvocationDeclarationsArePreserved(t *testing.T) {
 		},
 	}
 
-	h, _, c, sessionID := newGapHarness(t)
-	_, _, _, _, closeInvocation, err := h.runCompaction(context.Background(), c, testOpID, exec, gapCapture(), compactSnapshotMessages(), nil, nil)
-	defer closeInvocation()
-	testassert.NoError(t, err)
+	h, store, c, sessionID := newGapHarness(t)
+	testassert.NoError(t, runAutomaticMaintenance(t, h, c, exec))
 	testassert.Equal(t, passes, 1)
 
 	testassert.Require(t, sharedRequest[0].ID == "tampered.req" && sharedArgs == nil && sharedOutput[0].ID == "",
 		"opener-retained arrays after the procedure = %+v / %v / %+v, want the tamper to have landed on the opener side", sharedRequest, sharedArgs, sharedOutput)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 	testassert.NoError(t, err)
-	testassert.Require(t, rec.State.Status == OperationRunning && rec.State.UnreportedMaintenance,
-		"maintenance procedure state after the post-acceptance tamper = %+v, want the procedure to have completed over its summary pass", rec.State)
+	testassert.Require(t, rec.State.Status == OperationSuccess && !rec.State.UnreportedMaintenance,
+		"maintenance procedure state after the post-acceptance tamper = %+v, want the procedure to have completed and published over its summary pass", rec.State)
+	graph, err := validateFixture(t, store, sessionID)
+	testassert.NoError(t, err)
+	testassert.Require(t, compactedEntryOf(t, graph) != nil, "the maintenance procedure committed no checkpoint")
 }

@@ -62,14 +62,14 @@ type stubCoreStorage struct{ harness.Storage }
 // its pointer type.
 type hookValue struct{}
 
-func (hookValue) Prepare(context.Context, Invocation, harness.ExecutionCapture) (harness.ExecutionCapture, error) {
-	return harness.ExecutionCapture{}, nil
+func (hookValue) Prepare(context.Context, PreparationInput) (PreparationConsequence, error) {
+	return PreparationConsequence{}, nil
 }
 
 type ptrHookValue struct{}
 
-func (*ptrHookValue) Prepare(context.Context, Invocation, harness.ExecutionCapture) (harness.ExecutionCapture, error) {
-	return harness.ExecutionCapture{}, nil
+func (*ptrHookValue) Prepare(context.Context, PreparationInput) (PreparationConsequence, error) {
+	return PreparationConsequence{}, nil
 }
 
 // tamperScratch rewrites an equal-length substring of one raw JSON buffer in
@@ -1108,6 +1108,37 @@ func TestCompositionRejectsToolDeclarationWithoutDescription(t *testing.T) {
 	{
 		_, err := newComposition([]Plugin{provider, consumer})
 		testassert.NoError(t, err)
+	}
+}
+
+// TestDependencyOnToolsAndHooksUsesOrdinaryValidation proves tools and both
+// hook kinds compose like any other capability, whether the requirement names
+// the exact contract or a broader type, and that a wrongly typed requirement on
+// the same export is still rejected.
+func TestDependencyOnToolsAndHooksUsesOrdinaryValidation(t *testing.T) {
+	noop := func(context.Context, ScopeInfo, Bindings) (Instance, error) { return Instance{}, nil }
+	for _, row := range []struct {
+		name     string
+		provided CapabilitySpec
+		exact    CapabilitySpec
+	}{
+		{"tool", ToolSpec("x", staticToolDescription("x")), Spec[Tool]("x")},
+		{"preparation hook", Spec[PreparationHook]("x"), Spec[PreparationHook]("x")},
+		{"argument hook", Spec[ToolArgumentsHook]("x"), Spec[ToolArgumentsHook]("x")},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			compose := func(required CapabilitySpec) error {
+				_, err := newComposition([]Plugin{
+					{ID: "provider", Scope: ScopeRuntime, Provides: []CapabilitySpec{row.provided}, Open: noop},
+					{ID: "consumer", Scope: ScopeRuntime, Provides: []CapabilitySpec{Spec[any]("consumer.cap")}, Requires: []CapabilitySpec{required}, Open: noop},
+				})
+				return err
+			}
+			testassert.NoError(t, compose(row.exact))
+			testassert.NoError(t, compose(Spec[any]("x")))
+			err := compose(Spec[greeter]("x"))
+			testassert.Require(t, errors.Is(err, ErrComposition), "wrongly typed requirement = %v, want ErrComposition", err)
+		})
 	}
 }
 

@@ -40,6 +40,12 @@ type graphStorage struct {
 	// and aborts the transaction with its error when non-nil. It gives
 	// fixtures a deterministic barrier on one committed entry kind.
 	entryHook func(draft EntryDraft) error
+
+	// replaceHook, when set, runs before each register replacement with the
+	// exact key and payload and aborts the transaction with its error when
+	// non-nil. It gives fixtures a deterministic, identity-targeted barrier
+	// on one register intent instead of a shifted write ordinal.
+	replaceHook func(key RegisterKey, payload json.RawMessage) error
 }
 
 func (s *graphStorage) ReadEntries(_ context.Context, sessionID string, after int64) ([]Entry, error) {
@@ -242,6 +248,11 @@ func (t *graphTx) InsertRegister(draft RegisterDraft) (Register, error) {
 func (t *graphTx) ReplaceRegister(key RegisterKey, expectedRevision int64, payload json.RawMessage) (Register, error) {
 	if err := t.store.hook("replace_register"); err != nil {
 		return Register{}, err
+	}
+	if t.store.replaceHook != nil {
+		if err := t.store.replaceHook(key, payload); err != nil {
+			return Register{}, err
+		}
 	}
 	if !json.Valid(payload) {
 		return Register{}, invalidInput("register payload is not valid JSON")

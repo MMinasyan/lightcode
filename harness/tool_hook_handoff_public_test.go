@@ -59,7 +59,7 @@ func TestPublicExecutionCancellationAtToolIntentHandoff(t *testing.T) {
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
 								executed++
-								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+								return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
 							}}
 						},
 					}, nil
@@ -111,7 +111,7 @@ func TestPublicExecutionCancellationAtHookIntentHandoff(t *testing.T) {
 						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 							prepared++
 							return harness.PreparedTool{Permissions: publicPermission, Execute: func(context.Context) harness.ToolOutcome {
-								return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
+								return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}
 							}}
 						},
 						ToolHooks: []harness.ToolArgumentsHook{{ID: "hook.handoff", ExtensionID: "handoff-ext", Mode: harness.HookModeEffectful, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {

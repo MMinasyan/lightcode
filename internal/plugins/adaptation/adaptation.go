@@ -1,61 +1,83 @@
-// Package adaptation declares Lightcode's per-model adaptation plugin: one
-// Runtime-scoped ModelAdaptation export resolved from the bundled binding
-// table in internal/adaptation. It is an ordinary composition unit selected
-// through static registration — the same Plugin/Instance contract an
-// externally supplied capability implements, with no additional Runtime
-// authority, no settings, and no Close.
+// Package adaptation declares Lightcode's per-model adaptation plugin as one
+// ordinary Runtime-scoped PreparationHook contribution selected through static
+// registration. It retains the bundled model matching and applies its
+// exclusions, full-mode prompt append and tool-description replacements
+// through the same closed consequence every other preparation contribution
+// uses. It has no settings and no Close.
 package adaptation
 
 import (
 	"context"
 
 	modeladapt "github.com/MMinasyan/lightcode/internal/adaptation"
-	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/prompt"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
-const exportID = "model_adaptation"
+// CapabilityID is the plugin's one declared preparation capability.
+const CapabilityID = "model_adaptation"
 
-// Plugin returns the Runtime-scoped plugin whose single export is declared
-// exactly as the public ModelAdaptation contract. It has no dependencies and
-// no settings validator.
+// Plugin returns the Runtime-scoped plugin whose single export is declared as
+// the public PreparationHook contract. It has no dependencies and no settings
+// validator.
 func Plugin() runtime.Plugin {
 	return runtime.Plugin{
 		ID:    "adaptation",
 		Scope: runtime.ScopeRuntime,
 		Provides: []runtime.CapabilitySpec{
-			runtime.Spec[runtime.ModelAdaptation](exportID),
+			runtime.Spec[runtime.PreparationHook](CapabilityID),
 		},
 		Open: open,
 	}
 }
 
-// resolver adapts the bundled binding table to the public contract. Match
-// receives the model component of the ref alone and returns an independent
-// copy; nil is the baseline. The bundled guidance append paragraphs apply only
-// to full-mode prompts; tool exclusions and description replacements apply in
-// every mode.
-type resolver struct{}
+// hook applies the bundled treatment for the input's model component. The
+// resolved guidance append paragraphs apply only to full-mode prompts; tool
+// exclusions and description replacements apply in every mode.
+type hook struct{}
 
-func (resolver) Resolve(ref model.ModelRef, mode prompt.Mode) (runtime.Adaptation, error) {
-	match := modeladapt.Match(ref.Model)
+func (hook) Prepare(_ context.Context, input runtime.PreparationInput) (runtime.PreparationConsequence, error) {
+	match := modeladapt.Match(input.Model.Model)
 	if match == nil {
-		return runtime.Adaptation{}, nil
+		return runtime.PreparationConsequence{}, nil
 	}
-	out := runtime.Adaptation{
-		ExcludeTools:                match.ExcludeTools,
-		ToolDescriptionReplacements: match.ToolDescriptionReplacements,
+	var consequence runtime.PreparationConsequence
+	if len(match.Append) > 0 && input.Assembly.Mode == prompt.ModeFull {
+		prompt := modeladapt.TransformPrompt(input.Prompt, &modeladapt.Adaptation{Append: match.Append})
+		consequence.Prompt = &prompt
 	}
-	if mode == prompt.ModeFull {
-		out.Append = match.Append
+	if len(match.ExcludeTools) > 0 {
+		excluded := make(map[string]bool, len(match.ExcludeTools))
+		for _, name := range match.ExcludeTools {
+			excluded[name] = true
+		}
+		visible := make([]string, 0, len(input.Catalog))
+		for _, definition := range input.Catalog {
+			if !excluded[definition.Name] {
+				visible = append(visible, definition.Name)
+			}
+		}
+		consequence.ToolNames = visible
 	}
-	return out, nil
+	if len(match.ToolDescriptionReplacements) > 0 {
+		replacements := &modeladapt.Adaptation{ToolDescriptionReplacements: match.ToolDescriptionReplacements}
+		descriptions := make(map[string]string)
+		for _, definition := range input.Catalog {
+			rendered := modeladapt.RenderToolDescription(definition.Description, replacements)
+			if rendered != definition.Description {
+				descriptions[definition.Name] = rendered
+			}
+		}
+		if len(descriptions) > 0 {
+			consequence.Descriptions = descriptions
+		}
+	}
+	return consequence, nil
 }
 
 func open(ctx context.Context, _ runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return runtime.Instance{}, err
 	}
-	return runtime.Instance{Values: map[string]any{exportID: resolver{}}}, nil
+	return runtime.Instance{Values: map[string]any{CapabilityID: hook{}}}, nil
 }

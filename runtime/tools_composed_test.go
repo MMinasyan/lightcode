@@ -251,52 +251,60 @@ func envCallContext(t *testing.T, workspace string, constraints ToolConstraints)
 }
 
 // scriptBackground is the test BackgroundServices over no Harness: StartJob
-// runs the spawn inline (or surfaces the scripted failure); DeliverCompletion
-// is a no-op.
+// runs the spawn inline (or surfaces the scripted failure) with a no-op
+// deliver.
 type scriptBackground struct {
 	startErr error
 }
 
-func (scriptBackground) LaunchChild(context.Context, harness.LaunchChildRequest) (harness.LaunchChildResult, error) {
-	return harness.LaunchChildResult{}, errors.New("unexpected child launch in this fixture")
+func (scriptBackground) LaunchChild(ChildRequest) (string, error) {
+	return "", errors.New("unexpected child launch in this fixture")
 }
 
-func (b scriptBackground) StartJob(ctx context.Context, _, _ string, spawn func(context.Context, string) error) error {
+func (b scriptBackground) StartJob(_ string, spawn func(context.Context, func(string) error) error) error {
 	if b.startErr != nil {
 		return b.startErr
 	}
-	return spawn(ctx, "0123456789abcdef0123456789abcdef")
-}
-
-func (scriptBackground) DeliverCompletion(context.Context, string, string, string) error {
-	return nil
+	return spawn(context.Background(), func(string) error { return nil })
 }
 
 // harnessBackground is the production-shaped BackgroundServices over the
-// fixture Harness; DeliverCompletion signals after the harness accepted the
-// delivery.
+// fixture Harness; the delivered signal fires when the job's deliver closure
+// reaches the Harness.
 type harnessBackground struct {
 	h         *harness.Harness
+	sessionID string
 	delivered chan struct{}
 }
 
-func (b *harnessBackground) LaunchChild(ctx context.Context, req harness.LaunchChildRequest) (harness.LaunchChildResult, error) {
-	return b.h.LaunchChildSession(ctx, req)
-}
-
-func (b *harnessBackground) StartJob(ctx context.Context, sessionID, jobID string, spawn func(context.Context, string) error) error {
-	return b.h.StartJob(ctx, sessionID, jobID, spawn)
-}
-
-func (b *harnessBackground) DeliverCompletion(ctx context.Context, sessionID, completionID, content string) error {
-	err := b.h.DeliverBackgroundCompletion(ctx, sessionID, completionID, content)
-	if err == nil {
-		select {
-		case b.delivered <- struct{}{}:
-		default:
-		}
+func (b *harnessBackground) LaunchChild(req ChildRequest) (string, error) {
+	result, err := b.h.LaunchChildSession(context.Background(), harness.LaunchChildRequest{
+		ParentSessionID: b.sessionID,
+		AgentType:       req.AgentType,
+		Content:         req.Content,
+		OperationID:     req.OperationID,
+		MaxConcurrent:   req.MaxConcurrent,
+		OutputLimit:     req.OutputLimit,
+	})
+	if err != nil {
+		return "", err
 	}
-	return err
+	return result.ChildSessionID, nil
+}
+
+func (b *harnessBackground) StartJob(jobID string, spawn func(context.Context, func(string) error) error) error {
+	return b.h.StartJob(context.Background(), b.sessionID, jobID, func(ctx context.Context, completionID string) error {
+		return spawn(ctx, func(content string) error {
+			err := b.h.DeliverBackgroundCompletion(context.Background(), b.sessionID, completionID, content)
+			if err == nil {
+				select {
+				case b.delivered <- struct{}{}:
+				default:
+				}
+			}
+			return err
+		})
+	})
 }
 
 // backgroundImmediatePattern is the retained complete immediate template;
@@ -460,12 +468,18 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 					th.mu.Lock()
 					th.admission = admission.AdmittedEntry
 					th.mu.Unlock()
+					background := opts.background
+					if bg, ok := background.(*harnessBackground); ok {
+						copied := *bg
+						copied.sessionID = admission.AdmittedEntry.SessionID
+						background = &copied
+					}
 					tc := ToolContext{
 						Workspace:     workspace,
 						AdmittedEntry: admission.AdmittedEntry,
 						Invocation:    opts.invocation,
 						Constraints:   ToolConstraints{Readonly: admission.Execution.Readonly, WriteDir: admission.Execution.WriteDir},
-						Background:    opts.background,
+						Background:    background,
 						SubprocessEnv: opts.subprocessEnv,
 					}
 					return harness.Execution{

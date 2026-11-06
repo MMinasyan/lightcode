@@ -53,23 +53,23 @@ func changedHook(id string, replacement string) ToolArgumentsHook {
 	}}
 }
 
-// runReuseFixture admits the reuse fixture, publishes the given calls through
-// its own execution, and returns the pieces the settle rows drive.
-func runReuseFixture(t *testing.T, hooks []ToolArgumentsHook, calls ...model.ToolCall) (*Harness, *graphStorage, *coordinator, string, Execution, *hookToolSpy, *seqNormalizer) {
+// runReuseFixture admits the reuse fixture and returns the pieces the settle
+// rows drive; each settle row runs the real admitted execution that publishes
+// and settles its calls.
+func runReuseFixture(t *testing.T, hooks []ToolArgumentsHook) (*Harness, *graphStorage, *coordinator, string, Execution, *hookToolSpy, *seqNormalizer) {
 	t.Helper()
 	spy := &hookToolSpy{}
 	n := &seqNormalizer{}
 	exec := hookFixtureExecution(spy.tool, n.normalize, hooks...)
 	h, store, c, sessionID := newHookHarness(t, exec)
-	publishHookCalls(t, h, c, exec, calls...)
 	return h, store, c, sessionID, exec, spy, n
 }
 
-func settleCall(t *testing.T, h *Harness, c *coordinator, exec Execution, call model.ToolCall) model.ToolResult {
+func settleCall(t *testing.T, h *Harness, c *coordinator, store *graphStorage, sessionID string, exec Execution, call model.ToolCall) model.ToolResult {
 	t.Helper()
-	got, err := h.toolEffect(c, testOpID, exec, openedConversation(t, exec), testCapture())(context.Background(), call, []string{"echo"})
+	results, err := runToolCalls(t, h, c, store, sessionID, context.Background(), testOpID, exec, testCapture(), []model.ToolCall{call})
 	testassert.NoError(t, err)
-	return got
+	return model.ToolResult{CallID: results[0].ToolCallID, Status: results[0].Status, Content: results[0].Content}
 }
 
 func rawCall(id string, arguments string) model.ToolCall {
@@ -79,10 +79,8 @@ func rawCall(id string, arguments string) model.ToolCall {
 func TestArgumentHookNormalizationOutcomeReuse(t *testing.T) {
 	t.Run("a valid original returned unchanged consumes the producer normalization without another one", func(t *testing.T) {
 		var received json.RawMessage
-		h, store, c, sessionID, exec, spy, n := runReuseFixture(t, []ToolArgumentsHook{passthroughHook("reuse.pure", &received)}, rawCall("call-1", `{"x":1}`))
-		// The producer normalization at publication is the only invocation.
-		testassert.Equal(t, n.attempts, 1)
-		got := settleCall(t, h, c, exec, rawCall("call-1", `{"x":1}`))
+		h, store, c, sessionID, exec, spy, n := runReuseFixture(t, []ToolArgumentsHook{passthroughHook("reuse.pure", &received)})
+		got := settleCall(t, h, c, store, sessionID, exec, rawCall("call-1", `{"x":1}`))
 		testassert.Require(t, got.Status == model.ResultSuccess && got.Content == "done", "settled result = %+v, want the call prepared after the reused accepted outcome", got)
 		testassert.Require(t, string(received) == `{"x":1}`, "hook input = %q, want the raw original bytes", string(received))
 		prepared := spy.received()
@@ -96,9 +94,8 @@ func TestArgumentHookNormalizationOutcomeReuse(t *testing.T) {
 
 	t.Run("an invalid original returned unchanged settles with the exact stored diagnostic and no preparation", func(t *testing.T) {
 		var received json.RawMessage
-		h, store, c, sessionID, exec, spy, n := runReuseFixture(t, []ToolArgumentsHook{passthroughHook("reuse.pure", &received)}, rawCall("call-1", `[1,2]`))
-		testassert.Equal(t, n.attempts, 1)
-		got := settleCall(t, h, c, exec, rawCall("call-1", `[1,2]`))
+		h, store, c, sessionID, exec, spy, n := runReuseFixture(t, []ToolArgumentsHook{passthroughHook("reuse.pure", &received)})
+		got := settleCall(t, h, c, store, sessionID, exec, rawCall("call-1", `[1,2]`))
 		testassert.Require(t, got.Status == model.ResultError && got.Content == "normalize attempt 1 rejected",
 			"settled result = %+v, want the call to consume the stored producer diagnostic verbatim", got)
 		testassert.Require(t, got.Content != invalidToolResultContent, "settled content = %q, want the stored diagnostic, never generic object-parse text", got.Content)
@@ -110,9 +107,8 @@ func TestArgumentHookNormalizationOutcomeReuse(t *testing.T) {
 	})
 
 	t.Run("a changed replacement runs exactly one separate normalization", func(t *testing.T) {
-		h, store, c, sessionID, exec, spy, n := runReuseFixture(t, []ToolArgumentsHook{changedHook("reuse.changer", `{"x":2}`)}, rawCall("call-1", `{"x":1}`))
-		testassert.Equal(t, n.attempts, 1)
-		got := settleCall(t, h, c, exec, rawCall("call-1", `{"x":1}`))
+		h, store, c, sessionID, exec, spy, n := runReuseFixture(t, []ToolArgumentsHook{changedHook("reuse.changer", `{"x":2}`)})
+		got := settleCall(t, h, c, store, sessionID, exec, rawCall("call-1", `{"x":1}`))
 		testassert.Require(t, got.Status == model.ResultSuccess, "settled result = %+v, want the repaired call prepared", got)
 		testassert.Equal(t, n.attempts, 2) // the producer normalization plus exactly one for the changed replacement
 		prepared := spy.received()
@@ -128,8 +124,8 @@ func TestArgumentHookNormalizationOutcomeReuse(t *testing.T) {
 		h, store, c, sessionID, exec, spy, n := runReuseFixture(t, []ToolArgumentsHook{
 			changedHook("reuse.changer", `{"x":2}`),
 			passthroughHook("reuse.successor", &seen),
-		}, rawCall("call-1", `{"x":1}`))
-		got := settleCall(t, h, c, exec, rawCall("call-1", `{"x":1}`))
+		})
+		got := settleCall(t, h, c, store, sessionID, exec, rawCall("call-1", `{"x":1}`))
 		testassert.Require(t, got.Status == model.ResultSuccess, "settled result = %+v, want the repaired call prepared", got)
 		testassert.Require(t, string(seen) == `{"seq":"2","x":2}`, "successor input = %q, want the predecessor's committed value", string(seen))
 		testassert.Equal(t, n.attempts, 2) // the changed hook normalized once; the unchanged successor consumed that outcome
@@ -143,13 +139,14 @@ func TestArgumentHookNormalizationOutcomeReuse(t *testing.T) {
 
 	t.Run("a settled invalid original never suppresses a valid batch sibling", func(t *testing.T) {
 		var seen json.RawMessage
-		h, store, c, sessionID, exec, spy, n := runReuseFixture(t, []ToolArgumentsHook{passthroughHook("reuse.pure", &seen)},
-			rawCall("call-1", `[1,2]`), rawCall("call-2", `{"x":1}`))
+		h, store, c, sessionID, exec, spy, n := runReuseFixture(t, []ToolArgumentsHook{passthroughHook("reuse.pure", &seen)})
+		results, err := runToolCalls(t, h, c, store, sessionID, context.Background(), testOpID, exec, testCapture(),
+			[]model.ToolCall{rawCall("call-1", `[1,2]`), rawCall("call-2", `{"x":1}`)})
+		testassert.NoError(t, err)
 		testassert.Equal(t, n.attempts, 2) // the two producer normalizations at publication
-		first := settleCall(t, h, c, exec, rawCall("call-1", `[1,2]`))
+		first, second := results[0], results[1]
 		testassert.Require(t, first.Status == model.ResultError && first.Content == "normalize attempt 1 rejected",
 			"call-1 result = %+v, want the stored diagnostic settling the invalid original", first)
-		second := settleCall(t, h, c, exec, rawCall("call-2", `{"x":1}`))
 		testassert.Require(t, second.Status == model.ResultSuccess && second.Content == "done", "call-2 result = %+v, want the valid sibling prepared", second)
 		prepared := spy.received()
 		testassert.Require(t, len(prepared) == 1 && prepared[0].ID == "call-2" && string(prepared[0].Arguments) == `{"seq":"2","x":1}`,

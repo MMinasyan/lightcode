@@ -10,9 +10,10 @@ import (
 )
 
 // The context strategy contract: one pure algorithm deciding the context
-// maintenance of a conversation. Plan and Consume are pure — no context, no
-// I/O, no dispatch, no canonical mutation. The selected strategy's identity
-// and declared requirements are resolved execution inputs captured on the
+// maintenance of a conversation. Plan and Consume are pure — no I/O, no
+// dispatch, no canonical mutation, and no context — and hold no state beyond
+// what their inputs carry. The selected strategy's identity and declared
+// requirements are resolved execution inputs captured on the
 // ExecutionCapture; its implementation is an owned execution resource on the
 // opened Execution.
 
@@ -97,10 +98,10 @@ type PlanOutput struct {
 	Checkpoint *CheckpointPlan
 }
 
-// ContextStrategy is the pure context-maintenance algorithm. Plan decides the
-// next step over the frozen input; Consume folds one completed model output
-// back into the plan stream. Neither callback may dispatch effects or mutate
-// canonical state.
+// ContextStrategy is the pure, stateless context-maintenance algorithm. Plan
+// decides the next step over the frozen input; Consume folds one completed
+// model output back into the plan stream. Neither callback may dispatch
+// effects or mutate canonical state.
 type ContextStrategy interface {
 	Plan(PlanInput) (PlanOutput, error)
 	Consume(ConsumeInput) (PlanOutput, error)

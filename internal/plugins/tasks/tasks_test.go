@@ -68,11 +68,19 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		json.RawMessage(`{"max_output_bytes":"many"}`),
 		json.RawMessage(`{"max_concurrent":"4"}`),
 		json.RawMessage(`{"max_concurrent":4.5}`),
+		json.RawMessage(`{"max_concurrent":4.0}`),
+		json.RawMessage(`{"max_concurrent":4e0}`),
 		json.RawMessage(`[]`),
 	}
 	for _, raw := range wrongType {
 		err := validate(raw)
 		testassert.Check(t, err != nil && strings.HasPrefix(err.Error(), "tasks: invalid settings: "), "ValidateConfig(%s) = %v, want the tasks invalid-settings wrap", raw, err)
+	}
+	// The ordinary JSON member-name rule stays case-insensitive.
+	{
+		s, err := decodeSettings(json.RawMessage(`{"MAX_CONCURRENT":1}`))
+		testassert.Require(t, err == nil, "decodeSettings with a mixed-case member name: %v", err)
+		testassert.Check(t, s.MaxConcurrent == 1, "MaxConcurrent = %d, want 1 from the mixed-case member name", s.MaxConcurrent)
 	}
 }
 

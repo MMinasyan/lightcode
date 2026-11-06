@@ -505,7 +505,7 @@ func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 						default:
 						}
 						<-releaseTool
-						return harness.ToolOutcome{
+						return harness.ToolOutcome{Evidence: harness.ExecutionObserved,
 							Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "second"},
 							Metadata: json.RawMessage(`{"late":true}`),
 						}
@@ -671,7 +671,7 @@ func parkedReadCallPrepare(releaseTool <-chan struct{}, toolStarted chan<- struc
 				case <-execCtx.Done(): // the interrupt releases the started call
 				}
 				// A returned real outcome wins the cancellation race.
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
 			},
 		}
 	}

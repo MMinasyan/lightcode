@@ -712,7 +712,7 @@ func observedBlockedToolFixture(t *testing.T, store harness.Storage) (*publicFac
 			Execute: func(context.Context) harness.ToolOutcome {
 				startOnce.Do(func() { close(execStarted) })
 				<-released
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 			},
 		}
 	}

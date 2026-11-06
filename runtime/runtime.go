@@ -24,13 +24,19 @@ import (
 var ErrOwned = errors.New("runtime: data directory owned by another Runtime")
 
 // Options are the public construction inputs of one managed Runtime: the
-// sole data root, the main configuration path, and the complete plugin set —
+// sole data root, the main configuration path, the complete plugin set —
 // builtin.Plugins() for the shipped registration, an ordinary custom slice
-// for a custom build.
+// for a custom build — and the application-selected default capability IDs.
 type Options struct {
 	DataDir    string
 	ConfigPath string
 	Plugins    []Plugin
+
+	// DefaultCapabilityIDs is the application's selected baseline capability
+	// selection installed on the built-in definitions before user overlays and
+	// ordinary inheritance; nil selects none. It is ordinary host construction
+	// data, never discovered from a privileged type.
+	DefaultCapabilityIDs []string
 
 	// Identity is the application-supplied prompt persona text. GlobalRulesDir
 	// is the explicit directory holding the global AGENTS.md. Zero values
@@ -46,11 +52,12 @@ type Options struct {
 // one admitted-call gate, and the joined shutdown.
 func Open(ctx context.Context, opts Options) (*Runtime, error) {
 	return open(ctx, options{
-		DataDir:        opts.DataDir,
-		ConfigPath:     opts.ConfigPath,
-		Plugins:        opts.Plugins,
-		Identity:       opts.Identity,
-		GlobalRulesDir: opts.GlobalRulesDir,
+		DataDir:              opts.DataDir,
+		ConfigPath:           opts.ConfigPath,
+		Plugins:              opts.Plugins,
+		DefaultCapabilityIDs: opts.DefaultCapabilityIDs,
+		Identity:             opts.Identity,
+		GlobalRulesDir:       opts.GlobalRulesDir,
 	})
 }
 
@@ -63,11 +70,12 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 // sends carry each pass's explicit time; the zero value keeps the production
 // time.Ticker.
 type options struct {
-	DataDir, ConfigPath string
-	Plugins             []Plugin
-	Identity            string
-	GlobalRulesDir      string
-	sweepTicks          <-chan time.Time
+	DataDir, ConfigPath  string
+	Plugins              []Plugin
+	DefaultCapabilityIDs []string
+	Identity             string
+	GlobalRulesDir       string
+	sweepTicks           <-chan time.Time
 }
 
 // Runtime is the single live owner of one Harness, its durable Session
@@ -191,7 +199,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	adapter := newObservationAdapter(obs, warnings)
 	c.reportWarning = adapter.reportPluginWarning
 	loader := catalog.NewLoader(home, nil)
-	configService := newConfigurationService(work, c, loader, configPath, obs)
+	configService := newConfigurationService(work, c, loader, configPath, obs, options.DefaultCapabilityIDs)
 	configService.attachWarnings(warnings)
 	configService.attachEnv(managedEnv)
 	if _, err := configService.publish(work); err != nil {

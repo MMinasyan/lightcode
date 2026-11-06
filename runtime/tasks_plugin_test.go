@@ -63,21 +63,19 @@ func taskContext(t *testing.T, sections map[string]string, background runtime.Ba
 // taskBackground is the scripted BackgroundServices for the direct task
 // tests: it records every launch request and returns the scripted outcome.
 type taskBackground struct {
-	result   harness.LaunchChildResult
+	childID  string
 	err      error
-	launched []harness.LaunchChildRequest
+	launched []runtime.ChildRequest
 }
 
-func (b *taskBackground) LaunchChild(_ context.Context, req harness.LaunchChildRequest) (harness.LaunchChildResult, error) {
+func (b *taskBackground) LaunchChild(req runtime.ChildRequest) (string, error) {
 	b.launched = append(b.launched, req)
-	return b.result, b.err
+	return b.childID, b.err
 }
 
-func (*taskBackground) StartJob(context.Context, string, string, func(context.Context, string) error) error {
+func (*taskBackground) StartJob(string, func(context.Context, func(string) error) error) error {
 	return nil
 }
-
-func (*taskBackground) DeliverCompletion(context.Context, string, string, string) error { return nil }
 
 // TestTaskDescriptionComposesFromRoster proves the declared description: the
 // fixed prefix, the blank line, the header, and one retained roster line per
@@ -159,10 +157,10 @@ func TestTaskPrepareRejectsNonSubagentType(t *testing.T) {
 }
 
 // TestTaskLaunchForwardsFields proves the launch request carries every field
-// through the bridge: the admitted parent identity, the requested type, the
-// prompt as content, a fresh 32-lowercase-hex operation identity, and the
-// decoded per-call settings (defaults first, then a configured section), with
-// the retained immediate text returning the child session id.
+// through the bound object: the requested type, the prompt as content, a
+// fresh 32-lowercase-hex operation identity, and the decoded per-call
+// settings (defaults first, then a configured section), with the retained
+// immediate text returning the child session id.
 func TestTaskLaunchForwardsFields(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -176,7 +174,7 @@ func TestTaskLaunchForwardsFields(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tool := openTask(t)
-			background := &taskBackground{result: harness.LaunchChildResult{ChildSessionID: taskChildID}}
+			background := &taskBackground{childID: taskChildID}
 			ctx := taskContext(t, tc.sections, background)
 
 			plan := prepare(t, tool, ctx, "task", `{"prompt":"do the thing","subagent_type":"secondary"}`)
@@ -187,7 +185,6 @@ func TestTaskLaunchForwardsFields(t *testing.T) {
 			testassert.Require(t, outcome.Result.Status == model.ResultSuccess && outcome.Result.Content == wantContent, "outcome = %+v, want the retained immediate text with the child session id", outcome.Result)
 			testassert.Equal(t, len(background.launched), 1)
 			req := background.launched[0]
-			testassert.Check(t, req.ParentSessionID == testSessionID, "ParentSessionID = %q, want %q", req.ParentSessionID, testSessionID)
 			testassert.Check(t, req.AgentType == "secondary", "AgentType = %q, want secondary", req.AgentType)
 			testassert.Check(t, len(req.Content) == 1 && req.Content[0].Kind == model.PartText && req.Content[0].Text == "do the thing", "Content = %+v, want the prompt as one text part", req.Content)
 			testassert.Check(t, isLowerHexID(req.OperationID), "OperationID = %q, want a fresh 32-lowercase-hex identity", req.OperationID)
@@ -253,7 +250,7 @@ func TestComposedTaskPermissionDenialSettlesOnlyTheCall(t *testing.T) {
 	]}`), nil)
 	invocation, err := runtime.ConfiguredInvocationForTest("", "", "", nil)
 	testassert.NoError(t, err)
-	background := &taskBackground{result: harness.LaunchChildResult{ChildSessionID: taskChildID}}
+	background := &taskBackground{childID: taskChildID}
 	attempt := 0
 	var mu sync.Mutex
 	modelFn := func(_ context.Context, _ model.Request) (model.Stream, error) {

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/prompt"
 )
 
 // Preparation fixtures: the public Open over the existing owner environment
@@ -78,9 +80,9 @@ const prepAgentsDocument = `{
 }`
 
 // recordHook is one declared PreparationHook capability: it retains the tool
-// slice it received, records the Invocation, and answers with its configured
-// mutation or error. One armed call may park until its test releases it, and
-// one armed call may fail with a one-shot error.
+// slice it received and its provider settings, records the call, and answers
+// with its configured consequence or error. One armed call may park until its
+// test releases it, and one armed call may fail with a one-shot error.
 type recordHook struct {
 	name   string
 	events *traceLog
@@ -90,7 +92,7 @@ type recordHook struct {
 	inputTools  []model.ToolDefinition
 	inputDesc   string
 	fail        error
-	mutate      func(harness.ExecutionCapture) harness.ExecutionCapture
+	mutate      func(PreparationInput) PreparationConsequence
 	block       bool
 	blockSignal chan struct{}
 	parkRelease chan struct{}
@@ -99,16 +101,15 @@ type recordHook struct {
 }
 
 type hookCall struct {
-	revision string
-	tag      string
+	tag string
 }
 
-func (h *recordHook) Prepare(ctx context.Context, in Invocation, capture harness.ExecutionCapture) (harness.ExecutionCapture, error) {
+func (h *recordHook) Prepare(ctx context.Context, in PreparationInput) (PreparationConsequence, error) {
 	h.events.add("hook:" + h.name)
 	h.mu.Lock()
-	h.inputTools = capture.Tools
-	if len(capture.Tools) > 0 {
-		h.inputDesc = capture.Tools[0].Description
+	h.inputTools = in.Tools
+	if len(in.Tools) > 0 {
+		h.inputDesc = in.Tools[0].Description
 	}
 	block, blockSignal := h.block, h.blockSignal
 	fail, mutate := h.fail, h.mutate
@@ -127,7 +128,7 @@ func (h *recordHook) Prepare(ctx context.Context, in Invocation, capture harness
 		select {
 		case <-parkRelease:
 		case <-ctx.Done():
-			return harness.ExecutionCapture{}, ctx.Err()
+			return PreparationConsequence{}, ctx.Err()
 		}
 	}
 	if block {
@@ -137,33 +138,33 @@ func (h *recordHook) Prepare(ctx context.Context, in Invocation, capture harness
 			default:
 			}
 		}
-		// Answer with a valid unchanged capture only after cancellation, so the
-		// Runtime's own between-hooks check is the only observer.
+		// Answer with a valid unchanged consequence only after cancellation,
+		// so the Runtime's own between-hooks check is the only observer.
 		<-ctx.Done()
-		return capture, nil
+		return PreparationConsequence{}, nil
 	}
 	tag := ""
-	if raw := in.Config("hooks"); len(raw) > 0 {
+	if len(in.Settings) > 0 {
 		var settings struct {
 			Tag string `json:"tag"`
 		}
-		if err := json.Unmarshal(raw, &settings); err != nil {
-			return harness.ExecutionCapture{}, err
+		if err := json.Unmarshal(in.Settings, &settings); err != nil {
+			return PreparationConsequence{}, err
 		}
 		tag = settings.Tag
 	}
 	h.mu.Lock()
-	h.seen = append(h.seen, hookCall{revision: in.Revision(), tag: tag})
+	h.seen = append(h.seen, hookCall{tag: tag})
 	h.mu.Unlock()
 	if nextFail != nil {
-		return harness.ExecutionCapture{}, nextFail
+		return PreparationConsequence{}, nextFail
 	}
 	if fail != nil {
-		return harness.ExecutionCapture{}, fail
+		return PreparationConsequence{}, fail
 	}
-	next := capture
+	next := PreparationConsequence{}
 	if mutate != nil {
-		next = mutate(next)
+		next = mutate(in)
 	}
 	return next, nil
 }
@@ -184,7 +185,7 @@ func (h *recordHook) retainedInputs() ([]model.ToolDefinition, string) {
 	return h.inputTools, h.inputDesc
 }
 
-func (h *recordHook) set(fail error, mutate func(harness.ExecutionCapture) harness.ExecutionCapture) {
+func (h *recordHook) set(fail error, mutate func(PreparationInput) PreparationConsequence) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.fail, h.mutate = fail, mutate
@@ -278,9 +279,9 @@ func (t *prepTool) Prepare(_ context.Context, _ ToolContext, call model.ToolCall
 			t.executed++
 			t.mu.Unlock()
 			if fail {
-				return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "echo failed"}}
+				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "echo failed"}}
 			}
-			return harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
+			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 		},
 	}
 }
@@ -354,13 +355,13 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	e.workspace = e.dataDir
 	writeServiceFile(t, e.configPath, prepConfigDocument(e.server.URL, "A"))
 	writeServiceFile(t, agents.PathForConfig(e.configPath), prepAgentsDocument)
-	e.hooks[0] = &recordHook{name: "hook.first", events: e.events, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
-		c.SystemPrompt += "|first"
-		return c
+	e.hooks[0] = &recordHook{name: "hook.first", events: e.events, mutate: func(in PreparationInput) PreparationConsequence {
+		prompt := in.Prompt + "|first"
+		return PreparationConsequence{Prompt: &prompt}
 	}}
-	e.hooks[1] = &recordHook{name: "hook.second", events: e.events, mutate: func(c harness.ExecutionCapture) harness.ExecutionCapture {
-		c.SystemPrompt += "|second"
-		return c
+	e.hooks[1] = &recordHook{name: "hook.second", events: e.events, mutate: func(in PreparationInput) PreparationConsequence {
+		prompt := in.Prompt + "|second"
+		return PreparationConsequence{Prompt: &prompt}
 	}}
 	for i, name := range []string{"arg.runtime", "arg.workspace", "arg.operation", "arg.agent"} {
 		e.argHooks[i] = &recordArgumentHook{replace: json.RawMessage(`{"repaired":"` + name + `"}`)}
@@ -637,7 +638,7 @@ func TestPreparationHappyPathThroughHarness(t *testing.T) {
 
 		got := res.Operation.Admission.Execution
 		testassert.Require(t, slices.Equal(got.Capabilities, []string{"hook.first", "cap.shared", "hook.second"}) && slices.Equal(toolNames(got.Tools), []string{"echo", "read"}) && got.Model == prepModelRef && got.ConfigurationRevision == "1" && strings.HasSuffix(got.SystemPrompt, "|first|second"), "committed capture = %+v, want the post-hook selection capture", got)
-		wantCalls := []hookCall{{revision: "1", tag: "A"}}
+		wantCalls := []hookCall{{tag: "A"}}
 		for _, hook := range e.hooks {
 			{
 				calls := hook.calls()
@@ -1006,66 +1007,120 @@ func TestPreparationPreparationHookErrorOnDrainedAndForkDelivery(t *testing.T) {
 	})
 }
 
-// TestPreparationHooksAreOrderedAndValidated exercises the pure hook boundary
-// through the real Harness on both stores: identity and selection expansion,
-// invalid tool lists, non-owned capture handout, hook errors, cancellation
-// while a hook is parked, cancellation between hooks, and a closed supplying
-// scope all abort admission with no partial consequence published.
+// TestPreparationViewClosedConsequenceSemantics pins the one local view's
+// consequence rules: nil members change nothing, present empty Prompt and
+// ToolNames remove the prompt and advertisement, descriptions may be empty and
+// belong to the original catalog even while hidden, selected names restore
+// hidden tools in their given order, and foreign or duplicate names are rejected.
+func TestPreparationViewClosedConsequenceSemantics(t *testing.T) {
+	catalog := []model.ToolDefinition{
+		{Name: "read_file", Description: "reads one file", Parameters: json.RawMessage(`{}`)},
+		{Name: "write_file", Description: "writes one file", Parameters: json.RawMessage(`{}`)},
+		{Name: "apply_patch", Description: "applies one patch", Parameters: json.RawMessage(`{}`)},
+	}
+	view := newPreparationView(prompt.AssemblyInput{Mode: prompt.ModeFull}, "BASE_PROMPT", catalog)
+
+	// The nil consequence is the valid no-op.
+	testassert.NoError(t, view.apply("hook", PreparationConsequence{}))
+	testassert.Require(t, view.prompt == "BASE_PROMPT" && slices.Equal(toolNames(view.tools()), []string{"read_file", "write_file", "apply_patch"}), "zero consequence = prompt %q tools %v, want the baseline", view.prompt, toolNames(view.tools()))
+
+	// A present empty prompt removes the prompt; a present empty name list
+	// advertises nothing.
+	empty := ""
+	testassert.NoError(t, view.apply("hook", PreparationConsequence{Prompt: &empty}))
+	testassert.Require(t, view.prompt == "", "empty prompt consequence = %q, want removal", view.prompt)
+	testassert.NoError(t, view.apply("hook", PreparationConsequence{ToolNames: []string{}}))
+	testassert.Require(t, len(view.tools()) == 0, "empty name consequence = %v, want no advertisement", toolNames(view.tools()))
+
+	// A hidden tool's accepted description remains in the catalog and is seen
+	// when a later contribution restores it, in the order that contribution gives.
+	testassert.NoError(t, view.apply("hook", PreparationConsequence{Descriptions: map[string]string{"write_file": ""}}))
+	testassert.NoError(t, view.apply("hook", PreparationConsequence{ToolNames: []string{"apply_patch"}}))
+	testassert.Require(t, slices.Equal(toolNames(view.tools()), []string{"apply_patch"}), "selected names = %v, want only apply_patch", toolNames(view.tools()))
+	testassert.NoError(t, view.apply("hook", PreparationConsequence{ToolNames: []string{"apply_patch", "write_file"}}))
+	testassert.Require(t, slices.Equal(toolNames(view.tools()), []string{"apply_patch", "write_file"}), "restored names = %v, want the given order", toolNames(view.tools()))
+	testassert.Require(t, view.tools()[1].Description == "", "restored description = %q, want the earlier accepted empty text", view.tools()[1].Description)
+
+	for _, row := range []struct {
+		name        string
+		consequence PreparationConsequence
+	}{
+		{"foreign description", PreparationConsequence{Descriptions: map[string]string{"extra": "text"}}},
+		{"foreign selection", PreparationConsequence{ToolNames: []string{"extra"}}},
+		{"duplicate selection", PreparationConsequence{ToolNames: []string{"read_file", "read_file"}}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			testassert.Require(t, errors.Is(view.apply("hook", row.consequence), harness.ErrInvalid), "%s accepted, want harness.ErrInvalid", row.name)
+		})
+	}
+}
+
+// TestPreparationViewPreservesOpaqueToolBytes proves the view's copies keep
+// raw parameter bytes exact — including a large integer, an out-of-range
+// exponent literal and null — and that a contribution's in-place mutation of
+// its own input cannot rewrite the catalog or the final capture.
+func TestPreparationViewPreservesOpaqueToolBytes(t *testing.T) {
+	raw := json.RawMessage(`{ "n": 9007199254740993, "huge": 1e1000, "null": null }`)
+	view := newPreparationView(prompt.AssemblyInput{Mode: prompt.ModeFull, Rules: prompt.Rules{Warnings: []prompt.Warning{{Kind: "k", Message: "m"}}}}, "BASE", []model.ToolDefinition{{Name: "opaque", Parameters: raw}})
+	settings := json.RawMessage(`{"tag":"A"}`)
+	contribution := view.input(harness.SessionIdentity{}, model.ModelRef{}, ToolConstraints{}, settings)
+	testassert.Require(t, bytes.Equal(contribution.Catalog[0].Parameters, raw) && bytes.Equal(contribution.Tools[0].Parameters, raw), "contribution parameters = %q / %q, want the exact raw bytes", contribution.Catalog[0].Parameters, contribution.Tools[0].Parameters)
+	contribution.Catalog[0].Parameters[0] = 'X'
+	contribution.Tools[0].Parameters[1] = 'X'
+	contribution.Settings[0] = 'X'
+	contribution.Assembly.Rules.Warnings[0].Message = "changed"
+	testassert.Require(t, bytes.Equal(view.catalog[0].Parameters, raw), "the contribution's in-place parameter mutation reached the view: %q", view.catalog[0].Parameters)
+	testassert.Require(t, bytes.Equal(settings, json.RawMessage(`{"tag":"A"}`)) && view.assembly.Rules.Warnings[0].Message == "m", "the contribution's settings/assembly mutation reached the owner: %q / %+v", settings, view.assembly.Rules.Warnings)
+	empty := ""
+	testassert.NoError(t, view.apply("hook", PreparationConsequence{Prompt: &empty}))
+	testassert.Require(t, bytes.Equal(view.tools()[0].Parameters, raw), "final tool parameters = %q, want the exact raw bytes", view.tools()[0].Parameters)
+}
+
+// TestPreparationHooksAreOrderedAndValidated exercises the pure contribution
+// boundary through the real Harness on both stores: input mutation is a
+// non-effect, invalid description/name consequences, non-owned contribution
+// handouts, hook errors, cancellation while a hook is parked, cancellation
+// between hooks, and a closed supplying scope all abort admission with no
+// partial consequence published.
 func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
-	t.Run("hook replacement of identity is rejected", func(t *testing.T) {
+	t.Run("hook input mutation cannot change the core-owned capture", func(t *testing.T) {
 		violations := []struct {
 			name   string
-			mutate func(c harness.ExecutionCapture) harness.ExecutionCapture
+			mutate func(in PreparationInput) PreparationConsequence
 		}{
-			{"model", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Model = model.ModelRef{Provider: "prov", Model: "other"}
-				return c
+			{"model", func(in PreparationInput) PreparationConsequence {
+				in.Model = model.ModelRef{Provider: "prov", Model: "other"}
+				return PreparationConsequence{}
 			}},
-			{"revision", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.ConfigurationRevision = "9"
-				return c
+			{"readonly", func(in PreparationInput) PreparationConsequence {
+				in.Constraints = ToolConstraints{Readonly: true, WriteDir: "/tmp/hook-elsewhere"}
+				return PreparationConsequence{}
 			}},
-			{"capabilities", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Capabilities = []string{"hook.first"}
-				return c
+			{"assembly", func(in PreparationInput) PreparationConsequence {
+				in.Assembly.Mode = prompt.ModeNone
+				in.Assembly.Instructions = "mutated instructions"
+				return PreparationConsequence{}
 			}},
-			{"readonly", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Readonly = !c.Readonly
-				return c
+			{"prompt", func(in PreparationInput) PreparationConsequence {
+				in.Prompt = "mutated prompt"
+				return PreparationConsequence{}
 			}},
-			{"write_dir", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.WriteDir = "/tmp/hook-elsewhere"
-				return c
+			{"catalog definition", func(in PreparationInput) PreparationConsequence {
+				in.Catalog[0].Description = "mutated description"
+				in.Catalog[0].Name = "renamed"
+				return PreparationConsequence{}
 			}},
-			{"strategy id", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Strategy.ID = "other.strategy/v1"
-				return c
+			{"catalog parameter bytes", func(in PreparationInput) PreparationConsequence {
+				in.Catalog[0].Parameters[0] = 'X'
+				return PreparationConsequence{}
 			}},
-			{"strategy requirement", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Strategy.RequiresContextWindow = !c.Strategy.RequiresContextWindow
-				return c
+			{"visible definition", func(in PreparationInput) PreparationConsequence {
+				in.Tools[0].Description = "mutated description"
+				return PreparationConsequence{}
 			}},
-			{"strategy settings", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Strategy.Settings = json.RawMessage(`{"hook":1}`)
-				return c
-			}},
-			{"conversation pricing", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Pricing = &harness.ModelPricing{Input: ptrTo(9.0)}
-				return c
-			}},
-			{"conversation pricing dropped", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Pricing = nil
-				return c
-			}},
-			{"conversation pricing rate pointee", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				if c.Pricing != nil && c.Pricing.Input != nil {
-					*c.Pricing.Input = 9.0 // in-place on the hook's owned clone
-				}
-				return c
-			}},
-			{"compact pricing", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Compact.Pricing = &harness.ModelPricing{Input: ptrTo(9.0)}
-				return c
+			{"visible parameter bytes", func(in PreparationInput) PreparationConsequence {
+				in.Tools[0].Parameters[0] = 'X'
+				return PreparationConsequence{}
 			}},
 		}
 		for _, v := range violations {
@@ -1074,15 +1129,16 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 					e := newPrepEnv(t, store)
 					e.hooks[0].set(nil, v.mutate)
 					session := e.session("wide")
-					{
-						_, err := e.submit(context.Background(), session, "op-1", "x", harness.MessageModeRegular)
-						testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit error = %v, want harness.ErrInvalid", err)
-					}
-					events := strings.Join(e.events.all(), ",")
-					if !strings.Contains(events, "hook:hook.first") || strings.Contains(events, "hook:hook.second") {
-						t.Fatalf("events = %v, want the failing hook to stop the rest", e.events.all())
-					}
-					testassert.Equal(t, e.opOpens.Load()+e.agOpens.Load(), 0)
+					res := e.admit(session, "op-1", "x")
+					e.awaitTerminal(session, "op-1", harness.OperationSuccess)
+					got := res.Operation.Admission.Execution
+					testassert.Require(t, got.Model == prepModelRef && !got.Readonly && got.WriteDir == "", "capture identity = (%s, %v, %q), want the definition's values", got.Model.String(), got.Readonly, got.WriteDir)
+					testassert.Require(t, slices.Equal(got.Capabilities, []string{"hook.first", "cap.shared", "hook.second"}), "capture capabilities = %v, want the selected list", got.Capabilities)
+					testassert.Require(t, slices.Equal(toolNames(got.Tools), []string{"echo", "read"}), "capture tools = %v, want the eligible catalog subset", got.Tools)
+					testassert.Require(t, got.Tools[0].Description == "" && got.Tools[0].Parameters[0] == '{', "capture tool = %+v, want the definition's untouched metadata", got.Tools[0])
+					testassert.Require(t, got.Pricing != nil && got.Pricing.Input != nil && *got.Pricing.Input == 1.5 && got.Compact.Model == prepModelRef, "capture pricing/compact = %+v, want the catalog-owned values", got)
+					testassert.Require(t, got.Strategy.ID == productionStrategy.ID && got.ConfigurationRevision == "1", "capture strategy/revision = %+v/%q, want the core-owned values", got.Strategy, got.ConfigurationRevision)
+					testassert.Require(t, got.SystemPrompt != "mutated prompt" && strings.HasSuffix(got.SystemPrompt, "|second"), "capture prompt = %.120s, want the assembled baseline with the accepted contribution only", got.SystemPrompt)
 					testassert.NoError(t, e.converge())
 				})
 			})
@@ -1091,15 +1147,16 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 	t.Run("hook tool violations are rejected", func(t *testing.T) {
 		violations := []struct {
 			name   string
-			mutate func(c harness.ExecutionCapture) harness.ExecutionCapture
+			mutate func(in PreparationInput) PreparationConsequence
 		}{
-			{"tool outside the original capture", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Tools = append(append([]model.ToolDefinition(nil), c.Tools...), model.ToolDefinition{Name: "extra", Parameters: json.RawMessage(`{}`)})
-				return c
+			{"tool outside the original catalog", func(PreparationInput) PreparationConsequence {
+				return PreparationConsequence{ToolNames: []string{"echo", "extra"}}
 			}},
-			{"invalid duplicate tool capture", func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Tools = append(append([]model.ToolDefinition(nil), c.Tools...), c.Tools[0])
-				return c
+			{"duplicate selected tool", func(PreparationInput) PreparationConsequence {
+				return PreparationConsequence{ToolNames: []string{"echo", "echo"}}
+			}},
+			{"description outside the original catalog", func(PreparationInput) PreparationConsequence {
+				return PreparationConsequence{Descriptions: map[string]string{"extra": "text"}}
 			}},
 		}
 		for _, v := range violations {
@@ -1121,37 +1178,67 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 			})
 		}
 	})
-	t.Run("hooks receive and return owned captures", func(t *testing.T) {
+	t.Run("hooks receive and return owned contributions", func(t *testing.T) {
 		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 			e := newPrepEnv(t, store)
-			e.hooks[0].set(nil, func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Tools[0].Description = "hook.first" // in-place on what it received
-				return c
+			e.hooks[0].set(nil, func(in PreparationInput) PreparationConsequence {
+				in.Tools[0].Description = "tampered input" // in-place on what it received
+				in.Catalog[0].Description = "tampered catalog"
+				return PreparationConsequence{Descriptions: map[string]string{"echo": "hook.first"}}
 			})
-			e.hooks[1].set(nil, func(c harness.ExecutionCapture) harness.ExecutionCapture {
-				c.Tools[0].Description = "hook.second" // in-place again
-				return c
+			e.hooks[1].set(nil, func(PreparationInput) PreparationConsequence {
+				return PreparationConsequence{Descriptions: map[string]string{"echo": "hook.second"}}
 			})
 			session := e.session("wide")
 			res := e.admit(session, "op-1", "x")
 			e.awaitTerminal(session, "op-1", harness.OperationSuccess)
-			// Each hook's input carried the previous result (fresh owned copies
-			// chain), and mutating the second hook's own copy cannot
-			// retroactively change the array the first hook received and
-			// retained.
+			// Each hook's input carried the previous accepted description (fresh
+			// owned copies chain), and mutating the first hook's own copy cannot
+			// change the value the second hook or the committed capture sees.
 			{
 				firstTools, firstDesc := e.hooks[0].retainedInputs()
-				testassert.Require(t, firstDesc == "" && len(firstTools) != 0 && firstTools[0].Description == "hook.first", "hook.first input = %+v description %q, want the unaliased pre-hook capture it mutated", firstTools, firstDesc)
+				testassert.Require(t, firstDesc == "" && len(firstTools) != 0 && firstTools[0].Description == "tampered input", "hook.first input = %+v description %q, want its own baseline copy", firstTools, firstDesc)
 			}
 			{
 				_, secondDesc := e.hooks[1].retainedInputs()
 				testassert.Equal(t, secondDesc, "hook.first")
 			}
-			// The committed capture carries the final owned result.
+			// The committed capture carries the final accepted result.
 			{
 				got := res.Operation.Admission.Execution.Tools
-				testassert.Require(t, len(got) != 0 && got[0].Description == "hook.second", "committed tools = %+v, want the final owned result", got)
+				testassert.Require(t, len(got) != 0 && got[0].Description == "hook.second", "committed tools = %+v, want the final accepted description", got)
 			}
+			testassert.NoError(t, e.converge())
+		})
+	})
+	t.Run("contributions apply prompt descriptions and visibility in selected order", func(t *testing.T) {
+		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+			e := newPrepEnv(t, store)
+			e.hooks[0].set(nil, func(PreparationInput) PreparationConsequence {
+				prompt := "FIRST"
+				return PreparationConsequence{
+					Prompt:       &prompt,
+					Descriptions: map[string]string{"echo": "first echo"},
+					ToolNames:    []string{},
+				}
+			})
+			e.hooks[1].set(nil, func(in PreparationInput) PreparationConsequence {
+				testassert.Require(t, len(in.Tools) == 0 && len(in.Catalog) == 2, "second contribution saw tools %v catalog %v, want the first contribution's empty advertisement over the full eligible catalog", toolNames(in.Tools), toolNames(in.Catalog))
+				prompt := "SECOND"
+				return PreparationConsequence{
+					Prompt:       &prompt,
+					Descriptions: map[string]string{"echo": "second echo"},
+					ToolNames:    []string{"echo"},
+				}
+			})
+			session := e.session("wide")
+			res := e.admit(session, "op-1", "x")
+			e.awaitTerminal(session, "op-1", harness.OperationSuccess)
+			got := res.Operation.Admission.Execution
+			testassert.Equal(t, got.SystemPrompt, "SECOND")
+			testassert.Require(t, slices.Equal(toolNames(got.Tools), []string{"echo"}), "capture tools = %v, want the second contribution's restored selection", toolNames(got.Tools))
+			testassert.Equal(t, got.Tools[0].Description, "second echo")
+			testassert.Require(t, slices.Equal(got.Capabilities, []string{"hook.first", "cap.shared", "hook.second"}), "capture capabilities = %v, want the definition's selection untouched", got.Capabilities)
 			testassert.NoError(t, e.converge())
 		})
 	})
@@ -1318,10 +1405,10 @@ func TestPreparationSelectsShortScopeCapabilitiesAtOpen(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newPrepEnv(t, store)
 		var hookSawOp, hookSawAg atomic.Int64
-		e.hooks[0].set(nil, func(c harness.ExecutionCapture) harness.ExecutionCapture {
+		e.hooks[0].set(nil, func(PreparationInput) PreparationConsequence {
 			hookSawOp.Store(e.opOpens.Load())
 			hookSawAg.Store(e.agOpens.Load())
-			return c
+			return PreparationConsequence{}
 		})
 		session := e.session("deep")
 		e.admit(session, "op-1", "one")

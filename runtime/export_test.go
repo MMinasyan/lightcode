@@ -133,3 +133,7 @@ func SubmitForTest(ctx context.Context, r *Runtime, sessionID, operationID, text
 	_, err := submitRawThroughRuntime(ctx, r, sessionID, operationID, text, harness.MessageModeRegular)
 	return err
 }
+
+// ShippedAdaptationPlugin supplies the shipped adaptation plugin to in-package
+// tests, which cannot import it without an import cycle.
+var ShippedAdaptationPlugin func() Plugin

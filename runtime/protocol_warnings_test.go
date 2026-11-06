@@ -143,10 +143,10 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		}
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
 
-		// A failed hook (capture rejected before publication) changes nothing.
-		hook.set(nil, func(c harness.ExecutionCapture) harness.ExecutionCapture {
-			c.Capabilities = append(c.Capabilities, "hook.second")
-			return c
+		// A failed hook (invalid consequence rejected before publication)
+		// changes nothing.
+		hook.set(nil, func(PreparationInput) PreparationConsequence {
+			return PreparationConsequence{ToolNames: []string{"outside_catalog"}}
 		})
 		hookSession, err := r.createSession(ctx, e.workspace("prompt-ws-4"), "worker")
 		testassert.NoError(t, err)
@@ -439,7 +439,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		defer cancel()
 		comp := mustComposition(t, compactToolsPlugin())
 		runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
-		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs)
+		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs, nil)
 		svc.attachWarnings(r.warnings)
 		{
 			_, err := svc.publish(context.Background())

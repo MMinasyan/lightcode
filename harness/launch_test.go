@@ -123,6 +123,21 @@ func TestStartJobRejectsBeforeSpawn(t *testing.T) {
 		testassert.Require(t, !hasGroup, "the rejected start created a member")
 	})
 
+	t.Run("canceled caller on a resident Session", func(t *testing.T) {
+		h := newTestHarness(t, freshSessionStore(t), nil)
+		h.deps.Jobs = stubJobStopper{}
+		c := leaseCoordinator(t, h, testSessionID)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := h.StartJob(ctx, testSessionID, jobFixtureID, spawn)
+		testassert.Require(t, errors.Is(err, context.Canceled), "canceled caller start = %v, want context.Canceled", err)
+		testassert.Equal(t, len(spawned), 0)
+		c.mu.Lock()
+		empty := c.group == nil || len(c.group.members) == 0
+		c.mu.Unlock()
+		testassert.Require(t, empty, "the refused start left its member live")
+	})
+
 	t.Run("canceled harness", func(t *testing.T) {
 		hctx, cancel := context.WithCancel(context.Background())
 		h, err := New(hctx, Dependencies{

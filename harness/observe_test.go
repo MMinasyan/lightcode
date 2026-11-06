@@ -107,22 +107,22 @@ func awaitHarnessQuiet(t *testing.T, h *Harness, sessionID string) SessionReadVi
 // members it requires and no other member, produced by real model and tool
 // boundaries.
 func TestObserveFactKinds(t *testing.T) {
+	rounds := 0
 	modelFn := func(context.Context, model.Request) (model.Stream, error) {
-		return completedTurnStream(testToolCall("call-1")), nil
-	}
-	h, _, c, sessionID := newEffectHarness(t, modelFn)
-	col := observeHarness(h)
-	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
-		testassert.NoError(t, err)
+		rounds++
+		if rounds == 1 {
+			return completedTurnStream(testToolCall("call-1")), nil
+		}
+		return completedTurnStream(), nil
 	}
 	plan := func(_ context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
-	{
-		_, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), invocationExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
-		testassert.NoError(t, err)
-	}
+	h, _, c, sessionID := newEffectHarness(t, nil)
+	col := observeHarness(h)
+	testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+		return effectExecution(modelFn, plan), nil
+	})))
 
 	var (
 		invalidations int
@@ -148,7 +148,7 @@ func TestObserveFactKinds(t *testing.T) {
 			t.Fatalf("fact kind %q is outside the closed set", fact.Kind)
 		}
 	}
-	testassert.Require(t, invalidations >= 2 && deltas == 1 && started == 1 && finished == 1, "fact counts = invalidations %d deltas %d started %d finished %d", invalidations, deltas, started, finished)
+	testassert.Require(t, invalidations >= 2 && deltas == 2 && started == 1 && finished == 1, "fact counts = invalidations %d deltas %d started %d finished %d", invalidations, deltas, started, finished)
 }
 
 // TestObserveReservationClocks proves each reservation acquisition and release
@@ -298,10 +298,11 @@ func TestObserveBufferClocks(t *testing.T) {
 			testassert.Equal(t, disposition, DispositionAdmitted)
 		}
 		c := cachedCoordinator(t, h, testSessionID)
-		{
-			_, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess})
-			testassert.NoError(t, err)
-		}
+		testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return effectExecution(func(context.Context, model.Request) (model.Stream, error) {
+				return completedTurnStream(), nil
+			}, nil), nil
+		})))
 		col := observeHarness(h)
 
 		// The process-local queued publication the active route would make.
@@ -561,16 +562,14 @@ func TestObserveDurableAdvances(t *testing.T) {
 	})
 
 	t.Run("model result and compaction", func(t *testing.T) {
-		modelFn := func(context.Context, model.Request) (model.Stream, error) {
-			return completedTurnStream(), nil
-		}
-		h, _, c, sessionID := newEffectHarness(t, modelFn)
+		h, _, c, sessionID := newEffectHarness(t, nil)
 		col := observeHarness(h)
 		base := snapshotPair(t, h, sessionID)
-		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
-			testassert.NoError(t, err)
-		}
+		testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return effectExecution(func(context.Context, model.Request) (model.Stream, error) {
+				return completedTurnStream(), nil
+			}, nil), nil
+		})))
 		before := snapshotPair(t, h, sessionID)
 		{
 			got := col.invalidations()
@@ -578,23 +577,24 @@ func TestObserveDurableAdvances(t *testing.T) {
 		}
 		testassert.Require(t, before.DurableRevision > base.DurableRevision, "model result pair = %+v, want a durable advance over %+v", before, base)
 
-		col.reset()
-		compactionBase := snapshotPair(t, h, sessionID)
-		{
-			canonical, _, _, cErr := h.projectCanonical(c, testOpID)
-			testassert.NoError(t, cErr)
-			facts := &maintenanceFacts{consumed: RequestEvidence{}, maintenanceID: hexID(8), facts: []maintenanceFact{{
-				RequestID: hexID(8),
-				Model:     testCompactCapture().Model,
-				Input:     cloneRequestMessages(canonical),
-			}}}
-			err := h.commitMaintenance(context.Background(), c, testOpID, testCapture(), PlanInput{BoundaryEntryID: fixtureInputEntryID(c)}, facts, summaryCheckpoint(t, "summary", fixtureInputEntryID(c)), false)
-			testassert.NoError(t, err)
-		}
-		facts := col.invalidations()
-		testassert.Equal(t, len(facts), 1)
-		after := snapshotPair(t, h, sessionID)
-		testassert.Require(t, after.DurableRevision > compactionBase.DurableRevision, "compaction pair = %+v, want a durable advance over %+v", after, compactionBase)
+		// The compaction publication on its own idle fixture: one transaction,
+		// one invalidation, one durable advance.
+		compactBase := idleFixture(t, validTestGraph(), hexID(20))
+		var factsCol *factCollector
+		compactExec := compactionExecution(t, func(context.Context, model.Request) (model.Stream, error) {
+			factsCol.reset() // the admission and install publications precede the checkpoint transaction
+			return summaryStream("summary", model.Usage{}), nil
+		}, nil)
+		compactPreparedExec := compactPrepared(testCapture(), compactExec)
+		compactHarness := newCompactHarness(t, compactBase, compactPreparedExec)
+		compactCoordinator := leaseCoordinator(t, compactHarness, testSessionID)
+		factsCol = observeHarness(compactHarness)
+		compactBefore := snapshotPair(t, compactHarness, testSessionID)
+		testassert.NoError(t, runManualCompact(t, compactHarness, compactCoordinator, testSessionID, "compact-1"))
+		facts := factsCol.invalidations()
+		testassert.Require(t, len(facts) >= 1, "compaction publication emitted %+v, want at least the checkpoint invalidation", facts)
+		after := snapshotPair(t, compactHarness, testSessionID)
+		testassert.Require(t, after.DurableRevision > compactBefore.DurableRevision, "compaction pair = %+v, want a durable advance over %+v", after, compactBefore)
 	})
 
 	t.Run("fork destination", func(t *testing.T) {
@@ -610,10 +610,11 @@ func TestObserveDurableAdvances(t *testing.T) {
 			testassert.Equal(t, disposition, DispositionAdmitted)
 		}
 		c := cachedCoordinator(t, h, testSessionID)
-		{
-			_, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationSuccess})
-			testassert.NoError(t, err)
-		}
+		testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return effectExecution(func(context.Context, model.Request) (model.Stream, error) {
+				return completedTurnStream(), nil
+			}, nil), nil
+		})))
 		sourceFacts := readSessionFacts(t, h, testSessionID)
 		testassert.Require(t, len(sourceFacts) != 0 && sourceFacts[0].Kind == EntryInput, "source facts = %+v", sourceFacts)
 		col := observeHarness(h)
@@ -703,10 +704,9 @@ func TestObserveIntentOnly(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			{
-				_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(script.model, nil), invocationExecution(script.model, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
-				testassert.Check(t, err == nil, "model effect: %v", err)
-			}
+			testassert.Check(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+				return effectExecution(script.model, nil), nil
+			})) == nil, "model effect failed")
 		}()
 		<-script.arrived // the intent committed and the physical attempt started
 		{
@@ -718,13 +718,13 @@ func TestObserveIntentOnly(t *testing.T) {
 	})
 
 	t.Run("tool intent", func(t *testing.T) {
+		rounds := 0
 		modelFn := func(context.Context, model.Request) (model.Stream, error) {
-			return completedTurnStream(testToolCall("call-1")), nil
-		}
-		h, _, c, _ := newEffectHarness(t, modelFn)
-		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
-			testassert.NoError(t, err)
+			rounds++
+			if rounds == 1 {
+				return completedTurnStream(testToolCall("call-1")), nil
+			}
+			return completedTurnStream(), nil
 		}
 		executeStarted := make(chan struct{})
 		release := make(chan struct{})
@@ -732,21 +732,25 @@ func TestObserveIntentOnly(t *testing.T) {
 			return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
 				close(executeStarted)
 				<-release
-				return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
+				return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 			}}
 		}
+		h, _, c, _ := newEffectHarness(t, nil)
 		col := observeHarness(h)
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			{
-				_, err := h.toolEffect(c, testOpID, effectExecution(nil, plan), invocationExecution(nil, plan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
-				testassert.Check(t, err == nil, "tool effect: %v", err)
-			}
+			testassert.Check(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+				return effectExecution(modelFn, plan), nil
+			})) == nil, "tool effect failed")
 		}()
 		<-executeStarted // the tool intent committed and the executor started
 		facts := col.snapshot()
-		testassert.Require(t, len(facts) == 1 && facts[0].Kind == FactToolStarted, "tool intent facts = %+v, want only the started fact", facts)
+		testassert.Require(t, len(facts) != 0 && facts[len(facts)-1].Kind == FactToolStarted, "tool intent facts = %+v, want the started fact after the model round", facts)
+		for _, fact := range facts[:len(facts)-1] {
+			testassert.Require(t, fact.Kind == FactTextDelta || fact.Kind == FactInvalidation, "the tool intent emitted %+v", fact)
+		}
+		testassert.Require(t, len(slices.DeleteFunc(slices.Clone(facts), func(f HarnessFact) bool { return f.Kind != FactToolStarted })) == 1, "tool started facts = %+v, want exactly one", facts)
 		close(release)
 		<-done
 	})
@@ -870,8 +874,21 @@ func TestObserveCurrentPair(t *testing.T) {
 // both facts keep their own Session identity, and the current pair reaches
 // the expected owning-state value after both commits.
 func TestObserveConcurrentCommits(t *testing.T) {
-	h, _, c, sessionID := newEffectHarness(t, nil)
-	before := snapshotPair(t, h, sessionID)
+	h := newTestHarness(t, emptyStore(t), newPrepareStub(validPrepared()).prepare)
+	sessionA := createSession(t, h)
+	sessionB := createSession(t, h)
+	{
+		_, disposition := mustAdmitWithoutExecution(t, h, sessionA, "op-a", admissionContent("a"))
+		testassert.Equal(t, disposition, DispositionAdmitted)
+	}
+	{
+		_, disposition := mustAdmitWithoutExecution(t, h, sessionB, "op-b", admissionContent("b"))
+		testassert.Equal(t, disposition, DispositionAdmitted)
+	}
+	coordA := cachedCoordinator(t, h, sessionA)
+	coordB := cachedCoordinator(t, h, sessionB)
+	baseA := snapshotPair(t, h, sessionA)
+	baseB := snapshotPair(t, h, sessionB)
 
 	col := &factCollector{}
 	firstArrived := make(chan struct{})
@@ -885,41 +902,47 @@ func TestObserveConcurrentCommits(t *testing.T) {
 		}
 	}
 
+	run := func(coordinator *coordinator, session, operationID string) func() {
+		return func() {
+			testassert.Check(t, executeDirect(h, coordinator, context.Background(), operationID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+				return effectExecution(func(context.Context, model.Request) (model.Stream, error) {
+					return completedTurnStream(), nil
+				}, nil), nil
+			})) == nil, "run for session %s failed", session)
+		}
+	}
 	firstDone := make(chan struct{})
 	go func() {
 		defer close(firstDone)
-		{
-			_, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{})
-			testassert.Check(t, err == nil, "first commit: %v", err)
-		}
+		run(coordA, sessionA, "op-a")()
 	}()
-	<-firstArrived // the first commit emitted and its callback is parked
+	<-firstArrived // the first run published and its callback is parked
 
 	secondDone := make(chan struct{})
 	go func() {
 		defer close(secondDone)
-		{
-			_, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{})
-			testassert.Check(t, err == nil, "second commit: %v", err)
-		}
+		run(coordB, sessionB, "op-b")()
 	}()
 	select {
-	case <-secondDone: // the concurrent publication completed while the callback was parked
+	case <-secondDone: // the independent run completed while the callback was parked
 	case <-time.After(10 * time.Second):
-		t.Fatalf("the concurrent publication did not complete while the observer was parked")
+		t.Fatalf("the independent publication did not complete while the observer was parked")
 	}
 	close(releaseFirst)
 	<-firstDone
 
-	got := col.snapshot()
-	testassert.Require(t, len(got) == 2, "concurrent commit facts = %+v, want two", got)
-	for i, fact := range got {
-		testassert.Require(t, fact.Kind == FactInvalidation && fact.SessionID == sessionID, "fact %d lost its owner attribution: %+v", i, fact)
+	facts := col.snapshot()
+	var sawA, sawB bool
+	for _, fact := range facts {
+		testassert.Require(t, fact.SessionID == sessionA || fact.SessionID == sessionB, "fact lost its owner attribution: %+v", fact)
+		sawA = sawA || fact.SessionID == sessionA
+		sawB = sawB || fact.SessionID == sessionB
 	}
-	// Both commits durably advanced; the pair is read after both producers
-	// released their locks, so the publisher's current-pair rule is proven
-	// against the concurrent interleaving.
-	wantPairAt(t, h, sessionID, before.DurableRevision+2, before.LocalRevision)
+	testassert.Require(t, sawA && sawB, "concurrent run facts = %+v, want both independently admitted Sessions", facts)
+	finalA := snapshotPair(t, h, sessionA)
+	finalB := snapshotPair(t, h, sessionB)
+	testassert.Require(t, finalA.DurableRevision > baseA.DurableRevision, "session A pair = %+v, want the run's durable advance over %+v", finalA, baseA)
+	testassert.Require(t, finalB.DurableRevision > baseB.DurableRevision, "session B pair = %+v, want the run's durable advance over %+v", finalB, baseB)
 }
 
 // transactionProbe wraps one Storage and records whether a transaction is
@@ -1195,12 +1218,11 @@ func TestObserveStreamFilter(t *testing.T) {
 	t.Run("assembly close stays exactly once through the wrapper", func(t *testing.T) {
 		stream := completedTurnStream()
 		modelFn := func(context.Context, model.Request) (model.Stream, error) { return stream, nil }
-		h, _, c, _ := newEffectHarness(t, modelFn)
+		h, _, c, _ := newEffectHarness(t, nil)
 		observeHarness(h)
-		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
-			testassert.NoError(t, err)
-		}
+		testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return effectExecution(modelFn, nil), nil
+		})))
 		testassert.Equal(t, stream.closes, 1)
 	})
 
@@ -1218,24 +1240,23 @@ func TestObserveStreamFilter(t *testing.T) {
 // TestObserveCompactAttribution proves a compact model stream's deltas are
 // attributed to the enclosing Operation.
 func TestObserveCompactAttribution(t *testing.T) {
+	store := idleFixture(t, validTestGraph(), hexID(20))
 	compactFn := func(context.Context, model.Request) (model.Stream, error) {
 		return completedTurnStream(), nil
 	}
-	h, _, c, sessionID := newEffectHarness(t, nil)
+	exec := compactionExecution(t, compactFn, nil)
+	prepared := compactPrepared(testCapture(), exec)
+	h := newCompactHarness(t, store, prepared)
+	c := leaseCoordinator(t, h, testSessionID)
 	col := observeHarness(h)
-	exec := effectExecution(compactFn, nil)
-	effect := h.compactModelEffect(c, testOpID, invocationExecution(compactFn, nil), exec.Retry, testCapture(), hexID(8), &maintenanceFacts{maintenanceID: "maintenance-test"}, nil)
-	{
-		_, err := invokeModelEffect(t, effect, defaultModelRequest(t), nil)
-		testassert.NoError(t, err)
-	}
+	testassert.NoError(t, runManualCompact(t, h, c, testSessionID, "compact-1"))
 	deltas := 0
 	for _, fact := range col.snapshot() {
 		if fact.Kind != FactTextDelta {
 			continue
 		}
 		deltas++
-		testassert.Require(t, fact.SessionID == sessionID && fact.OperationID == testOpID && fact.Position == 0 && fact.Content == "done", "compact delta fact = %+v, want the enclosing Operation attribution", fact)
+		testassert.Require(t, fact.SessionID == testSessionID && fact.OperationID == "compact-1" && fact.Position == 0 && fact.Content == "done", "compact delta fact = %+v, want the enclosing Operation attribution", fact)
 	}
 	testassert.Equal(t, deltas, 1)
 }
@@ -1253,12 +1274,11 @@ func TestObserveRefusalFacts(t *testing.T) {
 			model.StreamDelta{HasChoice: true, FinishReason: "stop"},
 		), nil
 	}
-	h, _, c, sessionID := newEffectHarness(t, modelFn)
+	h, _, c, sessionID := newEffectHarness(t, nil)
 	col := observeHarness(h)
-	{
-		_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
-		testassert.NoError(t, err)
-	}
+	testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+		return effectExecution(modelFn, nil), nil
+	})))
 	var refusals []HarnessFact
 	for _, fact := range col.snapshot() {
 		if fact.Kind != FactRefusalDelta {
@@ -1291,56 +1311,63 @@ func TestObserveRefusalFacts(t *testing.T) {
 // fact without a started one for a terminal settlement's synthetic unstarted
 // result. Hooks have no progress kind.
 func TestObserveToolLifecycle(t *testing.T) {
-	publishStream := func(t *testing.T, h *Harness, c *coordinator, stream model.Stream) {
+	run := func(t *testing.T, rounds int, plan func(context.Context, model.ToolCall) PreparedTool, cancelOnClose bool) (*factCollector, error) {
 		t.Helper()
-		modelFn := func(context.Context, model.Request) (model.Stream, error) { return stream, nil }
-		{
-			_, err := invokeModelEffect(t, h.modelEffect(c, testOpID, effectExecution(modelFn, nil), invocationExecution(modelFn, nil), testCapture(), fixtureRound(h, c)), defaultModelRequest(t), nil)
-			testassert.NoError(t, err)
+		h, _, c, _ := newEffectHarness(t, nil)
+		col := observeHarness(h)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		round := 0
+		modelFn := func(context.Context, model.Request) (model.Stream, error) {
+			round++
+			if round > rounds {
+				return completedTurnStream(), nil
+			}
+			stream := completedTurnStream(testToolCall("call-1"))
+			if cancelOnClose {
+				return &cancelOnCloseStream{scriptStream: stream, cancel: cancel}, nil
+			}
+			return stream, nil
 		}
+		err := executeDirect(h, c, ctx, testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return effectExecution(modelFn, plan), nil
+		}))
+		return col, err
 	}
-	publishCall := func(t *testing.T, h *Harness, c *coordinator, call model.ToolCall) {
-		t.Helper()
-		publishStream(t, h, c, completedTurnStream(call))
+	successPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
+	}
+	errorPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "boom"}}}
+	}
+	deniedPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
+		return PreparedTool{Execute: func(context.Context) ToolOutcome {
+			return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
+		}}
 	}
 
 	t.Run("statuses share one lifecycle", func(t *testing.T) {
-		successPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
-		}
-		errorPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
-			return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "boom"}}}
-		}
-		deniedPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
-			return PreparedTool{Execute: func(context.Context) ToolOutcome {
-				return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
-			}}
-		}
 		cases := []struct {
-			name   string
-			plan   func(context.Context, model.ToolCall) PreparedTool
-			status model.ToolResultStatus
-			cancel bool
+			name          string
+			plan          func(context.Context, model.ToolCall) PreparedTool
+			status        model.ToolResultStatus
+			cancelOnClose bool
+			synthetic     bool
 		}{
 			{name: "success", plan: successPlan, status: model.ResultSuccess},
 			{name: "error", plan: errorPlan, status: model.ResultError},
 			{name: "denied", plan: deniedPlan, status: model.ResultDenied},
-			{name: "interrupted", plan: successPlan, status: model.ResultInterrupted, cancel: true},
+			{name: "executor interrupted", plan: func(_ context.Context, call model.ToolCall) PreparedTool {
+				return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
+					return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}}
+				}}
+			}, status: model.ResultInterrupted},
+			{name: "synthetic unstarted interruption", plan: successPlan, status: model.ResultInterrupted, cancelOnClose: true, synthetic: true},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				h, _, c, _ := newEffectHarness(t, nil)
-				publishCall(t, h, c, testToolCall("call-1"))
-				col := observeHarness(h)
-				ctx := context.Background()
-				if tc.cancel {
-					canceled, cancel := context.WithCancel(ctx)
-					cancel()
-					ctx = canceled
-				}
-				got, err := h.toolEffect(c, testOpID, effectExecution(nil, tc.plan), invocationExecution(nil, tc.plan), testCapture())(ctx, testToolCall("call-1"), []string{"echo"})
+				col, err := run(t, 1, tc.plan, tc.cancelOnClose)
 				testassert.NoError(t, err)
-				testassert.Equal(t, got.Status, tc.status)
 				facts := col.snapshot()
 				var startedAt, finishedAt = -1, -1
 				for i, fact := range facts {
@@ -1353,12 +1380,19 @@ func TestObserveToolLifecycle(t *testing.T) {
 						testassert.Require(t, finishedAt < 0, "the call finished more than once: %+v", facts)
 						finishedAt = i
 						testassert.Require(t, fact.CallID == "call-1" && fact.Status == tc.status && fact.OperationID == testOpID, "finished fact = %+v, want status %s", fact, tc.status)
-					case FactInvalidation:
+					case FactInvalidation, FactTextDelta:
 					default:
 						t.Fatalf("unexpected progress kind %q in %+v", fact.Kind, facts)
 					}
 				}
-				testassert.Require(t, startedAt >= 0 && finishedAt >= 0 && startedAt <= finishedAt, "lifecycle order = started %d finished %d in %+v", startedAt, finishedAt, facts)
+				if tc.synthetic {
+					// A cancellation observed after the accepted result but before the
+					// dispatcher entry settles the reserved call through the terminal
+					// helper: the finished result carries no started progress.
+					testassert.Require(t, startedAt < 0 && finishedAt >= 0, "synthetic interrupted lifecycle = started %d finished %d in %+v, want the terminal's unstarted result", startedAt, finishedAt, facts)
+				} else {
+					testassert.Require(t, startedAt >= 0 && finishedAt >= 0 && startedAt <= finishedAt, "lifecycle order = started %d finished %d in %+v", startedAt, finishedAt, facts)
+				}
 			})
 		}
 	})
@@ -1377,46 +1411,67 @@ func TestObserveToolLifecycle(t *testing.T) {
 				Position: &position, ID: "call-1", Name: "ghost", ArgumentFragment: `{"x":1}`,
 			}},
 		}, usageDelta(model.Usage{InputTokens: 1, OutputTokens: 1}))
-		publishStream(t, h, c, stream)
+		round := 0
 		col := observeHarness(h)
-		got, err := h.toolEffect(c, testOpID, effectExecution(nil, nil), invocationExecution(nil, nil), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
-		testassert.Require(t, err == nil && got.Status == model.ResultError, "unavailable tool = %+v err %v, want the error result", got, err)
+		testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return effectExecution(func(context.Context, model.Request) (model.Stream, error) {
+				round++
+				if round == 1 {
+					return stream, nil
+				}
+				return completedTurnStream(), nil
+			}, nil), nil
+		})))
 		facts := col.snapshot()
-		testassert.Require(t, len(facts) == 3 && facts[0].Kind == FactToolStarted && facts[1].Kind == FactInvalidation && facts[2].Kind == FactToolFinished, "advertisement-gate facts = %+v, want started, the result commit, then finished", facts)
+		started, invalidated, finished := -1, -1, -1
+		for i, fact := range facts {
+			switch fact.Kind {
+			case FactToolStarted:
+				started = i
+				testassert.Require(t, fact.CallID == "call-1" && fact.Name == "ghost", "started fact = %+v", fact)
+			case FactInvalidation:
+				if started >= 0 && finished < 0 {
+					invalidated = i
+				}
+			case FactToolFinished:
+				finished = i
+				testassert.Require(t, fact.CallID == "call-1" && fact.Status == model.ResultError, "finished fact = %+v, want the unavailable error result", fact)
+			}
+		}
+		testassert.Require(t, started >= 0 && invalidated > started && finished > invalidated, "advertisement-gate facts = %+v, want started, the result commit, then finished", facts)
 	})
 
 	t.Run("synthetic unstarted result finishes without started", func(t *testing.T) {
 		h, _, c, _ := newEffectHarness(t, nil)
-		publishStream(t, h, c, completedTurnStream(testToolCall("call-1"), testToolCall("call-2")))
-		successPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
-			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
-		}
-		{
-			_, err := h.toolEffect(c, testOpID, effectExecution(nil, successPlan), invocationExecution(nil, successPlan), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
-			testassert.NoError(t, err)
-		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		round := 0
 		col := observeHarness(h)
-		{
-			_, err := h.commitEffectResult(context.Background(), c, testOpID, nil, modelResult{terminal: OperationInterruption, detail: "stopped"})
-			testassert.NoError(t, err)
-		}
+		testassert.NoError(t, executeDirect(h, c, ctx, testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return effectExecution(func(context.Context, model.Request) (model.Stream, error) {
+				round++
+				if round == 1 {
+					return &cancelOnCloseStream{scriptStream: completedTurnStream(testToolCall("call-1"), testToolCall("call-2")), cancel: cancel}, nil
+				}
+				return completedTurnStream(), nil
+			}, successPlan), nil
+		})))
 		facts := col.snapshot()
-		var finished int
+		var started, finished int
 		for _, fact := range facts {
 			switch fact.Kind {
 			case FactToolStarted:
-				t.Fatalf("a synthetic unstarted result emitted a started fact: %+v", fact)
+				started++
 			case FactToolFinished:
 				finished++
-				testassert.Require(t, fact.CallID == "call-2" && fact.Status == model.ResultInterrupted, "synthetic finished fact = %+v", fact)
 			}
 		}
-		testassert.Require(t, finished == 1, "synthetic finished facts = %d, want one; facts %+v", finished, facts)
+		testassert.Require(t, started == 0 && finished == 2, "synthetic unstarted facts = %+v, want two finished results without a started fact", facts)
 	})
 
 	t.Run("hooks have no progress kind", func(t *testing.T) {
 		h, _, c, _ := newEffectHarness(t, nil)
-		publishCall(t, h, c, testToolCall("call-1"))
+		rounds := 0
 		toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
 			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}
@@ -1424,11 +1479,18 @@ func TestObserveToolLifecycle(t *testing.T) {
 			return nil, errors.New("hook boom")
 		}}}
 		exec := Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
-			return InvocationExecution{Tool: toolFn, NormalizeTool: objectNormalize, ToolHooks: hooks}, nil
+			return InvocationExecution{Model: func(context.Context, model.Request) (model.Stream, error) {
+				rounds++
+				if rounds == 1 {
+					return completedTurnStream(testToolCall("call-1")), nil
+				}
+				return completedTurnStream(), nil
+			}, Tool: toolFn, NormalizeTool: objectNormalize, ToolHooks: hooks}, nil
 		}}
 		col := observeHarness(h)
-		got, err := h.toolEffect(c, testOpID, exec, openedConversation(t, exec), testCapture())(context.Background(), testToolCall("call-1"), []string{"echo"})
-		testassert.Require(t, err == nil && got.Status == model.ResultError, "hook-settled tool = %+v err %v, want the error result", got, err)
+		testassert.NoError(t, executeDirect(h, c, context.Background(), testOpID, preparedExecutionFor(testCapture(), func(context.Context, OperationAdmission) (Execution, error) {
+			return exec, nil
+		})))
 		var started, finished, invalidations int
 		for _, fact := range col.snapshot() {
 			switch fact.Kind {
@@ -1438,12 +1500,13 @@ func TestObserveToolLifecycle(t *testing.T) {
 				finished++
 			case FactInvalidation:
 				invalidations++
+			case FactTextDelta:
 			default:
 				t.Fatalf("hook flow emitted progress kind %q", fact.Kind)
 			}
 		}
 		// the hook result and the tool result
-		testassert.Require(t, started == 1 && finished == 1 && invalidations == 2, "hook flow counts = started %d finished %d invalidations %d", started, finished, invalidations)
+		testassert.Require(t, started == 1 && finished == 1 && invalidations >= 2, "hook flow counts = started %d finished %d invalidations %d", started, finished, invalidations)
 	})
 }
 
