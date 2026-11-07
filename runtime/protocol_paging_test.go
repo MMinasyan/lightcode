@@ -366,6 +366,7 @@ type usageSeedSessionState struct {
 	CheckpointEntryID  string                   `json:"checkpoint_entry_id,omitempty"`
 	Usage              usageWireTotals          `json:"usage"`
 	LastActivity       time.Time                `json:"last_activity"`
+	ExternalDataOwners []string                 `json:"external_data_owners"`
 }
 
 type usageSeedSessionRegister struct {
@@ -387,6 +388,7 @@ func usageSeedSession(t *testing.T, store harness.Storage, sessionID, currentOp,
 			CheckpointEntryID:  compactionID,
 			Usage:              totals,
 			LastActivity:       now,
+			ExternalDataOwners: []string{},
 		},
 	})
 	testassert.NoError(t, err)
@@ -543,7 +545,10 @@ func TestHistoryReadsArchivedDeletedSessions(t *testing.T) {
 			_, err := h.ArchiveSession(ctx, deleted)
 			return err
 		}))
-		testassert.NoError(t, r.deleteSession(context.Background(), deleted))
+		{
+			_, err := r.deleteSession(context.Background(), deleted)
+			testassert.NoError(t, err)
+		}
 
 		archivedReads := sessionReadCalls(context.Background(), r, archived)
 		for i, read := range archivedReads {

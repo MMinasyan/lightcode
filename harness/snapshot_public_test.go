@@ -570,7 +570,7 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := f.h.DeleteSession(ctx, session)
+			_, err := f.h.DeleteSession(ctx, session)
 			testassert.NoError(t, err)
 		}
 		{
@@ -738,7 +738,7 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := lister.h.DeleteSession(ctx, second)
+			_, err := lister.h.DeleteSession(ctx, second)
 			testassert.NoError(t, err)
 		}
 		{
@@ -746,7 +746,7 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := lister.h.DeleteSession(ctx, third)
+			_, err := lister.h.DeleteSession(ctx, third)
 			testassert.NoError(t, err)
 		}
 		listed, err = lister.h.ListSessions(ctx)
@@ -859,7 +859,7 @@ func TestPublicSnapshotSessionDeletionRace(t *testing.T) {
 				}
 			}()
 		}
-		if err := f.h.DeleteSession(ctx, session); err != nil {
+		if _, err := f.h.DeleteSession(ctx, session); err != nil {
 			errs <- err
 		}
 		close(stop)
@@ -1248,7 +1248,7 @@ func TestPublicListSessionsStaleEnumeratedRow(t *testing.T) {
 		}()
 		<-wrapped.listed
 		{
-			err := f.h.DeleteSession(ctx, victim)
+			_, err := f.h.DeleteSession(ctx, victim)
 			testassert.NoError(t, err)
 		}
 		close(wrapped.listRelease)
@@ -1826,7 +1826,8 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 
 			deleteDone := make(chan error, 1)
 			go func() {
-				deleteDone <- h.DeleteSession(context.Background(), session)
+				_, err := h.DeleteSession(context.Background(), session)
+				deleteDone <- err
 			}()
 			<-gate.started // the deleting transaction is parked, holding the coordinator mutex
 
@@ -1866,7 +1867,8 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 
 			deleteDone := make(chan error, 1)
 			go func() {
-				deleteDone <- h.DeleteSession(context.Background(), session)
+				_, err := h.DeleteSession(context.Background(), session)
+				deleteDone <- err
 			}()
 			<-gate.started
 			close(gate.release)

@@ -40,7 +40,7 @@ const (
 // recordContent builds one private discovery document pointing at the
 // fixture endpoint.
 func recordContent(endpoint string) string {
-	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"11","credential":%q}`,
+	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"12","credential":%q}`,
 		endpoint, testInstance, testCredential)
 }
 
@@ -69,7 +69,7 @@ func newFixture(t *testing.T, health, events http.HandlerFunc, extra ...map[stri
 func jsonHealth() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"11"}`, testInstance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"12"}`, testInstance)
 	}
 }
 
@@ -253,6 +253,14 @@ func TestDesktopHostCallClassification(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, "not json")
 		},
+		"/v1/sessions/good-delete": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"cleanup_failures":[]}`)
+		},
+		"/v1/sessions/bad-delete": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"cleanup_failures":[{"code":"storage","extension_id":"guest","message":"x"}]}`)
+		},
 	})
 	host := newHost(t, server)
 	info, err := host.Open()
@@ -273,6 +281,15 @@ func TestDesktopHostCallClassification(t *testing.T) {
 	invalid, err := host.Call(info.Generation, "GetSessionHydration", `{"session_id":"malformed"}`)
 	testassert.NoError(t, err)
 	testassert.Require(t, invalid.Status == http.StatusOK && invalid.Invalid && invalid.Body == "not json", "invalid response = %+v, want the received status/body with the Invalid bit", invalid)
+
+	deleted, err := host.Call(info.Generation, "DeleteSession", `{"session_id":"good-delete"}`)
+	testassert.NoError(t, err)
+	testassert.Require(t, deleted.Status == http.StatusOK && !deleted.Invalid && deleted.Body == `{"cleanup_failures":[]}`, "valid deletion = %+v, want the accepted result", deleted)
+
+	badDeletion, err := host.Call(info.Generation, "DeleteSession", `{"session_id":"bad-delete"}`)
+	testassert.NoError(t, err)
+	badBody := `{"cleanup_failures":[{"code":"storage","extension_id":"guest","message":"x"}]}`
+	testassert.Require(t, badDeletion.Status == http.StatusOK && badDeletion.Invalid && badDeletion.Body == badBody, "invalid deletion = %+v, want the received status/body with the Invalid bit", badDeletion)
 
 	{
 		_, err := host.Call(info.Generation, "Nope", "")
@@ -1057,7 +1074,7 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 	testassert.Equal(t, response.Status, http.StatusOK)
 	var health protocol.Health
 	testassert.NoError(t, json.Unmarshal([]byte(response.Body), &health))
-	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N11, "health = %+v, want the connected owner", health)
+	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N12, "health = %+v, want the connected owner", health)
 
 	create, err := host.Call(info.Generation, "CreateSession", `{"body":{"workspace":"/ws/smoke","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"integrated"}}}}`)
 	testassert.NoError(t, err)

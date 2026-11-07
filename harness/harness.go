@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -587,6 +588,96 @@ func (h *Harness) SetSessionModel(ctx context.Context, sessionID string, ref mod
 	})
 }
 
+// ClaimExternalData durably records one installed extension as an owner of
+// external data for one open Session before that data is created. It follows
+// the Agent-type mutation rule: any open Session qualifies, including one with
+// an active Operation, and a repeated claim is a no-op that writes nothing. A
+// refused claim leaves the register unchanged.
+func (h *Harness) ClaimExternalData(ctx context.Context, sessionID, extensionID string) error {
+	if extensionID == "" {
+		return invalidInput("external data owner must be a nonempty extension ID")
+	}
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	for {
+		if err := c.waitIdle(ctx); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if c.reserved != nil { // a reservation was taken between the wait and the lock
+			c.mu.Unlock()
+			continue
+		}
+		if c.gone { // a deletion committed while this call waited or relocked
+			c.mu.Unlock()
+			return notFoundSession(sessionID)
+		}
+		if c.graph.Session.State.Lifecycle != LifecycleOpen {
+			c.mu.Unlock()
+			return invalidInput("session %q is archived; an external data claim requires an open Session", sessionID)
+		}
+		expected := c.graph.Session.Revision
+		var (
+			updated SessionRecord
+			changed bool
+		)
+		err := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
+			key := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+			reg, err := tx.ReadRegister(key)
+			if err != nil {
+				return err
+			}
+			current, err := decodeSessionRegister(reg)
+			if err != nil {
+				return corruptSession(sessionID, "session register: %v", err)
+			}
+			if reg.Revision != expected {
+				return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, sessionID, expected, reg.Revision)
+			}
+			if slices.Contains(current.State.ExternalDataOwners, extensionID) {
+				updated = current // a repeated claim is a true no-op
+				return nil
+			}
+			state := current.State
+			state.ExternalDataOwners = append(append([]string(nil), state.ExternalDataOwners...), extensionID)
+			changedRecord := SessionRecord{Identity: current.Identity, State: state}
+			payload, err := encodeSessionRegister(changedRecord)
+			if err != nil {
+				return err
+			}
+			replaced, err := tx.ReplaceRegister(key, reg.Revision, payload)
+			if err != nil {
+				return err
+			}
+			changedRecord.Revision = replaced.Revision
+			updated = changedRecord
+			changed = true
+			return nil
+		})
+		if err != nil {
+			h.markCorrupt(sessionID, err)
+			c.mu.Unlock()
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
+				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil {
+					return rerr
+				}
+			}
+			return err
+		}
+		if changed {
+			c.graph.Session = updated
+		}
+		c.mu.Unlock()
+		if changed {
+			h.observeInvalidation(c) // the durable external-data claim
+		}
+		return nil
+	}
+}
+
 func (h *Harness) changeSelection(ctx context.Context, sessionID string, update func(AgentSelection) (AgentSelection, error)) (SessionRecord, error) {
 	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
@@ -993,19 +1084,20 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 }
 
 // DeleteSession deletes one archived Session: the same transaction that
-// validates its state performs the storage deletion. After the commit it uses
-// the post-commit coordinator invalidation: callers already holding that
-// coordinator and later materialization both return ErrNotFound. Deleting an
-// open or absent Session is rejected without a write.
-func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
+// validates its state performs the storage deletion and the committed
+// register's external-data owners are returned only after that commit. After
+// the commit it uses the post-commit coordinator invalidation: callers already
+// holding that coordinator and later materialization both return ErrNotFound.
+// Deleting an open or absent Session is rejected without a write.
+func (h *Harness) DeleteSession(ctx context.Context, sessionID string) ([]string, error) {
 	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer release()
 	for {
 		if err := c.waitIdle(ctx); err != nil {
-			return err
+			return nil, err
 		}
 		c.mu.Lock()
 		if c.reserved != nil { // a reservation was taken between the wait and the lock
@@ -1014,13 +1106,14 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 		}
 		if c.gone { // a deletion committed while this call waited or relocked
 			c.mu.Unlock()
-			return notFoundSession(sessionID)
+			return nil, notFoundSession(sessionID)
 		}
 		if c.graph.Session.State.Lifecycle != LifecycleArchived {
 			c.mu.Unlock()
-			return invalidInput("session %q is open; deletion requires an archived Session", sessionID)
+			return nil, invalidInput("session %q is open; deletion requires an archived Session", sessionID)
 		}
 		expected := c.graph.Session.Revision
+		var owners []string
 		err := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
 			key := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
 			reg, err := tx.ReadRegister(key)
@@ -1030,22 +1123,30 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 			if reg.Revision != expected {
 				return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, sessionID, expected, reg.Revision)
 			}
-			return tx.DeleteSession(sessionID)
+			current, err := decodeSessionRegister(reg)
+			if err != nil {
+				return corruptSession(sessionID, "session register: %v", err)
+			}
+			if err := tx.DeleteSession(sessionID); err != nil {
+				return err
+			}
+			owners = append([]string(nil), current.State.ExternalDataOwners...)
+			return nil
 		})
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
 			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-					return rerr
+					return nil, rerr
 				}
 			}
-			return err
+			return nil, err
 		}
 		c.invalidate() // post-commit, under the same coordinator ownership: buffers cleared and absence marked before registry removal
 		c.mu.Unlock()
 		h.removeCoordinator(sessionID)
-		return nil
+		return owners, nil
 	}
 }
 
@@ -1061,15 +1162,16 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 // not-found class and a corrupt one the corruption class, both left
 // unchanged. Deletion uses the same post-commit coordinator invalidation as
 // DeleteSession; archiving adopts the committed record under the same hold.
-// It reports whether the deletion transition committed: the flag is true only
+// It reports whether the deletion transition committed and, only after that
+// commit, the removed register's external-data owners: the flag is true only
 // after the deleting transaction and its post-commit adoption succeeded.
-func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy SweepPolicy, now time.Time) (bool, error) {
+func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy SweepPolicy, now time.Time) (bool, []string, error) {
 	if now.IsZero() {
-		return false, invalidInput("sweep time must not be zero")
+		return false, nil, invalidInput("sweep time must not be zero")
 	}
 	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	defer release()
 	return h.sweepOne(ctx, c, sessionID, policy, now)
@@ -1086,26 +1188,28 @@ func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy Swe
 // and a corrupt register the corruption class, both left unchanged. Deletion
 // uses the same post-commit coordinator invalidation as DeleteSession;
 // archiving adopts the committed record under the same hold. It reports
-// whether the deletion transition committed: the flag is true only after the
+// whether the deletion transition committed and, only after that commit, the
+// removed register's external-data owners: the flag is true only after the
 // deleting transaction and its post-commit adoption succeeded.
-func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string, policy SweepPolicy, now time.Time) (bool, error) {
+func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string, policy SweepPolicy, now time.Time) (bool, []string, error) {
 	c.mu.Lock()
 	if c.reserved != nil { // a reserved candidate skips like every other busy state: the pass never waits on admission work
 		c.mu.Unlock()
-		return false, nil
+		return false, nil, nil
 	}
 	if c.gone { // a deletion committed before this transition
 		c.mu.Unlock()
-		return false, notFoundSession(sessionID)
+		return false, nil, notFoundSession(sessionID)
 	}
 	if !c.quiescentLocked() { // running, buffered, or live background work: left unchanged
 		c.mu.Unlock()
-		return false, nil
+		return false, nil, nil
 	}
 	var (
 		archived   SessionRecord
 		didArchive bool
 		deleted    bool
+		owners     []string
 	)
 	err := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
 		key := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
@@ -1150,6 +1254,7 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 			if err := tx.DeleteSession(sessionID); err != nil {
 				return err
 			}
+			owners = append([]string(nil), current.State.ExternalDataOwners...)
 			deleted = true
 		}
 		return nil
@@ -1157,13 +1262,13 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 	if err != nil {
 		h.markCorrupt(sessionID, err)
 		c.mu.Unlock()
-		return false, err
+		return false, nil, err
 	}
 	if deleted { // the same post-commit coordinator invalidation as DeleteSession, under this hold
 		c.invalidate()
 		c.mu.Unlock()
 		h.removeCoordinator(sessionID)
-		return true, nil
+		return true, owners, nil
 	}
 	if didArchive {
 		c.graph.Session = archived
@@ -1172,7 +1277,7 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 	if didArchive {
 		h.observeInvalidation(c) // the durable sweep archive advance
 	}
-	return false, nil
+	return false, nil, nil
 }
 
 // quiescentLocked applies the one lifecycle gate under the caller-held
@@ -2184,6 +2289,7 @@ func ownSessionRecord(rec SessionRecord) SessionRecord {
 		out.State.ArchivedAt = &stamped
 	}
 	out.State.Usage = ownUsageTotals(rec.State.Usage)
+	out.State.ExternalDataOwners = append([]string(nil), rec.State.ExternalDataOwners...)
 	return out
 }
 

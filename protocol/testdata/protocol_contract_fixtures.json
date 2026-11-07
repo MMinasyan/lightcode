@@ -94,6 +94,50 @@
    "reject": []
   },
   {
+   "schema": "CleanupFailure",
+   "accept": [
+    {
+     "name": "local-storage",
+     "json": "{\"code\":\"storage\",\"message\":\"remove tree: permission denied\"}"
+    },
+    {
+     "name": "external-unavailable",
+     "json": "{\"extension_id\":\"guest\",\"code\":\"unavailable\",\"message\":\"extension data cleanup is unavailable\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "empty-extension-id",
+     "json": "{\"extension_id\":\"\",\"code\":\"unavailable\",\"message\":\"x\"}",
+     "typescript": false
+    },
+    {
+     "name": "missing-code",
+     "json": "{\"message\":\"x\"}"
+    },
+    {
+     "name": "unknown-member",
+     "json": "{\"code\":\"storage\",\"message\":\"x\",\"path\":\"/tmp\"}"
+    },
+    {
+     "name": "unknown-code",
+     "json": "{\"code\":\"teapot\",\"message\":\"x\"}"
+    },
+    {
+     "name": "case-alias-code",
+     "json": "{\"code\":\"Storage\",\"message\":\"x\"}"
+    },
+    {
+     "name": "null-extension-id",
+     "json": "{\"extension_id\":null,\"code\":\"unavailable\",\"message\":\"x\"}"
+    },
+    {
+     "name": "numeric-message",
+     "json": "{\"code\":\"storage\",\"message\":5}"
+    }
+   ]
+  },
+  {
    "schema": "CodeRevertError",
    "accept": [
     {
@@ -440,6 +484,29 @@
    "reject": []
   },
   {
+   "schema": "DeletionResult",
+   "accept": [
+    {
+     "name": "complete",
+     "json": "{\"cleanup_failures\":[]}"
+    },
+    {
+     "name": "partial",
+     "json": "{\"cleanup_failures\":[{\"code\":\"storage\",\"message\":\"remove tree: permission denied\"},{\"extension_id\":\"guest\",\"code\":\"unavailable\",\"message\":\"extension data cleanup is unavailable\"}]}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-cleanup-failures",
+     "json": "{}"
+    },
+    {
+     "name": "null-cleanup-failures",
+     "json": "{\"cleanup_failures\":null}"
+    }
+   ]
+  },
+  {
    "schema": "DiscoveredModelCandidate",
    "accept": [
     {
@@ -509,6 +576,10 @@
     {
      "name": "code-internal",
      "json": "{\"code\":\"internal\",\"message\":\"unexpected\"}"
+    },
+    {
+     "name": "code-unavailable",
+     "json": "{\"code\":\"unavailable\",\"message\":\"extension cleanup unavailable\"}"
     }
    ],
    "reject": [
@@ -622,7 +693,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"11\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"12\"}"
     }
    ],
    "reject": [
@@ -632,16 +703,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"11\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"12\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"11\"}"
+     "json": "{\"protocol_version\":\"12\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"11\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"12\",\"extra\":true}"
     }
    ]
   },
@@ -2280,6 +2351,7 @@
    "path": "/v1/sessions/{id}",
    "request": null,
    "responses": {
+    "200": "DeletionResult",
     "default": "Error"
    }
   },

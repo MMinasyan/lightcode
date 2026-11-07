@@ -620,7 +620,7 @@ func TestCodeRevertPartialTraversalParkedGroup(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the restore never returned after its parked group completed")
 		}
-		testassert.Require(t, out.err != nil && len(out.result.Restored) == 1 && out.result.Restored[0] == target && out.result.Skipped != nil && out.result.Error != nil && out.result.Error.Code == protocol.Internal && out.result.Error.Message != "" && out.result.Error.SessionId == nil, "restore = %+v, want the later bad group's traversal error; partial result = %+v, want the parked group's accumulated restore and a non-nil skip list; partial error = %+v, want the internal class with no target Session id", out.result, out.result, out.result.Error)
+		testassert.Require(t, out.err != nil && len(out.result.Restored) == 1 && out.result.Restored[0] == target && out.result.Skipped != nil && out.result.Error != nil && out.result.Error.Code == protocol.ErrorCodeInternal && out.result.Error.Message != "" && out.result.Error.SessionId == nil, "restore = %+v, want the later bad group's traversal error; partial result = %+v, want the parked group's accumulated restore and a non-nil skip list; partial error = %+v, want the internal class with no target Session id", out.result, out.result, out.result.Error)
 		{
 			data, err := os.ReadFile(target)
 			testassert.Require(t, err == nil && string(data) == "restored", "parked target = (%q, %v), want the FIFO restore to complete", data, err)
@@ -838,7 +838,7 @@ func TestDeleteSessionConflictsWithRestoreInterval(t *testing.T) {
 
 		defer park.flush()
 		{
-			err := r.deleteSession(context.Background(), session)
+			_, err := r.deleteSession(context.Background(), session)
 			testassert.Require(t, errors.Is(err, harness.ErrConflict), "delete during a parked restore = %v, want the conflict class", err)
 		}
 		{
@@ -859,7 +859,10 @@ func TestDeleteSessionConflictsWithRestoreInterval(t *testing.T) {
 		}
 		testassert.Require(t, parked.err == nil, "parked restore = %v", parked.err)
 		// The interval, not the Session, blocked the deletion.
-		testassert.NoError(t, r.deleteSession(context.Background(), session))
+		{
+			_, err := r.deleteSession(context.Background(), session)
+			testassert.NoError(t, err)
+		}
 		{
 			_, err := os.Stat(groupRoot)
 			testassert.Require(t, os.IsNotExist(err), "group root after the deletion = %v, want it removed", err)

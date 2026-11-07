@@ -131,7 +131,7 @@ func (c *composition) bindTool(sel selection, id string) (Tool, error) {
 	if value.implementation.Tool == nil {
 		return nil, fmt.Errorf("tool %q has no implementation: %w", id, ErrComposition)
 	}
-	return extensionTool{composition: c, value: value}, nil
+	return extensionTool{composition: c, value: value, lease: sel.lease}, nil
 }
 
 // extensionTool adapts one native Tool contribution to the host's baseline
@@ -139,6 +139,7 @@ func (c *composition) bindTool(sel selection, id string) (Tool, error) {
 type extensionTool struct {
 	composition *composition
 	value       *capabilityValue
+	lease       *artifactCallLease
 }
 
 func (t extensionTool) baseIdentity(tc ToolContext, callID string, grant nativeGrant) callIdentity {
@@ -150,6 +151,7 @@ func (t extensionTool) baseIdentity(tc ToolContext, callID string, grant nativeG
 		toolCallID:   callID,
 		revision:     tc.Invocation.Revision(),
 		grant:        grant,
+		lease:        t.lease,
 	}
 }
 

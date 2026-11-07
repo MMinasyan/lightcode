@@ -43,6 +43,12 @@ type selection struct {
 	selected   []string
 	invocation Invocation
 
+	// lease is the actual privately acquired execution artifact interval.
+	// Every native callback running in this execution receives this same
+	// borrowed pointer regardless of its implementation lifetime; nil outside
+	// an admitted execution.
+	lease *artifactCallLease
+
 	// credentials is the preparation's one captured credential observation
 	// set, sampled with the same capture as the Invocation's snapshot: the
 	// concrete preparation resolves its transport secrets from it, and no
@@ -305,7 +311,13 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	if err != nil {
 		return harness.Execution{}, err
 	}
-	base := ScopeInfo{DataDir: runtimeScope.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID, Revision: snapshot.resources.revisionString()}
+	artifactLease := &artifactCallLease{
+		intervals: p.artifacts,
+		key:       sessionArtifactDir(runtimeScope.info.DataDir, admission.SessionID),
+		borrowed:  true,
+		release:   releaseArtifacts,
+	}
+	base := ScopeInfo{DataDir: runtimeScope.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID, Revision: snapshot.resources.revisionString(), artifactLease: artifactLease}
 	base.sections = snapshot.extensions
 	operationInfo := base
 	operationInfo.Kind = ScopeOperation
@@ -345,7 +357,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		selected := make([]string, 0, len(inputs.Capabilities)+len(inputs.Tools))
 		selected = append(selected, inputs.Capabilities...)
 		selected = append(selected, inputs.Tools...)
-		invocation, err := opener(callCtx, admission, selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope, operation, agentScope}, selected: selected, invocation: Invocation{snapshot: snapshot}}, request)
+		invocation, err := opener(callCtx, admission, selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope, operation, agentScope}, selected: selected, invocation: Invocation{snapshot: snapshot}, lease: artifactLease}, request)
 		if err != nil {
 			return unwind(err, releaseAgent)
 		}
@@ -689,7 +701,7 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 			}
 			table[definition.Name] = tool
 		}
-		identity := callIdentity{session: session, operationID: admission.OperationID, invocationID: request.ID, purpose: string(request.Purpose)}
+		identity := callIdentity{session: session, operationID: admission.OperationID, invocationID: request.ID, purpose: string(request.Purpose), lease: sel.lease}
 		hooks := bindToolArgumentHooks(sel, identity)
 		requestHooks := bindRequestHooks(sel, identity)
 		outputHooks := bindToolOutputHooks(sel, identity)

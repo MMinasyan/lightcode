@@ -17,6 +17,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // ErrOwned reports advisory-lock contention: another Runtime process owns the
@@ -185,6 +186,13 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	configService := newConfigurationService(work, c, loader, configPath, obs)
 	configService.attachWarnings(warnings)
 	configService.attachEnv(managedEnv)
+	// The private per-Session artifact interval registry initializes before
+	// the first resource set: every committed opener, standalone data call,
+	// restore, committed deletion and sweep candidate coordinates on it, and
+	// the same shared host owner supplies it to the data service.
+	artifacts := newArtifactIntervals()
+	c.hosts.artifacts = artifacts
+	c.hosts.dataDir = dataDir
 	initial, err := configService.build(work, 1)
 	if err != nil {
 		cancelWork()
@@ -248,7 +256,6 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	// the Harness: every committed opener, restore, committed deletion and
 	// sweep candidate coordinates on it, and no caller can observe an
 	// unarmed registry because the owner is unpublished.
-	artifacts := newArtifactIntervals()
 	// The call-time subprocess environment producer exists only when the
 	// retained manager exists; without it no manager is constructed on
 	// demand and every cooperative command fails. Each request takes one
@@ -280,9 +287,10 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	}
 	// Armed before publication: harness.New performed no I/O and the first
 	// Prepare requires the admission gate, so no caller can observe the
-	// unarmed bridge or the adapter's unbound Harness.
+	// unarmed bridge, data owner or the adapter's unbound Harness.
 	background.h = h
 	adapter.h = h
+	c.hosts.harness = h
 
 	r := &Runtime{
 		lock:         lock,
@@ -407,27 +415,34 @@ func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, w
 // runs inside one admitted call, so shutdown joins the deletion and its
 // cleanup together. The deletion takes the Session's artifact interval
 // nonblockingly around its Harness transition and retains it through the
-// warning and artifact cleanup, so a held interval refuses the deletion
-// before any transition; after Harness.DeleteSession commits — or reports
-// the Session already absent for a valid identity, the same idempotent result
-// — the Session's warning groups are removed in one observation section with
-// one runtime-scoped hint, then its artifact tree is removed once. Any other
-// Harness error (invalid input, corruption, revision races, a closed
-// admission) returns as-is and authorizes no cleanup.
-func (r *Runtime) deleteSession(ctx context.Context, sessionID string) error {
-	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+// warning and cleanup producer, so a held interval refuses the deletion before
+// any transition; after Harness.DeleteSession commits — or reports the Session
+// already absent for a valid identity, the same idempotent result — the
+// Session's warning groups are removed in one observation section with one
+// runtime-scoped hint, then one producer removes the local tree and calls each
+// once-returned external owner. Any other Harness error (invalid input,
+// corruption, revision races, a closed admission) returns as-is and authorizes
+// no cleanup.
+func (r *Runtime) deleteSession(ctx context.Context, sessionID string) (protocol.DeletionResult, error) {
+	var result protocol.DeletionResult
+	err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 		releaseArtifacts, err := r.artifacts.acquireTry(sessionArtifactDir(r.dataDir, sessionID))
 		if err != nil {
 			return err
 		}
 		defer releaseArtifacts()
-		err = h.DeleteSession(ctx, sessionID)
+		owners, err := h.DeleteSession(ctx, sessionID)
 		if err != nil && !errors.Is(err, harness.ErrNotFound) {
 			return err
 		}
 		r.passive.removeSessionWarnings([]string{sessionID})
-		return r.removeSessionCode(sessionID)
+		result.CleanupFailures = r.cleanupDeletedSessions(ctx, []deletedSession{{sessionID: sessionID, owners: owners}})
+		return nil
 	})
+	if err != nil {
+		return protocol.DeletionResult{}, err
+	}
+	return result, nil
 }
 
 // removeSessionCode removes one Session's artifact tree under the normalized

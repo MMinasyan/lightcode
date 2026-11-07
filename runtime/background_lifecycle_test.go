@@ -324,7 +324,7 @@ func seedLifecycleRoot(t *testing.T, store harness.Storage, sessionID string) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	payload := fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q},`+
-			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"solo"}},"usage":{"by_model":[]},"last_activity":%q}}`,
+			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"solo"}},"usage":{"by_model":[]},"last_activity":%q,"external_data_owners":[]}}`,
 		sessionID, now, now)
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}, payload)
 }
@@ -338,7 +338,7 @@ func seedLifecycleChild(t *testing.T, store harness.Storage, parentID, childID, 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	sessionPayload := fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q,"parent_session_id":%q},`+
-			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"worker"}},"current_operation_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
+			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"worker"}},"current_operation_id":%q,"usage":{"by_model":[]},"last_activity":%q,"external_data_owners":[]}}`,
 		childID, now, parentID, operationID, now)
 	entryID := newLifecycleID(t)
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: childID, Kind: harness.RegisterSession}, sessionPayload)

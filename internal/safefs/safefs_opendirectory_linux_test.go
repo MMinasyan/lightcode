@@ -62,3 +62,39 @@ func TestOpenDirectoryRefusesMissingLeaf(t *testing.T) {
 		testassert.Require(t, err != nil, "OpenDirectory accepted a missing leaf")
 	}
 }
+
+func TestEnsureDirectoryCreatesOwnedTreeWithoutFollowingSymlinks(t *testing.T) {
+	root := t.TempDir()
+	owned := filepath.Join(root, "extensions", "abc", "cache")
+	testassert.NoError(t, EnsureDirectory(owned, 0o700))
+	{
+		info, err := os.Stat(owned)
+		testassert.Require(t, err == nil && info.IsDir(), "EnsureDirectory(%s) = %v", owned, err)
+	}
+	// Existing real directories are idempotent.
+	testassert.NoError(t, EnsureDirectory(owned, 0o700))
+
+	outside := t.TempDir()
+	sentinel := filepath.Join(outside, "sentinel")
+	testassert.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
+
+	leafLink := filepath.Join(root, "leaf-link")
+	testassert.NoError(t, os.Symlink(outside, leafLink))
+	if err := EnsureDirectory(leafLink, 0o700); err == nil {
+		t.Fatal("EnsureDirectory followed a symlink leaf")
+	}
+	ancestorLink := filepath.Join(root, "ancestor")
+	testassert.NoError(t, os.Symlink(outside, ancestorLink))
+	if err := EnsureDirectory(filepath.Join(ancestorLink, "child"), 0o700); err == nil {
+		t.Fatal("EnsureDirectory followed a symlink ancestor")
+	}
+	{
+		data, err := os.ReadFile(sentinel)
+		testassert.Require(t, err == nil && string(data) == "keep", "outside sentinel = (%q, %v), want it untouched", data, err)
+	}
+	file := filepath.Join(root, "file")
+	testassert.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+	if err := EnsureDirectory(file, 0o700); err == nil {
+		t.Fatal("EnsureDirectory accepted a regular-file leaf")
+	}
+}

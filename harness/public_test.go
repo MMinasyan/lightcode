@@ -618,7 +618,7 @@ func TestPublicIdempotency(t *testing.T) {
 				testassert.NoError(t, err)
 			}
 			{
-				err := f.h.DeleteSession(context.Background(), source)
+				_, err := f.h.DeleteSession(context.Background(), source)
 				testassert.NoError(t, err)
 			}
 
@@ -2180,7 +2180,7 @@ func TestPublicSessionLifecycle(t *testing.T) {
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive during the terminal-to-retirement window = err %v, want ErrInvalid", err)
 			}
 			{
-				deleted, err := f.h.SweepSession(ctx, sessionID, harness.SweepPolicy{ArchiveAfter: time.Second}, time.Now().Add(time.Hour))
+				deleted, _, err := f.h.SweepSession(ctx, sessionID, harness.SweepPolicy{ArchiveAfter: time.Second}, time.Now().Add(time.Hour))
 				testassert.Require(t, err == nil && !deleted, "sweep during the terminal-to-retirement window = deleted %v err %v, want the busy Session skipped", deleted, err)
 			}
 			after := sessionRegister(t, store, sessionID)
@@ -2232,7 +2232,7 @@ func TestPublicSessionLifecycle(t *testing.T) {
 			before := sessionRegister(t, store, session)
 
 			{
-				err := f.h.DeleteSession(ctx, session)
+				_, err := f.h.DeleteSession(ctx, session)
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "delete of an open session = err %v, want ErrInvalid", err)
 			}
 			after := sessionRegister(t, store, session)
@@ -2243,7 +2243,7 @@ func TestPublicSessionLifecycle(t *testing.T) {
 				testassert.NoError(t, err)
 			}
 			{
-				err := f.h.DeleteSession(ctx, session)
+				_, err := f.h.DeleteSession(ctx, session)
 				testassert.NoError(t, err)
 			}
 
@@ -2284,7 +2284,7 @@ func TestPublicSessionLifecycle(t *testing.T) {
 				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "archive after delete = err %v, want ErrNotFound", err)
 			}
 			{
-				err := f.h.DeleteSession(ctx, session)
+				_, err := f.h.DeleteSession(ctx, session)
 				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "second delete = err %v, want ErrNotFound", err)
 			}
 		})
@@ -2302,7 +2302,7 @@ func TestPublicSessionLifecycle(t *testing.T) {
 				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "archive of unknown = err %v, want ErrNotFound", err)
 			}
 			{
-				err := f.h.DeleteSession(ctx, unknown)
+				_, err := f.h.DeleteSession(ctx, unknown)
 				testassert.Require(t, errors.Is(err, harness.ErrNotFound), "delete of unknown = err %v, want ErrNotFound", err)
 			}
 			malformed := "not-a-session-id"
@@ -2315,7 +2315,7 @@ func TestPublicSessionLifecycle(t *testing.T) {
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive of malformed = err %v, want ErrInvalid", err)
 			}
 			{
-				err := f.h.DeleteSession(ctx, malformed)
+				_, err := f.h.DeleteSession(ctx, malformed)
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "delete of malformed = err %v, want ErrInvalid", err)
 			}
 		})
@@ -2340,7 +2340,7 @@ func TestPublicSweepArchiveBoundary(t *testing.T) {
 		boundary := first.LastActivity.Add(policy.ArchiveAfter)
 		before := sessionRegister(t, store, session)
 		{
-			_, err := f.h.SweepSession(ctx, session, policy, boundary)
+			_, _, err := f.h.SweepSession(ctx, session, policy, boundary)
 			testassert.NoError(t, err)
 		}
 		still, err := f.h.ReadSessionHeader(ctx, session)
@@ -2350,7 +2350,7 @@ func TestPublicSweepArchiveBoundary(t *testing.T) {
 
 		past := boundary.Add(time.Nanosecond)
 		{
-			_, err := f.h.SweepSession(ctx, session, policy, past)
+			_, _, err := f.h.SweepSession(ctx, session, policy, past)
 			testassert.NoError(t, err)
 		}
 		archived, err := f.h.ReadSessionHeader(ctx, session)
@@ -2382,7 +2382,7 @@ func TestPublicSweepDeleteBoundary(t *testing.T) {
 		boundary := archived.State.ArchivedAt.Add(policy.DeleteAfterArchive)
 		before := sessionRegister(t, store, session)
 		{
-			_, err := f.h.SweepSession(ctx, session, policy, boundary)
+			_, _, err := f.h.SweepSession(ctx, session, policy, boundary)
 			testassert.NoError(t, err)
 		}
 		{
@@ -2393,7 +2393,7 @@ func TestPublicSweepDeleteBoundary(t *testing.T) {
 		testassert.Require(t, after.Revision == before.Revision && bytes.Equal(after.Payload, before.Payload), "no-op delete-boundary sweep changed the durable register (revision %d -> %d)", before.Revision, after.Revision)
 
 		{
-			_, err := f.h.SweepSession(ctx, session, policy, boundary.Add(time.Nanosecond))
+			_, _, err := f.h.SweepSession(ctx, session, policy, boundary.Add(time.Nanosecond))
 			testassert.NoError(t, err)
 		}
 		key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
@@ -2435,11 +2435,11 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			beforeArchived, err := f.h.ReadSessionHeader(ctx, archivedID)
 			testassert.NoError(t, err)
 			{
-				_, err := f.h.SweepSession(ctx, open, harness.SweepPolicy{}, farPast(beforeOpen.LastActivity))
+				_, _, err := f.h.SweepSession(ctx, open, harness.SweepPolicy{}, farPast(beforeOpen.LastActivity))
 				testassert.NoError(t, err)
 			}
 			{
-				_, err := f.h.SweepSession(ctx, archivedID, harness.SweepPolicy{}, farPast(beforeOpen.LastActivity))
+				_, _, err := f.h.SweepSession(ctx, archivedID, harness.SweepPolicy{}, farPast(beforeOpen.LastActivity))
 				testassert.NoError(t, err)
 			}
 			afterOpen, err := f.h.ReadSessionHeader(ctx, open)
@@ -2461,11 +2461,11 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			testassert.NoError(t, err)
 			policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour}
 			{
-				_, err := f.h.SweepSession(ctx, open, policy, farPast(beforeOpen.LastActivity))
+				_, _, err := f.h.SweepSession(ctx, open, policy, farPast(beforeOpen.LastActivity))
 				testassert.NoError(t, err)
 			}
 			{
-				_, err := f.h.SweepSession(ctx, archivedID, policy, farPast(beforeOpen.LastActivity))
+				_, _, err := f.h.SweepSession(ctx, archivedID, policy, farPast(beforeOpen.LastActivity))
 				testassert.NoError(t, err)
 			}
 			sweptOpen, err := f.h.ReadSessionHeader(ctx, open)
@@ -2494,11 +2494,11 @@ func TestPublicSweepDisabledThresholds(t *testing.T) {
 			policy := harness.SweepPolicy{DeleteAfterArchive: 12 * time.Hour}
 			now := beforeOpen.LastActivity.Add(100 * time.Hour)
 			{
-				_, err := f.h.SweepSession(ctx, open, policy, now)
+				_, _, err := f.h.SweepSession(ctx, open, policy, now)
 				testassert.NoError(t, err)
 			}
 			{
-				_, err := f.h.SweepSession(ctx, archivedID, policy, now)
+				_, _, err := f.h.SweepSession(ctx, archivedID, policy, now)
 				testassert.NoError(t, err)
 			}
 			stillOpen, err := f.h.ReadSessionHeader(ctx, open)
@@ -2543,7 +2543,7 @@ func TestPublicSweepRunningLeftUnchanged(t *testing.T) {
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
 		{
-			deleted, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
+			deleted, _, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
 			testassert.Require(t, err == nil && !deleted, "sweep of the running session = (%v, %v), want the no-transition outcome", deleted, err)
 		}
 		still, err := f.h.ReadSessionHeader(ctx, session)
@@ -2597,11 +2597,11 @@ func TestPublicSweepCorruptSibling(t *testing.T) {
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
 		when := validBefore.LastActivity.Add(100 * time.Hour)
 		{
-			_, err := f.h.SweepSession(ctx, corrupt, policy, when)
+			_, _, err := f.h.SweepSession(ctx, corrupt, policy, when)
 			testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "sweep of the corrupt session = %v, want the corruption error and the row left in place", err)
 		}
 		{
-			_, err := f.h.SweepSession(ctx, valid, policy, when)
+			_, _, err := f.h.SweepSession(ctx, valid, policy, when)
 			testassert.NoError(t, err)
 		}
 
@@ -2679,7 +2679,7 @@ func seedArchivedSession(t *testing.T, store harness.Storage) string {
 	payload := fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q},`+
 			`"state":{"lifecycle":"archived","archived_at":%q,"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}},`+
-			`"usage":{"by_model":[]},"last_activity":%q}}`, id, now, now, now)
+			`"usage":{"by_model":[]},"last_activity":%q,"external_data_owners":[]}}`, id, now, now, now)
 	err := store.Transact(context.Background(), func(tx harness.Transaction) error {
 		_, err := tx.InsertRegister(harness.RegisterDraft{
 			Key:     harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession},
@@ -2705,7 +2705,7 @@ func TestPublicSweepZeroTime(t *testing.T) {
 
 		policy := harness.SweepPolicy{ArchiveAfter: 24 * time.Hour, DeleteAfterArchive: 12 * time.Hour}
 		{
-			deleted, err := f.h.SweepSession(ctx, session, policy, time.Time{})
+			deleted, _, err := f.h.SweepSession(ctx, session, policy, time.Time{})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid) && !deleted, "sweep with a zero time = (%v, %v), want ErrInvalid and no transition", deleted, err)
 		}
 		testassert.Equal(t, counting.reads, 0)
@@ -2771,7 +2771,7 @@ func TestPublicSweepSkipsBlockedPreparation(t *testing.T) {
 		sweepDone := make(chan error, 1)
 		policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
 		go func() {
-			_, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
+			_, _, err := f.h.SweepSession(ctx, session, policy, first.LastActivity.Add(100*time.Hour))
 			sweepDone <- err
 		}()
 		select {
@@ -2823,7 +2823,10 @@ func TestPublicDeleteVsMaterialization(t *testing.T) {
 		<-gated.started                                                                // parked inside the load, holding the Session's cell
 
 		deleteDone := make(chan error, 1)
-		go func() { deleteDone <- f.h.DeleteSession(ctx, session) }() // the canonical deletion of the same Session
+		go func() {
+			_, err := f.h.DeleteSession(ctx, session) // the canonical deletion of the same Session
+			deleteDone <- err
+		}()
 		select {
 		case err := <-deleteDone:
 			t.Fatalf("delete returned (%v) while the load still held the Session's cell", err)
@@ -3004,7 +3007,8 @@ var rollbackCases = []rollbackCase{
 		archived: true,
 		arm:      func(probe *rollbackProbeStore) { probe.failDelete = true },
 		run: func(t *testing.T, h *harness.Harness, session string, _ harness.SessionHeader) error {
-			return h.DeleteSession(context.Background(), session)
+			_, err := h.DeleteSession(context.Background(), session)
+			return err
 		},
 		afterFailure: func(t *testing.T, store harness.Storage, session string) {
 			ids, err := store.ListSessionIDs(context.Background())
@@ -3019,7 +3023,7 @@ var rollbackCases = []rollbackCase{
 		},
 		retry: func(t *testing.T, store harness.Storage, h *harness.Harness, session string, _ harness.SessionHeader) {
 			{
-				err := h.DeleteSession(context.Background(), session)
+				_, err := h.DeleteSession(context.Background(), session)
 				testassert.NoError(t, err)
 			}
 			key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
@@ -3035,14 +3039,14 @@ var rollbackCases = []rollbackCase{
 		run: func(t *testing.T, h *harness.Harness, session string, before harness.SessionHeader) error {
 			policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
 			now := before.LastActivity.Add(100 * time.Hour)
-			_, err := h.SweepSession(context.Background(), session, policy, now)
+			_, _, err := h.SweepSession(context.Background(), session, policy, now)
 			return err
 		},
 		retry: func(t *testing.T, _ harness.Storage, h *harness.Harness, session string, before harness.SessionHeader) {
 			policy := harness.SweepPolicy{ArchiveAfter: time.Hour}
 			now := before.LastActivity.Add(100 * time.Hour)
 			{
-				_, err := h.SweepSession(context.Background(), session, policy, now)
+				_, _, err := h.SweepSession(context.Background(), session, policy, now)
 				testassert.NoError(t, err)
 			}
 			archived, err := h.ReadSessionHeader(context.Background(), session)
@@ -3056,14 +3060,14 @@ var rollbackCases = []rollbackCase{
 		run: func(t *testing.T, h *harness.Harness, session string, before harness.SessionHeader) error {
 			policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
 			now := before.ArchivedAt.Add(100 * time.Hour)
-			_, err := h.SweepSession(context.Background(), session, policy, now)
+			_, _, err := h.SweepSession(context.Background(), session, policy, now)
 			return err
 		},
 		retry: func(t *testing.T, store harness.Storage, h *harness.Harness, session string, before harness.SessionHeader) {
 			policy := harness.SweepPolicy{DeleteAfterArchive: time.Hour}
 			now := before.ArchivedAt.Add(100 * time.Hour)
 			{
-				_, err := h.SweepSession(context.Background(), session, policy, now)
+				_, _, err := h.SweepSession(context.Background(), session, policy, now)
 				testassert.NoError(t, err)
 			}
 			key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterSession}
@@ -3282,7 +3286,7 @@ func rawSessionRegister(sessionID, currentOp string) string {
 	}
 	return fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q},`+
-			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}}%s,"usage":{"by_model":[]},"last_activity":%q}}`,
+			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}}%s,"usage":{"by_model":[]},"last_activity":%q,"external_data_owners":[]}}`,
 		sessionID, now, current, now)
 }
 
@@ -5266,7 +5270,7 @@ func rawForkSessionRegister(sessionID, sourceID, boundaryID, currentOp string) s
 	return fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q,`+
 			`"source_session_id":%q,"source_boundary_entry_id":%q},`+
-			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}}%s,"usage":{"by_model":[]},"last_activity":%q}}`,
+			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}}%s,"usage":{"by_model":[]},"last_activity":%q,"external_data_owners":[]}}`,
 		sessionID, now, sourceID, boundaryID, current, now)
 }
 
@@ -5426,6 +5430,7 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		}
 
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-2").ID
+		testassert.NoError(t, f.h.ClaimExternalData(ctx, source, "guest"))
 		before := snapshotSession(t, store, source)
 
 		// the fork's own turn settles through its model-originated terminal,
@@ -5443,7 +5448,8 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		testassert.NoError(t, err)
 		dest := res.Session.Identity.SessionID
 		testassert.Require(t, dest != source && res.Session.Identity.SessionID != "", "fork session identity = %+v, want one fresh identity", res.Session.Identity)
-		testassert.Require(t, res.Session.Identity.Workspace == "/tmp/works" && res.Session.Identity.SourceSessionID == source && res.Session.Identity.SourceBoundaryEntryID == boundary && (res.Session.State.Lifecycle == harness.LifecycleOpen && res.Session.State.AgentSelection.Definition.DefinitionID == "coder" && len(res.Session.State.Usage.ByModel) == 0 && res.Session.State.CurrentOperationID == "fork-1") && (res.Operation.State.Status == harness.OperationRunning && res.Operation.Admission.OperationID == "fork-1" && res.Operation.Admission.RequestKind == harness.RequestKindMessage && res.Operation.Admission.AgentSelection.Definition.DefinitionID == "coder" && res.Operation.Admission.AdmittedEntry.SessionID == dest && res.Operation.Admission.Execution.ConfigurationRevision == "rev-1"), "fork identity = %+v, want the inherited workspace and source/boundary lineage; fork session state = %+v, want open, the source type, zero usage, and the running fork; fork operation = %+v, want a running message admission with the fresh capture", res.Session.Identity, res.Session.State, res.Operation)
+		testassert.Require(t, len(storedOwners(t, store, dest)) == 0, "durable fork destination owners = %v, want none", storedOwners(t, store, dest))
+		testassert.Require(t, res.Session.Identity.Workspace == "/tmp/works" && res.Session.Identity.SourceSessionID == source && res.Session.Identity.SourceBoundaryEntryID == boundary && (res.Session.State.Lifecycle == harness.LifecycleOpen && res.Session.State.AgentSelection.Definition.DefinitionID == "coder" && len(res.Session.State.Usage.ByModel) == 0 && res.Session.State.CurrentOperationID == "fork-1" && len(res.Session.State.ExternalDataOwners) == 0) && (res.Operation.State.Status == harness.OperationRunning && res.Operation.Admission.OperationID == "fork-1" && res.Operation.Admission.RequestKind == harness.RequestKindMessage && res.Operation.Admission.AgentSelection.Definition.DefinitionID == "coder" && res.Operation.Admission.AdmittedEntry.SessionID == dest && res.Operation.Admission.Execution.ConfigurationRevision == "rev-1"), "fork identity = %+v, want the inherited workspace and source/boundary lineage; fork session state = %+v, want open, the source type, zero usage, and the running fork; fork operation = %+v, want a running message admission with the fresh capture", res.Session.Identity, res.Session.State, res.Operation)
 
 		<-forkScript.arrived // the destination execution reached its model boundary
 		{
@@ -5746,7 +5752,7 @@ func TestPublicForkExistingLookup(t *testing.T) {
 				testassert.NoError(t, err)
 			}
 			{
-				err := f5.h.DeleteSession(ctx, source)
+				_, err := f5.h.DeleteSession(ctx, source)
 				testassert.NoError(t, err)
 			}
 			res, err := f5.h.Fork(ctx, forkReq)
@@ -6031,7 +6037,7 @@ func TestPublicForkIndependentSourceDeletion(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := f3.h.DeleteSession(ctx, source)
+			_, err := f3.h.DeleteSession(ctx, source)
 			testassert.NoError(t, err)
 		}
 		{
@@ -6625,7 +6631,7 @@ func rawSessionRegisterWithCompaction(sessionID, currentOp, compactionEntryID st
 	return fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q},`+
 			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}},"current_operation_id":%q,`+
-			`"checkpoint_entry_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
+			`"checkpoint_entry_id":%q,"usage":{"by_model":[]},"last_activity":%q,"external_data_owners":[]}}`,
 		sessionID, now, currentOp, compactionEntryID, now)
 }
 

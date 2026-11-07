@@ -88,6 +88,11 @@ type ScopeInfo struct {
 	Revision     string
 
 	sections map[string]json.RawMessage
+
+	// artifactLease is the execution's already-held Session interval shared
+	// by its Operation and invocation scopes. Standalone callbacks leave it
+	// nil and create their own call-owned lease.
+	artifactLease *artifactCallLease
 }
 
 // toolDeclaration is one selected tool's composition declaration: an owner
@@ -161,12 +166,16 @@ type composition struct {
 
 	// hosts supplies the fixed host named services. The child-launch handler
 	// reads the Runtime's background bridge at call time; it is nil until the
-	// owner arms it.
-	hosts hostServices
+	// owner arms it. The data handler reads the owner Harness and Session
+	// artifact registry from the same shared value.
+	hosts *hostServices
 }
 
 type hostServices struct {
 	background *backgroundBridge
+	harness    *harness.Harness
+	artifacts  *artifactIntervals
+	dataDir    string
 }
 
 // registeredComposition owns registration data without composing inactive
@@ -180,6 +189,7 @@ func registeredComposition(natives []extension.Native) *composition {
 		natives:        owned,
 		plan:           make(map[ScopeKind][]*extension.CompiledComponent),
 		standardValues: make(map[string]Tool),
+		hosts:          &hostServices{},
 	}
 	return c
 }
@@ -332,7 +342,7 @@ func (c *composition) openScopeReporting(ctx context.Context, info ScopeInfo, an
 		return nil, err
 	}
 	scopeCtx, cancel := context.WithCancel(ctx)
-	sc := &scope{info: info, ctx: scopeCtx, cancel: cancel}
+	sc := &scope{info: info, ctx: scopeCtx, cancel: cancel, artifactLease: info.artifactLease}
 
 	if len(ancestors) > 0 {
 		sc.obs = ancestors[0].obs
@@ -492,12 +502,14 @@ func ownInstanceMaps(instance extension.Instance) extension.Instance {
 }
 
 // hostHandler returns one fixed host named service.
-func (c *composition) hostHandler(id string) (extension.Handler, bool) {
+func (c *composition) hostHandler(id, method string) (extension.Handler, bool) {
 	switch id {
 	case extension.ContractPrompt:
 		return c.promptHandler, true
 	case extension.ContractChildLaunch:
 		return c.childLaunchHandler, true
+	case extension.ContractData:
+		return c.dataHandler(method)
 	}
 	return nil, false
 }
@@ -538,7 +550,7 @@ func (c *composition) childLaunchHandler(ctx context.Context, call extension.Cal
 	if call.SessionID == "" {
 		return extension.Result{}, fmt.Errorf("child launch has no calling Session: %w", ErrClosed)
 	}
-	if c.hosts.background == nil || c.hosts.background.h == nil {
+	if c.hosts == nil || c.hosts.background == nil || c.hosts.background.h == nil {
 		return extension.Result{}, ErrClosed
 	}
 	result, err := c.hosts.background.h.LaunchChildSession(ctx, harness.LaunchChildRequest{
@@ -568,6 +580,10 @@ type scope struct {
 	cancel context.CancelFunc
 
 	obs *observation
+
+	// artifactLease is the execution interval's borrowed call lease, shared
+	// by every root view this scope opens. Standalone scopes carry nil.
+	artifactLease *artifactCallLease
 
 	capabilities map[string]*capabilityValue
 	closers      []func() error

@@ -110,6 +110,24 @@ func (e CheckpointItemKind) Valid() bool {
 	}
 }
 
+// Defines values for CleanupFailureCode.
+const (
+	CleanupFailureCodeStorage     CleanupFailureCode = "storage"
+	CleanupFailureCodeUnavailable CleanupFailureCode = "unavailable"
+)
+
+// Valid indicates whether the value is a known member of the CleanupFailureCode enum.
+func (e CleanupFailureCode) Valid() bool {
+	switch e {
+	case CleanupFailureCodeStorage:
+		return true
+	case CleanupFailureCodeUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ConfigurationChangedEventKind.
 const (
 	ConfigurationChanged ConfigurationChangedEventKind = "configuration_changed"
@@ -127,37 +145,40 @@ func (e ConfigurationChangedEventKind) Valid() bool {
 
 // Defines values for ErrorCode.
 const (
-	Closed        ErrorCode = "closed"
-	Configuration ErrorCode = "configuration"
-	Conflict      ErrorCode = "conflict"
-	Corrupt       ErrorCode = "corrupt"
-	Internal      ErrorCode = "internal"
-	Invalid       ErrorCode = "invalid"
-	NotFound      ErrorCode = "not_found"
-	Storage       ErrorCode = "storage"
-	Unauthorized  ErrorCode = "unauthorized"
+	ErrorCodeClosed        ErrorCode = "closed"
+	ErrorCodeConfiguration ErrorCode = "configuration"
+	ErrorCodeConflict      ErrorCode = "conflict"
+	ErrorCodeCorrupt       ErrorCode = "corrupt"
+	ErrorCodeInternal      ErrorCode = "internal"
+	ErrorCodeInvalid       ErrorCode = "invalid"
+	ErrorCodeNotFound      ErrorCode = "not_found"
+	ErrorCodeStorage       ErrorCode = "storage"
+	ErrorCodeUnauthorized  ErrorCode = "unauthorized"
+	ErrorCodeUnavailable   ErrorCode = "unavailable"
 )
 
 // Valid indicates whether the value is a known member of the ErrorCode enum.
 func (e ErrorCode) Valid() bool {
 	switch e {
-	case Closed:
+	case ErrorCodeClosed:
 		return true
-	case Configuration:
+	case ErrorCodeConfiguration:
 		return true
-	case Conflict:
+	case ErrorCodeConflict:
 		return true
-	case Corrupt:
+	case ErrorCodeCorrupt:
 		return true
-	case Internal:
+	case ErrorCodeInternal:
 		return true
-	case Invalid:
+	case ErrorCodeInvalid:
 		return true
-	case NotFound:
+	case ErrorCodeNotFound:
 		return true
-	case Storage:
+	case ErrorCodeStorage:
 		return true
-	case Unauthorized:
+	case ErrorCodeUnauthorized:
+		return true
+	case ErrorCodeUnavailable:
 		return true
 	default:
 		return false
@@ -187,13 +208,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N11 HealthProtocolVersion = "11"
+	N12 HealthProtocolVersion = "12"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N11:
+	case N12:
 		return true
 	default:
 		return false
@@ -979,6 +1000,17 @@ type CheckpointItem struct {
 // CheckpointItemKind defines model for CheckpointItem.Kind.
 type CheckpointItemKind string
 
+// CleanupFailure One cleanup attempt that did not complete after the canonical Session deletion committed. An absent extension_id is local Session-tree cleanup; an external failure names its extension.
+type CleanupFailure struct {
+	// Code storage for local Session-tree cleanup, unavailable for an external owner's cleanup.
+	Code        CleanupFailureCode `json:"code"`
+	ExtensionId *string            `json:"extension_id,omitempty"`
+	Message     string             `json:"message"`
+}
+
+// CleanupFailureCode storage for local Session-tree cleanup, unavailable for an external owner's cleanup.
+type CleanupFailureCode string
+
 // CodeRevertError defines model for CodeRevertError.
 type CodeRevertError struct {
 	union json.RawMessage
@@ -1080,6 +1112,11 @@ type DefinitionRef struct {
 	CapabilityId string `json:"capability_id"`
 	DefinitionId string `json:"definition_id"`
 	ExtensionId  string `json:"extension_id"`
+}
+
+// DeletionResult The committed Session deletion and every incomplete cleanup attempt. The cleanup_failures array is always present.
+type DeletionResult struct {
+	CleanupFailures []CleanupFailure `json:"cleanup_failures"`
 }
 
 // DiscoveredModelCandidate defines model for DiscoveredModelCandidate.
@@ -6981,8 +7018,15 @@ func (r CreateSessionResponse) ContentType() string {
 type DeleteSessionResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *DeletionResult
 	// JSONDefault the response for an HTTP default `application/json` response
 	JSONDefault *Error
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r DeleteSessionResponse) GetJSON200() *DeletionResult {
+	return r.JSON200
 }
 
 // GetJSONDefault returns the response for an HTTP default `application/json` response
@@ -9089,8 +9133,12 @@ func ParseDeleteSessionResponse(rsp *http.Response) (*DeleteSessionResponse, err
 	}
 
 	switch {
-	case rsp.StatusCode == 204:
-		break // No content-type
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest DeletionResult
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
 		var dest Error

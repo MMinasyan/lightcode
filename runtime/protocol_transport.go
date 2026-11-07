@@ -248,23 +248,23 @@ func validateContentPart(raw []byte, part protocol.ContentPart, path string) err
 func classifyProtocolError(err error) (protocol.ErrorCode, int) {
 	switch {
 	case errors.Is(err, errUnauthorized):
-		return protocol.Unauthorized, http.StatusUnauthorized
+		return protocol.ErrorCodeUnauthorized, http.StatusUnauthorized
 	case errors.Is(err, harness.ErrInvalid):
-		return protocol.Invalid, http.StatusBadRequest
+		return protocol.ErrorCodeInvalid, http.StatusBadRequest
 	case errors.Is(err, harness.ErrNotFound), errors.Is(err, catalog.ErrUnknownProvider), errors.Is(err, catalog.ErrUnknownModel):
-		return protocol.NotFound, http.StatusNotFound
+		return protocol.ErrorCodeNotFound, http.StatusNotFound
 	case errors.Is(err, harness.ErrConflict):
-		return protocol.Conflict, http.StatusConflict
+		return protocol.ErrorCodeConflict, http.StatusConflict
 	case errors.Is(err, ErrClosed):
-		return protocol.Closed, http.StatusGone
+		return protocol.ErrorCodeClosed, http.StatusGone
 	case errors.Is(err, harness.ErrCorrupt):
-		return protocol.Corrupt, http.StatusUnprocessableEntity
+		return protocol.ErrorCodeCorrupt, http.StatusUnprocessableEntity
 	case errors.Is(err, ErrConfiguration):
-		return protocol.Configuration, http.StatusUnprocessableEntity
+		return protocol.ErrorCodeConfiguration, http.StatusUnprocessableEntity
 	case errors.Is(err, harness.ErrStorage):
-		return protocol.Storage, http.StatusInternalServerError
+		return protocol.ErrorCodeStorage, http.StatusInternalServerError
 	default:
-		return protocol.Internal, http.StatusInternalServerError
+		return protocol.ErrorCodeInternal, http.StatusInternalServerError
 	}
 }
 

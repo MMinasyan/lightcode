@@ -967,7 +967,10 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		unrelated := filepath.Join(e.dataDir, "unrelated.txt")
 		testassert.NoError(t, os.WriteFile(unrelated, []byte("keep"), 0o644))
 
-		testassert.NoError(t, r.deleteSession(ctx, archivedID))
+		{
+			_, err := r.deleteSession(ctx, archivedID)
+			testassert.NoError(t, err)
+		}
 		mustNotExist(t, archivedCode, "the deleted session's artifact tree")
 		mustExist(t, siblingCode, "the sibling session's artifact tree")
 		mustExist(t, unrelated, "unrelated data-directory content")
@@ -977,18 +980,27 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		}
 
 		// the repeated delete is the same idempotent result with no artifacts left to clean
-		testassert.NoError(t, r.deleteSession(ctx, archivedID))
+		{
+			_, err := r.deleteSession(ctx, archivedID)
+			testassert.NoError(t, err)
+		}
 
 		// canonical deletion with no artifact directory at all is already clean
 		bare, err := r.createSession(ctx, filepath.Join(e.dataDir, "bare"), "solo")
 		testassert.NoError(t, err)
 		archive(bare.Identity.SessionID)
-		testassert.NoError(t, r.deleteSession(ctx, bare.Identity.SessionID))
+		{
+			_, err := r.deleteSession(ctx, bare.Identity.SessionID)
+			testassert.NoError(t, err)
+		}
 
 		// an unknown valid identity with planted artifacts still cleans them
 		const ghost = "0123456789abcdef0123456789abcdef" // valid hex identity, never registered
 		ghostCode := plantSessionCode(t, e.dataDir, ghost)
-		testassert.NoError(t, r.deleteSession(ctx, ghost))
+		{
+			_, err := r.deleteSession(ctx, ghost)
+			testassert.NoError(t, err)
+		}
 		mustNotExist(t, ghostCode, "the unknown identity's artifacts")
 
 		// invalid and uncommitted deletions remove nothing
@@ -996,12 +1008,12 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		testassert.NoError(t, err)
 		openCode := plantSessionCode(t, e.dataDir, open.Identity.SessionID)
 		{
-			err := r.deleteSession(ctx, open.Identity.SessionID)
+			_, err := r.deleteSession(ctx, open.Identity.SessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "deleteSession of an open session = err %v, want ErrInvalid", err)
 		}
 		mustExist(t, openCode, "the open session's artifacts after the rejected delete")
 		{
-			err := r.deleteSession(ctx, "not-a-session-id")
+			_, err := r.deleteSession(ctx, "not-a-session-id")
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "deleteSession of a malformed identity = err %v, want ErrInvalid", err)
 		}
 		mustExist(t, siblingCode, "the sibling session's artifacts after the malformed delete")
@@ -1034,7 +1046,10 @@ func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
 
 		blocked.block(id)
 		done := make(chan error, 1)
-		go func() { done <- r.deleteSession(ctx, id) }()
+		go func() {
+			_, err := r.deleteSession(ctx, id)
+			done <- err
+		}()
 		select {
 		case <-blocked.arrived:
 		case <-time.After(10 * time.Second):
@@ -1068,8 +1083,8 @@ func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
 
 // TestPrivateDeleteSessionReturnsCleanupErrors proves the direct path's
 // cleanup-error half: when the artifact removal fails, deleteSession returns
-// the removal error naming the blocked path while the committed deletion
-// stays committed — never rolled back or recreated.
+// a structured local cleanup failure naming the blocked tree while the
+// committed deletion stays committed — never rolled back or recreated.
 func TestPrivateDeleteSessionReturnsCleanupErrors(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
@@ -1093,8 +1108,9 @@ func TestPrivateDeleteSessionReturnsCleanupErrors(t *testing.T) {
 		testassert.NoError(t, os.Chmod(codeRoot, 0o555))
 		t.Cleanup(func() { os.Chmod(codeRoot, 0o755) })
 
-		delErr := r.deleteSession(ctx, id)
-		testassert.Require(t, delErr != nil && strings.Contains(delErr.Error(), code), "deleteSession with a failing cleanup = err %v, want the removal error naming the blocked tree", delErr)
+		result, delErr := r.deleteSession(ctx, id)
+		testassert.NoError(t, delErr)
+		testassert.Require(t, len(result.CleanupFailures) == 1 && result.CleanupFailures[0].ExtensionId == nil && result.CleanupFailures[0].Code == "storage" && strings.Contains(result.CleanupFailures[0].Message, code), "deleteSession cleanup result = %+v, want one local storage failure naming the blocked tree", result.CleanupFailures)
 		{
 			_, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession})
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "register after the failed cleanup = err %v, want it gone: the deletion stays committed", err)

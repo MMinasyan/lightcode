@@ -267,7 +267,7 @@ func startBridge(t *testing.T, f *fixture, workspace string) *bridge {
 func startBridgeWith(t *testing.T, f *fixture, workspace string, writer io.Writer) *bridge {
 	t.Helper()
 	dataDir := t.TempDir()
-	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"11","credential":%q}`,
+	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"12","credential":%q}`,
 		f.server.URL, testInstance, testCredential)
 	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600))
 	return startRunner(t, clienthost.Options{
@@ -494,7 +494,7 @@ func sseFrame(document string) string {
 }
 
 func healthBody() string {
-	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"11"}`, testInstance)
+	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"12"}`, testInstance)
 }
 
 func hydrationBody(sessionID, workspace string) string {
@@ -755,6 +755,33 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 	testassert.Equal(t, errorCode(t, b.call(t, "13", "runtime/GetHealth", `{"bogus":true}`)), -32602)
 }
 
+// TestACPReturnsStructuredDeletionResult proves the generic runtime carrier
+// passes the committed deletion result with incomplete cleanup through as the
+// method result, not as a blanket JSON-RPC success or error, and reports an
+// unusable 200 deletion body as invalid delivery.
+func TestACPReturnsStructuredDeletionResult(t *testing.T) {
+	body := `{"cleanup_failures":[{"code":"storage","message":"remove tree: denied"},{"extension_id":"guest","code":"unavailable","message":"extension data cleanup is unavailable"}]}`
+	f := newFixture(t, map[string]http.HandlerFunc{
+		"/v1/sessions/" + startupSessionID: jsonHandler(200, body),
+	})
+	b := startBridge(t, f, "/ws")
+	b.call(t, "1", "initialize", "")
+	frame := b.call(t, "2", "runtime/DeleteSession", `{"session_id":"`+startupSessionID+`"}`)
+	testassert.Equal(t, resultOf(t, frame), body)
+
+	invalid := newFixture(t, map[string]http.HandlerFunc{
+		"/v1/sessions/" + startupSessionID: jsonHandler(200, `{"cleanup_failures":null}`),
+	})
+	invalidBridge := startBridge(t, invalid, "/ws")
+	invalidBridge.call(t, "1", "initialize", "")
+	bad := invalidBridge.call(t, "2", "runtime/DeleteSession", `{"session_id":"`+startupSessionID+`"}`)
+	testassert.Require(t, errorCode(t, bad) == -32001, "invalid DeleteSession result = %s, want the transport invalid-delivery error", bad)
+	{
+		_, hasResult := bad["result"]
+		testassert.Require(t, !hasResult, "invalid DeleteSession carried a result beside the error: %s", bad)
+	}
+}
+
 func TestACPStartupRosterControlsCreation(t *testing.T) {
 	supplied := `{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
 	foreignPrimary := `{"name":"primary","definition":{"extension_id":"guest","capability_id":"guest.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
@@ -944,7 +971,7 @@ func TestACPEventsAndRepair(t *testing.T) {
 	connected := b.awaitFrame(t, methodFrame("runtime/connected"))
 	var health map[string]any
 	testassert.NoError(t, json.Unmarshal(connected["params"], &health))
-	testassert.Require(t, health["instance_id"] == testInstance && health["protocol_version"] == "11", "runtime/connected params = %v, want the generated Health", health)
+	testassert.Require(t, health["instance_id"] == testInstance && health["protocol_version"] == "12", "runtime/connected params = %v, want the generated Health", health)
 	resync := b.awaitFrame(t, methodFrame("runtime/resync_required"))
 	{
 		params, ok := resync["params"]

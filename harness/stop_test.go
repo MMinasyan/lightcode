@@ -1159,7 +1159,7 @@ func TestArchiveGateRejectsLiveMembers(t *testing.T) {
 		_, err := h.ArchiveSession(context.Background(), testSessionID)
 		testassert.Require(t, errors.Is(err, ErrInvalid) && strings.Contains(err.Error(), "archiving requires a quiescent Session"), "ArchiveSession = %v, want the live-background rejection", err)
 	}
-	deleted, err := h.SweepSession(context.Background(), testSessionID, SweepPolicy{ArchiveAfter: time.Hour}, testTime.Add(2*time.Hour))
+	deleted, _, err := h.SweepSession(context.Background(), testSessionID, SweepPolicy{ArchiveAfter: time.Hour}, testTime.Add(2*time.Hour))
 	testassert.NoError(t, err)
 	testassert.Require(t, !deleted, "SweepSession deleted the Session, want the live member to skip it")
 	rec, err := h.ReadSessionHeader(context.Background(), testSessionID)

@@ -525,7 +525,10 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 			_, err := r.archiveSession(ctx, sessionID)
 			testassert.NoError(t, err)
 		}
-		testassert.NoError(t, r.deleteSession(ctx, sessionID))
+		{
+			_, err := r.deleteSession(ctx, sessionID)
+			testassert.NoError(t, err)
+		}
 		beforeLate, _ := r.warnings.snapshot()
 		_, _ = inv.Model(context.Background(), diagnostic)
 		afterLate, lateWarnings := r.warnings.snapshot()
@@ -842,7 +845,10 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 
 		// The committed deletion removes the group in one observation section
 		// and publishes exactly one runtime-scoped hint.
-		testassert.NoError(t, r.deleteSession(ctx, victimID))
+		{
+			_, err := r.deleteSession(ctx, victimID)
+			testassert.NoError(t, err)
+		}
 		afterDelete, err := r.getWarnings(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, !sessionWarningPresent(afterDelete.Warnings, victimID) && warningOf(afterDelete.Warnings, "runtime:prompt", "rules_not_found", siblingID) != nil, "the committed deletion kept the Session's group: %+v; the deletion removed the sibling's group: %+v", afterDelete.Warnings, afterDelete.Warnings)
@@ -891,7 +897,10 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		beforeBare, _ := r.warnings.snapshot()
-		testassert.NoError(t, r.deleteSession(ctx, bare.Identity.SessionID))
+		{
+			_, err := r.deleteSession(ctx, bare.Identity.SessionID)
+			testassert.NoError(t, err)
+		}
 		{
 			afterBare, _ := r.warnings.snapshot()
 			testassert.Equal(t, afterBare, beforeBare)

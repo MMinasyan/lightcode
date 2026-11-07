@@ -353,7 +353,7 @@ func TestCaptureAvailabilityFamily(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := h.DeleteSession(ctx, testSessionID)
+			_, err := h.DeleteSession(ctx, testSessionID)
 			testassert.NoError(t, err)
 		}
 		{

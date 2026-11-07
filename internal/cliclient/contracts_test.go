@@ -385,7 +385,7 @@ func TestCreateRequiresValidRoster(t *testing.T) {
 			if row.wantBody != "" {
 				created := receive(t, transport.requests)
 				testassert.Require(t, created.req.URL.Path == "/v1/sessions" && string(created.body) == row.wantBody, "create = %s %s, want %s", created.req.URL, created.body, row.wantBody)
-				created.reject(400, protocol.Error{Code: protocol.Invalid, Message: "rejected"})
+				created.reject(400, protocol.Error{Code: protocol.ErrorCodeInvalid, Message: "rejected"})
 			}
 			settleTasks(t, c)
 			select {

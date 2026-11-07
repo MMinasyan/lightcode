@@ -787,7 +787,7 @@ func TestObserveNoWriteAndDelete(t *testing.T) {
 	}
 	col.reset()
 	{
-		err := h.DeleteSession(context.Background(), testSessionID)
+		_, err := h.DeleteSession(context.Background(), testSessionID)
 		testassert.NoError(t, err)
 	}
 	{
@@ -808,7 +808,7 @@ func TestObserveSuppression(t *testing.T) {
 		c := cachedCoordinator(t, h, testSessionID)
 		col := observeHarness(h)
 		{
-			err := h.DeleteSession(context.Background(), testSessionID)
+			_, err := h.DeleteSession(context.Background(), testSessionID)
 			testassert.NoError(t, err)
 		}
 		h.observeInvalidation(c)
@@ -1664,7 +1664,7 @@ func TestReadObservation(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := h.DeleteSession(context.Background(), testSessionID)
+			_, err := h.DeleteSession(context.Background(), testSessionID)
 			testassert.NoError(t, err)
 		}
 		{

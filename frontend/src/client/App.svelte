@@ -6,7 +6,7 @@
   import { settings } from '../lib/settings.js';
   import { ProvisionalActivity } from './activity';
   import { AttemptLedger } from './attempts';
-  import { invokeNative } from './results';
+  import { decodeDeletionResult, invokeNative } from './results';
   import { classifyRestore, restoreLines } from './restore';
   import { composeForkBody, composeObjectPatch, parseExactJSON, presentNumber } from './exactjson';
   import { SessionReader, okRead, failRead, sameStamp } from './reader';
@@ -98,6 +98,22 @@
     if (classified.kind !== 'ok') {
       outcomeNote = `${label} outcome unknown for ${target}; nothing was retransmitted.`;
       return false;
+    }
+    return true;
+  }
+
+  function reportDeletion(classified, target) {
+    if (!reportAddressed(classified, 'Delete', target)) return false;
+    const failures = classified.data && Array.isArray(classified.data.cleanup_failures)
+      ? classified.data.cleanup_failures
+      : [];
+    if (failures.length > 0) {
+      const detail = failures.map((failure) => failure.extension_id
+        ? `${failure.extension_id}: ${failure.message}`
+        : failure.message).join('; ');
+      outcomeNote = detail === ''
+        ? `Deleted ${target} with incomplete cleanup.`
+        : `Deleted ${target} with incomplete cleanup: ${detail}`;
     }
     return true;
   }
@@ -877,8 +893,8 @@
       return;
     }
     void refreshPicker();
-    const removed = await invoke('session delete', 'DeleteSession', JSON.stringify({ session_id: id }), JSON.parse);
-    reportAddressed(removed, 'Delete', `session ${id}`);
+    const removed = await invoke('session delete', 'DeleteSession', JSON.stringify({ session_id: id }), decodeDeletionResult);
+    reportDeletion(removed, `session ${id}`);
     await refreshPicker();
   }
 

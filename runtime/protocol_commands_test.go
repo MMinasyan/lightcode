@@ -486,7 +486,10 @@ func TestSessionCommandFork(t *testing.T) {
 			header, err := r.archiveSession(ctx, sourceID)
 			testassert.Require(t, err == nil && header.Lifecycle == protocol.Archived, "archive source = (%+v, %v), want archived", header, err)
 		}
-		testassert.NoError(t, r.deleteSession(ctx, sourceID))
+		{
+			_, err := r.deleteSession(ctx, sourceID)
+			testassert.NoError(t, err)
+		}
 
 		afterDelete, err := r.forkSession(ctx, sourceID, req)
 		testassert.NoError(t, err)
@@ -666,7 +669,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		openSession, err := r.createSession(ctx, filepath.Join(e.home, "life-open"), "solo")
 		testassert.NoError(t, err)
 		{
-			err := r.deleteSession(ctx, openSession.Identity.SessionID)
+			_, err := r.deleteSession(ctx, openSession.Identity.SessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "delete open Session = %v, want the archived-only rule", err)
 		}
 		{
@@ -678,7 +681,10 @@ func TestSessionCommandLifecycle(t *testing.T) {
 			_, err := r.archiveSession(ctx, sessionID)
 			testassert.NoError(t, err)
 		}
-		testassert.NoError(t, r.deleteSession(ctx, sessionID))
+		{
+			_, err := r.deleteSession(ctx, sessionID)
+			testassert.NoError(t, err)
+		}
 		{
 			_, err := os.Stat(ownTree)
 			testassert.Require(t, os.IsNotExist(err), "own artifact tree survived deletion: %v", err)
@@ -691,7 +697,10 @@ func TestSessionCommandLifecycle(t *testing.T) {
 			err := headerErrorThroughRuntime(ctx, r, sessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleted by-ID read = %v, want harness.ErrNotFound", err)
 		}
-		testassert.NoError(t, r.deleteSession(ctx, sessionID))
+		{
+			_, err := r.deleteSession(ctx, sessionID)
+			testassert.NoError(t, err)
+		}
 	})
 }
 
@@ -959,7 +968,7 @@ func TestSessionCommandClosedOwner(t *testing.T) {
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed stop = %v, want ErrClosed", err)
 		}
 		{
-			err := r.deleteSession(ctx, sessionID)
+			_, err := r.deleteSession(ctx, sessionID)
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed delete = %v, want ErrClosed", err)
 		}
 	})

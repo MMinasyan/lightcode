@@ -92,7 +92,7 @@ var operationDescriptors = map[string]descriptor{
 	},
 	"DeleteSession": {
 		session: memberRequired,
-		status:  204,
+		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
 			var pathValue protocol.SessionID
 			if err := bindPath(env.session, &pathValue); err != nil {

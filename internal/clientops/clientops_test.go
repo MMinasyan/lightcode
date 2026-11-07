@@ -127,7 +127,7 @@ var dispatchCases = []dispatchCase{
 	{
 		name: "DeleteSession", operation: "DeleteSession",
 		params: `{"session_id":"s1"}`,
-		status: 204, response: "",
+		status: 200, response: `{"cleanup_failures":[]}`,
 		method: "DELETE", path: "/v1/sessions/s1",
 	},
 	{
@@ -662,7 +662,7 @@ func TestInvokeMapsDeclaredErrors(t *testing.T) {
 		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want *clientops.ResponseError", err)
 		testassert.Require(t, status == http.StatusConflict && string(raw) == payload, "Invoke = (%d, %q), want the received status and body", status, raw)
 		testassert.Check(t, responseErr.Status == http.StatusConflict, "status = %d, want %d", responseErr.Status, http.StatusConflict)
-		testassert.Check(t, responseErr.Payload.Code == protocol.Conflict && responseErr.Payload.Message == "in use", "payload = %+v", responseErr.Payload)
+		testassert.Check(t, responseErr.Payload.Code == protocol.ErrorCodeConflict && responseErr.Payload.Message == "in use", "payload = %+v", responseErr.Payload)
 		testassert.Check(t, responseErr.Partial == nil, "partial = %+v, want nil", responseErr.Partial)
 		if responseErr.Error() != "in use" {
 			t.Errorf("Error() = %q, want the returned message", responseErr.Error())
@@ -846,9 +846,19 @@ func TestInvokeRetainsStatusAndBodyOnFailure(t *testing.T) {
 		doer.respond = func(*http.Request) (*http.Response, error) {
 			return scriptedResponse(http.StatusNoContent, ""), nil
 		}
-		status, body, err := clientops.Invoke(context.Background(), c, "DeleteSession", json.RawMessage(`{"session_id":"s1"}`))
+		status, body, err := clientops.Invoke(context.Background(), c, "InterruptSession", json.RawMessage(`{"session_id":"s1"}`))
 		testassert.NoError(t, err)
 		testassert.Require(t, status == http.StatusNoContent && len(body) == 0, "Invoke = (%d, %q), want the 204 status and empty body", status, body)
+	})
+	t.Run("valid 200 deletion result retains its cleanup failures", func(t *testing.T) {
+		c, doer := newScriptFixture(t)
+		body := `{"cleanup_failures":[{"extension_id":"guest","code":"unavailable","message":"extension data cleanup is unavailable"}]}`
+		doer.respond = func(*http.Request) (*http.Response, error) {
+			return scriptedResponse(http.StatusOK, body), nil
+		}
+		status, received, err := clientops.Invoke(context.Background(), c, "DeleteSession", json.RawMessage(`{"session_id":"s1"}`))
+		testassert.NoError(t, err)
+		testassert.Require(t, status == http.StatusOK && string(received) == body, "Invoke = (%d, %q), want the 200 status and exact cleanup result", status, received)
 	})
 	t.Run("local binding failure returns zero status and no body", func(t *testing.T) {
 		c, _ := newScriptFixture(t)

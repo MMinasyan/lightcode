@@ -410,7 +410,10 @@ func TestProjectionListAndReadsAroundUnavailableSessions(t *testing.T) {
 			return err
 		})
 		testassert.NoError(t, err)
-		testassert.NoError(t, r.deleteSession(context.Background(), deleted))
+		{
+			_, err := r.deleteSession(context.Background(), deleted)
+			testassert.NoError(t, err)
+		}
 
 		list, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
 		testassert.NoError(t, err)
@@ -528,7 +531,8 @@ func TestProjectionConcurrentReadDelete(t *testing.T) {
 		defer release()
 		deleteDone := make(chan error, 1)
 		go func() {
-			deleteDone <- r.deleteSession(context.Background(), session)
+			_, err := r.deleteSession(context.Background(), session)
+			deleteDone <- err
 		}()
 		select {
 		case <-blocked.arrived:
@@ -847,7 +851,10 @@ func TestProjectionListCandidateDeletionDuringScan(t *testing.T) {
 		}
 		// While the survivor's read is parked, the already-copied victim is
 		// deleted: the scan must observe it as absent, not fail.
-		testassert.NoError(t, r.deleteSession(context.Background(), victim))
+		{
+			_, err := r.deleteSession(context.Background(), victim)
+			testassert.NoError(t, err)
+		}
 		gated.releaseGate()
 		select {
 		case err := <-listDone:

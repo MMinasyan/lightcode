@@ -343,6 +343,8 @@ func hostCapability(id string) (CapabilityDefinition, bool) {
 		return hostPromptDefinition(), true
 	case ContractChildLaunch:
 		return hostChildLaunchDefinition(), true
+	case ContractData:
+		return hostDataDefinition(), true
 	}
 	return CapabilityDefinition{}, false
 }

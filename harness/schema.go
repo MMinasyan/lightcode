@@ -304,6 +304,11 @@ type SessionState struct {
 	CheckpointEntryID  string           `json:"checkpoint_entry_id,omitempty"`
 	Usage              UsageTotals      `json:"usage"`
 	LastActivity       time.Time        `json:"last_activity"`
+
+	// ExternalDataOwners is the ordered unique set of installed extension IDs
+	// that durably claimed external data for this Session. Fork copies leave
+	// it empty; deletion returns it once and never stores it elsewhere.
+	ExternalDataOwners []string `json:"external_data_owners"`
 }
 
 // SessionRecord is one decoded Session register: the payload's identity and

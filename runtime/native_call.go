@@ -30,6 +30,7 @@ type callIdentity struct {
 	revision     string
 	caller       extension.CallerIdentity
 	grant        nativeGrant
+	lease        *artifactCallLease
 }
 
 // nativeView is one callback's private admission and cancellation owner. End
@@ -42,10 +43,12 @@ type nativeView struct {
 	auth        extension.CallContext
 	grant       nativeGrant
 
-	origin  context.Context
-	ctx     context.Context
-	cancel  context.CancelFunc
-	release func()
+	origin    context.Context
+	ctx       context.Context
+	cancel    context.CancelFunc
+	release   func()
+	lease     *artifactCallLease
+	ownsLease bool
 
 	mu   sync.Mutex
 	done bool
@@ -59,7 +62,31 @@ func (c *composition) newView(value *capabilityValue, parent context.Context, id
 	if parent == nil {
 		parent = context.Background()
 	}
+	sessionID := identity.session.SessionID
+	if sessionID == "" {
+		sessionID = value.scope.info.SessionID
+	}
+	// One callback tree owns one Session artifact lease: a nested call
+	// borrows its parent's, an execution callback shares its execution's
+	// already-held interval, and a standalone Session callback acquires one
+	// lazily on its first data access. A cache-only callback creates no lease.
+	lease := identity.lease
+	if lease == nil {
+		lease = value.scope.artifactLease
+	}
+	ownsLease := false
+	if lease == nil && sessionID != "" {
+		var intervals *artifactIntervals
+		if c.hosts != nil {
+			intervals = c.hosts.artifacts
+		}
+		lease = &artifactCallLease{intervals: intervals, key: sessionArtifactDir(value.scope.info.DataDir, sessionID)}
+		ownsLease = true
+	}
 	ctx, cancel := context.WithCancel(parent)
+	if lease != nil {
+		ctx = context.WithValue(ctx, artifactLeaseKey{}, lease)
+	}
 	view := &nativeView{
 		composition: c,
 		component:   value.component,
@@ -68,10 +95,8 @@ func (c *composition) newView(value *capabilityValue, parent context.Context, id
 		origin:      parent,
 		ctx:         ctx,
 		cancel:      cancel,
-	}
-	sessionID := identity.session.SessionID
-	if sessionID == "" {
-		sessionID = value.scope.info.SessionID
+		lease:       lease,
+		ownsLease:   ownsLease,
 	}
 	operationID := identity.operationID
 	if operationID == "" {
@@ -141,7 +166,7 @@ func (v *nativeView) call(supplied context.Context, binding, method string, argu
 	if err := supplied.Err(); err != nil {
 		return extension.Result{}, err
 	}
-	return v.composition.dispatch(merged, v.auth, v.grant, v.component, v.targets, binding, method, arguments)
+	return v.composition.dispatch(merged, v.auth, v.grant, v.component, v.targets, binding, method, arguments, v.lease)
 }
 
 // end closes admission, cancels the view origin, joins nested calls, then
@@ -158,6 +183,9 @@ func (v *nativeView) end() {
 	if v.release != nil {
 		v.release()
 	}
+	if v.ownsLease {
+		v.lease.end()
+	}
 }
 
 type grantContextKey struct{}
@@ -168,7 +196,7 @@ func hostGrant(ctx context.Context) nativeGrant {
 }
 
 // dispatch resolves, validates, admits and runs one nested named-service call.
-func (c *composition) dispatch(ctx context.Context, caller extension.CallContext, grant nativeGrant, component *extension.CompiledComponent, targets map[string]*capabilityValue, bindingName, methodName string, arguments json.RawMessage) (extension.Result, error) {
+func (c *composition) dispatch(ctx context.Context, caller extension.CallContext, grant nativeGrant, component *extension.CompiledComponent, targets map[string]*capabilityValue, bindingName, methodName string, arguments json.RawMessage, lease *artifactCallLease) (extension.Result, error) {
 	var binding *extension.CompiledBinding
 	for i := range component.Requires {
 		if component.Requires[i].Name == bindingName {
@@ -191,7 +219,7 @@ func (c *composition) dispatch(ctx context.Context, caller extension.CallContext
 		return extension.Result{}, fmt.Errorf("%w: %w", ErrComposition, err)
 	}
 	if binding.Host {
-		handler, ok := c.hostHandler(binding.CapabilityID)
+		handler, ok := c.hostHandler(binding.CapabilityID, methodName)
 		if !ok {
 			return extension.Result{}, fmt.Errorf("unknown host service %q: %w", binding.CapabilityID, ErrComposition)
 		}
@@ -201,6 +229,9 @@ func (c *composition) dispatch(ctx context.Context, caller extension.CallContext
 		hostCaller := caller
 		hostCaller.Call = nil
 		hostCtx := context.WithValue(ctx, grantContextKey{}, nativeGrant{permissions: append([]harness.PermissionRequest(nil), grant.permissions...)})
+		if lease != nil {
+			hostCtx = context.WithValue(hostCtx, artifactLeaseKey{}, lease)
+		}
 		result, err := handler(hostCtx, hostCaller, arguments)
 		if err != nil {
 			return extension.Result{}, err
@@ -227,6 +258,7 @@ func (c *composition) dispatch(ctx context.Context, caller extension.CallContext
 		revision:     caller.Revision,
 		caller:       extension.CallerIdentity{ExtensionID: caller.ExtensionID, ComponentID: caller.ComponentID, InstanceID: caller.InstanceID},
 		grant:        nativeGrant{permissions: grant.permissions, pure: pure, lifecycle: grant.lifecycle},
+		lease:        lease,
 	}
 	return c.invokeProvider(ctx, provider, binding.Methods, methodName, arguments, nil, childIdentity, grant.lifecycle)
 }

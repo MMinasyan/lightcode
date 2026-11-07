@@ -74,6 +74,31 @@ func resultText(raw json.RawMessage, err error) string {
 	return terminal.RenderWarningMsg("Outcome unknown: " + err.Error())
 }
 
+// deletionText reports one committed deletion result: a complete cleanup is
+// ordinary success, while any reported failure says deleted with incomplete
+// cleanup and never a blanket success or rejection.
+func deletionText(raw json.RawMessage, err error) string {
+	if err != nil {
+		return resultText(raw, err)
+	}
+	result, decodeErr := clientops.DecodeDeletionResult(raw)
+	if decodeErr != nil {
+		return terminal.RenderWarningMsg("Outcome unknown: invalid deletion result")
+	}
+	if len(result.CleanupFailures) == 0 {
+		return terminal.RenderSystemMsg("Deleted.")
+	}
+	details := make([]string, 0, len(result.CleanupFailures))
+	for _, failure := range result.CleanupFailures {
+		detail := string(failure.Code) + ": " + failure.Message
+		if failure.ExtensionId != nil {
+			detail += " (extension " + *failure.ExtensionId + ")"
+		}
+		details = append(details, detail)
+	}
+	return terminal.RenderWarningMsg("Deleted with incomplete cleanup: " + strings.Join(details, "; "))
+}
+
 func (c *CLI) navigationLocked() {
 	c.selection++
 	c.listGeneration++
@@ -411,7 +436,7 @@ func (c *CLI) archiveDelete(s stamp, id string, deleteAfter bool) {
 		}
 		// Refresh runs independently: a slow list cannot delay archive-first DELETE.
 		raw, err = call(s, "DeleteSession", id, nil, nil, nil)
-		c.report(s, resultText(raw, err), true)
+		c.report(s, deletionText(raw, err), true)
 		c.mu.Lock()
 		if c.conn == s.conn {
 			c.invalidateListLocked()

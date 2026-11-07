@@ -729,7 +729,7 @@ func TestSweepCandidateScanOverAColdCorpus(t *testing.T) {
 	policy := SweepPolicy{ArchiveAfter: time.Hour, DeleteAfterArchive: time.Hour}
 	now := time.Now().UTC()
 	for _, id := range candidates {
-		commit, err := h.SweepSession(ctx, id, policy, now)
+		commit, _, err := h.SweepSession(ctx, id, policy, now)
 		testassert.Require(t, err == nil && !commit, "sweep %q = commit %v err %v, want the archive without a deletion", id, commit, err)
 	}
 	{

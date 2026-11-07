@@ -893,3 +893,65 @@ func TestFixedExecuteSchemaIsContextAndPlanOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionCleanupAndDataContracts(t *testing.T) {
+	cleanup := CleanupCapability("cleanup")
+	native := testNative("ext", LifetimeHarness, []Capability{ToolCapability("tool"), cleanup}, nil, nil)
+	native.Declaration.Components = []Component{
+		{ID: "tool-c", Lifetime: LifetimeHarness, Provides: []string{"tool"}},
+		{ID: "cleanup-c", Lifetime: LifetimeHarness, Provides: []string{"cleanup"}},
+	}
+	compiled, err := Compile([]Native{native})
+	if err != nil {
+		t.Fatalf("Compile with one cleanup declaration: %v", err)
+	}
+	{
+		resolved, ok := compiled.CleanupCapability("ext")
+		if !ok || resolved.ContractID != ContractSessionCleanup || resolved.ID != "cleanup" {
+			t.Fatalf("CleanupCapability = (%+v, %v), want the extension's declaration", resolved, ok)
+		}
+		if _, ok := compiled.CleanupCapability("other"); ok {
+			t.Fatal("CleanupCapability resolved an unknown extension")
+		}
+	}
+
+	hostData, ok := HostCapability(ContractData)
+	if !ok || len(hostData.Methods) != 3 {
+		t.Fatalf("host data capability = (%+v, %v), want the three fixed methods", hostData, ok)
+	}
+	bound := testNative("bound", LifetimeHarness, []Capability{ServiceCapability("caller", "test.caller", PureMethod("call", `{}`, `{}`))}, []Binding{{Name: "data", Provider: HostProvider, CapabilityID: ContractData, Definition: hostData}}, nil)
+	if _, err := Compile([]Native{bound}); err != nil {
+		t.Fatalf("Compile with the data host binding: %v", err)
+	}
+
+	for _, row := range []struct {
+		name   string
+		native Native
+		want   string
+	}{
+		{"two cleanup declarations", func() Native {
+			n := testNative("ext", LifetimeHarness, []Capability{CleanupCapability("a"), CleanupCapability("b")}, nil, nil)
+			n.Declaration.Components = []Component{{ID: "c", Lifetime: LifetimeHarness, Provides: []string{"a", "b"}}}
+			return n
+		}(), "more than one"},
+		{"shorter cleanup lifetime", func() Native {
+			n := testNative("ext", LifetimeWorkspace, []Capability{CleanupCapability("cleanup")}, nil, nil)
+			return n
+		}(), "Harness lifetime"},
+		{"cleanup method mismatch", func() Native {
+			n := testNative("ext", LifetimeHarness, []Capability{CleanupCapability("cleanup")}, nil, nil)
+			n.Declaration.Capabilities[0].Methods[0].Input = json.RawMessage(`{}`)
+			return n
+		}(), "exact method definitions"},
+		{"data host definition mismatch", func() Native {
+			n := testNative("ext", LifetimeHarness, []Capability{ServiceCapability("caller", "test.caller", PureMethod("call", `{}`, `{}`))}, []Binding{{Name: "data", Provider: HostProvider, CapabilityID: ContractData, Definition: CapabilityDefinition{ContractID: ContractData, ContractVersion: ContractVersion, Kind: KindService, Methods: []Method{PureMethod("session_namespace", `{}`, `{}`)}}}}, nil)
+			return n
+		}(), "expected host contract differs"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			if _, err := Compile([]Native{row.native}); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), row.want) {
+				t.Fatalf("Compile error = %v, want ErrInvalid containing %q", err, row.want)
+			}
+		})
+	}
+}

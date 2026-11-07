@@ -41,7 +41,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 		absent := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/health"), "", "")
 		testassert.Equal(t, absent.StatusCode, http.StatusUnauthorized)
 		typed := decodeProtocolError(t, absent)
-		testassert.Require(t, typed.Code == protocol.Unauthorized && !strings.Contains(typed.Message, ps.credential), "absent credential error = %+v, want unauthorized with no credential echo", typed)
+		testassert.Require(t, typed.Code == protocol.ErrorCodeUnauthorized && !strings.Contains(typed.Message, ps.credential), "absent credential error = %+v, want unauthorized with no credential echo", typed)
 
 		wrong := rawProtocol(t, http.MethodGet, protocolTarget(ps, "/v1/health"), "wrong-token", "")
 		testassert.Equal(t, wrong.StatusCode, http.StatusUnauthorized)
@@ -57,7 +57,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 		testassert.Equal(t, binding.StatusCode, http.StatusBadRequest)
 		{
 			typed := decodeProtocolError(t, binding)
-			testassert.Require(t, typed.Code == protocol.Invalid, "missing query error = %+v, want invalid", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "missing query error = %+v, want invalid", typed)
 		}
 
 		// Authentication precedes every producer effect: a creation with a
@@ -82,7 +82,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 		testassert.Equal(t, unauthenticatedEvents.StatusCode, http.StatusUnauthorized)
 		{
 			typed := decodeProtocolError(t, unauthenticatedEvents)
-			testassert.Require(t, typed.Code == protocol.Unauthorized, "unauthenticated events error = %+v, want unauthorized", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeUnauthorized, "unauthenticated events error = %+v, want unauthorized", typed)
 		}
 		testassert.Equal(t, subscriberCount(r), 0)
 
@@ -104,7 +104,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 			t.Fatalf("decode versioned health: %v", err)
 		}
 		versionedResponse.Body.Close()
-		testassert.Equal(t, health.ProtocolVersion, protocol.N11)
+		testassert.Equal(t, health.ProtocolVersion, protocol.N12)
 	})
 }
 
@@ -132,7 +132,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 			testassert.Require(t, response.StatusCode == http.StatusBadRequest, "%s = %d, want the typed invalid rejection 400", name, response.StatusCode)
 			{
 				typed := decodeProtocolError(t, response)
-				testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want invalid", name, typed)
+				testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "%s error = %+v, want invalid", name, typed)
 			}
 			sessions, err := r.listSessions(ctx, protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
 			testassert.Require(t, err == nil, "list after %s: %v", name, err)
@@ -184,7 +184,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 			}
 			{
 				typed := decodeProtocolError(t, response)
-				testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want the typed invalid body", name, typed)
+				testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "%s error = %+v, want the typed invalid body", name, typed)
 			}
 			after := sessionViewThroughRuntime(t, r, session)
 			testassert.Require(t, reflect.DeepEqual(before, after), "%s changed the Session snapshot (pending queues, facts, or revisions)", name)
@@ -237,7 +237,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		testassert.Equal(t, invalidEnum.StatusCode, http.StatusBadRequest)
 		{
 			typed := decodeProtocolError(t, invalidEnum)
-			testassert.Require(t, typed.Code == protocol.Invalid, "invalid nested SystemRole error = %+v, want invalid", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "invalid nested SystemRole error = %+v, want invalid", typed)
 		}
 		// The same typed map carries an invalid element inside the real
 		// input_modalities slice; its valid sibling slice element is
@@ -247,7 +247,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		testassert.Equal(t, invalidModalities.StatusCode, http.StatusBadRequest)
 		{
 			typed := decodeProtocolError(t, invalidModalities)
-			testassert.Require(t, typed.Code == protocol.Invalid, "invalid input_modalities element error = %+v, want invalid", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "invalid input_modalities element error = %+v, want invalid", typed)
 		}
 		validModalities := providerCreate(`{"id":"validmods","provider":{"base_url":"https://x.test/v1"},"models":{"m":{"context_window":4096,"input_modalities":["text"]}}}`)
 		defer validModalities.Body.Close()
@@ -275,7 +275,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 			testassert.Require(t, response.StatusCode == http.StatusBadRequest, "%s = %d, want the typed invalid rejection 400", name, response.StatusCode)
 			{
 				typed := decodeProtocolError(t, response)
-				testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want invalid", name, typed)
+				testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "%s error = %+v, want invalid", name, typed)
 			}
 		}
 		retiredEdit("retired edit max_tokens_field", `{"provider":{"max_tokens_field":"max_completion_tokens"}}`)
@@ -285,7 +285,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		testassert.Equal(t, retiredReset.StatusCode, http.StatusBadRequest)
 		{
 			typed := decodeProtocolError(t, retiredReset)
-			testassert.Require(t, typed.Code == protocol.Invalid, "retired reset options error = %+v, want invalid", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "retired reset options error = %+v, want invalid", typed)
 		}
 		afterRetired, err := r.getProvider(ctx, "validmods")
 		testassert.NoError(t, err)
@@ -344,7 +344,7 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 		testassert.Equal(t, unknown.StatusCode, http.StatusNotFound)
 		{
 			typed := decodeProtocolError(t, unknown)
-			testassert.Require(t, typed.Code == protocol.NotFound, "unknown route error = %+v, want not_found", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeNotFound, "unknown route error = %+v, want not_found", typed)
 		}
 		{
 			media := unknown.Header.Get("Content-Type")
@@ -355,7 +355,7 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 		testassert.Equal(t, wrongMethod.StatusCode, http.StatusNotFound)
 		{
 			typed := decodeProtocolError(t, wrongMethod)
-			testassert.Require(t, typed.Code == protocol.NotFound, "wrong method error = %+v, want not_found", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeNotFound, "wrong method error = %+v, want not_found", typed)
 		}
 
 		// The removed standalone Session reads are unregistered routes: each
@@ -369,7 +369,7 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 			testassert.Require(t, response.StatusCode == http.StatusNotFound, "removed route %s = %d, want the typed 404", removed, response.StatusCode)
 			{
 				typed := decodeProtocolError(t, response)
-				testassert.Require(t, typed.Code == protocol.NotFound, "removed route %s error = %+v, want not_found", removed, typed)
+				testassert.Require(t, typed.Code == protocol.ErrorCodeNotFound, "removed route %s error = %+v, want not_found", removed, typed)
 			}
 		}
 
@@ -453,7 +453,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		unused := newLifecycleID(t)
 		{
 			missing, err := client.GetSessionHydrationWithResponse(ctx, unused)
-			testassert.Require(t, err == nil && missing.JSONDefault != nil && missing.JSONDefault.Code == protocol.NotFound && missing.HTTPResponse.StatusCode == http.StatusNotFound, "unknown session = (%d, %+v, %v), want the typed 404", missing.HTTPResponse.StatusCode, missing.JSONDefault, err)
+			testassert.Require(t, err == nil && missing.JSONDefault != nil && missing.JSONDefault.Code == protocol.ErrorCodeNotFound && missing.HTTPResponse.StatusCode == http.StatusNotFound, "unknown session = (%d, %+v, %v), want the typed 404", missing.HTTPResponse.StatusCode, missing.JSONDefault, err)
 		}
 		// A target route never accepts a legacy 8-hex identity.
 		legacy := rawProtocol(t, http.MethodDelete, protocolTarget(ps, "/v1/sessions/decafbad"), ps.credential, "")
@@ -463,7 +463,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		// A valid unknown provider answers the catalog's typed not-found.
 		{
 			unknown, err := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "ghost"})
-			testassert.Require(t, err == nil && unknown.JSONDefault != nil && unknown.JSONDefault.Code == protocol.NotFound, "unknown provider = (%d, %+v, %v), want the typed 404", unknown.HTTPResponse.StatusCode, unknown.JSONDefault, err)
+			testassert.Require(t, err == nil && unknown.JSONDefault != nil && unknown.JSONDefault.Code == protocol.ErrorCodeNotFound, "unknown provider = (%d, %+v, %v), want the typed 404", unknown.HTTPResponse.StatusCode, unknown.JSONDefault, err)
 		}
 
 		// A slash provider identity is refused at creation by the complete
@@ -482,7 +482,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		testassert.Equal(t, slash.StatusCode, http.StatusUnprocessableEntity)
 		{
 			typed := decodeProtocolError(t, slash)
-			testassert.Require(t, typed.Code == protocol.Configuration, "slash provider creation error = %+v, want configuration", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeConfiguration, "slash provider creation error = %+v, want configuration", typed)
 		}
 		assertRuntimeMutationRefused(t, r, subscription, slashBefore, slashGeneration, slashWarnRev,
 			fmt.Errorf("mounted slash refusal: %w", ErrConfiguration), ErrConfiguration)
@@ -495,7 +495,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: corruptID, Kind: harness.RegisterSession}, `{"not":"a session register"}`)
 		valid := projectionSession(t, r, workspace, "solo").Identity.SessionID
 		corrupt, err := client.GetSessionHydrationWithResponse(ctx, corruptID)
-		testassert.Require(t, err == nil && corrupt.JSONDefault != nil && corrupt.JSONDefault.Code == protocol.Corrupt && corrupt.HTTPResponse.StatusCode == http.StatusUnprocessableEntity, "corrupt session = (%d, %+v, %v), want the typed corrupt 422", corrupt.HTTPResponse.StatusCode, corrupt.JSONDefault, err)
+		testassert.Require(t, err == nil && corrupt.JSONDefault != nil && corrupt.JSONDefault.Code == protocol.ErrorCodeCorrupt && corrupt.HTTPResponse.StatusCode == http.StatusUnprocessableEntity, "corrupt session = (%d, %+v, %v), want the typed corrupt 422", corrupt.HTTPResponse.StatusCode, corrupt.JSONDefault, err)
 		testassert.Require(t, corrupt.JSONDefault.SessionId != nil && *corrupt.JSONDefault.SessionId == corruptID, "corrupt error session id = %v, want the corrupt session's identity", corrupt.JSONDefault.SessionId)
 		listed, err := client.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
 		if err != nil || listed.JSON200 == nil || len(*listed.JSON200) != 1 || (*listed.JSON200)[0].SessionId != valid {
@@ -533,7 +533,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		testassert.Equal(t, invalidSettings.StatusCode, http.StatusBadRequest)
 		{
 			typed := decodeProtocolError(t, invalidSettings)
-			testassert.Require(t, typed.Code == protocol.Invalid && strings.Contains(typed.Message, "extensions"), "invalid settings shape error = %+v, want invalid naming extensions", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid && strings.Contains(typed.Message, "extensions"), "invalid settings shape error = %+v, want invalid naming extensions", typed)
 		}
 		after, err := client.GetConfigurationWithResponse(ctx)
 		testassert.Require(t, err == nil && after.JSON200 != nil, "read after invalid settings: %v", err)
@@ -551,7 +551,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		testassert.Equal(t, unknownPlugin.StatusCode, http.StatusUnprocessableEntity)
 		{
 			typed := decodeProtocolError(t, unknownPlugin)
-			testassert.Require(t, typed.Code == protocol.Configuration, "unknown plugin settings error = %+v, want configuration", typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeConfiguration, "unknown plugin settings error = %+v, want configuration", typed)
 		}
 		assertRuntimeMutationRefused(t, r, unknownSub, unknownBaseline, unknownGeneration, unknownWarn,
 			fmt.Errorf("mounted unknown plugin settings: %w", ErrConfiguration), ErrConfiguration)
@@ -590,7 +590,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 				t.Fatalf("%s = %d, want the typed invalid 400", row.name, response.StatusCode)
 			}
 			typed := decodeProtocolError(t, response)
-			testassert.Require(t, typed.Code == protocol.Invalid, "%s error = %+v, want invalid", row.name, typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "%s error = %+v, want invalid", row.name, typed)
 			testassert.Require(t, strings.Contains(typed.Message, row.member), "%s diagnostic = %q, want the addressed member %q", row.name, typed.Message, row.member)
 		}
 		finalRead, err := client.GetConfigurationWithResponse(ctx)
@@ -645,7 +645,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 				t.Fatalf("%s = %d, want the typed configuration 422", row.name, response.StatusCode)
 			}
 			typed := decodeProtocolError(t, response)
-			testassert.Require(t, typed.Code == protocol.Configuration, "%s error = %+v, want configuration", row.name, typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeConfiguration, "%s error = %+v, want configuration", row.name, typed)
 			assertRuntimeMutationRefused(t, r, refusalSub, refusalFile, refusalGeneration, refusalWarn,
 				fmt.Errorf("mounted settings refusal %s: %w", row.name, ErrConfiguration), ErrConfiguration)
 		}
@@ -666,7 +666,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		conflict, err := client.RevertSessionCodeWithResponse(ctx, session, protocol.RevertCodeRequest{BoundaryOperationId: "op-1"})
 		testassert.Require(t, err == nil && conflict.JSONDefault != nil, "busy revert = (%v, %+v)", err, conflict.JSONDefault)
 		conflictError, err := conflict.JSONDefault.AsError()
-		testassert.Require(t, err == nil && conflictError.Code == protocol.Conflict && conflict.HTTPResponse.StatusCode == http.StatusConflict, "busy revert = (%d, %+v, %v), want the typed conflict 409", conflict.HTTPResponse.StatusCode, conflictError, err)
+		testassert.Require(t, err == nil && conflictError.Code == protocol.ErrorCodeConflict && conflict.HTTPResponse.StatusCode == http.StatusConflict, "busy revert = (%d, %+v, %v), want the typed conflict 409", conflict.HTTPResponse.StatusCode, conflictError, err)
 	})
 
 	// The classifier table for the classes a wire request cannot reach
@@ -678,11 +678,11 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		code   protocol.ErrorCode
 		status int
 	}{
-		{fmt.Errorf("wrapped: %w", ErrClosed), protocol.Closed, http.StatusGone},
-		{context.Canceled, protocol.Internal, http.StatusInternalServerError},
-		{context.DeadlineExceeded, protocol.Internal, http.StatusInternalServerError},
-		{fmt.Errorf("engine: %w", harness.ErrStorage), protocol.Storage, http.StatusInternalServerError},
-		{errors.New("anything unclassified"), protocol.Internal, http.StatusInternalServerError},
+		{fmt.Errorf("wrapped: %w", ErrClosed), protocol.ErrorCodeClosed, http.StatusGone},
+		{context.Canceled, protocol.ErrorCodeInternal, http.StatusInternalServerError},
+		{context.DeadlineExceeded, protocol.ErrorCodeInternal, http.StatusInternalServerError},
+		{fmt.Errorf("engine: %w", harness.ErrStorage), protocol.ErrorCodeStorage, http.StatusInternalServerError},
+		{errors.New("anything unclassified"), protocol.ErrorCodeInternal, http.StatusInternalServerError},
 	}
 	for _, row := range classes {
 		code, status := classifyProtocolError(row.err)
@@ -714,43 +714,43 @@ func TestClassifyProtocolMissingMetadata(t *testing.T) {
 			{"provider read missing", func() error {
 				_, err := r.getProvider(ctx, "ghost")
 				return err
-			}, catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound},
+			}, catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"provider delete missing", func() error {
 				_, err := r.deleteProvider(ctx, "ghost")
 				return err
-			}, catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound},
+			}, catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"provider field reset missing", func() error {
 				_, err := r.resetProviderField(ctx, "ghost", protocol.ProviderFieldName)
 				return err
-			}, catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound},
+			}, catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"model delete missing", func() error {
 				_, err := r.deleteModel(ctx, "prov", "ghost")
 				return err
-			}, catalog.ErrUnknownModel, protocol.NotFound, http.StatusNotFound},
+			}, catalog.ErrUnknownModel, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"model field reset missing", func() error {
 				_, err := r.resetModelField(ctx, "prov", "ghost", protocol.ModelFieldName)
 				return err
-			}, catalog.ErrUnknownModel, protocol.NotFound, http.StatusNotFound},
+			}, catalog.ErrUnknownModel, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"model delete under missing provider", func() error {
 				_, err := r.deleteModel(ctx, "ghost", "m")
 				return err
-			}, catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound},
+			}, catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"empty provider identity", func() error {
 				_, err := r.deleteProvider(ctx, "")
 				return err
-			}, harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest},
+			}, harness.ErrInvalid, protocol.ErrorCodeInvalid, http.StatusBadRequest},
 			{"empty model identity", func() error {
 				_, err := r.deleteModel(ctx, "prov", "")
 				return err
-			}, harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest},
+			}, harness.ErrInvalid, protocol.ErrorCodeInvalid, http.StatusBadRequest},
 			{"invalid model field on a missing model", func() error {
 				_, err := r.resetModelField(ctx, "prov", "ghost", protocol.ModelField("bogus"))
 				return err
-			}, harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest},
+			}, harness.ErrInvalid, protocol.ErrorCodeInvalid, http.StatusBadRequest},
 			{"complete candidate refusal", func() error {
 				_, err := r.saveModel(ctx, "prov", "m", protocol.ModelEdit{ExtraBody: &reserved})
 				return err
-			}, ErrConfiguration, protocol.Configuration, http.StatusUnprocessableEntity},
+			}, ErrConfiguration, protocol.ErrorCodeConfiguration, http.StatusUnprocessableEntity},
 		}
 		for _, row := range rows {
 			t.Run(row.name, func(t *testing.T) {
@@ -833,10 +833,10 @@ func TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession(t *testing
 			Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 		})
 		testassert.Require(t, err == nil && refused.JSONDefault != nil, "fork over HTTP = (%d, %+v, %v), want the typed corrupt refusal", refused.HTTPResponse.StatusCode, refused.JSONDefault, err)
-		testassert.Require(t, refused.JSONDefault.Code == protocol.Corrupt && refused.HTTPResponse.StatusCode == http.StatusUnprocessableEntity && refused.JSONDefault.SessionId != nil && *refused.JSONDefault.SessionId == sourceID, "fork over HTTP = (%d, %+v), want the typed corrupt 422; fork corrupt error session id = %v, want the marked source identity", refused.HTTPResponse.StatusCode, refused.JSONDefault, refused.JSONDefault.SessionId)
+		testassert.Require(t, refused.JSONDefault.Code == protocol.ErrorCodeCorrupt && refused.HTTPResponse.StatusCode == http.StatusUnprocessableEntity && refused.JSONDefault.SessionId != nil && *refused.JSONDefault.SessionId == sourceID, "fork over HTTP = (%d, %+v), want the typed corrupt 422; fork corrupt error session id = %v, want the marked source identity", refused.HTTPResponse.StatusCode, refused.JSONDefault, refused.JSONDefault.SessionId)
 
 		after, err := client.GetSessionHydrationWithResponse(ctx, sourceID)
-		testassert.Require(t, err == nil && after.JSONDefault != nil && after.JSONDefault.Code == protocol.Corrupt && after.HTTPResponse.StatusCode == http.StatusUnprocessableEntity, "hydration of the marked warm source = (%d, %+v, %v), want the typed corrupt 422", after.HTTPResponse.StatusCode, after.JSONDefault, err)
+		testassert.Require(t, err == nil && after.JSONDefault != nil && after.JSONDefault.Code == protocol.ErrorCodeCorrupt && after.HTTPResponse.StatusCode == http.StatusUnprocessableEntity, "hydration of the marked warm source = (%d, %+v, %v), want the typed corrupt 422", after.HTTPResponse.StatusCode, after.JSONDefault, err)
 		testassert.Require(t, after.JSONDefault.SessionId != nil && *after.JSONDefault.SessionId == sourceID, "hydration corrupt error session id = %v, want the marked source identity", after.JSONDefault.SessionId)
 
 		siblingHydration, err := client.GetSessionHydrationWithResponse(ctx, siblingID)
@@ -901,7 +901,7 @@ func TestProtocolServerRevertPartialFailure(t *testing.T) {
 	if err := json.Unmarshal(response.Body, &result); err != nil {
 		t.Fatalf("decode partial restore body %s: %v", string(response.Body), err)
 	}
-	testassert.Require(t, result.Error != nil && result.Error.Code == protocol.Internal && slices.Contains(result.Restored, newestTarget), "partial restore error member = %+v, want the accumulated internal error; partial restore restored = %v, want the newest group's file before the failure", result.Error, result.Restored)
+	testassert.Require(t, result.Error != nil && result.Error.Code == protocol.ErrorCodeInternal && slices.Contains(result.Restored, newestTarget), "partial restore error member = %+v, want the accumulated internal error; partial restore restored = %v, want the newest group's file before the failure", result.Error, result.Restored)
 	{
 		restored, err := os.ReadFile(newestTarget)
 		testassert.Require(t, err == nil && string(restored) == "v0", "the newest group's file = (%q, %v), want its restored pre-turn content", restored, err)
@@ -916,7 +916,7 @@ func TestProtocolServerRevertPartialFailure(t *testing.T) {
 	}
 	typed, err := refusal.JSONDefault.AsError()
 	testassert.NoError(t, err)
-	testassert.Require(t, typed.Code == protocol.Invalid && refusal.HTTPResponse.StatusCode == http.StatusBadRequest, "unknown-boundary revert = (%d, %+v), want the typed invalid 400", refusal.HTTPResponse.StatusCode, typed)
+	testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid && refusal.HTTPResponse.StatusCode == http.StatusBadRequest, "unknown-boundary revert = (%d, %+v), want the typed invalid 400", refusal.HTTPResponse.StatusCode, typed)
 }
 
 // TestProtocolServerIntervalProtectionAndAvailability proves the artifact

@@ -2054,6 +2054,7 @@ func encodeSessionState(v SessionState) (json.RawMessage, error) {
 		CheckpointEntryID  string          `json:"checkpoint_entry_id,omitempty"`
 		Usage              json.RawMessage `json:"usage"`
 		LastActivity       string          `json:"last_activity"`
+		ExternalDataOwners []string        `json:"external_data_owners"`
 	}{
 		Lifecycle:          string(v.Lifecycle),
 		ArchivedAt:         archivedAt,
@@ -2062,6 +2063,7 @@ func encodeSessionState(v SessionState) (json.RawMessage, error) {
 		CheckpointEntryID:  v.CheckpointEntryID,
 		Usage:              usage,
 		LastActivity:       lastActivity,
+		ExternalDataOwners: append([]string{}, v.ExternalDataOwners...),
 	})
 	if err != nil {
 		return nil, err
@@ -2195,7 +2197,7 @@ func validateSessionIdentity(v SessionIdentity) error {
 
 // decodeSessionState reads the state section with exact keys.
 func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
-	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "agent_selection", "current_operation_id", "checkpoint_entry_id", "usage", "last_activity"); err != nil {
+	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "agent_selection", "current_operation_id", "checkpoint_entry_id", "usage", "last_activity", "external_data_owners"); err != nil {
 		return SessionState{}, err
 	}
 	lifecycle, err := stringMember(obj, "lifecycle", true)
@@ -2230,6 +2232,18 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 	if err != nil {
 		return SessionState{}, fmt.Errorf("member %q: %w", "last_activity", err)
 	}
+	ownerItems, err := arrayMember(obj, "external_data_owners", true)
+	if err != nil {
+		return SessionState{}, err
+	}
+	owners := make([]string, 0, len(ownerItems))
+	for i, item := range ownerItems {
+		var owner string
+		if err := json.Unmarshal(item, &owner); err != nil || owner == "" {
+			return SessionState{}, fmt.Errorf("member %q[%d] must be a nonempty string", "external_data_owners", i)
+		}
+		owners = append(owners, owner)
+	}
 	v := SessionState{
 		Lifecycle:          SessionLifecycle(lifecycle),
 		AgentSelection:     selection,
@@ -2237,6 +2251,7 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 		CheckpointEntryID:  checkpointEntryID,
 		Usage:              usage,
 		LastActivity:       lastStamped,
+		ExternalDataOwners: owners,
 	}
 	if _, present := obj["archived_at"]; present {
 		archived, err := stringMember(obj, "archived_at", true)
@@ -2286,6 +2301,16 @@ func validateSessionState(v SessionState) error {
 	}
 	if v.LastActivity.IsZero() {
 		return errors.New("last_activity must not be zero")
+	}
+	seenOwners := make(map[string]bool, len(v.ExternalDataOwners))
+	for _, owner := range v.ExternalDataOwners {
+		if owner == "" {
+			return errors.New("external_data_owners must hold nonempty extension IDs")
+		}
+		if seenOwners[owner] {
+			return fmt.Errorf("external_data_owners repeats extension ID %q", owner)
+		}
+		seenOwners[owner] = true
 	}
 	return validateUsageTotals(v.Usage)
 }

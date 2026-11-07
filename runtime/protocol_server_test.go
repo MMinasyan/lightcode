@@ -282,7 +282,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		health, err := client.GetHealthWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, health.JSON200 != nil && health.HTTPResponse.StatusCode == http.StatusOK, "health = (%d, %v), want the 200 typed body", health.HTTPResponse.StatusCode, health.JSON200)
-		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N11, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N11)
+		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N12, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N12)
 
 		workspace := filepath.Join(e.home, "mounted")
 		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentSelection: wireSelection("solo")})
@@ -324,7 +324,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		} {
 			refused, err := client.ListSessionsWithResponse(ctx, &params)
 			testassert.Require(t, err == nil, "%s list: %v", name, err)
-			if refused.JSONDefault == nil || refused.JSONDefault.Code != protocol.Invalid {
+			if refused.JSONDefault == nil || refused.JSONDefault.Code != protocol.ErrorCodeInvalid {
 				body, _ := json.Marshal(refused.JSONDefault)
 				t.Fatalf("%s list = %s (status %d), want the typed invalid refusal", name, body, refused.HTTPResponse.StatusCode)
 			}
@@ -346,7 +346,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 			}
 			{
 				typed := decodeProtocolError(t, omitted)
-				testassert.Require(t, typed.Code == protocol.Invalid, "%s list error = %+v, want invalid", name, typed)
+				testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "%s list error = %+v, want invalid", name, typed)
 			}
 		}
 
@@ -572,10 +572,13 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		}
 		deleted, err := client.DeleteSessionWithResponse(ctx, other)
 		testassert.NoError(t, err)
-		testassert.Equal(t, deleted.HTTPResponse.StatusCode, http.StatusNoContent)
+		testassert.Require(t, deleted.JSON200 != nil && len(deleted.JSON200.CleanupFailures) == 0, "DeleteSession = (%+v, %v), want the 200 committed result with no cleanup failures", deleted.JSON200, err)
+		repeated, err := client.DeleteSessionWithResponse(ctx, other)
+		testassert.NoError(t, err)
+		testassert.Require(t, repeated.JSON200 != nil && len(repeated.JSON200.CleanupFailures) == 0, "repeated DeleteSession = (%+v, %v), want the 200 idempotent result", repeated.JSON200, err)
 		if missing, err := client.GetSessionHydrationWithResponse(ctx, other); err != nil || missing.JSON200 != nil {
 			t.Fatalf("deleted session read = (%d, %+v), want the typed not-found", missing.HTTPResponse.StatusCode, missing.JSON200)
-		} else if missing.JSONDefault == nil || missing.JSONDefault.Code != protocol.NotFound {
+		} else if missing.JSONDefault == nil || missing.JSONDefault.Code != protocol.ErrorCodeNotFound {
 			t.Fatalf("deleted session read error = %+v, want not_found", missing.JSONDefault)
 		}
 
@@ -1101,7 +1104,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 				Extensions: row.plugins,
 			}})
 			testassert.Require(t, err == nil, "%s: UpdateConfigurationSettings: %v", row.name, err)
-			if response.HTTPResponse.StatusCode != http.StatusUnprocessableEntity || response.JSONDefault == nil || response.JSONDefault.Code != protocol.Configuration {
+			if response.HTTPResponse.StatusCode != http.StatusUnprocessableEntity || response.JSONDefault == nil || response.JSONDefault.Code != protocol.ErrorCodeConfiguration {
 				body, _ := json.Marshal(response)
 				t.Fatalf("%s = %s (status %d), want the typed configuration 422", row.name, body, response.HTTPResponse.StatusCode)
 			}
@@ -1163,7 +1166,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			}()
 			response, err := client.ReloadConfigurationWithResponse(ctx)
 			testassert.NoError(t, err)
-			testassert.Require(t, response.JSONDefault != nil && response.JSONDefault.Code == protocol.Configuration, "malformed reload error = %+v, want the typed configuration failure", response.JSONDefault)
+			testassert.Require(t, response.JSONDefault != nil && response.JSONDefault.Code == protocol.ErrorCodeConfiguration, "malformed reload error = %+v, want the typed configuration failure", response.JSONDefault)
 			kept, err := client.GetConfigurationWithResponse(ctx)
 			testassert.Require(t, err == nil && kept.JSON200 != nil, "read after malformed reload: %v", err)
 			testassert.Require(t, kept.JSON200.ConfigurationRevision.Generation == after.JSON200.ConfigurationRevision.Generation, "a malformed candidate changed the published revision")
@@ -1235,14 +1238,14 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 		ApiKey:   &supplied,
 	})
 	testassert.NoError(t, err)
-	if refused.JSONDefault == nil || refused.JSONDefault.Code != protocol.Configuration {
+	if refused.JSONDefault == nil || refused.JSONDefault.Code != protocol.ErrorCodeConfiguration {
 		body, _ := json.Marshal(refused.JSON200)
 		t.Fatalf("external-binding create = %s (status %d), want the typed configuration refusal", body, refused.HTTPResponse.StatusCode)
 	}
 	testassert.Require(t, !r.managedEnv.IsManaged("PATH"), "the refused create managed the external variable")
 	{
 		detail, derr := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "external"})
-		testassert.Require(t, derr == nil && detail.JSONDefault != nil && detail.JSONDefault.Code == protocol.NotFound, "the refused create registered the provider: (%v, %+v)", derr, detail.JSONDefault)
+		testassert.Require(t, derr == nil && detail.JSONDefault != nil && detail.JSONDefault.Code == protocol.ErrorCodeNotFound, "the refused create registered the provider: (%v, %+v)", derr, detail.JSONDefault)
 	}
 
 	// The same credential rule crosses the mounted connect route for both
@@ -1278,14 +1281,14 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 	testassert.Require(t, err == nil && baselineView.JSON200 != nil, "read revision baseline: %v", err)
 	suppliedConnect := "mounted-connect-secret"
 	keylessConnect, err := client.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "keylessc"}, protocol.ConnectRequest{ApiKey: &suppliedConnect})
-	if err != nil || keylessConnect.JSONDefault == nil || keylessConnect.JSONDefault.Code != protocol.Configuration {
+	if err != nil || keylessConnect.JSONDefault == nil || keylessConnect.JSONDefault.Code != protocol.ErrorCodeConfiguration {
 		body, _ := json.Marshal(keylessConnect.JSON200)
 		t.Fatalf("keyless connect with a supplied key = %s (status %d, %+v), want the typed configuration refusal", body, keylessConnect.HTTPResponse.StatusCode, keylessConnect.JSONDefault)
 	}
 	// The supplied-key connect on the externally defined PATH variable
 	// refuses through the same shared rule.
 	externalConnect, err := client.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "externalc"}, protocol.ConnectRequest{ApiKey: &suppliedConnect})
-	if err != nil || externalConnect.JSONDefault == nil || externalConnect.JSONDefault.Code != protocol.Configuration {
+	if err != nil || externalConnect.JSONDefault == nil || externalConnect.JSONDefault.Code != protocol.ErrorCodeConfiguration {
 		body, _ := json.Marshal(externalConnect.JSON200)
 		t.Fatalf("external connect with a supplied key = %s (status %d, %+v), want the typed configuration refusal", body, externalConnect.HTTPResponse.StatusCode, externalConnect.JSONDefault)
 	}
@@ -1307,7 +1310,7 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 		testassert.Require(t, refusal.StatusCode == http.StatusBadRequest, "reset %q = %d, want the typed invalid rejection 400", target, refusal.StatusCode)
 		{
 			typed := decodeProtocolError(t, refusal)
-			testassert.Require(t, typed.Code == protocol.Invalid, "reset %q error = %+v, want invalid", target, typed)
+			testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "reset %q error = %+v, want invalid", target, typed)
 		}
 	}
 	afterConfig, rerr = os.ReadFile(configPath)
@@ -1469,7 +1472,7 @@ func TestProtocolServerAgentModelEdit(t *testing.T) {
 		Arguments:   string(unknownArguments),
 	}})
 	testassert.NoError(t, err)
-	testassert.Require(t, unknown.JSONDefault != nil && unknown.JSONDefault.Code == protocol.Invalid, "unknown agent type edit = %+v, want the typed invalid refusal", unknown.JSONDefault)
+	testassert.Require(t, unknown.JSONDefault != nil && unknown.JSONDefault.Code == protocol.ErrorCodeInvalid, "unknown agent type edit = %+v, want the typed invalid refusal", unknown.JSONDefault)
 }
 
 // TestProtocolServerIdentityQueryRoundTrips pins the identity rule: every
@@ -1530,7 +1533,7 @@ func TestProtocolServerIdentityQueryRoundTrips(t *testing.T) {
 		// A keyless provider's disconnect is the retained invalid refusal,
 		// never a successful no-op.
 		keylessDisconnect, err := client.DisconnectProviderWithResponse(ctx, &protocol.DisconnectProviderParams{ProviderId: id})
-		if err != nil || keylessDisconnect.JSONDefault == nil || keylessDisconnect.JSONDefault.Code != protocol.Invalid {
+		if err != nil || keylessDisconnect.JSONDefault == nil || keylessDisconnect.JSONDefault.Code != protocol.ErrorCodeInvalid {
 			body, _ := json.Marshal(keylessDisconnect.JSONDefault)
 			t.Fatalf("keyless disconnect %q = %s (status %d, %v), want the typed invalid refusal", id, body, keylessDisconnect.HTTPResponse.StatusCode, err)
 		}
@@ -1567,7 +1570,7 @@ func TestProtocolServerIdentityQueryRoundTrips(t *testing.T) {
 	// An empty required identity value is the one invalid-set rule.
 	empty, err := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: ""})
 	testassert.NoError(t, err)
-	if empty.JSONDefault == nil || empty.JSONDefault.Code != protocol.Invalid {
+	if empty.JSONDefault == nil || empty.JSONDefault.Code != protocol.ErrorCodeInvalid {
 		body, _ := json.Marshal(empty.JSONDefault)
 		t.Fatalf("empty identity = %s (status %d), want the typed invalid refusal", body, empty.HTTPResponse.StatusCode)
 	}
@@ -1646,35 +1649,35 @@ func TestProtocolServerMissingMetadata(t *testing.T) {
 		status int
 		call   func(t *testing.T) (int, protocol.Error)
 	}{
-		{"model delete missing", catalog.ErrUnknownModel, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+		{"model delete missing", catalog.ErrUnknownModel, protocol.ErrorCodeNotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
 			resp, err := client.DeleteProviderModelWithResponse(ctx, &protocol.DeleteProviderModelParams{ProviderId: "prov", ModelId: "ghost"})
 			return refusedAnswer(t, resp, err)
 		}},
-		{"model reset missing", catalog.ErrUnknownModel, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+		{"model reset missing", catalog.ErrUnknownModel, protocol.ErrorCodeNotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
 			resp, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ModelFieldName, &protocol.ResetProviderModelFieldParams{ProviderId: "prov", ModelId: "ghost"})
 			return refusedAnswer(t, resp, err)
 		}},
-		{"provider detail missing", catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+		{"provider detail missing", catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
 			resp, err := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "ghost"})
 			return refusedAnswer(t, resp, err)
 		}},
-		{"provider delete missing", catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+		{"provider delete missing", catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
 			resp, err := client.DeleteProviderDetailWithResponse(ctx, &protocol.DeleteProviderDetailParams{ProviderId: "ghost"})
 			return refusedAnswer(t, resp, err)
 		}},
-		{"provider reset missing", catalog.ErrUnknownProvider, protocol.NotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
+		{"provider reset missing", catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound, func(t *testing.T) (int, protocol.Error) {
 			resp, err := client.ResetProviderFieldWithResponse(ctx, protocol.ProviderFieldName, &protocol.ResetProviderFieldParams{ProviderId: "ghost"})
 			return refusedAnswer(t, resp, err)
 		}},
-		{"model delete empty identity", harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest, func(t *testing.T) (int, protocol.Error) {
+		{"model delete empty identity", harness.ErrInvalid, protocol.ErrorCodeInvalid, http.StatusBadRequest, func(t *testing.T) (int, protocol.Error) {
 			resp, err := client.DeleteProviderModelWithResponse(ctx, &protocol.DeleteProviderModelParams{ProviderId: "prov", ModelId: ""})
 			return refusedAnswer(t, resp, err)
 		}},
-		{"model reset empty identity", harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest, func(t *testing.T) (int, protocol.Error) {
+		{"model reset empty identity", harness.ErrInvalid, protocol.ErrorCodeInvalid, http.StatusBadRequest, func(t *testing.T) (int, protocol.Error) {
 			resp, err := client.ResetProviderModelFieldWithResponse(ctx, protocol.ModelFieldName, &protocol.ResetProviderModelFieldParams{ProviderId: "prov", ModelId: ""})
 			return refusedAnswer(t, resp, err)
 		}},
-		{"provider delete empty identity", harness.ErrInvalid, protocol.Invalid, http.StatusBadRequest, func(t *testing.T) (int, protocol.Error) {
+		{"provider delete empty identity", harness.ErrInvalid, protocol.ErrorCodeInvalid, http.StatusBadRequest, func(t *testing.T) (int, protocol.Error) {
 			resp, err := client.DeleteProviderDetailWithResponse(ctx, &protocol.DeleteProviderDetailParams{ProviderId: ""})
 			return refusedAnswer(t, resp, err)
 		}},

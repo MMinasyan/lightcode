@@ -2129,7 +2129,7 @@ describe('session picker tasks', () => {
     const connection = fakeConnection();
     basicMocks(connection);
     vi.mocked(sdk.ArchiveSession).mockResolvedValue(json(200, session('root1', NEWER)));
-    vi.mocked(sdk.DeleteSession).mockResolvedValue(native(204, '', false));
+    vi.mocked(sdk.DeleteSession).mockResolvedValue(json(200, { cleanup_failures: [] }));
     const { target } = await mountApp(connection);
     await openPicker(target);
     (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
@@ -2146,9 +2146,36 @@ describe('session picker tasks', () => {
     expect(target.textContent).not.toContain('Delete outcome unknown');
   });
 
+  it('reports a committed deletion with incomplete cleanup distinctly from success', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.ArchiveSession).mockResolvedValue(json(200, session('root1', NEWER)));
+    vi.mocked(sdk.DeleteSession).mockResolvedValue(json(200, {
+      cleanup_failures: [
+        { code: 'storage', message: 'remove tree: permission denied' },
+        { extension_id: 'guest_a', code: 'unavailable', message: 'first extension cleanup unavailable' },
+        { extension_id: 'guest_b', code: 'unavailable', message: 'second extension cleanup unavailable' },
+      ],
+    }));
+    const { target } = await mountApp(connection);
+    await openPicker(target);
+    (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
+    await settle();
+    await settle();
+    expect(target.querySelector('.note.outcome')?.textContent).toContain('Deleted session root1 with incomplete cleanup');
+    expect(target.textContent).toContain('remove tree: permission denied');
+    expect(target.textContent).toContain('guest_a: first extension cleanup unavailable');
+    expect(target.textContent).toContain('guest_b: second extension cleanup unavailable');
+    expect(target.textContent).toContain('no session');
+  });
+
   it.each([
     ['reports a lost Delete as outcome unknown and never as success', () => Promise.reject(new Error('delete lost'))],
     ['reports an invalid-delivery Delete as outcome unknown and never as success', () => Promise.resolve(native(200, 'delete body undecodable', true))],
+    ['reports an unusable Delete success shape as outcome unknown and never as success', () => Promise.resolve(native(200, '{"cleanup_failures":null}', false))],
+    ['reports a Delete success shape with an unknown code as outcome unknown', () => Promise.resolve(native(200, '{"cleanup_failures":[{"code":"teapot","message":"x"}]}', false))],
+    ['reports the obsolete Delete 204 as invalid delivery', () => Promise.resolve(native(204, '', false))],
+    ['reports an unexpected Delete 201 as invalid delivery', () => Promise.resolve(native(201, '{"cleanup_failures":[]}', false))],
   ])('%s', async (_title, deleteOutcome) => {
     vi.mocked(sdk.ArchiveSession).mockResolvedValue(json(200, session('root2', OLDER)));
     vi.mocked(sdk.DeleteSession).mockImplementation(deleteOutcome);
@@ -2211,7 +2238,7 @@ describe('session picker tasks', () => {
       if (openCalls === 3) return firstDeleteList as never;
       return json(200, [session('root1', NEWER)]);
     });
-    vi.mocked(sdk.DeleteSession).mockResolvedValue(native(204, '', false));
+    vi.mocked(sdk.DeleteSession).mockResolvedValue(json(200, { cleanup_failures: [] }));
     vi.mocked(sdk.ArchiveSession).mockResolvedValue(json(200, session('root2', OLDER)));
     const { target } = await mountApp(connection);
     await openPicker(target);
@@ -2263,7 +2290,7 @@ describe('session picker tasks', () => {
     const rows = [...target.querySelectorAll('dialog .row')].map((row) => row.textContent ?? '');
     expect(rows.some((text) => text.includes('root1'))).toBe(false);
     expect(rows.some((text) => text.includes('root2'))).toBe(true);
-    releaseDelete(native(204, '', false));
+    releaseDelete(json(200, { cleanup_failures: [] }));
     await settle();
     await settle();
     expect(target.textContent).toContain('no session');
@@ -2286,7 +2313,7 @@ describe('session picker tasks', () => {
       return json(200, openListCalls >= 4 ? [session('root2', OLDER)] : [session('root1', NEWER), session('root2', OLDER)]);
     });
     vi.mocked(sdk.ArchiveSession).mockResolvedValue(json(200, session('root1', NEWER)));
-    vi.mocked(sdk.DeleteSession).mockResolvedValue(native(204, '', false));
+    vi.mocked(sdk.DeleteSession).mockResolvedValue(json(200, { cleanup_failures: [] }));
     const { target } = await mountApp(connection);
     await openPicker(target);
     (target.querySelector('[aria-label="Delete session root1"]') as HTMLElement).click();
@@ -2318,7 +2345,7 @@ describe('session picker tasks', () => {
       const id = (JSON.parse(options) as { session_id: string }).session_id;
       return json(200, session(id, OLDER));
     });
-    vi.mocked(sdk.DeleteSession).mockResolvedValue(native(204, '', false));
+    vi.mocked(sdk.DeleteSession).mockResolvedValue(json(200, { cleanup_failures: [] }));
     vi.mocked(sdk.ReopenSession).mockResolvedValue(json(200, session('arch8', OLDER)));
     const { target } = await mountApp(connection);
     await openPicker(target);
@@ -3995,7 +4022,7 @@ describe('usage details and global warnings', () => {
       ],
     }));
     vi.mocked(sdk.ArchiveSession).mockResolvedValue(json(200, session('root1', NEWER)));
-    vi.mocked(sdk.DeleteSession).mockResolvedValue(native(204, '', false));
+    vi.mocked(sdk.DeleteSession).mockResolvedValue(json(200, { cleanup_failures: [] }));
     const { target } = await mountApp(connection);
     // Remove the selected root: no hydration remains, so the global-only
     // indicator filters absent session_id from the GetWarnings snapshot.
@@ -4743,7 +4770,7 @@ describe('workspace and empty-selection repair', () => {
     const connection = fakeConnection();
     basicMocks(connection);
     vi.mocked(sdk.ArchiveSession).mockResolvedValue(json(200, session('root1', NEWER)));
-    vi.mocked(sdk.DeleteSession).mockResolvedValue(native(204, '', false));
+    vi.mocked(sdk.DeleteSession).mockResolvedValue(json(200, { cleanup_failures: [] }));
     const { target } = await mountApp(connection);
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
     await settle();
@@ -4791,7 +4818,7 @@ describe('session mutation commits', () => {
     basicMocks(connection);
     const { promise: pending, resolve: releaseArchive } = Promise.withResolvers();
     vi.mocked(sdk.ArchiveSession).mockImplementationOnce(() => pending as never);
-    vi.mocked(sdk.DeleteSession).mockResolvedValue(native(204, '', false));
+    vi.mocked(sdk.DeleteSession).mockResolvedValue(json(200, { cleanup_failures: [] }));
     const { target } = await mountApp(connection);
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
     await settle();
@@ -4863,7 +4890,7 @@ describe('global snapshot adoption', () => {
       warnings: [{ source: 'g', kind: 'k', message: 'g-old' }],
     }));
     vi.mocked(sdk.ArchiveSession).mockResolvedValue(json(200, session('root1', NEWER)));
-    vi.mocked(sdk.DeleteSession).mockResolvedValue(native(204, '', false));
+    vi.mocked(sdk.DeleteSession).mockResolvedValue(json(200, { cleanup_failures: [] }));
     // The displayed hydration must clear the accepted warnings floor ('2');
     // the fixture carries the matching revision so the reader is not held
     // dirty by an inconsistent mock.
@@ -5106,7 +5133,7 @@ describe('uniform archive→delete for both lifecycles', () => {
       return json(200, [{ ...session('arch1', OLDER), lifecycle: 'archived' as const }]);
     });
     vi.mocked(sdk.ArchiveSession).mockImplementation(async () => json(200, session('arch1', OLDER)));
-    vi.mocked(sdk.DeleteSession).mockImplementation(async () => native(204, '', false));
+    vi.mocked(sdk.DeleteSession).mockImplementation(async () => json(200, { cleanup_failures: [] }));
     const { target } = await mountApp(connection);
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true }));
     await settle();

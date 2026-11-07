@@ -5,9 +5,31 @@ export type ClientOptions = {
 };
 
 export type Error = {
-    code: 'invalid' | 'unauthorized' | 'not_found' | 'conflict' | 'corrupt' | 'closed' | 'configuration' | 'storage' | 'internal';
+    code: 'invalid' | 'unauthorized' | 'not_found' | 'conflict' | 'corrupt' | 'closed' | 'configuration' | 'storage' | 'unavailable' | 'internal';
     message: string;
     session_id?: string;
+};
+
+/**
+ * One cleanup attempt that did not complete after the canonical Session deletion committed. An absent extension_id is local Session-tree cleanup; an external failure names its extension.
+ *
+ */
+export type CleanupFailure = {
+    extension_id?: string;
+    /**
+     * storage for local Session-tree cleanup, unavailable for an external owner's cleanup.
+     *
+     */
+    code: 'storage' | 'unavailable';
+    message: string;
+};
+
+/**
+ * The committed Session deletion and every incomplete cleanup attempt. The cleanup_failures array is always present.
+ *
+ */
+export type DeletionResult = {
+    cleanup_failures: Array<CleanupFailure>;
 };
 
 export type SessionLifecycle = 'open' | 'archived';
@@ -51,7 +73,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '11';
+    protocol_version: '12';
 };
 
 /**
@@ -974,9 +996,9 @@ export type DeleteSessionError = DeleteSessionErrors[keyof DeleteSessionErrors];
 
 export type DeleteSessionResponses = {
     /**
-     * The archived Session was deleted.
+     * The committed deletion and any incomplete cleanup.
      */
-    204: void;
+    200: DeletionResult;
 };
 
 export type DeleteSessionResponse = DeleteSessionResponses[keyof DeleteSessionResponses];

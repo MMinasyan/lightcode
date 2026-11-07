@@ -149,12 +149,19 @@ func (c *Compiled) addDeclaration(declaration Declaration, index int) error {
 		}
 		seenSecrets[secret.Field] = true
 	}
+	cleanupCapabilities := 0
 	for _, capability := range declaration.Capabilities {
 		if capability.ID == "" {
 			return invalid("extension %q: empty capability ID", declaration.ID)
 		}
 		if _, duplicate := c.capabilities[capability.ID]; duplicate {
 			return invalid("capability %q: duplicate provider", capability.ID)
+		}
+		if capability.ContractID == ContractSessionCleanup {
+			cleanupCapabilities++
+			if cleanupCapabilities > 1 {
+				return invalid("extension %q: declares more than one %s capability", declaration.ID, ContractSessionCleanup)
+			}
 		}
 		resolved, err := c.compileCapability(compiled, capability)
 		if err != nil {
@@ -212,6 +219,8 @@ func (c *Compiled) addDeclaration(declaration Declaration, index int) error {
 			return invalid("capability %q: context strategies require an Operation-or-longer lifetime", id)
 		case capability.Kind == KindService && capability.ContractID == ContractAgentDefinitions && capability.Component.Lifetime != LifetimeHarness:
 			return invalid("capability %q: agent definition resolvers require a Harness lifetime", id)
+		case capability.Kind == KindService && capability.ContractID == ContractSessionCleanup && capability.Component.Lifetime != LifetimeHarness:
+			return invalid("capability %q: session cleanup services require a Harness lifetime", id)
 		}
 	}
 	if err := validateEdits(compiled); err != nil {
@@ -282,13 +291,18 @@ func validateFixedContractIdentity(capability Capability) error {
 			return invalid("capability %q: fixed contract %s requires version %s, kind %s and its exact method definitions", capability.ID, ContractAgentDefinitions, ContractVersion, KindService)
 		}
 		return nil
-	case ContractPrompt, ContractChildLaunch:
+	case ContractPrompt, ContractChildLaunch, ContractData:
 		definition, ok := hostCapability(capability.ContractID)
 		if !ok {
 			return invalid("capability %q: fixed host contract %s has no definition", capability.ID, capability.ContractID)
 		}
 		if capability.ContractVersion != ContractVersion || capability.Kind != definition.Kind || !methodsStructurallyEqual(capability.Methods, definition.Methods) {
 			return invalid("capability %q: fixed host contract %s requires version %s, kind %s and its exact method definitions", capability.ID, capability.ContractID, ContractVersion, definition.Kind)
+		}
+		return nil
+	case ContractSessionCleanup:
+		if capability.ContractVersion != ContractVersion || capability.Kind != KindService || !methodsStructurallyEqual(capability.Methods, cleanupMethods()) {
+			return invalid("capability %q: fixed contract %s requires version %s, kind %s and its exact method definitions", capability.ID, ContractSessionCleanup, ContractVersion, KindService)
 		}
 		return nil
 	default:
@@ -704,6 +718,21 @@ func (c *Compiled) Declarations() []*CompiledDeclaration { return c.declarations
 func (c *Compiled) Capability(id string) (*CompiledCapability, bool) {
 	capability, ok := c.capabilities[id]
 	return capability, ok
+}
+
+// CleanupCapability resolves one installed extension's single fixed session
+// cleanup capability. An extension with no such declaration reports false.
+func (c *Compiled) CleanupCapability(extensionID string) (*CompiledCapability, bool) {
+	declaration, ok := c.byID[extensionID]
+	if !ok {
+		return nil, false
+	}
+	for _, capability := range declaration.Capabilities {
+		if capability.ContractID == ContractSessionCleanup {
+			return capability, true
+		}
+	}
+	return nil, false
 }
 
 // Components returns one lifetime's construction order.

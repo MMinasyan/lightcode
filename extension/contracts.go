@@ -187,6 +187,38 @@ func ServiceIOMethod(name, input, success string) Method {
 	return method(name, ModeServiceIO, input, success, "", "")
 }
 
+// cleanupMethods is the fixed melta.session_cleanup/v1 method set: one
+// idempotent service call over the deleted Session identity.
+func cleanupMethods() []Method {
+	return []Method{method("cleanup", ModeServiceIO,
+		`{"type":"object","required":["session_id"],"properties":{"session_id":{"type":"string","minLength":1}},"additionalProperties":false}`,
+		`{"type":"null"}`, "", "")}
+}
+
+// CleanupCapability constructs the fixed melta.session_cleanup/v1 capability.
+// It is the one cleanup declaration a claiming extension supplies.
+func CleanupCapability(id string) Capability {
+	return Capability{ID: id, ContractID: ContractSessionCleanup, ContractVersion: ContractVersion, Kind: KindService, Methods: cleanupMethods()}
+}
+
+// hostDataDefinition is the fixed melta.data/v1 host service: the extension's
+// own Session and cache namespaces plus the durable external-data claim.
+func hostDataDefinition() CapabilityDefinition {
+	return CapabilityDefinition{
+		ContractID:      ContractData,
+		ContractVersion: ContractVersion,
+		Kind:            KindService,
+		Methods: []Method{
+			method("session_namespace", ModeServiceIO,
+				`{"type":"object","additionalProperties":false}`, `{"type":"object","required":["directory"],"properties":{"directory":{"type":"string","minLength":1}},"additionalProperties":false}`, "", ""),
+			method("cache_namespace", ModeServiceIO,
+				`{"type":"object","additionalProperties":false}`, `{"type":"object","required":["directory"],"properties":{"directory":{"type":"string","minLength":1}},"additionalProperties":false}`, "", ""),
+			method("claim_external_data", ModeServiceIO,
+				`{"type":"object","additionalProperties":false}`, `{"type":"null"}`, "", ""),
+		},
+	}
+}
+
 // hostPromptDefinition is the fixed melta.prompt/v1 host service: one pure
 // assembler over captured values.
 func hostPromptDefinition() CapabilityDefinition {

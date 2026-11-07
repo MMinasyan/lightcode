@@ -585,7 +585,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// endpoint is no usable owner.
 		foreign := filepath.Join(t.TempDir(), "foreign.json")
 		wrongCredential := strings.Repeat("0", 64)
-		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N11, wrongCredential))
+		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N12, wrongCredential))
 		{
 			_, err := client.Connect(ctx, foreign)
 			testassert.Require(t, errors.Is(err, client.ErrNoRuntime), "wrong-credential connect = %v, want ErrNoRuntime", err)
@@ -876,7 +876,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		composedAwaitOp(t, c, sessionB, "op-b", protocol.OperationStatusSuccess)
 		foreignCursor, err := c.GetSessionHistoryWithResponse(ctx, sessionB, &protocol.GetSessionHistoryParams{Cursor: first.OlderCursor})
 		testassert.NoError(t, err)
-		testassert.Require(t, foreignCursor.JSONDefault != nil && foreignCursor.JSONDefault.Code == protocol.Invalid, "cross-session cursor response = %+v (status %d), want the typed invalid refusal", foreignCursor.JSONDefault, foreignCursor.HTTPResponse.StatusCode)
+		testassert.Require(t, foreignCursor.JSONDefault != nil && foreignCursor.JSONDefault.Code == protocol.ErrorCodeInvalid, "cross-session cursor response = %+v (status %d), want the typed invalid refusal", foreignCursor.JSONDefault, foreignCursor.HTTPResponse.StatusCode)
 
 		// 7. Settings: the stale whole-section save succeeds under
 		// last-writer-wins; the top-level tools object and each compiled
@@ -907,13 +907,13 @@ func TestProtocolComposedFlow(t *testing.T) {
 		invalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Extensions: protocol.ExtensionsSettings{"agents": `{"enabled":true,"task":{"max_concurrent":99,"max_output_bytes":4096}}`}}
 		refused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &invalid})
 		testassert.NoError(t, err)
-		testassert.Require(t, refused.JSONDefault != nil && refused.JSONDefault.Code == protocol.Configuration, "invalid settings response = %+v (status %d), want the typed configuration refusal", refused.JSONDefault, refused.HTTPResponse.StatusCode)
+		testassert.Require(t, refused.JSONDefault != nil && refused.JSONDefault.Code == protocol.ErrorCodeConfiguration, "invalid settings response = %+v (status %d), want the typed configuration refusal", refused.JSONDefault, refused.HTTPResponse.StatusCode)
 		// The selected custom plugin's own validator refuses its invalid
 		// document with the same configuration class.
 		customInvalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Extensions: protocol.ExtensionsSettings{composedCustomPluginID: `{"enabled":true,"threshold":0}`}}
 		customRefused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &customInvalid})
 		testassert.NoError(t, err)
-		testassert.Require(t, customRefused.JSONDefault != nil && customRefused.JSONDefault.Code == protocol.Configuration, "invalid custom settings response = %+v (status %d), want the typed configuration refusal", customRefused.JSONDefault, customRefused.HTTPResponse.StatusCode)
+		testassert.Require(t, customRefused.JSONDefault != nil && customRefused.JSONDefault.Code == protocol.ErrorCodeConfiguration, "invalid custom settings response = %+v (status %d), want the typed configuration refusal", customRefused.JSONDefault, customRefused.HTTPResponse.StatusCode)
 		view, err := c.GetConfigurationWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, view.JSON200 != nil, "GetConfiguration = status %d: %s", view.HTTPResponse.StatusCode, view.Body)
@@ -983,7 +983,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 			Content:     []protocol.ContentPart{refusedPart},
 		})
 		testassert.NoError(t, err)
-		testassert.Require(t, refusedSubmit.JSONDefault != nil && refusedSubmit.JSONDefault.Code == protocol.Invalid && refusedSubmit.HTTPResponse.StatusCode == http.StatusBadRequest, "refused submit response = %+v (status %d), want the typed invalid refusal over HTTP 400", refusedSubmit.JSONDefault, refusedSubmit.HTTPResponse.StatusCode)
+		testassert.Require(t, refusedSubmit.JSONDefault != nil && refusedSubmit.JSONDefault.Code == protocol.ErrorCodeInvalid && refusedSubmit.HTTPResponse.StatusCode == http.StatusBadRequest, "refused submit response = %+v (status %d), want the typed invalid refusal over HTTP 400", refusedSubmit.JSONDefault, refusedSubmit.HTTPResponse.StatusCode)
 		afterRefusal := composedHydrate(t, c, main)
 		for _, operation := range afterRefusal.Operations {
 			testassert.Require(t, operation.OperationId != "op-refused", "the refused admission published operation %+v, want no Operation", operation)
@@ -1004,7 +1004,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		testassert.Require(t, archivedChild.JSON200 != nil, "archive child = status %d: %s", archivedChild.HTTPResponse.StatusCode, archivedChild.Body)
 		deletedChild, err := c.DeleteSessionWithResponse(ctx, childID)
 		testassert.NoError(t, err)
-		testassert.Require(t, deletedChild.HTTPResponse.StatusCode == http.StatusNoContent, "delete child = status %d: %s", deletedChild.HTTPResponse.StatusCode, deletedChild.Body)
+		testassert.Require(t, deletedChild.JSON200 != nil && len(deletedChild.JSON200.CleanupFailures) == 0, "delete child = status %d: %s", deletedChild.HTTPResponse.StatusCode, deletedChild.Body)
 		archived, err := c.ArchiveSessionWithResponse(ctx, main)
 		testassert.NoError(t, err)
 		testassert.Require(t, archived.JSON200 != nil && archived.JSON200.Lifecycle == protocol.Archived, "archive main = %+v (status %d)", archived.JSON200, archived.HTTPResponse.StatusCode)
@@ -1019,10 +1019,10 @@ func TestProtocolComposedFlow(t *testing.T) {
 		}
 		deleted, err := c.DeleteSessionWithResponse(ctx, main)
 		testassert.NoError(t, err)
-		testassert.Require(t, deleted.HTTPResponse.StatusCode == http.StatusNoContent, "delete main = status %d: %s", deleted.HTTPResponse.StatusCode, deleted.Body)
+		testassert.Require(t, deleted.JSON200 != nil && len(deleted.JSON200.CleanupFailures) == 0, "delete main = status %d: %s", deleted.HTTPResponse.StatusCode, deleted.Body)
 		missing, err := c.GetSessionHydrationWithResponse(ctx, main)
 		testassert.NoError(t, err)
-		testassert.Require(t, missing.JSON200 == nil && missing.JSONDefault != nil && missing.JSONDefault.Code == protocol.NotFound, "deleted session read = (%+v, %+v), want the typed not-found", missing.JSON200, missing.JSONDefault)
+		testassert.Require(t, missing.JSON200 == nil && missing.JSONDefault != nil && missing.JSONDefault.Code == protocol.ErrorCodeNotFound, "deleted session read = (%+v, %+v), want the typed not-found", missing.JSON200, missing.JSONDefault)
 		mainList, err := c.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{Workspace: wsMain, Lifecycle: protocol.Open})
 		testassert.NoError(t, err)
 		testassert.Require(t, mainList.JSON200 != nil && len(*mainList.JSON200) == 0, "deleted workspace list = %+v (status %d), want the empty array", mainList.JSON200, mainList.HTTPResponse.StatusCode)

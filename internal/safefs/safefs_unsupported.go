@@ -21,6 +21,10 @@ func OpenDirectory(path string) (*os.File, error) {
 	return nil, unsupported(path)
 }
 
+func EnsureDirectory(path string, perm os.FileMode) error {
+	return unsupported(path)
+}
+
 func OpenForWrite(path string, perm os.FileMode) (*os.File, bool, error) {
 	return nil, false, unsupported(path)
 }

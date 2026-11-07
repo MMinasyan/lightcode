@@ -314,6 +314,70 @@ func TestForkAndRevertMenusWaitRealOlderReader(t *testing.T) {
 	}
 }
 
+func TestDeletionTextDistinguishesIncompleteCleanup(t *testing.T) {
+	complete := deletionText(json.RawMessage(`{"cleanup_failures":[]}`), nil)
+	testassert.Require(t, strings.Contains(complete, "Deleted.") && !strings.Contains(complete, "incomplete"), "complete deletion text = %q, want ordinary success", complete)
+	partial := deletionText(json.RawMessage(`{"cleanup_failures":[{"code":"storage","message":"remove tree: denied"},{"extension_id":"guest","code":"unavailable","message":"extension data cleanup is unavailable"}]}`), nil)
+	testassert.Require(t, strings.Contains(partial, "Deleted with incomplete cleanup") && strings.Contains(partial, "remove tree: denied") && strings.Contains(partial, "extension guest") && !strings.Contains(partial, "Outcome unknown"), "partial deletion text = %q, want deleted with incomplete cleanup", partial)
+}
+
+func TestLifecycleReportsIncompleteCleanupOutcome(t *testing.T) {
+	c, transport := fixture(t)
+	c.mu.Lock()
+	s := c.stampLocked()
+	c.mu.Unlock()
+	c.archiveDelete(s, rootA, true)
+	var deleteReq request
+	for {
+		req := receive(t, transport.requests)
+		switch {
+		case strings.HasSuffix(req.req.URL.Path, "/archive"):
+			req.respond(protocol.Session{SessionId: rootA, Lifecycle: "archived"})
+		case req.req.Method == http.MethodDelete:
+			deleteReq = req
+			goto deleted
+		default:
+			req.respond([]protocol.Session{})
+		}
+	}
+deleted:
+	deleteReq.respond(protocol.DeletionResult{CleanupFailures: []protocol.CleanupFailure{
+		{Code: "storage", Message: "remove tree: denied"},
+		{ExtensionId: pointer("guest"), Code: "unavailable", Message: "extension data cleanup is unavailable"},
+	}})
+	settleAnswering(t, c, transport)
+	out := outputs(c)
+	testassert.Require(t, strings.Contains(out, "Deleted with incomplete cleanup") && strings.Contains(out, "remove tree: denied") && strings.Contains(out, "extension guest"), "CLI output = %q, want the incomplete-cleanup report", out)
+	testassert.Require(t, !strings.Contains(out, "Delete outcome unknown"), "CLI output = %q, want a known committed deletion", out)
+}
+
+func TestLifecycleInvalidDeleteBodyReportsUnknown(t *testing.T) {
+	c, transport := fixture(t)
+	c.mu.Lock()
+	s := c.stampLocked()
+	c.mu.Unlock()
+	c.archiveDelete(s, rootA, true)
+	var deleteReq request
+	for {
+		req := receive(t, transport.requests)
+		switch {
+		case strings.HasSuffix(req.req.URL.Path, "/archive"):
+			req.respond(protocol.Session{SessionId: rootA, Lifecycle: "archived"})
+		case req.req.Method == http.MethodDelete:
+			deleteReq = req
+			goto deleted
+		default:
+			req.respond([]protocol.Session{})
+		}
+	}
+deleted:
+	deleteReq.respondBody(`{"cleanup_failures":null}`)
+	settleAnswering(t, c, transport)
+	out := outputs(c)
+	testassert.Require(t, strings.Contains(out, "Outcome unknown:") && strings.Contains(out, "invalid runtime response"), "CLI output = %q, want invalid delivery", out)
+	testassert.Require(t, !strings.Contains(out, "Deleted"), "CLI output = %q, malformed success became a deletion result", out)
+}
+
 func TestLifecycleInvalidatesStaleListArchiveFirstDelete(t *testing.T) {
 	c, transport := fixture(t)
 	settledReader(t, c, transport)
@@ -338,7 +402,7 @@ func TestLifecycleInvalidatesStaleListArchiveFirstDelete(t *testing.T) {
 	c.mu.Lock()
 	testassert.Require(t, c.rootID == "" && c.childID == "", "known archive did not clear selection immediately")
 	c.mu.Unlock()
-	deleteReq.reject(204, nil)
+	deleteReq.respond(protocol.DeletionResult{CleanupFailures: []protocol.CleanupFailure{}})
 	final := receive(t, transport.requests)
 	final.respond([]protocol.Session{{SessionId: rootB}})
 	listReq.respond([]protocol.Session{{SessionId: rootA}})

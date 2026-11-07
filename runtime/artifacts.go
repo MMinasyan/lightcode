@@ -165,3 +165,71 @@ func (a *artifactIntervals) dropReference(key string) {
 		delete(a.entries, key)
 	}
 }
+
+// artifactCallLease is one native callback tree's private Session artifact
+// ownership. A standalone root leases lazily on its first Session data access;
+// an execution root supplies the interval it already holds, and every nested
+// call borrows that same lease. The call-owned release joins ordinary scope
+// cleanup; a borrowed lease is released only by its execution owner.
+type artifactCallLease struct {
+	intervals *artifactIntervals
+	key       string
+	borrowed  bool
+
+	mu      sync.Mutex
+	release func()
+	closed  bool
+}
+
+// artifactLeaseKey carries one callback tree's lease to a host service
+// handler. It is host-issued private state, never an authoring value.
+type artifactLeaseKey struct{}
+
+// artifactLeaseFromContext returns the enclosing callback tree's lease.
+func artifactLeaseFromContext(ctx context.Context) *artifactCallLease {
+	lease, _ := ctx.Value(artifactLeaseKey{}).(*artifactCallLease)
+	return lease
+}
+
+// acquire lazily takes the nonblocking Session interval for one standalone
+// call. A borrowed execution lease is already held; busy contention keeps the
+// conflict class. A nil registry (isolated preparation) grants no interval.
+func (l *artifactCallLease) acquire() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return ErrClosed
+	}
+	if l.release != nil {
+		return nil
+	}
+	release, err := l.intervals.acquireTry(l.key)
+	if err != nil {
+		return err
+	}
+	l.release = release
+	return nil
+}
+
+// end releases one call-owned standalone lease. A borrowed execution lease
+// stays with its execution owner.
+func (l *artifactCallLease) end() {
+	if l == nil || l.borrowed {
+		return
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	l.closed = true
+	release := l.release
+	l.release = nil
+	l.mu.Unlock()
+	if release != nil {
+		release()
+	}
+}

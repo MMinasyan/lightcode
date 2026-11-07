@@ -7,7 +7,7 @@
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "11"
+  version: "12"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -82,8 +82,12 @@ paths:
       parameters:
         - $ref: "#/components/parameters/SessionID"
       responses:
-        "204":
-          description: The archived Session was deleted.
+        "200":
+          description: The committed deletion and any incomplete cleanup.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletionResult"
         default:
           $ref: "#/components/responses/Error"
   /v1/sessions/{id}/archive:
@@ -723,12 +727,50 @@ components:
             - closed
             - configuration
             - storage
+            - unavailable
             - internal
         message:
           type: string
         session_id:
           type: string
           pattern: "^[0-9a-f]{32}$"
+    CleanupFailure:
+      description: >
+        One cleanup attempt that did not complete after the canonical Session
+        deletion committed. An absent extension_id is local Session-tree
+        cleanup; an external failure names its extension.
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        extension_id:
+          type: string
+          minLength: 1
+        code:
+          type: string
+          description: >
+            storage for local Session-tree cleanup, unavailable for an
+            external owner's cleanup.
+          enum:
+            - storage
+            - unavailable
+        message:
+          type: string
+    DeletionResult:
+      description: >
+        The committed Session deletion and every incomplete cleanup attempt.
+        The cleanup_failures array is always present.
+      type: object
+      additionalProperties: false
+      required:
+        - cleanup_failures
+      properties:
+        cleanup_failures:
+          type: array
+          items:
+            $ref: "#/components/schemas/CleanupFailure"
     SessionLifecycle:
       type: string
       enum:
@@ -834,7 +876,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "11"
+            - "12"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
