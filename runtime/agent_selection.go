@@ -9,10 +9,6 @@ import (
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
-func suppliedDefinition(name string) harness.AgentSelection {
-	return harness.AgentSelection{Definition: &harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: name}}
-}
-
 func defaultAgentSelection() harness.AgentSelection {
 	declarations := standardToolDeclarations()
 	tools := make([]string, 0, len(declarations))

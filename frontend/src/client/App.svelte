@@ -141,6 +141,7 @@
       globalWarnings: hydration ? hydration.warnings.filter((warning) => !warning.session_id) : (globalWarnings ? globalWarnings.payload : []),
       model: hydration && hydration.selected_model ? hydration.selected_model : '',
       agentType: hydration ? hydration.session.agent_selection?.definition?.definition_id || '' : '',
+      agentDefinition: hydration ? hydration.session.agent_selection?.definition ?? null : null,
       agentSelection: hydration ? hydration.session.agent_selection : null,
       activity: activity.getState(),
       attempts: ledger.outstanding(sessionID),
@@ -405,6 +406,10 @@
     return selectionTask;
   }
 
+  // Full-reference identity is the three-field tuple; display names are not
+  // unique and never address a roster entry.
+  const refKey = (ref) => JSON.stringify([ref?.extension_id ?? '', ref?.capability_id ?? '', ref?.definition_id ?? '']);
+
   // ONE Create task for a captured Workspace address; callers keep their own adoption.
   async function createSessionIn(addressed) {
     const roster = await invoke('configuration', 'GetConfiguration', '{}', JSON.parse);
@@ -413,11 +418,14 @@
     const seen = new Set();
     if (!Array.isArray(agents) || !agents.every((agent) => {
       const ref = agent?.definition;
-      if (!agent || typeof agent !== 'object' || Array.isArray(agent) || Object.keys(agent).length !== 9 || typeof agent.name !== 'string' || !agent.name || seen.has(agent.name) || !ref || typeof ref !== 'object' || Array.isArray(ref) || Object.keys(ref).length !== 3 || typeof ref.extension_id !== 'string' || !ref.extension_id || typeof ref.capability_id !== 'string' || !ref.capability_id || typeof ref.definition_id !== 'string' || !ref.definition_id || typeof agent.description !== 'string' || typeof agent.subagent !== 'boolean' || typeof agent.model !== 'string' || typeof agent.readonly !== 'boolean' || typeof agent.write_dir !== 'string' || !Array.isArray(agent.tools) || !agent.tools.every((value) => typeof value === 'string') || !Array.isArray(agent.capabilities) || !agent.capabilities.every((value) => typeof value === 'string')) return false;
-      seen.add(agent.name);
+      if (!agent || typeof agent !== 'object' || Array.isArray(agent) || Object.keys(agent).length !== 9 || typeof agent.name !== 'string' || !agent.name || !ref || typeof ref !== 'object' || Array.isArray(ref) || Object.keys(ref).length !== 3 || typeof ref.extension_id !== 'string' || !ref.extension_id || typeof ref.capability_id !== 'string' || !ref.capability_id || typeof ref.definition_id !== 'string' || !ref.definition_id || seen.has(refKey(ref)) || typeof agent.description !== 'string' || typeof agent.subagent !== 'boolean' || typeof agent.model !== 'string' || typeof agent.readonly !== 'boolean' || typeof agent.write_dir !== 'string' || !Array.isArray(agent.tools) || !agent.tools.every((value) => typeof value === 'string') || !Array.isArray(agent.capabilities) || !agent.capabilities.every((value) => typeof value === 'string')) return false;
+      seen.add(refKey(ref));
       return true;
-    }) || (agents.length > 0 && !seen.has('primary'))) return { kind: 'rejection', message: 'Invalid agent roster' };
-    const selection = agents.length === 0 ? undefined : { definition: agents.find((agent) => agent.name === 'primary').definition };
+    })) return { kind: 'rejection', message: 'Invalid agent roster' };
+    // Root creation selects only the supplied application definition; a
+    // foreign-only roster or a roster without it creates a resolved Session.
+    const suppliedPrimary = agents.find((agent) => agent.definition.extension_id === 'agents' && agent.definition.capability_id === 'agents.definitions' && agent.definition.definition_id === 'primary');
+    const selection = suppliedPrimary ? { definition: suppliedPrimary.definition } : undefined;
     return invoke('session create', 'CreateSession', JSON.stringify({
       body: { workspace: addressed, ...(selection ? { agent_selection: selection } : {}) },
     }), JSON.parse);
@@ -877,12 +885,10 @@
   // --- Agent type ------------------------------------------------------------
 
   // SetSessionAgentType is reported against its captured Session; the stamped refresh is gated.
-  async function pickAgentType(type) {
+  async function pickAgentType(definition) {
     closeModal('agent');
     const addressed = rootID;
-    if (!addressed || !type) return;
-    const definition = configuration?.payload?.find((agent) => agent.name === type)?.definition;
-    if (!definition) return;
+    if (!addressed || !definition) return;
     const cap = stampFor(addressed, 'root')();
     const classified = await invoke('agent type', 'SetSessionAgentType', JSON.stringify({
       session_id: addressed,
@@ -934,7 +940,9 @@
     }
   }
 
-  // SetAgentTypeModel is type-wide and reports against the captured agent type.
+  // A supplied named definition edits its own latest extension section through
+  // the declared set_model edit; a resolved selection mutates its Session
+  // model field.
   async function pickModel(ref) {
     const addressedSession = rootID;
     const selection = root.agentSelection;
@@ -945,10 +953,11 @@
       return;
     }
     const cap = stampFor(addressedSession, 'root')();
-    const classified = await invoke('model selection', addressedType ? 'SetAgentTypeModel' : 'SetSessionModel', JSON.stringify({
-      ...(addressedType ? { query: { agent_type: addressedType } } : { session_id: addressedSession }),
-      body: { model: ref },
-    }), JSON.parse);
+    const classified = await invoke('model selection', addressedType ? 'UpdateConfigurationSettings' : 'SetSessionModel', JSON.stringify(
+      addressedType
+        ? { body: { extension_edit: { extension_id: 'agents', edit_id: 'set_model', arguments: JSON.stringify({ definition_id: addressedType, model: ref }) } } }
+        : { session_id: addressedSession, body: { model: ref } },
+    ), JSON.parse);
     if (!reportAddressed(classified, 'Model selection', addressedType ? `agent type ${addressedType}` : `session ${addressedSession}`)) {
       modelError = classified.message;
       return;
@@ -1156,7 +1165,7 @@
       on:close={() => closeModal('workspace')} />
   {/if}
   {#if $modal === 'agent'}
-    <AgentPicker agents={configuration ? configuration.payload : []} current={root.agentType}
+    <AgentPicker agents={configuration ? configuration.payload : []} current={root.agentDefinition}
       on:select={(e) => void pickAgentType(e.detail)}
       on:close={() => closeModal('agent')} />
   {/if}

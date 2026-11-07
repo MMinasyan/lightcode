@@ -63,7 +63,7 @@ func (h *serviceHarness) serviceWithDefaults(owner context.Context, defaults []s
 	if err != nil {
 		h.t.Fatalf("newComposition: %v", err)
 	}
-	return newConfigurationService(owner, c, h.loader, h.configPath, newObservation(), defaults)
+	return newConfigurationService(owner, c, h.loader, h.configPath, newObservation())
 }
 
 func staticBundledFS() fstest.MapFS {
@@ -148,10 +148,8 @@ func writeAgentDefinitions(t *testing.T, configPath, content string) {
 	writeServiceFile(t, configPath, string(data))
 }
 
-func fixtureAgentPlugin() extension.Native {
-	native := testServiceNative("agents", extension.LifetimeHarness, nil)
-	native.Declaration.ConfigSchema = json.RawMessage(`{"type":"object","required":["enabled"],"properties":{"enabled":{"type":"boolean"},"definitions":true,"task":true},"additionalProperties":true}`)
-	return native
+func fixtureAgentPlugin(registered ...extension.Native) extension.Native {
+	return agentsTestNative(registered...)
 }
 
 func enableFixturePlugin(t *testing.T, configPath, id string) {
@@ -255,7 +253,7 @@ func TestRuntimeConfigurationResourceReplacement(t *testing.T) {
 	view, err := r.getConfiguration(context.Background())
 	testassert.NoError(t, err)
 	view.Settings.Sessions.ArchiveAfterDays++
-	_, err = r.updateSettings(context.Background(), view.Settings)
+	_, err = updateSettingsOnly(r, context.Background(), view.Settings)
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(1))
 	testassert.Equal(t, string(r.config.current().extensions["alpha"]), `{ "enabled":true,"value" : 1 }`)
@@ -288,7 +286,7 @@ func TestResourceFactoryWithoutWarningSink(t *testing.T) {
 		return extension.Instance{Capabilities: map[string]extension.Implementation{"capability.alpha": testServiceImplementation()}}, nil
 	}
 	c := mustComposition(t, p)
-	s := newConfigurationService(context.Background(), c, h.loader, h.configPath, newObservation(), nil)
+	s := newConfigurationService(context.Background(), c, h.loader, h.configPath, newObservation())
 	s.composition, s.dataDir = c, h.dataDir
 	_, err := s.publish(context.Background())
 	testassert.NoError(t, err)
@@ -332,7 +330,7 @@ func TestRuntimeConfigurationCandidateResources(t *testing.T) {
 	settings := projectSettings(previous.sessions, previous.tools, previous.jobs, previous.compaction, previous.extensions)
 	settings.Extensions["alpha"] = `{"enabled":true,"value":2}`
 	fail.Store(true)
-	_, err = r.updateSettings(context.Background(), settings)
+	_, err = updateSettingsOnly(r, context.Background(), settings)
 	testassert.Require(t, errors.Is(err, errFactory), "failed candidate = %v", err)
 	testassert.Require(t, r.config.current() == previous && string(mustRead(t, e.configPath)) == string(before), "failed candidate changed publication or owning bytes")
 	testassert.Equal(t, opens.Load(), int64(2))
@@ -341,7 +339,7 @@ func TestRuntimeConfigurationCandidateResources(t *testing.T) {
 	testassert.Equal(t, gotRevision, warnRevision)
 	assertNoEvent(t, sub)
 	fail.Store(false)
-	result, err := r.updateSettings(context.Background(), settings)
+	result, err := updateSettingsOnly(r, context.Background(), settings)
 	testassert.NoError(t, err)
 	testassert.Equal(t, result.ConfigurationRevision.Generation, "2")
 	testassert.Equal(t, opens.Load(), int64(3))
@@ -357,7 +355,7 @@ func TestRuntimeConfigurationCandidateResources(t *testing.T) {
 		}
 	}
 	testassert.Require(t, seen, "successful candidate warning was not published: %v", warnings)
-	_, err = r.updateSettings(context.Background(), result.Result)
+	_, err = updateSettingsOnly(r, context.Background(), result.Result)
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(3))
 	err = r.Close(context.Background())
@@ -625,8 +623,8 @@ func snapshotModelName(cfg *configuration, providerID, modelID string) string {
 
 func hasDefinition(cfg *configuration, name string) (bool, string) {
 	for _, def := range cfg.definitions {
-		if def.Name == name {
-			return true, def.Model
+		if def.name == name {
+			return true, modelRefString(def.inputs.Model)
 		}
 	}
 	return false, ""
@@ -696,7 +694,8 @@ func TestConfigurationServiceCapturesInputOnce(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { candidateBarrier = nil })
-	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, acceptValidator), fixtureAgentPlugin())
+	alpha := servicePlugin("alpha", &h.opens, acceptValidator)
+	svc := h.preparedService(context.Background(), alpha, fixtureAgentPlugin(alpha))
 
 	first, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
@@ -1123,7 +1122,7 @@ func TestConfigurationServiceGenerationOverflow(t *testing.T) {
 // wholly missing.
 func TestConfigurationServiceKeepsFirstRunSkeletons(t *testing.T) {
 	h := newServiceHarness(t)
-	svc := h.service(context.Background(), servicePlugin("agents", &h.opens, acceptValidator))
+	svc := h.preparedService(context.Background(), fixtureAgentPlugin())
 	first, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	if configData, err := os.ReadFile(h.configPath); err != nil || string(configData) != mainConfigSkeleton {
@@ -1358,13 +1357,13 @@ func TestConfigurationServiceToolDeclarationsStayDeclarative(t *testing.T) {
 		describeCalled = true
 		return extension.ToolDescription{Definition: model.ToolDefinition{Name: "tool.x", Parameters: json.RawMessage(`{}`)}, Available: true}, nil
 	}
-	svc := h.service(context.Background(), toolPlugin, fixtureAgentPlugin())
+	svc := h.preparedService(context.Background(), toolPlugin, fixtureAgentPlugin(toolPlugin))
 	snapshot, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	// The declared tool ID validated the configured reference and produced no
 	// warning.
 	found, _ := hasDefinition(snapshot.snapshot, "worker")
-	testassert.Require(t, found && len(snapshot.snapshot.agentWarnings) == 0, "worker retained = %v with warnings %+v, want the declared tool to validate cleanly", found, snapshot.snapshot.agentWarnings)
+	testassert.Require(t, found, "worker retained = %v, want the declared tool to validate cleanly", found)
 	// An invalid active definition rejects the complete candidate.
 	previous := snapshot.snapshot
 	writeAgentDefinitions(t, h.configPath, `{"worker":{"tools":["ghost_tool"]}}`)
@@ -1390,26 +1389,28 @@ func TestConfigurationServiceProjectsHostSelectedDefaultCapabilities(t *testing.
 	  "clear": {"capabilities": []},
 	  "explicit": {"capabilities": ["capability.alpha"]}
 	}`)
-	svc := h.serviceWithDefaults(context.Background(), []string{"capability.alpha"}, servicePlugin("alpha", &atomic.Int64{}, nil), fixtureAgentPlugin())
+	alpha := servicePlugin("alpha", &atomic.Int64{}, nil)
+	svc := h.preparedService(context.Background(), alpha, agentsTestNativeWithDefaults([]string{"capability.alpha"}, alpha))
 	snapshot, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	want := []string{"capability.alpha"}
 	for _, def := range snapshot.snapshot.definitions {
-		switch def.Name {
+		switch def.name {
 		case "clear":
-			testassert.Require(t, def.Capabilities == nil, "%s capabilities = %q, want the explicit empty clear", def.Name, def.Capabilities)
+			testassert.Require(t, def.inputs.Capabilities == nil, "%s capabilities = %q, want the explicit empty clear", def.name, def.inputs.Capabilities)
 		default:
-			testassert.Require(t, reflect.DeepEqual(def.Capabilities, want), "%s capabilities = %q, want the projected default %q", def.Name, def.Capabilities, want)
+			testassert.Require(t, reflect.DeepEqual(def.inputs.Capabilities, want), "%s capabilities = %q, want the projected default %q", def.name, def.inputs.Capabilities, want)
 		}
 	}
 
 	plain := newServiceHarness(t)
 	writeServiceFile(t, plain.configPath, strings.TrimSuffix(providerConfigFile("One"), "}")+`,"extensions":{"hooks":{"enabled":true,"tag":"T"}}}`)
 	writeAgentDefinitions(t, plain.configPath, `{}`)
-	noDefaults := plain.service(context.Background(), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}), fixtureAgentPlugin())
+	hook := hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}})
+	noDefaults := plain.preparedService(context.Background(), hook, fixtureAgentPlugin(hook))
 	snapshot, err = noDefaults.publish(context.Background())
 	testassert.NoError(t, err)
 	for _, def := range snapshot.snapshot.definitions {
-		testassert.Require(t, def.Capabilities == nil, "%s capabilities = %q, want none without host defaults", def.Name, def.Capabilities)
+		testassert.Require(t, def.inputs.Capabilities == nil, "%s capabilities = %q, want none without host defaults", def.name, def.inputs.Capabilities)
 	}
 }

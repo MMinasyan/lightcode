@@ -261,7 +261,7 @@ func TestConnectionRepairClearsOldFloorsBeforeNewOwnerHydration(t *testing.T) {
 // unused opaque extra_body members carry the overflow numeric lexemes as
 // exact bytes, plus its malformed-delivery sibling body.
 const opaqueOverflowConfiguration = `{"configuration_revision":{"instance_id":"` + instance + `","generation":"2"},` +
-	`"settings":{"sessions":{"auto_archive":true,"archive_after_days":7,"delete_after_archive_days":7},"tools":{},"jobs":{},"compaction":{},"plugins":{}},"agents":[{"name":"primary","description":"primary agent"},{"name":"planner","description":"planning agent"}],` +
+	`"settings":{"sessions":{"auto_archive":true,"archive_after_days":7,"delete_after_archive_days":7},"tools":{},"jobs":{},"compaction":{},"plugins":{}},"agents":[{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"primary agent"},{"name":"planner","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"planner"},"description":"planning agent"}],` +
 	`"providers":[{"id":"prov","name":"Prov","connected":true,` +
 	`"extra_body":{"n":9007199254740993,"big":1e400},` +
 	`"models":[{"id":"m","name":"M","context_window":4096,"source":"user",` +
@@ -369,6 +369,7 @@ func TestGlobalsAndAgentMenuOpaqueOverflowConfiguration(t *testing.T) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		testassert.Require(t, c.menu != nil && len(c.menu.items) == 2 && c.menu.items[0].Label == "primary" && c.menu.items[1].Label == "planner", "valid opaque configuration was not listed")
+		testassert.Require(t, strings.Contains(c.menu.items[0].Detail, "agents/agents.definitions") && strings.Contains(c.menu.items[1].Detail, "agents/agents.definitions"), "agent source tuple missing from menu detail: %+v", c.menu.items)
 		testassert.Require(t, c.conn == oldConn, "the /agent menu triggered a repair loop")
 		select {
 		case <-c.exit:

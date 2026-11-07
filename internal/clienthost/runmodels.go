@@ -57,8 +57,9 @@ func RunModels(ctx context.Context, opts Options, provider string, all, asJSON b
 		return fmt.Errorf("decode configuration response: %w", err)
 	}
 	primaryModel := ""
+	suppliedPrimary := protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: "primary"}
 	for _, agent := range view.Agents {
-		if agent.Name == "primary" {
+		if agent.Definition == suppliedPrimary {
 			primaryModel = string(agent.Model)
 			break
 		}

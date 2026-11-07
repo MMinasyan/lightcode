@@ -80,7 +80,7 @@ func TestBackgroundBridgeArmingAcrossPublication(t *testing.T) {
 	probe := &backgroundProbe{}
 	useFixtureStore(t, store)
 	r, err := Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []extension.Native{
-		backgroundProbePlugin(probe), fixtureAgentPlugin(),
+		backgroundProbePlugin(probe), fixtureAgentPlugin(backgroundProbePlugin(probe)),
 	}})
 	testassert.NoError(t, err)
 	// The unarmed-to-armed window ends before publication: construction

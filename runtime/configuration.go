@@ -10,33 +10,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/jobs"
-	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // configuration is the immutable snapshot of one effective input set: the
 // assembled catalog with its build warnings and each model's source label,
-// the complete resolved agent definitions (retaining their private fields)
-// with the definition warnings, the session policy, every compiled plugin's
-// owned raw configuration section, the owned decoded provider user layer this
-// same build consumed, and the captured global and Workspace permission
-// inputs. Input documents are discarded once the snapshot is built; later
-// consumers add their own fields when they land.
+// the immutable Agent roster projection supplied by the active definition
+// resolvers, the session policy, every compiled plugin's owned raw
+// configuration section, the owned decoded provider user layer this same
+// build consumed, and the captured global and Workspace permission inputs.
+// Input documents are discarded once the snapshot is built; later consumers
+// add their own fields when they land.
 type configuration struct {
 	generation           uint64
 	resources            *resourceSet
 	composition          *composition
 	catalog              *catalog.Catalog
 	catalogWarnings      []catalog.Warning
-	definitions          []agents.Resolved
-	agentWarnings        []agents.Warning
+	definitions          []agentDefinition
 	sessions             config.SessionConfig
 	tools                json.RawMessage
 	jobs                 json.RawMessage
@@ -87,14 +83,12 @@ func decodeCapturedConfig(configData []byte) (capturedConfigDocument, error) {
 
 // newConfiguration assembles the complete snapshot from one decoded captured
 // document, the provider assembly already performed for the captured
-// providers layer (a catalog entry never rereads the main configuration), the
-// captured agent-definition bytes, and the captured Workspace permission
-// bytes: it calls ParseSessions and agents.ParseWithCapabilities against the
-// supplied ordinary visible export IDs and the compiled tool universe, with
-// the application-selected default capability IDs (empty selects none), and
-// carries the given publication generation. Plugin-section validation belongs
-// to the publisher, not here.
-func newConfiguration(generation uint64, doc capturedConfigDocument, built catalog.BuildResult, agentsData []byte, capabilityIDs, toolIDs, defaultCapabilityIDs []string, workspacePermissions map[string]json.RawMessage) (*configuration, error) {
+// providers layer (a catalog entry never rereads the main configuration), and
+// the captured Workspace permission bytes. Agent definitions are not parsed
+// here: the active resolver extensions supply the roster projection after
+// their Harness resources are ready. Plugin-section validation belongs to the
+// publisher, not here.
+func newConfiguration(generation uint64, doc capturedConfigDocument, built catalog.BuildResult, workspacePermissions map[string]json.RawMessage) (*configuration, error) {
 	sessions, err := config.ParseSessions(doc.Sessions)
 	if err != nil {
 		return nil, fmt.Errorf("captured configuration sessions: %w", err)
@@ -109,16 +103,10 @@ func newConfiguration(generation uint64, doc capturedConfigDocument, built catal
 	if err != nil {
 		return nil, fmt.Errorf("captured configuration compaction: %w", err)
 	}
-	definitions, err := agents.ParseWithCapabilities(agentsData, capabilityIDs, toolIDs, defaultCapabilityIDs)
-	if err != nil {
-		return nil, fmt.Errorf("decode captured agent definitions: %w", err)
-	}
 	return &configuration{
 		generation:           generation,
 		catalog:              built.Catalog,
 		catalogWarnings:      built.Warnings,
-		definitions:          definitions.All(),
-		agentWarnings:        definitions.Warnings(),
 		sessions:             sessions,
 		tools:                doc.Tools,
 		jobs:                 doc.Jobs,
@@ -181,59 +169,4 @@ func (c *configuration) permissionPolicy(workspace string) harness.PermissionPol
 		workspaceRaw = c.workspacePermissions[id]
 	}
 	return harness.ResolvePermissionPolicy(c.permissions, workspaceRaw)
-}
-
-// agentTypes projects the snapshot's resolved definitions onto the Harness
-// view.
-type agentType struct {
-	Name         string
-	Model        model.ModelRef
-	SystemPrompt string
-	Prompt       string
-	Tools        []string
-	Capabilities []string
-	Readonly     bool
-	WriteDir     string
-}
-
-func resolveAgentType(name string, available []agentType) (agentType, error) {
-	for _, agent := range available {
-		if agent.Name == name {
-			return agent, nil
-		}
-	}
-	return agentType{}, fmt.Errorf("unknown agent type %q: %w", name, harness.ErrInvalid)
-}
-
-func (c *configuration) agentTypes() []agentType {
-	return projectAgentTypes(c.definitions)
-}
-
-// projectAgentTypes projects resolved definitions onto the Harness view: the
-// shared producer admission and the Agent-model edit's known-type check both
-// resolve through — public model identity, owned slices, the permission
-// capability constraints with WriteDir trimmed once (preserving the legacy
-// whitespace-as-unset behavior: no environment expansion, no new path
-// syntax), the subagent eligibility and roster description, and the complete
-// roster with no internal package type reaching the view.
-func projectAgentTypes(defs []agents.Resolved) []agentType {
-	out := make([]agentType, 0, len(defs))
-	for _, def := range defs {
-		at := agentType{
-			Name:         def.Name,
-			SystemPrompt: def.SystemPrompt,
-			Prompt:       def.Prompt,
-			Readonly:     def.Readonly,
-			WriteDir:     strings.TrimSpace(def.WriteDir),
-		}
-		if def.Model != "" {
-			if ref, err := model.Parse(def.Model); err == nil {
-				at.Model = ref
-			}
-		}
-		at.Tools = append([]string(nil), def.Tools...)
-		at.Capabilities = append([]string(nil), def.Capabilities...)
-		out = append(out, at)
-	}
-	return out
 }

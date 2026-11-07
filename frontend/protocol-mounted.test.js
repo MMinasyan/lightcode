@@ -42,7 +42,7 @@ mounted('generated SDK round-trips special identity query values over the mounte
   // 0600 mode; these are the record-shape checks it does not duplicate.
   expect(discovery.endpoint).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
   expect(discovery.instance_id).toMatch(/^[0-9a-f]{32}$/);
-  expect(discovery.protocol_version).toBe('10');
+  expect(discovery.protocol_version).toBe('11');
   // The credential is validated without an assertion diff: a mismatch must
   // never print the value this check exists to protect.
   if (typeof discovery.credential !== 'string' || !/^[0-9a-f]{64}$/.test(discovery.credential)) {
@@ -52,7 +52,7 @@ mounted('generated SDK round-trips special identity query values over the mounte
   const client = createClient({ baseUrl: discovery.endpoint, auth: discovery.credential });
   const health = await getHealth({ client });
   expect(health.error).toBeUndefined();
-  expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '10' });
+  expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '11' });
 
   // The open warning source crosses the generated TypeScript boundary: the
   // mounted owner's real Runtime-scoped reporter plugin attributes its report
@@ -219,11 +219,17 @@ mounted('generated SDK round-trips special identity query values over the mounte
   const refusedDetail = await getProviderDetail({ client, query: { provider_id: 'externalk' } });
   expect(refusedDetail.error?.code).toBe('not_found');
 
-  // The directory-like Agent type name is addressable for model edits.
-  const agentEdit = await setAgentTypeModel({ client, query: { agent_type: '..' }, body: { model: 'prov/m' } });
+  // The directory-like Agent definition name is addressable through the
+  // supplied extension's declared model edit, and the roster projection
+  // carries the edited model.
+  const agentEdit = await updateConfigurationSettings({
+    client,
+    body: { extension_edit: { extension_id: 'agents', edit_id: 'set_model', arguments: JSON.stringify({ definition_id: '..', model: 'prov/m' }) } },
+  });
   expect(agentEdit.error).toBeUndefined();
-  expect(agentEdit.data?.result.name).toBe('..');
-  expect(agentEdit.data?.result.model).toBe('prov/m');
+  const editedConfiguration = await getConfiguration({ client });
+  const editedAgent = editedConfiguration.data?.agents.find((agent) => agent.definition.definition_id === '..');
+  expect(editedAgent?.model).toBe('prov/m');
 
   // The Session hydration carries the required nullable next-admission
   // selection: a resolved Agent type names its configured model, and an

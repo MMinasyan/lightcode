@@ -442,8 +442,8 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		enableFixturePlugin(t, sh.configPath, "compacttools")
 		owner, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin())
-		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs, nil)
+		comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin(compactToolsPlugin()))
+		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs)
 		svc.composition, svc.dataDir = comp, sh.dataDir
 		svc.attachWarnings(r.warnings)
 		{

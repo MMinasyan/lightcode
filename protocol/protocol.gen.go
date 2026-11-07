@@ -187,13 +187,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N10 HealthProtocolVersion = "10"
+	N11 HealthProtocolVersion = "11"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N10:
+	case N11:
 		return true
 	default:
 		return false
@@ -924,12 +924,6 @@ type AgentInputs struct {
 // AgentInputsAssemblyMode defines model for AgentInputs.AssemblyMode.
 type AgentInputsAssemblyMode string
 
-// AgentMutation defines model for AgentMutation.
-type AgentMutation struct {
-	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
-	Result                Agent                 `json:"result"`
-}
-
 // AgentSelection defines model for AgentSelection.
 type AgentSelection struct {
 	Definition *DefinitionRef `json:"definition,omitempty"`
@@ -1126,6 +1120,14 @@ type ExecutionEvidence string
 
 // ExtensionConfigDocument One extension configuration document as exact JSON text.
 type ExtensionConfigDocument = string
+
+// ExtensionEdit defines model for ExtensionEdit.
+type ExtensionEdit struct {
+	// Arguments The edit call's JSON document, carried as exact text.
+	Arguments   string `json:"arguments"`
+	EditId      string `json:"edit_id"`
+	ExtensionId string `json:"extension_id"`
+}
 
 // ExtensionsSettings Extension sections as JSON document strings, keyed by extension ID.
 type ExtensionsSettings map[string]ExtensionConfigDocument
@@ -1615,12 +1617,6 @@ type SessionsSettings struct {
 	DeleteAfterArchiveDays int  `json:"delete_after_archive_days"`
 }
 
-// SetAgentTypeModelRequest defines model for SetAgentTypeModelRequest.
-type SetAgentTypeModelRequest struct {
-	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
-	Model ModelRef `json:"model"`
-}
-
 // SetSessionAgentTypeRequest defines model for SetSessionAgentTypeRequest.
 type SetSessionAgentTypeRequest struct {
 	AgentSelection AgentSelection `json:"agent_selection"`
@@ -1817,9 +1813,10 @@ type UpdateProviderModelRequest struct {
 	Model ModelEdit `json:"model"`
 }
 
-// UpdateSettingsRequest defines model for UpdateSettingsRequest.
+// UpdateSettingsRequest Exactly one of the complete settings shape or one declared extension configuration edit; the accepting owner rejects zero or both.
 type UpdateSettingsRequest struct {
-	Settings Settings `json:"settings"`
+	ExtensionEdit *ExtensionEdit `json:"extension_edit,omitempty"`
+	Settings      *Settings      `json:"settings,omitempty"`
 }
 
 // UsageContext defines model for UsageContext.
@@ -1914,11 +1911,6 @@ type SessionID = string
 // WorkspaceQuery defines model for WorkspaceQuery.
 type WorkspaceQuery = string
 
-// SetAgentTypeModelParams defines parameters for SetAgentTypeModel.
-type SetAgentTypeModelParams struct {
-	AgentType string `form:"agent_type" json:"agent_type"`
-}
-
 // ListModelsParams defines parameters for ListModels.
 type ListModelsParams struct {
 	All bool `form:"all" json:"all"`
@@ -1992,9 +1984,6 @@ type ListSessionsParams struct {
 type GetSessionHistoryParams struct {
 	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
 }
-
-// SetAgentTypeModelJSONRequestBody defines body for SetAgentTypeModel for application/json ContentType.
-type SetAgentTypeModelJSONRequestBody = SetAgentTypeModelRequest
 
 // UpdateConfigurationSettingsJSONRequestBody defines body for UpdateConfigurationSettings for application/json ContentType.
 type UpdateConfigurationSettingsJSONRequestBody = UpdateSettingsRequest
@@ -3020,14 +3009,6 @@ func WithRequestEditorFn(fn RequestEditorFn) ClientOption {
 // The interface specification for the client above.
 type ClientInterface interface {
 
-	// SetAgentTypeModelWithBody performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request,
-	// with any type of body and a specified content type.
-	SetAgentTypeModelWithBody(ctx context.Context, params *SetAgentTypeModelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// SetAgentTypeModel performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request.
-	// Takes a body of the `application/json` content type.
-	SetAgentTypeModel(ctx context.Context, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
 	// GetConfiguration performs a GET /v1/configuration (the `GetConfiguration` operationId) request.
 	GetConfiguration(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -3214,34 +3195,6 @@ type ClientInterface interface {
 	// ReadWorkspaceFile performs a POST /v1/workspaces/files/read (the `ReadWorkspaceFile` operationId) request.
 	// Takes a body of the `application/json` content type.
 	ReadWorkspaceFile(ctx context.Context, body ReadWorkspaceFileJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-}
-
-// SetAgentTypeModelWithBody performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request,
-// with any type of body and a specified content type.
-func (c *Client) SetAgentTypeModelWithBody(ctx context.Context, params *SetAgentTypeModelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewSetAgentTypeModelRequestWithBody(c.Server, params, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// SetAgentTypeModel performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request.
-// Takes a body of the `application/json` content type.
-func (c *Client) SetAgentTypeModel(ctx context.Context, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewSetAgentTypeModelRequest(c.Server, params, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
 }
 
 // GetConfiguration performs a GET /v1/configuration (the `GetConfiguration` operationId) request.
@@ -3959,69 +3912,6 @@ func (c *Client) ReadWorkspaceFile(ctx context.Context, body ReadWorkspaceFileJS
 		return nil, err
 	}
 	return c.Client.Do(req)
-}
-
-// NewSetAgentTypeModelRequest calls the generic SetAgentTypeModel builder with application/json body
-func NewSetAgentTypeModelRequest(server string, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewSetAgentTypeModelRequestWithBody(server, params, "application/json", bodyReader)
-}
-
-// NewSetAgentTypeModelRequestWithBody constructs an http.Request for the SetAgentTypeModel method, with any body, and a specified content type
-func NewSetAgentTypeModelRequestWithBody(server string, params *SetAgentTypeModelParams, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/v1/agent-types/model")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	if params != nil {
-		// queryValues collects non-styled parameters (passthrough, JSON)
-		// that are safe to round-trip through url.Values.Encode().
-		queryValues := queryURL.Query()
-		// rawQueryFragments collects pre-encoded query fragments from
-		// styled parameters, preserving literal commas as delimiters
-		// per the OpenAPI spec (e.g. "color=blue,black,brown").
-		var rawQueryFragments []string
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "agent_type", params.AgentType, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if encoded := queryValues.Encode(); encoded != "" {
-			rawQueryFragments = append(rawQueryFragments, encoded)
-		}
-		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
-	}
-
-	req, err := http.NewRequest(http.MethodPut, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
 }
 
 // NewGetConfigurationRequest constructs an http.Request for the GetConfiguration method
@@ -5773,16 +5663,6 @@ func WithBaseURL(baseURL string) ClientOption {
 // ClientWithResponsesInterface is the interface specification for the client with responses above.
 type ClientWithResponsesInterface interface {
 
-	// SetAgentTypeModelWithBodyWithResponse performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request,
-	// with any type of body and a specified content type.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	SetAgentTypeModelWithBodyWithResponse(ctx context.Context, params *SetAgentTypeModelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetAgentTypeModelResponse, error)
-
-	// SetAgentTypeModelWithResponse performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request.
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	SetAgentTypeModelWithResponse(ctx context.Context, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody, reqEditors ...RequestEditorFn) (*SetAgentTypeModelResponse, error)
-
 	// GetConfigurationWithResponse performs a GET /v1/configuration (the `GetConfiguration` operationId) request.
 	//
 	// Returns a wrapper object for the known response body format(s).
@@ -6047,54 +5927,6 @@ type ClientWithResponsesInterface interface {
 	// ReadWorkspaceFileWithResponse performs a POST /v1/workspaces/files/read (the `ReadWorkspaceFile` operationId) request.
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	ReadWorkspaceFileWithResponse(ctx context.Context, body ReadWorkspaceFileJSONRequestBody, reqEditors ...RequestEditorFn) (*ReadWorkspaceFileResponse, error)
-}
-
-type SetAgentTypeModelResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *AgentMutation
-	// JSONDefault the response for an HTTP default `application/json` response
-	JSONDefault *Error
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r SetAgentTypeModelResponse) GetJSON200() *AgentMutation {
-	return r.JSON200
-}
-
-// GetJSONDefault returns the response for an HTTP default `application/json` response
-func (r SetAgentTypeModelResponse) GetJSONDefault() *Error {
-	return r.JSONDefault
-}
-
-// GetBody returns the raw response body bytes
-func (r SetAgentTypeModelResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r SetAgentTypeModelResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r SetAgentTypeModelResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r SetAgentTypeModelResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
 }
 
 type GetConfigurationResponse struct {
@@ -7941,28 +7773,6 @@ func (r ReadWorkspaceFileResponse) ContentType() string {
 	return ""
 }
 
-// SetAgentTypeModelWithBodyWithResponse performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request,
-// with any type of body and a specified content type.
-//
-// Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) SetAgentTypeModelWithBodyWithResponse(ctx context.Context, params *SetAgentTypeModelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetAgentTypeModelResponse, error) {
-	rsp, err := c.SetAgentTypeModelWithBody(ctx, params, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseSetAgentTypeModelResponse(rsp)
-}
-
-// SetAgentTypeModelWithResponse performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request.
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) SetAgentTypeModelWithResponse(ctx context.Context, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody, reqEditors ...RequestEditorFn) (*SetAgentTypeModelResponse, error) {
-	rsp, err := c.SetAgentTypeModel(ctx, params, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseSetAgentTypeModelResponse(rsp)
-}
-
 // GetConfigurationWithResponse performs a GET /v1/configuration (the `GetConfiguration` operationId) request.
 //
 // Returns a wrapper object for the known response body format(s).
@@ -8544,39 +8354,6 @@ func (c *ClientWithResponses) ReadWorkspaceFileWithResponse(ctx context.Context,
 		return nil, err
 	}
 	return ParseReadWorkspaceFileResponse(rsp)
-}
-
-// ParseSetAgentTypeModelResponse parses an HTTP response from a SetAgentTypeModelWithResponse call
-func ParseSetAgentTypeModelResponse(rsp *http.Response) (*SetAgentTypeModelResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &SetAgentTypeModelResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest AgentMutation
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
-		var dest Error
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSONDefault = &dest
-
-	}
-
-	return response, nil
 }
 
 // ParseGetConfigurationResponse parses an HTTP response from a GetConfigurationWithResponse call
@@ -9850,9 +9627,6 @@ func ParseReadWorkspaceFileResponse(rsp *http.Response) (*ReadWorkspaceFileRespo
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
 
-	// (PUT /v1/agent-types/model)
-	SetAgentTypeModel(w http.ResponseWriter, r *http.Request, params SetAgentTypeModelParams)
-
 	// (GET /v1/configuration)
 	GetConfiguration(w http.ResponseWriter, r *http.Request)
 
@@ -9979,39 +9753,6 @@ type ServerInterfaceWrapper struct {
 }
 
 type MiddlewareFunc func(http.Handler) http.Handler
-
-// SetAgentTypeModel operation middleware
-func (siw *ServerInterfaceWrapper) SetAgentTypeModel(w http.ResponseWriter, r *http.Request) {
-
-	var err error
-	_ = err
-
-	// Parameter object where we will unmarshal all parameters from the context
-	var params SetAgentTypeModelParams
-
-	// ------------- Required query parameter "agent_type" -------------
-
-	err = runtime.BindQueryParameterWithOptions("form", true, true, "agent_type", r.URL.Query(), &params.AgentType, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
-	if err != nil {
-		var requiredError *runtime.RequiredParameterError
-		if errors.As(err, &requiredError) {
-			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "agent_type"})
-		} else {
-			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "agent_type", Err: err})
-		}
-		return
-	}
-
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.SetAgentTypeModel(w, r, params)
-	}))
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		handler = middleware(handler)
-	}
-
-	handler.ServeHTTP(w, r)
-}
 
 // GetConfiguration operation middleware
 func (siw *ServerInterfaceWrapper) GetConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -11203,7 +10944,6 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/configuration", wrapper.GetConfiguration)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/configuration/reload", wrapper.ReloadConfiguration)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/configuration/settings", wrapper.UpdateConfigurationSettings)
-	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/agent-types/model", wrapper.SetAgentTypeModel)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/models", wrapper.ListModels)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/providers", wrapper.ListProviders)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/providers", wrapper.CreateProvider)

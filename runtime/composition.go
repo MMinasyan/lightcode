@@ -149,10 +149,8 @@ type composition struct {
 	natives  []extension.Native
 	compiled *extension.Compiled
 
-	plan          map[ScopeKind][]*extension.CompiledComponent
-	capabilityIDs []string
-	toolIDs       []string
-	exports       map[string]capabilityExport
+	plan    map[ScopeKind][]*extension.CompiledComponent
+	exports map[string]capabilityExport
 
 	// standardValues holds the owner-constructed standard tool values the
 	// Runtime scope binds as its own provided capabilities.
@@ -183,18 +181,6 @@ func registeredComposition(natives []extension.Native) *composition {
 		plan:           make(map[ScopeKind][]*extension.CompiledComponent),
 		standardValues: make(map[string]Tool),
 	}
-	for _, declaration := range standardToolDeclarations() {
-		c.capabilityIDs = append(c.capabilityIDs, declaration.id)
-		c.toolIDs = append(c.toolIDs, declaration.id)
-	}
-	for _, native := range c.natives {
-		for _, capability := range native.Declaration.Capabilities {
-			c.capabilityIDs = append(c.capabilityIDs, capability.ID)
-			if capability.Kind == extension.KindTool {
-				c.toolIDs = append(c.toolIDs, capability.ID)
-			}
-		}
-	}
 	return c
 }
 
@@ -220,8 +206,6 @@ func newNativeComposition(natives []extension.Native) (*composition, error) {
 			return nil, fmt.Errorf("standard tool %q declared twice: %w", declaration.id, ErrComposition)
 		}
 		c.exports[declaration.id] = capabilityExport{standard: true, standardDescribe: declaration.describe}
-		c.capabilityIDs = append(c.capabilityIDs, declaration.id)
-		c.toolIDs = append(c.toolIDs, declaration.id)
 	}
 	for _, lifetime := range []extension.Lifetime{extension.LifetimeHarness, extension.LifetimeWorkspace, extension.LifetimeOperation, extension.LifetimeInvocation} {
 		for _, component := range compiled.Components(lifetime) {
@@ -232,10 +216,6 @@ func newNativeComposition(natives []extension.Native) (*composition, error) {
 					return nil, fmt.Errorf("capability %q already exported: %w", capability.ID, ErrComposition)
 				}
 				c.exports[capability.ID] = capabilityExport{capability: capability, native: native}
-				c.capabilityIDs = append(c.capabilityIDs, capability.ID)
-				if capability.Kind == extension.KindTool {
-					c.toolIDs = append(c.toolIDs, capability.ID)
-				}
 			}
 		}
 	}
@@ -539,18 +519,21 @@ func (c *composition) promptHandler(_ context.Context, _ extension.CallContext, 
 }
 func (c *composition) childLaunchHandler(ctx context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
 	var request struct {
-		AgentType     string `json:"agent_type"`
-		Prompt        string `json:"prompt"`
-		OperationID   string `json:"operation_id"`
-		MaxConcurrent int    `json:"max_concurrent"`
-		OutputLimit   int    `json:"output_limit"`
+		Definition    harness.DefinitionRef `json:"definition"`
+		Prompt        string                `json:"prompt"`
+		OperationID   string                `json:"operation_id"`
+		MaxConcurrent int                   `json:"max_concurrent"`
+		OutputLimit   int                   `json:"output_limit"`
 	}
 	if err := json.Unmarshal(arguments, &request); err != nil {
 		return extension.Result{}, err
 	}
 	grant := hostGrant(ctx)
-	if !slices.Contains(grant.permissions, harness.PermissionRequest{Permission: harness.PermissionChildLaunch, Target: request.AgentType}) {
-		return extension.Result{}, fmt.Errorf("child launch target %q is not authorized by the prepared plan: %w", request.AgentType, ErrClosed)
+	// The permission target stays the selected definition ID; the complete
+	// source-qualified reference rides the launch so admission resolves the
+	// exact provider.
+	if !slices.Contains(grant.permissions, harness.PermissionRequest{Permission: harness.PermissionChildLaunch, Target: request.Definition.DefinitionID}) {
+		return extension.Result{}, fmt.Errorf("child launch target %q is not authorized by the prepared plan: %w", request.Definition.DefinitionID, ErrClosed)
 	}
 	if call.SessionID == "" {
 		return extension.Result{}, fmt.Errorf("child launch has no calling Session: %w", ErrClosed)
@@ -560,7 +543,7 @@ func (c *composition) childLaunchHandler(ctx context.Context, call extension.Cal
 	}
 	result, err := c.hosts.background.h.LaunchChildSession(ctx, harness.LaunchChildRequest{
 		ParentSessionID: call.SessionID,
-		AgentSelection:  suppliedDefinition(request.AgentType),
+		AgentSelection:  harness.AgentSelection{Definition: &request.Definition},
 		Content:         []model.ContentPart{{Kind: model.PartText, Text: request.Prompt}},
 		OperationID:     request.OperationID,
 		MaxConcurrent:   request.MaxConcurrent,

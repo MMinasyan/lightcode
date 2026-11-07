@@ -24,7 +24,11 @@ import (
 
 func bridgeChildLaunchArguments(operationID string) json.RawMessage {
 	value, _ := json.Marshal(map[string]any{
-		"agent_type":     "secondary",
+		"definition": map[string]string{
+			"extension_id":  "agents",
+			"capability_id": "agents.definitions",
+			"definition_id": "secondary",
+		},
 		"prompt":         "child work",
 		"operation_id":   operationID,
 		"max_concurrent": 4,
@@ -204,7 +208,7 @@ func TestNativeChildBridgeRetainsCommittedChildren(t *testing.T) {
 					t.Fatal("the committed child was never observed")
 				}
 				testassert.Require(t, probe.executes.Load() == 1, "probe Execute calls = %d, want one per tool call", probe.executes.Load())
-				testassert.Require(t, len(probe.childID) == 32, "child id = %q, want the committed child identity", probe.childID)
+				testassert.Require(t, len(probe.childID) == 32, "child id = %q, want the committed child identity (launch error %v)", probe.childID, probe.launchErr)
 				childHeader, err := r.harness.ReadSessionHeader(context.Background(), probe.childID)
 				testassert.NoError(t, err)
 				testassert.Equal(t, childHeader.Identity.ParentSessionID, session.Identity.SessionID)

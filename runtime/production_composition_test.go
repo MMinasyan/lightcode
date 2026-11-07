@@ -342,10 +342,11 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		argHook := &rewriteWriteHook{replace: hookRewriteArgs}
 		useFixtureStore(t, e.store)
 		openChained := func(ctx context.Context, hook *recordHook, argHook *rewriteWriteHook) (*Runtime, error) {
-			return Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []extension.Native{
+			plugins := []extension.Native{
 				hookPlugin(hook),
-				argumentHookPlugin("arg.rewrite", argHook.BeforeTool), ShippedAdaptationPlugin(), fixtureAgentPlugin(),
-			}})
+				argumentHookPlugin("arg.rewrite", argHook.BeforeTool), ShippedAdaptationPlugin(),
+			}
+			return Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: append(plugins, fixtureAgentPlugin(plugins...))})
 		}
 		owner, ownerCancel := context.WithCancel(ctx)
 		defer ownerCancel()

@@ -267,7 +267,7 @@ func startBridge(t *testing.T, f *fixture, workspace string) *bridge {
 func startBridgeWith(t *testing.T, f *fixture, workspace string, writer io.Writer) *bridge {
 	t.Helper()
 	dataDir := t.TempDir()
-	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"10","credential":%q}`,
+	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"11","credential":%q}`,
 		f.server.URL, testInstance, testCredential)
 	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600))
 	return startRunner(t, clienthost.Options{
@@ -494,7 +494,7 @@ func sseFrame(document string) string {
 }
 
 func healthBody() string {
-	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"10"}`, testInstance)
+	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"11"}`, testInstance)
 }
 
 func hydrationBody(sessionID, workspace string) string {
@@ -756,25 +756,33 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 }
 
 func TestACPStartupRosterControlsCreation(t *testing.T) {
+	supplied := `{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	foreignPrimary := `{"name":"primary","definition":{"extension_id":"guest","capability_id":"guest.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	foreignOther := `{"name":"reviewer","definition":{"extension_id":"guest","capability_id":"guest.definitions","definition_id":"reviewer"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	suppliedBody := `{"agent_selection":{"definition":{"capability_id":"agents.definitions","definition_id":"primary","extension_id":"agents"}},"workspace":"/ws"}`
 	for _, tc := range []struct {
-		name       string
-		status     int
-		body       string
-		wantCreate bool
+		name     string
+		status   int
+		body     string
+		wantBody string
 	}{
-		{"no agents", 200, `{"agents":[]}`, true},
-		{"malformed roster", 200, `{"agents":null}`, false},
-		{"malformed entry", 200, `{"agents":[{"name":"primary"}]}`, false},
-		{"missing primary", 200, `{"agents":[{"name":"other","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"other"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}]}`, false},
-		{"read failure", 500, `{"code":"storage","message":"failed"}`, false},
+		{"no agents", 200, `{"agents":[]}`, `{"workspace":"/ws"}`},
+		{"supplied primary", 200, `{"agents":[` + supplied + `]}`, suppliedBody},
+		{"foreign-only primary", 200, `{"agents":[` + foreignPrimary + `]}`, `{"workspace":"/ws"}`},
+		{"foreign-only without primary", 200, `{"agents":[` + foreignOther + `]}`, `{"workspace":"/ws"}`},
+		{"duplicate names with supplied primary", 200, `{"agents":[` + foreignPrimary + `,` + supplied + `]}`, suppliedBody},
+		{"duplicate full references", 200, `{"agents":[` + supplied + `,` + supplied + `]}`, ``},
+		{"malformed roster", 200, `{"agents":null}`, ``},
+		{"malformed entry", 200, `{"agents":[{"name":"primary"}]}`, ``},
+		{"read failure", 500, `{"code":"storage","message":"failed"}`, ``},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t, map[string]http.HandlerFunc{"/v1/configuration": jsonHandler(tc.status, tc.body)})
 			b := startBridge(t, f, "/ws")
 			response := b.call(t, "1", "initialize", "")
-			if tc.wantCreate {
+			if tc.wantBody != "" {
 				_ = resultOf(t, response)
-				testassert.Equal(t, f.lastBody(t, "/v1/sessions"), `{"workspace":"/ws"}`)
+				testassert.Equal(t, f.lastBody(t, "/v1/sessions"), tc.wantBody)
 			} else {
 				_ = errorCode(t, response)
 				testassert.Equal(t, f.lastBody(t, "/v1/sessions"), "")
@@ -936,7 +944,7 @@ func TestACPEventsAndRepair(t *testing.T) {
 	connected := b.awaitFrame(t, methodFrame("runtime/connected"))
 	var health map[string]any
 	testassert.NoError(t, json.Unmarshal(connected["params"], &health))
-	testassert.Require(t, health["instance_id"] == testInstance && health["protocol_version"] == "10", "runtime/connected params = %v, want the generated Health", health)
+	testassert.Require(t, health["instance_id"] == testInstance && health["protocol_version"] == "11", "runtime/connected params = %v, want the generated Health", health)
 	resync := b.awaitFrame(t, methodFrame("runtime/resync_required"))
 	{
 		params, ok := resync["params"]

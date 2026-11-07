@@ -454,19 +454,15 @@ func (r *Runner) composeSelection(conn *connection) *rpcError {
 		return &rpcError{Code: codeTransport, Message: "invalid agent roster"}
 	}
 	body := protocol.CreateSessionRequest{Workspace: workspace}
-	if len(agents) != 0 {
-		var primary *protocol.DefinitionRef
-		for _, agent := range agents {
-			if agent.Name == "primary" {
-				ref := agent.Definition
-				primary = &ref
-				break
-			}
+	// Root creation selects only the supplied application definition; a
+	// foreign-only roster or a roster without it creates a resolved Session.
+	suppliedPrimary := protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: "primary"}
+	for _, agent := range agents {
+		if agent.Definition == suppliedPrimary {
+			ref := agent.Definition
+			body.AgentSelection = &protocol.AgentSelection{Definition: &ref}
+			break
 		}
-		if primary == nil {
-			return &rpcError{Code: codeTransport, Message: "invalid agent roster: primary is absent"}
-		}
-		body.AgentSelection = &protocol.AgentSelection{Definition: primary}
 	}
 	createParams, _ := json.Marshal(map[string]any{"body": body})
 	raw, err = clientops.Call(conn.ctx, conn.client, "CreateSession", createParams)

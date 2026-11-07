@@ -14,7 +14,7 @@ import (
 	"slices"
 	"sort"
 
-	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
+	agentcfg "github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 )

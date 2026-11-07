@@ -44,16 +44,6 @@
    "reject": []
   },
   {
-   "schema": "AgentMutation",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"configuration_revision\":{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"generation\":\"fixture\"},\"result\":{\"name\":\"fixture\",\"definition\":{\"extension_id\":\"agents\",\"capability_id\":\"agents.definitions\",\"definition_id\":\"fixture\"},\"description\":\"fixture\",\"subagent\":false,\"model\":\"fixture\",\"readonly\":false,\"write_dir\":\"fixture\",\"tools\":[],\"capabilities\":[]}}"
-    }
-   ],
-   "reject": []
-  },
-  {
    "schema": "AssistantItem",
    "accept": [
     {
@@ -632,7 +622,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"10\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"11\"}"
     }
    ],
    "reject": [
@@ -642,16 +632,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"10\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"11\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"10\"}"
+     "json": "{\"protocol_version\":\"11\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"10\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"11\",\"extra\":true}"
     }
    ]
   },
@@ -1676,21 +1666,6 @@
    ]
   },
   {
-   "schema": "SetAgentTypeModelRequest",
-   "accept": [
-    {
-     "name": "minimal",
-     "json": "{\"model\":\"fixture\"}"
-    }
-   ],
-   "reject": [
-    {
-     "name": "missing-model",
-     "json": "{}"
-    }
-   ]
-  },
-  {
    "schema": "SetSessionAgentTypeRequest",
    "accept": [
     {
@@ -2055,11 +2030,38 @@
    "schema": "UpdateSettingsRequest",
    "accept": [
     {
-     "name": "minimal",
+     "name": "settings",
      "json": "{\"settings\":{\"tools\":{},\"jobs\":{},\"compaction\":{},\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"extensions\":{}}}"
+    },
+    {
+     "name": "extension-edit",
+     "json": "{\"extension_edit\":{\"extension_id\":\"agents\",\"edit_id\":\"set_model\",\"arguments\":\"{\\\"definition_id\\\":\\\"primary\\\",\\\"model\\\":\\\"prov/m\\\"}\"}}"
     }
    ],
-   "reject": []
+   "reject": [
+    {
+     "name": "unknown",
+     "json": "{\"settings\":{\"tools\":{},\"jobs\":{},\"compaction\":{},\"sessions\":{\"auto_archive\":false,\"archive_after_days\":0,\"delete_after_archive_days\":0},\"extensions\":{}},\"unknown\":true}",
+     "typescript": false
+    }
+   ]
+  },
+  {
+   "schema": "ExtensionEdit",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"extension_id\":\"agents\",\"edit_id\":\"set_model\",\"arguments\":\"{\\\"definition_id\\\":\\\"primary\\\",\\\"model\\\":\\\"prov/m\\\"}\"}"
+    }
+   ],
+   "reject": [
+    {"name":"missing-arguments","json":"{\"extension_id\":\"agents\",\"edit_id\":\"set_model\"}"},
+    {
+     "name": "empty-extension",
+     "json": "{\"extension_id\":\"\",\"edit_id\":\"set_model\",\"arguments\":\"{}\"}",
+     "typescript": false
+    }
+   ]
   },
   {
    "schema": "UsageContext",
@@ -2517,16 +2519,6 @@
    "responses": {
     "200": "CodeRevertResult",
     "default": "CodeRevertError"
-   }
-  },
-  {
-   "operation_id": "SetAgentTypeModel",
-   "method": "put",
-   "path": "/v1/agent-types/model",
-   "request": "SetAgentTypeModelRequest",
-   "responses": {
-    "200": "AgentMutation",
-    "default": "Error"
    }
   },
   {

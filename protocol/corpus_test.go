@@ -538,7 +538,6 @@ func TestContractCorpusSSEIdentity(t *testing.T) {
 // target; the coverage test proves the map and the corpus name the same set.
 var contractGeneratedTypes = map[string]func() any{
 	"Agent":                       func() any { return new(protocol.Agent) },
-	"AgentMutation":               func() any { return new(protocol.AgentMutation) },
 	"InvocationScope":             func() any { return new(protocol.InvocationScope) },
 	"AssistantItem":               func() any { return new(protocol.AssistantItem) },
 	"BackgroundMember":            func() any { return new(protocol.BackgroundMember) },
@@ -593,6 +592,7 @@ var contractGeneratedTypes = map[string]func() any{
 	"PendingQueues":               func() any { return new(protocol.PendingQueues) },
 	"ExtensionConfigDocument":     func() any { return new(protocol.ExtensionConfigDocument) },
 	"ExtensionsSettings":          func() any { return new(protocol.ExtensionsSettings) },
+	"ExtensionEdit":               func() any { return new(protocol.ExtensionEdit) },
 	"AgentSelection":              func() any { return new(protocol.AgentSelection) },
 	"AgentInputs":                 func() any { return new(protocol.AgentInputs) },
 	"DefinitionRef":               func() any { return new(protocol.DefinitionRef) },
@@ -622,7 +622,6 @@ var contractGeneratedTypes = map[string]func() any{
 	"SessionScope":                func() any { return new(protocol.SessionScope) },
 	"SessionsSettings":            func() any { return new(protocol.SessionsSettings) },
 	"JobsSettings":                func() any { return new(protocol.JobsSettings) },
-	"SetAgentTypeModelRequest":    func() any { return new(protocol.SetAgentTypeModelRequest) },
 	"SetSessionAgentTypeRequest":  func() any { return new(protocol.SetSessionAgentTypeRequest) },
 	"Settings":                    func() any { return new(protocol.Settings) },
 	"SettingsMutation":            func() any { return new(protocol.SettingsMutation) },

@@ -46,12 +46,17 @@ type CompiledDeclaration struct {
 	Components   map[string]*CompiledComponent
 }
 
+// MethodSet is one compiled method declaration set. It is the common call
+// boundary for nested declared calls and host-initiated provider calls, so
+// both validate through the same compiled schemas.
+type MethodSet map[string]*methodContract
+
 // CompiledCapability is one resolved exported capability.
 type CompiledCapability struct {
 	Declaration *CompiledDeclaration
 	Capability
 	Component *CompiledComponent
-	Methods   map[string]*methodContract
+	Methods   MethodSet
 }
 
 // CompiledComponent is one component in the resolved construction graph.
@@ -67,7 +72,7 @@ type CompiledBinding struct {
 	Binding
 	Host    bool
 	Target  *CompiledCapability
-	Methods map[string]*methodContract
+	Methods MethodSet
 }
 
 // Compile validates every native declaration, compiles each local schema once,
@@ -205,6 +210,8 @@ func (c *Compiled) addDeclaration(declaration Declaration, index int) error {
 			return invalid("capability %q: preparation hooks require a Harness or Workspace lifetime", id)
 		case capability.Kind == KindStrategy && capability.Component.Lifetime.Rank() > LifetimeOperation.Rank():
 			return invalid("capability %q: context strategies require an Operation-or-longer lifetime", id)
+		case capability.Kind == KindService && capability.ContractID == ContractAgentDefinitions && capability.Component.Lifetime != LifetimeHarness:
+			return invalid("capability %q: agent definition resolvers require a Harness lifetime", id)
 		}
 	}
 	if err := validateEdits(compiled); err != nil {
@@ -228,7 +235,7 @@ func (c *Compiled) compileCapability(declaration *CompiledDeclaration, capabilit
 	if duplicateMethodNames(capability.Methods) {
 		return nil, invalid("capability %q: duplicate method name", capability.ID)
 	}
-	resolved := &CompiledCapability{Declaration: declaration, Capability: capability, Methods: make(map[string]*methodContract, len(capability.Methods))}
+	resolved := &CompiledCapability{Declaration: declaration, Capability: capability, Methods: make(MethodSet, len(capability.Methods))}
 	for i, method := range capability.Methods {
 		if method.Name == "" {
 			return nil, invalid("capability %q: empty method name", capability.ID)
@@ -268,6 +275,11 @@ func validateFixedContractIdentity(capability Capability) error {
 	case ContractContextStrategy:
 		if capability.ContractVersion != ContractVersion || capability.Kind != KindStrategy || !methodsStructurallyEqual(capability.Methods, strategyMethods()) {
 			return invalid("capability %q: fixed contract %s requires version %s, kind %s and its exact method definitions", capability.ID, ContractContextStrategy, ContractVersion, KindStrategy)
+		}
+		return nil
+	case ContractAgentDefinitions:
+		if capability.ContractVersion != ContractVersion || capability.Kind != KindService || !methodsStructurallyEqual(capability.Methods, agentDefinitionMethods()) {
+			return invalid("capability %q: fixed contract %s requires version %s, kind %s and its exact method definitions", capability.ID, ContractAgentDefinitions, ContractVersion, KindService)
 		}
 		return nil
 	case ContractPrompt, ContractChildLaunch:
@@ -409,7 +421,7 @@ func validateCapabilityShape(declaration *CompiledDeclaration, capability *Compi
 	return nil
 }
 
-func sameMethods(resolved map[string]*methodContract, declared []Method) bool {
+func sameMethods(resolved MethodSet, declared []Method) bool {
 	if len(resolved) != len(declared) {
 		return false
 	}
@@ -509,8 +521,8 @@ func (c *Compiled) resolveBinding(declaration *CompiledDeclaration, component *C
 	return resolved, nil
 }
 
-func compileDefinitionMethods(capabilityID string, definition CapabilityDefinition) (map[string]*methodContract, error) {
-	methods := make(map[string]*methodContract, len(definition.Methods))
+func compileDefinitionMethods(capabilityID string, definition CapabilityDefinition) (MethodSet, error) {
+	methods := make(MethodSet, len(definition.Methods))
 	for i, method := range definition.Methods {
 		compiled, err := compileMethod(capabilityID, method, i)
 		if err != nil {
@@ -780,7 +792,7 @@ func (c *Compiled) ComponentByID(extensionID, componentID string) (*CompiledComp
 
 // ValidateArguments validates one named-service call input against the exact
 // declared schema.
-func ValidateArguments(methods map[string]*methodContract, method string, arguments json.RawMessage) error {
+func ValidateArguments(methods MethodSet, method string, arguments json.RawMessage) error {
 	contract, ok := methods[method]
 	if !ok {
 		return invalid("method %q is not declared", method)
@@ -790,7 +802,7 @@ func ValidateArguments(methods map[string]*methodContract, method string, argume
 
 // ValidateResult validates one named-service result union against the exact
 // declared schemas.
-func ValidateResult(methods map[string]*methodContract, method string, result Result) error {
+func ValidateResult(methods MethodSet, method string, result Result) error {
 	contract, ok := methods[method]
 	if !ok {
 		return invalid("method %q is not declared", method)

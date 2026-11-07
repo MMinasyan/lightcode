@@ -227,17 +227,33 @@ func TestNativeImplementationProvenanceIncludesRootsAndDependencies(t *testing.T
 	consumer := nativeService("consumer", "test.consumer", extension.LifetimeHarness, func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
 		return extension.Result{Value: json.RawMessage(`{"ok":true}`)}, nil
 	}, binding)
-	agentsNative := nativeService("agents", "test.agents", extension.LifetimeHarness, func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
+	resolver := nativeService("guestdefs", "test.resolver", extension.LifetimeHarness, func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
+		return extension.Result{Value: json.RawMessage(`{}`)}, nil
+	}, binding)
+	resolver.Declaration.Version = "3"
+	unused := nativeService("agents", "test.agents", extension.LifetimeHarness, func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
 		return extension.Result{Value: json.RawMessage(`{}`)}, nil
 	})
-	c := mustComposition(t, provider, consumer, agentsNative)
-	sel := selection{selected: []string{"consumer"}, strategy: harness.StrategySelection{}, namedDefinition: true, invocation: Invocation{snapshot: &configuration{generation: 7, extensions: map[string]json.RawMessage{"consumer": json.RawMessage(`{"enabled":true,"value":9}`)}}}}
+	c := mustComposition(t, provider, consumer, resolver, unused)
+	sel := selection{
+		selected:   []string{"consumer"},
+		definition: &harness.DefinitionRef{ExtensionID: "guestdefs", CapabilityID: "guestdefs", DefinitionID: "named"},
+		invocation: Invocation{snapshot: &configuration{generation: 7, extensions: map[string]json.RawMessage{
+			"consumer":  json.RawMessage(`{"enabled":true,"value":9}`),
+			"guestdefs": json.RawMessage(`{"enabled":true,"resolver":true}`),
+		}}},
+	}
 	got := implementationProvenance(c, sel)
-	testassert.Require(t, len(got) == 3, "provenance = %+v, want the selected consumer, its provider dependency, and the named-definition owner", got)
+	testassert.Require(t, len(got) == 3, "provenance = %+v, want the selected consumer, its provider dependency, and the concrete resolver's dependency closure", got)
 	testassert.Equal(t, got[0].ExtensionID, "provider")
 	testassert.Equal(t, got[1].ExtensionID, "consumer")
 	testassert.Equal(t, string(got[1].Settings), `{"enabled":true,"value":9}`)
-	testassert.Equal(t, got[2].ExtensionID, "agents")
+	testassert.Equal(t, got[2].ExtensionID, "guestdefs")
+	testassert.Equal(t, got[2].Version, "3")
+	testassert.Equal(t, string(got[2].Settings), `{"enabled":true,"resolver":true}`)
+	for _, capture := range got {
+		testassert.Require(t, capture.ExtensionID != "agents", "unused Agents root appeared in provenance: %+v", got)
+	}
 }
 
 func TestNativeStrategyBindingUsesDeclaredMetadata(t *testing.T) {
@@ -522,7 +538,17 @@ type authorityProbe struct {
 }
 
 func childLaunchArguments(target string) json.RawMessage {
-	value, _ := json.Marshal(map[string]any{"agent_type": target, "prompt": "x", "operation_id": "op", "max_concurrent": 1, "output_limit": 1024})
+	value, _ := json.Marshal(map[string]any{
+		"definition": map[string]string{
+			"extension_id":  "agents",
+			"capability_id": "agents.definitions",
+			"definition_id": target,
+		},
+		"prompt":         "x",
+		"operation_id":   "op",
+		"max_concurrent": 1,
+		"output_limit":   1024,
+	})
 	return value
 }
 

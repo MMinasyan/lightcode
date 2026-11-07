@@ -21,7 +21,7 @@ func AgentRoster(raw json.RawMessage) ([]protocol.Agent, error) {
 		return nil, fmt.Errorf("invalid agent roster")
 	}
 	out := make([]protocol.Agent, 0, len(entries))
-	seen := make(map[string]bool, len(entries))
+	seen := make(map[protocol.DefinitionRef]bool, len(entries))
 	for _, entry := range entries {
 		var members map[string]json.RawMessage
 		if err := json.Unmarshal(entry, &members); err != nil || members == nil {
@@ -47,10 +47,10 @@ func AgentRoster(raw json.RawMessage) ([]protocol.Agent, error) {
 		var agent protocol.Agent
 		decoder := json.NewDecoder(bytes.NewReader(entry))
 		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&agent); err != nil || agent.Name == "" || seen[agent.Name] || agent.Definition.ExtensionId == "" || agent.Definition.CapabilityId == "" || agent.Definition.DefinitionId == "" {
+		if err := decoder.Decode(&agent); err != nil || agent.Name == "" || agent.Definition.ExtensionId == "" || agent.Definition.CapabilityId == "" || agent.Definition.DefinitionId == "" || seen[agent.Definition] {
 			return nil, fmt.Errorf("invalid agent roster entry")
 		}
-		seen[agent.Name] = true
+		seen[agent.Definition] = true
 		out = append(out, agent)
 	}
 	return out, nil

@@ -28,9 +28,9 @@ import (
 
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/extension"
+	"github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
-	"github.com/MMinasyan/lightcode/internal/plugins/tasks"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -69,6 +69,15 @@ const composedFlowAgentsDocument = `{
 // registered ID whose own settings document and Runtime-scoped warning the
 // mounted generated client must carry unchanged.
 const composedCustomPluginID = "custom"
+
+// composedAgentsNative is the real supplied Agents extension over the
+// shipped standard-tool universe the flow documents select.
+func composedAgentsNative() extension.Native {
+	return agents.Native(agents.Options{
+		CapabilityIDs: append([]string(nil), agents.StandardTools...),
+		ToolIDs:       append([]string(nil), agents.StandardTools...),
+	})
+}
 
 // composedCustomSettingsDocument is the custom plugin's own opaque document;
 // the exact integer lexeme must survive the whole mounted round-trip.
@@ -576,7 +585,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// endpoint is no usable owner.
 		foreign := filepath.Join(t.TempDir(), "foreign.json")
 		wrongCredential := strings.Repeat("0", 64)
-		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N10, wrongCredential))
+		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N11, wrongCredential))
 		{
 			_, err := client.Connect(ctx, foreign)
 			testassert.Require(t, errors.Is(err, client.ErrNoRuntime), "wrong-credential connect = %v, want ErrNoRuntime", err)
@@ -884,7 +893,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		settingsB := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 9, DeleteAfterArchiveDays: 5}, Tools: json.RawMessage(`{}`), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`), Extensions: protocol.ExtensionsSettings{}}
 		put := func(settings protocol.Settings) *protocol.UpdateConfigurationSettingsResponse {
 			t.Helper()
-			resp, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: settings})
+			resp, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &settings})
 			testassert.NoError(t, err)
 			return resp
 		}
@@ -896,13 +905,13 @@ func TestProtocolComposedFlow(t *testing.T) {
 		testassert.Require(t, stalePut.JSON200 != nil && stalePut.JSON200.Result.Sessions.AutoArchive && stalePut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays == 0 && compactComposed(t, stalePut.JSON200.Result.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(stalePut.JSON200.Result.Extensions[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "stale whole-section save = %+v, want the wholesale replacement back to A", stalePut.JSON200)
 		publishedGeneration := stalePut.JSON200.ConfigurationRevision.Generation
 		invalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Extensions: protocol.ExtensionsSettings{"agents": `{"enabled":true,"task":{"max_concurrent":99,"max_output_bytes":4096}}`}}
-		refused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: invalid})
+		refused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &invalid})
 		testassert.NoError(t, err)
 		testassert.Require(t, refused.JSONDefault != nil && refused.JSONDefault.Code == protocol.Configuration, "invalid settings response = %+v (status %d), want the typed configuration refusal", refused.JSONDefault, refused.HTTPResponse.StatusCode)
 		// The selected custom plugin's own validator refuses its invalid
 		// document with the same configuration class.
 		customInvalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Extensions: protocol.ExtensionsSettings{composedCustomPluginID: `{"enabled":true,"threshold":0}`}}
-		customRefused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: customInvalid})
+		customRefused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &customInvalid})
 		testassert.NoError(t, err)
 		testassert.Require(t, customRefused.JSONDefault != nil && customRefused.JSONDefault.Code == protocol.Configuration, "invalid custom settings response = %+v (status %d), want the typed configuration refusal", customRefused.JSONDefault, customRefused.HTTPResponse.StatusCode)
 		view, err := c.GetConfigurationWithResponse(ctx)
@@ -945,9 +954,24 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// configured while the provider is connected, the disconnect removes
 		// the managed key, and the following admission refuses with no
 		// published Operation.
-		selected, err := c.SetAgentTypeModelWithResponse(ctx, &protocol.SetAgentTypeModelParams{AgentType: "main"}, protocol.SetAgentTypeModelRequest{Model: "connprov/cm"})
+		editArguments, err := json.Marshal(map[string]string{"definition_id": "main", "model": "connprov/cm"})
 		testassert.NoError(t, err)
-		testassert.Require(t, selected.JSON200 != nil && selected.JSON200.Result.Model == "connprov/cm", "selected model edit = %+v, want the main roster entry's connected-provider model", selected.JSON200)
+		selected, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
+			ExtensionId: "agents",
+			EditId:      "set_model",
+			Arguments:   string(editArguments),
+		}})
+		testassert.NoError(t, err)
+		testassert.Require(t, selected.JSON200 != nil, "selected model edit = %+v, want the published mutation", selected.JSON200)
+		editedConfiguration, err := c.GetConfigurationWithResponse(ctx)
+		testassert.NoError(t, err)
+		editedModel := false
+		for _, agent := range editedConfiguration.JSON200.Agents {
+			if agent.Definition.DefinitionId == "main" && agent.Model == "connprov/cm" {
+				editedModel = true
+			}
+		}
+		testassert.Require(t, editedModel, "roster = %+v, want the main entry's connected-provider model", editedConfiguration.JSON200.Agents)
 		disconnected, err := c.DisconnectProviderWithResponse(ctx, &protocol.DisconnectProviderParams{ProviderId: "connprov"})
 		testassert.NoError(t, err)
 		testassert.Require(t, disconnected.JSON200 != nil && disconnected.JSON200.Result != nil && !disconnected.JSON200.Result.Connected, "disconnect response = %+v, want the disconnected provider view", disconnected.JSON200)
@@ -1027,7 +1051,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 
 	// The shipped composition over the included store: the composition's
 	// optional plugins ride the directly constructed baseline services.
-	run(t, []extension.Native{adaptation.Native(), tasks.Native(), composedCustomPlugin()})
+	run(t, []extension.Native{adaptation.Native(), composedAgentsNative(), composedCustomPlugin()})
 }
 
 func composedHistory(t *testing.T, c *client.Client, sessionID string, cursor *string) *protocol.HistoryPage {
@@ -1296,7 +1320,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		composedWriteFile(t, configPath, heldConfigDocument(model.URL, heldOldKeyEnv, false))
 		runtime.WriteAgentDefinitionsForTest(t, configPath, heldAgentsMain)
 
-		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []extension.Native{tasks.Native()}})
+		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []extension.Native{composedAgentsNative()}})
 		testassert.NoError(t, err)
 		store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
 		testassert.NoError(t, err)

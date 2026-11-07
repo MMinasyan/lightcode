@@ -256,13 +256,6 @@ var dispatchCases = []dispatchCase{
 		body: `{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"extensions":{"raw":"{\"n\":9007199254740993}"}}`,
 	},
 	{
-		name: "SetAgentTypeModel", operation: "SetAgentTypeModel",
-		params: `{"query":{"agent_type":"primary"},"body":{"model":"prov/m"}}`,
-		status: 200, response: `{"agent_type":"primary","selected_model":"prov/m"}`,
-		method: "PUT", path: "/v1/agent-types/model", rawQuery: "agent_type=primary",
-		body: `{"model":"prov/m"}`,
-	},
-	{
 		name: "ListModels", operation: "ListModels",
 		params: `{"query":{"all":false}}`,
 		status: 200, response: `{"models":[]}`,
@@ -385,6 +378,7 @@ var dispatchCases = []dispatchCase{
 
 func TestAgentRosterValidation(t *testing.T) {
 	valid := `{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	duplicateName := `{"name":"primary","definition":{"extension_id":"guest","capability_id":"guest.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
 	for _, row := range []struct {
 		name  string
 		raw   string
@@ -393,6 +387,8 @@ func TestAgentRosterValidation(t *testing.T) {
 	}{
 		{"empty", `{"agents":[]}`, 0, true},
 		{"supplied", `{"agents":[` + valid + `]}`, 1, true},
+		{"duplicate display names", `{"agents":[` + valid + `,` + duplicateName + `]}`, 2, true},
+		{"foreign-only primary", `{"agents":[` + duplicateName + `]}`, 1, true},
 		{"absent", `{}`, 0, false},
 		{"null", `{"agents":null}`, 0, false},
 		{"incomplete", `{"agents":[{"name":"primary"}]}`, 0, false},
@@ -439,6 +435,26 @@ func TestCallDispatchesEveryOperation(t *testing.T) {
 	for _, name := range names {
 		testassert.Check(t, seen[name], "supported operation %q has no dispatch case", name)
 	}
+}
+
+// TestCallDispatchesSettingsExtensionEdit drives the second arm of the
+// settings/extension-edit request union through the same generated operation:
+// the edit's document string is carried as exact text and only the declared
+// request is sent.
+func TestCallDispatchesSettingsExtensionEdit(t *testing.T) {
+	c, doer := newScriptFixture(t)
+	response := `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"3"},"result":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"extensions":{}}}`
+	doer.respond = func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(200, response), nil
+	}
+	params := json.RawMessage(`{"body":{"extension_edit":{"extension_id":"agents","edit_id":"set_model","arguments":"{\"definition_id\":\"primary\",\"model\":\"prov/m\"}"}}}`)
+	result, err := clientops.Call(context.Background(), c, "UpdateConfigurationSettings", params)
+	testassert.Require(t, err == nil, "Call(UpdateConfigurationSettings extension edit) = %v", err)
+	call := doer.one(t)
+	testassert.Equal(t, call.method, "PUT")
+	testassert.Equal(t, call.path, "/v1/configuration/settings")
+	testassert.Equal(t, call.body, `{"extension_edit":{"extension_id":"agents","edit_id":"set_model","arguments":"{\"definition_id\":\"primary\",\"model\":\"prov/m\"}"}}`)
+	testassert.Equal(t, string(result), response)
 }
 
 // TestCallAcceptsEmptyEnvelopePositives pins the operations whose declared

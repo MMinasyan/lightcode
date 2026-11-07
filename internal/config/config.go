@@ -1,6 +1,6 @@
 // Package config loads the Lightcode config file and resolves process-level
 // settings. Provider/model metadata is owned by internal/catalog and
-// internal/agents; this package keeps only non-model runtime sections.
+// extensions/agents; this package keeps only non-model runtime sections.
 //
 // Secrets are env vars. They are loaded at startup from ~/.lightcode/.env (if
 // present) or inherited from the shell. They are never written to config.json

@@ -104,7 +104,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 			t.Fatalf("decode versioned health: %v", err)
 		}
 		versionedResponse.Body.Close()
-		testassert.Equal(t, health.ProtocolVersion, protocol.N10)
+		testassert.Equal(t, health.ProtocolVersion, protocol.N11)
 	})
 }
 

@@ -215,10 +215,6 @@ func (c *composition) dispatch(ctx context.Context, caller extension.CallContext
 	if provider == nil {
 		return extension.Result{}, fmt.Errorf("binding %q: provider is unavailable: %w", bindingName, ErrClosed)
 	}
-	callCtx, release, err := provider.scope.enterFor(ctx, grant.lifecycle)
-	if err != nil {
-		return extension.Result{}, err
-	}
 	pure := grant.pure || method.Mode == extension.ModePure
 	childIdentity := callIdentity{
 		session:      harness.SessionIdentity{SessionID: caller.SessionID},
@@ -232,19 +228,53 @@ func (c *composition) dispatch(ctx context.Context, caller extension.CallContext
 		caller:       extension.CallerIdentity{ExtensionID: caller.ExtensionID, ComponentID: caller.ComponentID, InstanceID: caller.InstanceID},
 		grant:        nativeGrant{permissions: grant.permissions, pure: pure, lifecycle: grant.lifecycle},
 	}
-	child, childCall := c.newView(provider, callCtx, childIdentity)
+	return c.invokeProvider(ctx, provider, binding.Methods, methodName, arguments, nil, childIdentity, grant.lifecycle)
+}
+
+// invokeProvider runs one declared provider method under the provider scope's
+// guard: the same argument/result validation, private pure view and result
+// ownership as a nested declared call. Host-initiated resolver and
+// configuration-edit calls use this one path with the provider's own compiled
+// methods; a direct caller may override the captured section, never the
+// authority.
+func (c *composition) invokeProvider(ctx context.Context, provider *capabilityValue, methods extension.MethodSet, method string, arguments, section json.RawMessage, identity callIdentity, lifecycle bool) (extension.Result, error) {
+	if provider == nil {
+		return extension.Result{}, ErrClosed
+	}
+	contract, ok := provider.capability.Methods[method]
+	if !ok {
+		return extension.Result{}, fmt.Errorf("capability %q: method %q is not declared: %w", provider.capability.ID, method, ErrComposition)
+	}
+	if identity.grant.pure && contract.Mode != extension.ModePure {
+		return extension.Result{}, fmt.Errorf("capability %q: pure callback cannot invoke %s method %q: %w", provider.capability.ID, contract.Mode, method, ErrComposition)
+	}
+	arguments = append(json.RawMessage(nil), arguments...)
+	if err := extension.ValidateArguments(methods, method, arguments); err != nil {
+		return extension.Result{}, fmt.Errorf("%w: %w", ErrComposition, err)
+	}
+	callCtx, release, err := provider.scope.enterFor(ctx, lifecycle)
+	if err != nil {
+		return extension.Result{}, err
+	}
+	if identity.revision == "" {
+		identity.revision = provider.scope.info.Revision
+	}
+	child, childCall := c.newView(provider, callCtx, identity)
 	child.release = release
 	defer child.end()
-	handler := provider.implementation.Service[methodName]
+	if section != nil {
+		childCall.Section = append(json.RawMessage(nil), section...)
+	}
+	handler := provider.implementation.Service[method]
 	if handler == nil {
-		return extension.Result{}, fmt.Errorf("capability %q: method %q has no implementation: %w", provider.capability.ID, methodName, ErrComposition)
+		return extension.Result{}, fmt.Errorf("capability %q: method %q has no implementation: %w", provider.capability.ID, method, ErrComposition)
 	}
 	result, err := handler(child.ctx, childCall, arguments)
 	if err != nil {
 		return extension.Result{}, err
 	}
 	result = ownResult(result)
-	if err := extension.ValidateResult(binding.Methods, methodName, result); err != nil {
+	if err := extension.ValidateResult(methods, method, result); err != nil {
 		return extension.Result{}, fmt.Errorf("capability %q: %w", provider.capability.ID, err)
 	}
 	return result, nil

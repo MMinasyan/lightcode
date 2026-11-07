@@ -1,13 +1,13 @@
 # Lightcode Runtime protocol — the single source of truth for HTTP paths,
 # request/response DTOs, closed enums, error payloads, and SSE event frames.
-# Wire version "8" is the protocol identity, independent of the binary
+# The wire version is the protocol identity, independent of the binary
 # release version. This file is hand-maintained; the Go and TypeScript
 # artifacts under protocol/ and frontend/src/generated/protocol/ are
 # generated from it and are never hand-edited.
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "10"
+  version: "11"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -383,30 +383,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SettingsMutation"
-        default:
-          $ref: "#/components/responses/Error"
-  /v1/agent-types/model:
-    put:
-      operationId: SetAgentTypeModel
-      parameters:
-        - name: agent_type
-          in: query
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/SetAgentTypeModelRequest"
-      responses:
-        "200":
-          description: The updated Agent roster entry under the mutation envelope.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AgentMutation"
         default:
           $ref: "#/components/responses/Error"
   /v1/models:
@@ -858,7 +834,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "10"
+            - "11"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -2055,12 +2031,33 @@ components:
           $ref: "#/components/schemas/ConfigurationRevision"
     UpdateSettingsRequest:
       type: object
+      description: >-
+        Exactly one of the complete settings shape or one declared extension
+        configuration edit; the accepting owner rejects zero or both.
       additionalProperties: false
-      required:
-        - settings
       properties:
         settings:
           $ref: "#/components/schemas/Settings"
+        extension_edit:
+          $ref: "#/components/schemas/ExtensionEdit"
+    ExtensionEdit:
+      type: object
+      additionalProperties: false
+      required:
+        - extension_id
+        - edit_id
+        - arguments
+      properties:
+        extension_id:
+          type: string
+          minLength: 1
+        edit_id:
+          type: string
+          minLength: 1
+        arguments:
+          type: string
+          description: >-
+            The edit call's JSON document, carried as exact text.
     SettingsMutation:
       type: object
       additionalProperties: false
@@ -2072,25 +2069,6 @@ components:
           $ref: "#/components/schemas/ConfigurationRevision"
         result:
           $ref: "#/components/schemas/Settings"
-    SetAgentTypeModelRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - model
-      properties:
-        model:
-          $ref: "#/components/schemas/ModelRef"
-    AgentMutation:
-      type: object
-      additionalProperties: false
-      required:
-        - configuration_revision
-        - result
-      properties:
-        configuration_revision:
-          $ref: "#/components/schemas/ConfigurationRevision"
-        result:
-          $ref: "#/components/schemas/Agent"
     Cost:
       type: object
       additionalProperties: false

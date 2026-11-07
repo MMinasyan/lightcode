@@ -10,11 +10,10 @@ import (
 	"slices"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -355,82 +354,67 @@ func settingsSection(raw json.RawMessage) json.RawMessage {
 	return append(json.RawMessage(nil), raw...)
 }
 
-// editAgentModel applies the retained model-field mutation to the latest
-// extensions.agents.definitions member: a nonempty ref replaces the user model override, an
-// empty ref clears it. Every successful set or clear — absent override and
-// identical bytes included — is a real edit that writes the owning file and
-// publishes the next generation; the retained public field reset operator
-// carries the same shared publication rule. The known-type check resolves
-// the latest raw
-// bytes' definitions through the ordinary admission projection, so unknown
-// or dropped/invalid types fail harness.ErrInvalid before any bare
-// definition is created; builtins that need no explicit user entry stay
-// addressable.
-func (s *configurationService) editAgentModel(agentType, ref string) configurationEdit {
-	return configurationEdit{apply: func(roots rawRoots, _ configurationCapture) (editedFile, error) {
+// editExtension invokes one installed active extension's declared pure
+// configuration edit over the latest raw owning section and replaces only
+// that extension's member. The top-level call retains one short resource
+// reservation; the provider call reuses the prepared Harness instance through
+// the one guarded provider path. The writer's build serialization stays held,
+// no publication/capture mutex is held during the callback, and every other
+// extension document keeps its exact bytes.
+func (s *configurationService) editExtension(ctx context.Context, extensionID, editID string, arguments json.RawMessage) configurationEdit {
+	return configurationEdit{apply: func(roots rawRoots, seed configurationCapture) (editedFile, error) {
 		if len(roots.config["extensions"]) == 0 {
-			return 0, fmt.Errorf("agents extension is unavailable: %w", harness.ErrInvalid)
+			return 0, fmt.Errorf("extension %q is unavailable: %w", extensionID, harness.ErrInvalid)
 		}
 		extensions, err := decodeRoot(roots.config["extensions"])
 		if err != nil {
 			return 0, configurationFailure(err)
 		}
-		if !s.nativeIDs["agents"] || !sectionEnabled(extensions["agents"]) {
-			return 0, fmt.Errorf("agents extension is unavailable: %w", harness.ErrInvalid)
+		if !s.nativeIDs[extensionID] || !sectionEnabled(extensions[extensionID]) {
+			return 0, fmt.Errorf("extension %q is unavailable: %w", extensionID, harness.ErrInvalid)
 		}
-		section, err := decodeRoot(extensions["agents"])
-		if err != nil {
-			return 0, configurationFailure(err)
+		if seed.snapshot == nil || seed.snapshot.composition == nil || seed.snapshot.resources == nil || seed.snapshot.resources.runtime == nil {
+			return 0, fmt.Errorf("extension %q is unavailable: %w", extensionID, harness.ErrInvalid)
 		}
-		agentsRoot := map[string]json.RawMessage{}
-		if len(section["definitions"]) != 0 {
-			agentsRoot, err = decodeRoot(section["definitions"])
-			if err != nil {
-				return 0, configurationFailure(err)
+		declaration, ok := seed.snapshot.composition.compiled.Declaration(extensionID)
+		if !ok {
+			return 0, fmt.Errorf("extension %q is unavailable: %w", extensionID, harness.ErrInvalid)
+		}
+		var edit *extension.ConfigurationEdit
+		for i := range declaration.Declaration.Edits {
+			if declaration.Declaration.Edits[i].ID == editID {
+				edit = &declaration.Declaration.Edits[i]
+				break
 			}
 		}
-		if ref != "" {
-			if _, err := model.Parse(ref); err != nil {
-				return 0, fmt.Errorf("model ref %q: %v: %w", ref, err, harness.ErrInvalid)
+		if edit == nil {
+			return 0, fmt.Errorf("extension %q does not declare configuration edit %q: %w", extensionID, editID, harness.ErrInvalid)
+		}
+		capability, ok := declaration.Capabilities[edit.Method.CapabilityID]
+		if !ok {
+			return 0, fmt.Errorf("extension %q edit %q: capability %q is unavailable: %w", extensionID, editID, edit.Method.CapabilityID, harness.ErrInvalid)
+		}
+		value, ok := seed.snapshot.resources.runtime.capabilities[edit.Method.CapabilityID]
+		if !ok {
+			return 0, fmt.Errorf("extension %q edit %q: provider is unavailable: %w", extensionID, editID, ErrClosed)
+		}
+		seed.snapshot.resources.retain()
+		defer func() { _ = seed.snapshot.resources.release() }()
+		identity := callIdentity{revision: seed.snapshot.resources.revisionString(), grant: nativeGrant{pure: true}}
+		result, err := seed.snapshot.composition.invokeProvider(ctx, value, capability.Methods, edit.Method.Method, arguments, extensions[extensionID], identity, false)
+		if err != nil {
+			// The host-initiated call's argument document is caller input;
+			// its compiled-schema refusal is an invalid request, not an
+			// internal composition failure.
+			if errors.Is(err, ErrComposition) {
+				return 0, fmt.Errorf("%w: %w", err, harness.ErrInvalid)
 			}
-		}
-		data, err := json.Marshal(agentsRoot)
-		if err != nil {
 			return 0, err
 		}
-		parsed, err := agents.ParseWithCapabilities(data, s.capabilityIDs, s.toolIDs, s.defaultCapabilityIDs)
-		if err != nil {
-			return 0, configurationFailure(err)
+		if result.Failure != nil {
+			return 0, fmt.Errorf("%s: %s", result.Failure.Code, result.Failure.Message)
 		}
-		if _, err := resolveAgentType(agentType, projectAgentTypes(parsed.All())); err != nil {
-			return 0, err
-		}
-		var fields map[string]json.RawMessage
-		if raw, ok := agentsRoot[agentType]; ok {
-			if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
-				return 0, fmt.Errorf("agents.%s must be an object: %w", agentType, harness.ErrInvalid)
-			}
-		} else {
-			fields = map[string]json.RawMessage{}
-		}
-		if ref == "" {
-			delete(fields, "model")
-		} else {
-			if fields["model"], err = json.Marshal(ref); err != nil {
-				return 0, err
-			}
-		}
-		if agentsRoot[agentType], err = json.Marshal(fields); err != nil {
-			return 0, err
-		}
-		section["definitions"], err = json.Marshal(agentsRoot)
-		if err != nil {
-			return 0, err
-		}
-		extensions["agents"], err = json.Marshal(section)
-		if err != nil {
-			return 0, err
-		}
+		extensions[extensionID] = append(json.RawMessage(nil), result.Value...)
 		roots.config["extensions"], err = marshalRawObject(extensions, true)
 		if err != nil {
 			return 0, err

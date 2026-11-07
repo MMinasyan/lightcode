@@ -299,7 +299,7 @@ func (e *productionEnv) openPlugins(ctx context.Context, natives ...extension.Na
 		}
 	}
 	if !hasAgents && sectionEnabled(doc.Extensions["agents"]) {
-		natives = append(natives, fixtureAgentPlugin())
+		natives = append(natives, fixtureAgentPlugin(natives...))
 	}
 	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: natives, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
 }
@@ -963,8 +963,8 @@ func TestProductionHookCapture(t *testing.T) {
 }
 
 // TestProductionHostDefaultCapabilitiesSelectContribution proves the
-// application-supplied default capability IDs travel from public Open through
-// configuration loading: a definition with no explicit selection inherits the
+// application-supplied default capability selection travels through the
+// Agents constructor: a definition with no explicit selection inherits the
 // host's default and its ordinary preparation contribution runs.
 func TestProductionHostDefaultCapabilitiesSelectContribution(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
@@ -972,11 +972,12 @@ func TestProductionHostDefaultCapabilitiesSelectContribution(t *testing.T) {
 		writeAgentDefinitions(t, e.configPath, `{"defaulted":{"model":"prov/m","system_prompt":"simple","tools":["prod_write"]}}`)
 		enableFixturePlugin(t, e.configPath, "prodtools")
 		useFixtureStore(t, e.store)
+		tools := productionToolsPlugin()
+		hooks := hookPlugin(e.hookedHook())
 		r, err := Open(ctx, Options{
-			DataDir:              e.dataDir,
-			ConfigPath:           e.configPath,
-			Plugins:              []extension.Native{productionToolsPlugin(), hookPlugin(e.hookedHook()), fixtureAgentPlugin()},
-			DefaultCapabilityIDs: []string{"hook.first"},
+			DataDir:    e.dataDir,
+			ConfigPath: e.configPath,
+			Plugins:    []extension.Native{tools, hooks, agentsTestNativeWithDefaults([]string{"hook.first"}, tools, hooks)},
 		})
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
@@ -986,6 +987,35 @@ func TestProductionHostDefaultCapabilitiesSelectContribution(t *testing.T) {
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
 		testassert.Require(t, slices.Equal(rec.Admission.Execution.Capabilities, []string{"hook.first"}), "defaulted capabilities = %v, want the host-selected default", rec.Admission.Execution.Capabilities)
 		testassert.Require(t, strings.HasSuffix(rec.Admission.Execution.SystemPrompt, "|hooked"), "defaulted prompt = %.120s, want the selected contribution applied", rec.Admission.Execution.SystemPrompt)
+	})
+}
+
+// TestProductionDefaultCapabilityForDisabledContributionFailsAdmission proves
+// the constructor default is an unchecked selection: naming a registered but
+// inactive capability opens the Runtime normally and rejects the later
+// admission with no Operation published.
+func TestProductionDefaultCapabilityForDisabledContribution(t *testing.T) {
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		writeAgentDefinitions(t, e.configPath, `{"defaulted":{"model":"prov/m","system_prompt":"simple","tools":["prod_write"]}}`)
+		enableFixturePlugin(t, e.configPath, "prodtools")
+		useFixtureStore(t, e.store)
+		tools := productionToolsPlugin()
+		hooks := hookPlugin(e.hookedHook())
+		park := parkPlugin(&parkingHook{})
+		// The fixture enables hooks only; park stays installed but inactive.
+		r, err := Open(ctx, Options{
+			DataDir:    e.dataDir,
+			ConfigPath: e.configPath,
+			Plugins:    []extension.Native{tools, hooks, park, agentsTestNativeWithDefaults([]string{"park.second"}, tools, hooks, park)},
+		})
+		testassert.NoError(t, err)
+		defer r.Close(ctx)
+		session, err := r.createSession(ctx, e.workspace("disabled-default-ws"), "defaulted")
+		testassert.NoError(t, err)
+		_, err = submitRawThroughRuntime(ctx, r, session.Identity.SessionID, "op-disabled", "hello", harness.MessageModeRegular)
+		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "disabled default submit = %v, want harness.ErrInvalid", err)
+		testassert.Require(t, errors.Is(readOperationError(ctx, r, session.Identity.SessionID, "op-disabled"), harness.ErrNotFound), "disabled default published an operation")
 	})
 }
 

@@ -51,7 +51,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '10';
+    protocol_version: '11';
 };
 
 /**
@@ -554,22 +554,26 @@ export type RevisionResponse = {
     configuration_revision: ConfigurationRevision;
 };
 
+/**
+ * Exactly one of the complete settings shape or one declared extension configuration edit; the accepting owner rejects zero or both.
+ */
 export type UpdateSettingsRequest = {
-    settings: Settings;
+    settings?: Settings;
+    extension_edit?: ExtensionEdit;
+};
+
+export type ExtensionEdit = {
+    extension_id: string;
+    edit_id: string;
+    /**
+     * The edit call's JSON document, carried as exact text.
+     */
+    arguments: string;
 };
 
 export type SettingsMutation = {
     configuration_revision: ConfigurationRevision;
     result: Settings;
-};
-
-export type SetAgentTypeModelRequest = {
-    model: ModelRef;
-};
-
-export type AgentMutation = {
-    configuration_revision: ConfigurationRevision;
-    result: Agent;
 };
 
 export type Cost = {
@@ -1455,33 +1459,6 @@ export type UpdateConfigurationSettingsResponses = {
 };
 
 export type UpdateConfigurationSettingsResponse = UpdateConfigurationSettingsResponses[keyof UpdateConfigurationSettingsResponses];
-
-export type SetAgentTypeModelData = {
-    body: SetAgentTypeModelRequest;
-    path?: never;
-    query: {
-        agent_type: string;
-    };
-    url: '/v1/agent-types/model';
-};
-
-export type SetAgentTypeModelErrors = {
-    /**
-     * One schema-defined typed error.
-     */
-    default: Error;
-};
-
-export type SetAgentTypeModelError = SetAgentTypeModelErrors[keyof SetAgentTypeModelErrors];
-
-export type SetAgentTypeModelResponses = {
-    /**
-     * The updated Agent roster entry under the mutation envelope.
-     */
-    200: AgentMutation;
-};
-
-export type SetAgentTypeModelResponse = SetAgentTypeModelResponses[keyof SetAgentTypeModelResponses];
 
 export type ListModelsData = {
     body?: never;

@@ -39,11 +39,11 @@ func implementationProvenance(c *composition, sel selection) []harness.Implement
 	for _, id := range sel.selected {
 		add(id)
 	}
-	if sel.strategy.ID != "" {
-		add(sel.strategy.ID)
+	if sel.inputs.Strategy.ID != "" {
+		add(sel.inputs.Strategy.ID)
 	}
-	if sel.namedDefinition {
-		roots["agents"] = true
+	if sel.definition != nil {
+		add(sel.definition.CapabilityID)
 	}
 	var out []harness.ImplementationCapture
 	for _, declaration := range c.compiled.Declarations() {
@@ -63,13 +63,6 @@ func selectedCapability(scopes []*scope, id string) (*capabilityValue, bool) {
 		}
 	}
 	return nil, false
-}
-
-func selectedStrategy(chosen harness.AgentSelection) harness.StrategySelection {
-	if chosen.Inputs != nil {
-		return chosen.Inputs.Strategy
-	}
-	return harness.StrategySelection{}
 }
 
 // resolveStrategyBinding selects the execution's strategy.
@@ -246,7 +239,7 @@ func bindToolArgumentHooks(sel selection, base callIdentity) []harness.ToolArgum
 	composition := sel.invocation.snapshot.composition
 	base.revision = sel.invocation.Revision()
 	var hooks []harness.ToolArgumentsHook
-	for _, id := range sel.agent.Capabilities {
+	for _, id := range sel.inputs.Capabilities {
 		value, ok := selectedCapability(sel.scopes, id)
 		if !ok {
 			continue
@@ -292,7 +285,7 @@ func bindRequestHooks(sel selection, base callIdentity) []harness.RequestHook {
 	composition := sel.invocation.snapshot.composition
 	base.revision = sel.invocation.Revision()
 	var hooks []harness.RequestHook
-	for _, id := range sel.agent.Capabilities {
+	for _, id := range sel.inputs.Capabilities {
 		value, ok := selectedCapability(sel.scopes, id)
 		if !ok {
 			continue
@@ -337,7 +330,7 @@ func bindToolOutputHooks(sel selection, base callIdentity) []harness.ToolOutputH
 	composition := sel.invocation.snapshot.composition
 	base.revision = sel.invocation.Revision()
 	var hooks []harness.ToolOutputHook
-	for _, id := range sel.agent.Capabilities {
+	for _, id := range sel.inputs.Capabilities {
 		value, ok := selectedCapability(sel.scopes, id)
 		if !ok {
 			continue

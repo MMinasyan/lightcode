@@ -15,7 +15,7 @@ import (
 type ToolConstraints = harness.ToolConstraints
 
 func wireSelection(name string) *protocol.AgentSelection {
-	value := projectAgentSelection(suppliedDefinition(name))
+	value := projectAgentSelection(harness.AgentSelection{Definition: &harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: name}})
 	return &value
 }
 
@@ -52,7 +52,7 @@ func ConfiguredInvocationForTest(tools, jobs, compaction string, sections map[st
 		Compaction: json.RawMessage(compaction),
 		Extensions: plugins,
 	}
-	snapshot, err := newConfiguration(1, doc, catalog.BuildResult{}, []byte("{}"), nil, nil, nil, nil)
+	snapshot, err := newConfiguration(1, doc, catalog.BuildResult{}, nil)
 	if err != nil {
 		return Invocation{}, err
 	}
@@ -77,18 +77,31 @@ func GetWarningsForTest(r *Runtime) (protocol.WarningsSnapshot, error) {
 	return r.getWarnings(context.Background())
 }
 
-// UpdateSettingsForTest bridges the private settings mutation — the
-// whole-shape configuration writer — for the external composition tests that
-// compose the real plugin validators. It is absent from production builds.
+// UpdateSettingsForTest bridges the private settings/extension-edit mutation —
+// the whole-shape configuration writer — for the external composition tests
+// that compose the real plugin validators. It is absent from production
+// builds.
 func UpdateSettingsForTest(r *Runtime, settings protocol.Settings) (protocol.SettingsMutation, error) {
-	return r.updateSettings(context.Background(), settings)
+	return r.updateSettings(context.Background(), protocol.UpdateSettingsRequest{Settings: &settings})
 }
 
-// SetAgentTypeModelForTest bridges the private Agent-model mutation for the
-// external composition tests that compose the real agent roster. It is
-// absent from production builds.
-func SetAgentTypeModelForTest(r *Runtime, agentType, modelRef string) (protocol.AgentMutation, error) {
-	return r.setAgentTypeModel(context.Background(), agentType, modelRef)
+// SetAgentDefinitionModelForTest drives the supplied set_model configuration edit
+// through the public UpdateSettings extension-edit arm for the external
+// composition tests that compose the real agent roster. It is absent from
+// production builds.
+func SetAgentDefinitionModelForTest(r *Runtime, agentType, modelRef string) (protocol.SettingsMutation, error) {
+	arguments, err := json.Marshal(struct {
+		DefinitionID string `json:"definition_id"`
+		Model        string `json:"model"`
+	}{DefinitionID: agentType, Model: modelRef})
+	if err != nil {
+		return protocol.SettingsMutation{}, err
+	}
+	return r.updateSettings(context.Background(), protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
+		ExtensionId: "agents",
+		EditId:      "set_model",
+		Arguments:   string(arguments),
+	}})
 }
 
 // createSession is the test-build root Session creation bridge: it enters
@@ -99,7 +112,7 @@ func (r *Runtime) createSession(ctx context.Context, workspace, agentType string
 	var record harness.SessionRecord
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 		var err error
-		record, err = r.createSessionRecord(ctx, h, workspace, suppliedDefinition(agentType))
+		record, err = r.createSessionRecord(ctx, h, workspace, harness.AgentSelection{Definition: &harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: agentType}})
 		return err
 	}); err != nil {
 		return harness.SessionRecord{}, err

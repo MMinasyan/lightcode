@@ -47,17 +47,10 @@ const (
 // publication carries its passive configuration event inside the same
 // observation section as its atomic Store.
 type configurationService struct {
-	loader        *catalog.Loader
-	configPath    string
-	natives       []extension.Native
-	nativeIDs     map[string]bool
-	capabilityIDs []string
-	toolIDs       []string
-
-	// defaultCapabilityIDs is the application-supplied default capability
-	// selection installed on the built-in primary definition before ordinary
-	// inheritance. No plugin callback supplies it and no type is privileged.
-	defaultCapabilityIDs []string
+	loader     *catalog.Loader
+	configPath string
+	natives    []extension.Native
+	nativeIDs  map[string]bool
 
 	owner       context.Context
 	obs         *observation
@@ -102,26 +95,22 @@ type configurationCapture struct {
 
 // newConfigurationService binds the service to the composition's owned
 // declarations, the Loader rooted at the home the Runtime resolved once, the
-// Runtime owner context, the Runtime's passive observation, and the
-// application-selected default capability IDs. Neither DataDir nor ConfigPath
+// Runtime owner context, and the Runtime's passive observation. Neither DataDir nor ConfigPath
 // relocates the home-based discovery cache or its locks and TTL records, and
 // the service reads no dotenv: that belongs to Runtime startup, not to any
 // build or reload.
-func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configPath string, obs *observation, defaultCapabilityIDs []string) *configurationService {
+func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configPath string, obs *observation) *configurationService {
 	nativeIDs := make(map[string]bool, len(c.natives))
 	for _, native := range c.natives {
 		nativeIDs[native.Declaration.ID] = true
 	}
 	return &configurationService{
-		loader:               loader,
-		configPath:           configPath,
-		natives:              c.natives,
-		nativeIDs:            nativeIDs,
-		capabilityIDs:        c.capabilityIDs,
-		toolIDs:              c.toolIDs,
-		defaultCapabilityIDs: append([]string(nil), defaultCapabilityIDs...),
-		owner:                owner,
-		obs:                  obs,
+		loader:     loader,
+		configPath: configPath,
+		natives:    c.natives,
+		nativeIDs:  nativeIDs,
+		owner:      owner,
+		obs:        obs,
 	}
 }
 
@@ -264,7 +253,6 @@ func (s *configurationService) commit(candidate *configuration) configurationCap
 		if s.warnings != nil {
 			warningChanged = s.warnings.setGlobal(setupSource, setupWarnings(candidate, credentials)) || warningChanged
 			warningChanged = s.warnings.setGlobal(catalogSource, catalogWarnings(candidate.catalogWarnings)) || warningChanged
-			warningChanged = s.warnings.setGlobal(agentsSource, agentWarnings(candidate.agentWarnings)) || warningChanged
 		}
 		var events []Event
 		if candidate.resources != nil && (previous == nil || previous.resources != candidate.resources) {
@@ -352,19 +340,6 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 	if err != nil {
 		return nil, configurationFailure(err)
 	}
-	agentsActive := s.nativeIDs["agents"] && sectionEnabled(doc.Extensions["agents"])
-	agentsData := []byte("{}")
-	if agentsActive {
-		var section struct {
-			Definitions json.RawMessage `json:"definitions"`
-		}
-		if err := json.Unmarshal(doc.Extensions["agents"], &section); err != nil {
-			return nil, configurationFailure(err)
-		}
-		if len(section.Definitions) != 0 {
-			agentsData = section.Definitions
-		}
-	}
 	var built catalog.BuildResult
 	if conn == nil {
 		built, err = s.loader.LoadCaptured(ctx, doc.Providers)
@@ -377,21 +352,21 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 		}
 		return nil, configurationFailure(err)
 	}
-	snapshot, err := newConfiguration(generation, doc, built, agentsData, s.capabilityIDs, s.toolIDs, s.defaultCapabilityIDs, captureWorkspacePermissions())
+	snapshot, err := newConfiguration(generation, doc, built, captureWorkspacePermissions())
 	if err != nil {
 		return nil, configurationFailure(err)
-	}
-	if !agentsActive {
-		snapshot.definitions = nil
-		snapshot.agentWarnings = nil
-	} else if len(snapshot.agentWarnings) != 0 {
-		return nil, configurationFailure(snapshot.agentWarnings[0])
 	}
 	snapshot.composition = graph
 	if err := s.validateExtensions(ctx, graph, doc.Extensions); err != nil {
 		return nil, err
 	}
 	if err := s.prepareResources(ctx, snapshot); err != nil {
+		return nil, err
+	}
+	if err := s.projectDefinitions(ctx, snapshot); err != nil {
+		if fresh := s.freshResources(snapshot); fresh != nil {
+			_ = fresh.release()
+		}
 		return nil, err
 	}
 	return snapshot, nil

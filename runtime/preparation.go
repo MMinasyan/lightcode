@@ -37,12 +37,11 @@ type openInvocation func(context.Context, harness.OperationAdmission, selection,
 // whose supplying scope is not open yet is absent from the preparation view
 // and present in the execution view; neither selection is ever rebound.
 type selection struct {
-	agent           agentType
-	scopes          []*scope
-	selected        []string
-	strategy        harness.StrategySelection
-	namedDefinition bool
-	invocation      Invocation
+	inputs     harness.AgentInputs
+	definition *harness.DefinitionRef
+	scopes     []*scope
+	selected   []string
+	invocation Invocation
 
 	// credentials is the preparation's one captured credential observation
 	// set, sampled with the same capture as the Invocation's snapshot: the
@@ -187,50 +186,53 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		if snapshot == nil {
 			return harness.PreparedExecution{}, fmt.Errorf("agent has no published configuration: %w", harness.ErrInvalid)
 		}
-		var agent agentType
+		var inputs harness.AgentInputs
+		var definition *harness.DefinitionRef
+		name := "resolved inputs"
 		chosen := req.Session.AgentSelection
 		if chosen.Definition != nil {
-			ref := chosen.Definition
-			if ref.ExtensionID != "agents" || ref.CapabilityID != "agents.definitions" {
-				return harness.PreparedExecution{}, fmt.Errorf("unknown definition resolver: %w", harness.ErrInvalid)
-			}
-			agent, err = resolveAgentType(ref.DefinitionID, snapshot.agentTypes())
+			ref := *chosen.Definition
+			inputs, err = resolveDefinition(ctx, snapshot, ref)
 			if err != nil {
 				return harness.PreparedExecution{}, err
 			}
+			definition = &ref
+			name = ref.DefinitionID
 		} else if chosen.Inputs != nil {
-			input := chosen.Inputs
-			agent = agentType{Model: input.Model, SystemPrompt: input.AssemblyMode, Prompt: input.Instructions, Tools: input.Tools, Capabilities: input.Capabilities, Readonly: input.Constraints.Readonly, WriteDir: input.Constraints.WriteDir}
-			if input.Strategy.ID != "" {
-				capability, ok := snapshot.composition.compiled.Capability(input.Strategy.ID)
-				if !ok || capability.Kind != extension.KindStrategy {
-					return harness.PreparedExecution{}, fmt.Errorf("unknown strategy %q: %w", input.Strategy.ID, harness.ErrInvalid)
-				}
-				if capability.Component.Lifetime.Rank() > extension.LifetimeOperation.Rank() {
-					return harness.PreparedExecution{}, fmt.Errorf("strategy %q is shorter-lived than an Operation: %w", input.Strategy.ID, harness.ErrInvalid)
-				}
-			}
+			inputs = chosen.Inputs.Owned()
 		} else {
 			return harness.PreparedExecution{}, fmt.Errorf("invalid agent selection: %w", harness.ErrInvalid)
 		}
-		if err := harness.ValidateAgentInputs(harness.AgentInputs{Model: agent.Model, AssemblyMode: agent.SystemPrompt, Tools: agent.Tools, Capabilities: agent.Capabilities}); err != nil {
+		if err := harness.ValidateAgentInputs(inputs); err != nil {
 			return harness.PreparedExecution{}, fmt.Errorf("agent inputs: %v: %w", err, harness.ErrInvalid)
+		}
+		// A selected strategy's declared capability and lifetime are one
+		// admission rule for both selection forms; the concrete open
+		// implementation is resolved later under the execution guard.
+		if inputs.Strategy.ID != "" {
+			capability, ok := snapshot.composition.compiled.Capability(inputs.Strategy.ID)
+			if !ok || capability.Kind != extension.KindStrategy {
+				return harness.PreparedExecution{}, fmt.Errorf("unknown strategy %q: %w", inputs.Strategy.ID, harness.ErrInvalid)
+			}
+			if capability.Component.Lifetime.Rank() > extension.LifetimeOperation.Rank() {
+				return harness.PreparedExecution{}, fmt.Errorf("strategy %q is shorter-lived than an Operation: %w", inputs.Strategy.ID, harness.ErrInvalid)
+			}
 		}
 		// Every selected capability must exist in the compiled export table
 		// before admission. A selected binding that belongs to a shorter
 		// lifetime is still compiled here and correctly binds only when its
 		// scope opens; only an ID that no declaration owns is rejected.
-		for _, id := range agent.Capabilities {
+		for _, id := range inputs.Capabilities {
 			if _, ok := snapshot.composition.exports[id]; !ok {
-				return harness.PreparedExecution{}, fmt.Errorf("agent type %q selects undeclared capability %q: %w", agent.Name, id, harness.ErrInvalid)
+				return harness.PreparedExecution{}, fmt.Errorf("agent type %q selects undeclared capability %q: %w", name, id, harness.ErrInvalid)
 			}
 		}
-		for _, id := range agent.Tools {
+		for _, id := range inputs.Tools {
 			if _, ok := snapshot.composition.toolSpec(id); !ok {
 				return harness.PreparedExecution{}, fmt.Errorf("selected tool %q is unavailable: %w", id, harness.ErrInvalid)
 			}
 		}
-		if err := requireCatalogModel(snapshot, agent.Model); err != nil {
+		if err := requireCatalogModel(snapshot, inputs.Model); err != nil {
 			return harness.PreparedExecution{}, err
 		}
 		workspace := req.Session.Identity.Workspace
@@ -241,11 +243,10 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
-		strategy := selectedStrategy(chosen)
-		selected := make([]string, 0, len(agent.Capabilities)+len(agent.Tools))
-		selected = append(selected, agent.Capabilities...)
-		selected = append(selected, agent.Tools...)
-		sel := selection{agent: agent, scopes: []*scope{runtimeScope, workspaceScope}, selected: selected, strategy: strategy, namedDefinition: chosen.Definition != nil, invocation: Invocation{snapshot: snapshot}, credentials: captured.credentials}
+		selected := make([]string, 0, len(inputs.Capabilities)+len(inputs.Tools))
+		selected = append(selected, inputs.Capabilities...)
+		selected = append(selected, inputs.Tools...)
+		sel := selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope}, selected: selected, invocation: Invocation{snapshot: snapshot}, credentials: captured.credentials}
 
 		callCtx, release, err := workspaceScope.enter(ctx)
 		if err != nil {
@@ -268,7 +269,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		prepared = harness.PreparedExecution{
 			Capture: capture,
 			Open: func(openCtx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
-				return p.open(openCtx, admission, workspace, runtimeScope, workspaceScope, agent, strategy, snapshot, warnings, opener, &releaseArtifacts)
+				return p.open(openCtx, admission, workspace, runtimeScope, workspaceScope, inputs, definition, snapshot, warnings, opener, &releaseArtifacts)
 			},
 		}
 		prepared.Release = func() error {
@@ -299,7 +300,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 // after the opening succeeds does the collected prompt presentation publish,
 // so a failed fork or admission never creates warnings for an unpublished
 // Session and a successful opener publishes before any progress.
-func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, runtimeScope, workspaceScope *scope, agent agentType, strategy harness.StrategySelection, snapshot *configuration, warnings *preparationWarnings, opener openInvocation, artifactRelease *func()) (harness.Execution, error) {
+func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, runtimeScope, workspaceScope *scope, inputs harness.AgentInputs, definition *harness.DefinitionRef, snapshot *configuration, warnings *preparationWarnings, opener openInvocation, artifactRelease *func()) (harness.Execution, error) {
 	releaseArtifacts, err := p.artifacts.acquireExecution(ctx, sessionArtifactDir(runtimeScope.info.DataDir, admission.SessionID))
 	if err != nil {
 		return harness.Execution{}, err
@@ -341,10 +342,10 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		// The invocation view selects every capability the Agent declared —
 		// its non-tool capability IDs and each declared tool name, the
 		// standard tools included — over the freshly opened Agent tier.
-		selected := make([]string, 0, len(agent.Capabilities)+len(agent.Tools))
-		selected = append(selected, agent.Capabilities...)
-		selected = append(selected, agent.Tools...)
-		invocation, err := opener(callCtx, admission, selection{agent: agent, scopes: []*scope{runtimeScope, workspaceScope, operation, agentScope}, selected: selected, strategy: strategy, invocation: Invocation{snapshot: snapshot}}, request)
+		selected := make([]string, 0, len(inputs.Capabilities)+len(inputs.Tools))
+		selected = append(selected, inputs.Capabilities...)
+		selected = append(selected, inputs.Tools...)
+		invocation, err := opener(callCtx, admission, selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope, operation, agentScope}, selected: selected, invocation: Invocation{snapshot: snapshot}}, request)
 		if err != nil {
 			return unwind(err, releaseAgent)
 		}
@@ -359,7 +360,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	// progress.
 	warnings.publish(p.passive, admission.SessionID)
 	*artifactRelease = releaseArtifacts
-	strategyBinding, err := resolveStrategyBinding(snapshot.composition, []*scope{runtimeScope, workspaceScope, operation}, strategy)
+	strategyBinding, err := resolveStrategyBinding(snapshot.composition, []*scope{runtimeScope, workspaceScope, operation}, inputs.Strategy)
 	if err != nil {
 		err = errors.Join(err, operation.close())
 		releaseOperation()
@@ -409,9 +410,9 @@ func requireCatalogModel(snapshot *configuration, ref model.ModelRef) error {
 // durable capture fields.
 func (p *preparation) concretePrepare(ctx context.Context, req harness.PreparationRequest, sel selection) (harness.ExecutionCapture, openInvocation, error) {
 	snapshot := sel.invocation.snapshot
-	provider, entry, err := snapshot.catalog.Lookup(catalog.ModelRef{Provider: sel.agent.Model.Provider, Model: sel.agent.Model.Model})
+	provider, entry, err := snapshot.catalog.Lookup(catalog.ModelRef{Provider: sel.inputs.Model.Provider, Model: sel.inputs.Model.Model})
 	if err != nil {
-		return harness.ExecutionCapture{}, nil, fmt.Errorf("agent model %s is not available in the catalog: %w: %w", sel.agent.Model.String(), err, harness.ErrInvalid)
+		return harness.ExecutionCapture{}, nil, fmt.Errorf("agent model %s is not available in the catalog: %w: %w", sel.inputs.Model.String(), err, harness.ErrInvalid)
 	}
 	apiKey := ""
 	if env := provider.Transport.APIKeyEnv; env != "" {
@@ -420,7 +421,7 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 			return harness.ExecutionCapture{}, nil, fmt.Errorf("%w: %s (for provider %q): %w", config.ErrMissingEnvVar, env, provider.ID, harness.ErrInvalid)
 		}
 	}
-	transport, err := p.concreteTransport(provider, entry, sel.agent.Model, apiKey)
+	transport, err := p.concreteTransport(provider, entry, sel.inputs.Model, apiKey)
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
 	}
@@ -434,10 +435,10 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 	// transport over a resolved credential; otherwise the conversation model
 	// and its transport are kept. The recorded compact configuration is
 	// always the final effective model's.
-	compactRef := sel.agent.Model
+	compactRef := sel.inputs.Model
 	compactTransport := transport
 	compactCost := entry.Cost
-	if !compaction.model.IsZero() && compaction.model != sel.agent.Model {
+	if !compaction.model.IsZero() && compaction.model != sel.inputs.Model {
 		compactProvider, compactEntry, lookupErr := snapshot.catalog.Lookup(catalog.ModelRef{Provider: compaction.model.Provider, Model: compaction.model.Model})
 		if lookupErr == nil {
 			keyMissing := false
@@ -456,29 +457,21 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 			}
 		}
 	}
-	specs, err := snapshot.composition.toolDeclarations(sel.agent.Tools)
+	specs, err := snapshot.composition.toolDeclarations(sel.inputs.Tools)
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
 	}
-	agentInputs := (harness.AgentInputs{
-		Model:        sel.agent.Model,
-		Instructions: sel.agent.Prompt,
-		AssemblyMode: sel.agent.SystemPrompt,
-		Tools:        sel.agent.Tools,
-		Capabilities: sel.agent.Capabilities,
-		Constraints:  harness.ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
-		Strategy:     sel.strategy,
-	}).Owned()
+	agentInputs := sel.inputs
 	result, catalog, err := composeSurface(ctx, surfaceRequest{
 		hostIdentity:   p.identity,
 		globalRulesDir: p.globalRulesDir,
 		workspace:      req.Session.Identity.Workspace,
 		sessionStart:   req.Session.Identity.CreatedAt, // a Fork's zero start samples the compose time once
-		promptSize:     prompt.Mode(sel.agent.SystemPrompt),
-		promptBody:     sel.agent.Prompt,
+		promptSize:     prompt.Mode(sel.inputs.AssemblyMode),
+		promptBody:     sel.inputs.Instructions,
 		invocation:     sel.invocation,
-		model:          sel.agent.Model,
-		constraints:    harness.ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
+		model:          sel.inputs.Model,
+		constraints:    harness.ToolConstraints{Readonly: sel.inputs.Constraints.Readonly, WriteDir: sel.inputs.Constraints.WriteDir},
 		identity:       req.Session.Identity,
 		agentInputs:    agentInputs,
 		toolSpecs:      specs,
@@ -501,15 +494,15 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 	}
 	capture := harness.ExecutionCapture{
 		ConfigurationRevision: sel.invocation.Revision(),
-		Model:                 sel.agent.Model,
+		Model:                 sel.inputs.Model,
 		ContextWindow:         entry.ContextWindow,
 		OutputReserve:         outputReserve(entry.MaxOutputTokens),
 		SystemPrompt:          view.prompt,
 		Tools:                 ownToolDefinitions(view.catalog),
 		InitialToolNames:      slices.Clone(view.visible),
-		Capabilities:          slices.Clone(sel.agent.Capabilities),
-		Readonly:              sel.agent.Readonly,
-		WriteDir:              sel.agent.WriteDir,
+		Capabilities:          slices.Clone(sel.inputs.Capabilities),
+		Readonly:              sel.inputs.Constraints.Readonly,
+		WriteDir:              sel.inputs.Constraints.WriteDir,
 		Pricing:               capturedPricing(entry.Cost),
 		Compact: harness.CompactCapture{
 			Model:        compactRef,
@@ -522,13 +515,11 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 		},
 		Implementations: implementationProvenance(snapshot.composition, sel),
 	}
-	if sel.strategy.ID != "" {
-		capability, _ := snapshot.composition.compiled.Capability(sel.strategy.ID)
+	if sel.inputs.Strategy.ID != "" {
+		capability, _ := snapshot.composition.compiled.Capability(sel.inputs.Strategy.ID)
 		capture.Strategy = harness.StrategyCapture{ID: capability.ID, RequiresContextWindow: capability.Strategy.RequiresContextWindow}
 	}
-	if req.Session.AgentSelection.Inputs != nil {
-		capture.Strategy.Settings = append(json.RawMessage(nil), req.Session.AgentSelection.Inputs.Strategy.Settings...)
-	}
+	capture.Strategy.Settings = append(json.RawMessage(nil), sel.inputs.Strategy.Settings...)
 	workspace := req.Session.Identity.Workspace
 	// The prepared opener carries only the preparation-time credential
 	// names, never their values: the ToolContext's fixed callback filters
@@ -716,14 +707,14 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 		sessionID := admission.AdmittedEntry.SessionID
 		tc := ToolContext{
 			Session:       session,
-			Model:         sel.agent.Model,
+			Model:         sel.inputs.Model,
 			Workspace:     workspace,
 			OperationID:   admission.OperationID,
 			InvocationID:  request.ID,
 			Purpose:       request.Purpose,
 			AdmittedEntry: admission.AdmittedEntry,
 			Invocation:    sel.invocation,
-			Constraints:   harness.ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
+			Constraints:   harness.ToolConstraints{Readonly: sel.inputs.Constraints.Readonly, WriteDir: sel.inputs.Constraints.WriteDir},
 			Background:    &boundBackground{bridge: p.background, sessionID: sessionID},
 			SubprocessEnv: subprocessEnv,
 		}
@@ -865,9 +856,9 @@ func ownToolDefinitions(definitions []model.ToolDefinition) []model.ToolDefiniti
 // applied before the next runs. An invalid consequence, error or observed
 // cancellation aborts admission before the next contribution runs.
 func runPreparationContributions(ctx context.Context, session harness.SessionIdentity, sel selection, view *preparationView) error {
-	constraints := harness.ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir}
+	constraints := harness.ToolConstraints{Readonly: sel.inputs.Constraints.Readonly, WriteDir: sel.inputs.Constraints.WriteDir}
 	composition := sel.invocation.snapshot.composition
-	for _, id := range sel.agent.Capabilities {
+	for _, id := range sel.inputs.Capabilities {
 		value, ok := selectedCapability(sel.scopes, id)
 		if !ok || value.capability == nil || value.capability.Kind != extension.KindHook {
 			continue
@@ -887,7 +878,7 @@ func runPreparationContributions(ctx context.Context, session harness.SessionIde
 			settings = sel.invocation.Config(value.capability.Declaration.Declaration.ID)
 		}
 		viewScope, call := composition.newView(value, ctx, callIdentity{session: session, revision: sel.invocation.Revision(), grant: nativeGrant{pure: true}})
-		consequence, err := hook(viewScope.ctx, call, view.input(session, sel.agent.Model, constraints, settings))
+		consequence, err := hook(viewScope.ctx, call, view.input(session, sel.inputs.Model, constraints, settings))
 		viewScope.end()
 		if err != nil {
 			return err

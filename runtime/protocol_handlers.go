@@ -30,7 +30,7 @@ func (rt *protocolHandlers) GetHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N10}
+	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N11}
 	rt.writeQualifiedJSON(w, http.StatusOK, &health)
 }
 
@@ -59,30 +59,14 @@ func (rt *protocolHandlers) GetConfiguration(w http.ResponseWriter, r *http.Requ
 	rt.writeQualifiedJSON(w, http.StatusOK, &view)
 }
 
-// UpdateConfigurationSettings serves the whole-section settings write.
+// UpdateConfigurationSettings serves the settings/extension-edit writer.
 func (rt *protocolHandlers) UpdateConfigurationSettings(w http.ResponseWriter, r *http.Request) {
 	var body protocol.UpdateSettingsRequest
 	if err := decodeRequestBody(r, &body); err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	mutation, err := rt.updateSettings(r.Context(), body.Settings)
-	if err != nil {
-		writeProtocolError(w, err)
-		return
-	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
-}
-
-// SetAgentTypeModel serves one Agent type's model edit; the type's name is a
-// required query value.
-func (rt *protocolHandlers) SetAgentTypeModel(w http.ResponseWriter, r *http.Request, params protocol.SetAgentTypeModelParams) {
-	var body protocol.SetAgentTypeModelRequest
-	if err := decodeRequestBody(r, &body); err != nil {
-		writeProtocolError(w, err)
-		return
-	}
-	mutation, err := rt.setAgentTypeModel(r.Context(), params.AgentType, string(body.Model))
+	mutation, err := rt.updateSettings(r.Context(), body)
 	if err != nil {
 		writeProtocolError(w, err)
 		return

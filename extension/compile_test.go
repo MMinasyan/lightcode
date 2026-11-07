@@ -170,7 +170,7 @@ func TestCompileRejectsIncompatibleContractReuse(t *testing.T) {
 }
 
 func TestValidateResultDeclaredFailureUnion(t *testing.T) {
-	methods := map[string]*methodContract{}
+	var methods MethodSet
 	compiled, err := Compile([]Native{testNative("ext", LifetimeHarness, []Capability{ServiceCapability("service", "test.service", ServiceMethod("call", ModeServiceIO, `{}`, `{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}`, `{"type":"object","properties":{"reason":{"type":"string"}},"required":["reason"]}`, `{"type":"string"}`))}, nil, nil)})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -680,6 +680,10 @@ func TestFixedContractIdentityIsEnforcedBothWays(t *testing.T) {
 		testNative("fixed-version", LifetimeHarness, []Capability{customService("bad", "melta.prompt", "2", PureMethod("read", `{}`, `{}`))}, nil, nil),
 		testNative("wrong-methods", LifetimeHarness, []Capability{Capability{ID: "bad", ContractID: ContractTool, ContractVersion: ContractVersion, Kind: KindTool, Methods: []Method{method("describe", ModePure, `{}`, `{}`, "", "")}}}, nil, nil),
 		testNative("hook-wrong-boundary", LifetimeHarness, []Capability{Capability{ID: "bad", ContractID: ContractHook, ContractVersion: ContractVersion, Kind: KindHook, Hooks: []Hook{{Boundary: BoundaryPrepare, Mode: HookModePure}}, Methods: hookMethods([]Hook{{Boundary: BoundaryRequest, Mode: HookModePure}})}}, nil, nil),
+		testNative("definitions-wrong-kind", LifetimeHarness, []Capability{Capability{ID: "bad", ContractID: ContractAgentDefinitions, ContractVersion: ContractVersion, Kind: KindTool, Methods: agentDefinitionMethods()}}, nil, nil),
+		testNative("definitions-wrong-version", LifetimeHarness, []Capability{Capability{ID: "bad", ContractID: ContractAgentDefinitions, ContractVersion: "2", Kind: KindService, Methods: agentDefinitionMethods()}}, nil, nil),
+		testNative("definitions-wrong-methods", LifetimeHarness, []Capability{Capability{ID: "bad", ContractID: ContractAgentDefinitions, ContractVersion: ContractVersion, Kind: KindService, Methods: agentDefinitionMethods()[:1]}}, nil, nil),
+		testNative("definitions-shorter-lifetime", LifetimeWorkspace, []Capability{AgentDefinitionsCapability("bad")}, nil, nil),
 	}
 	for i, native := range rejected {
 		if _, err := Compile([]Native{native}); err == nil {
@@ -690,6 +694,7 @@ func TestFixedContractIdentityIsEnforcedBothWays(t *testing.T) {
 		testNative("tools", LifetimeHarness, []Capability{ToolCapability("tool")}, nil, nil),
 		testNative("hooks", LifetimeHarness, []Capability{HookCapability("hook", SingleHook(BoundaryPrepare, HookModePure))}, nil, nil),
 		testNative("strategies", LifetimeOperation, []Capability{StrategyCapability("strategy", true)}, nil, nil),
+		testNative("definitions", LifetimeHarness, []Capability{AgentDefinitionsCapability("definitions")}, nil, nil),
 	}); err != nil {
 		t.Fatalf("Compile rejected valid fixed contracts: %v", err)
 	}

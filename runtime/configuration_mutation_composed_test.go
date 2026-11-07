@@ -121,7 +121,7 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	}
 }
 
-// TestComposedAgentModelMutationThroughRealRoster proves the Agent-model PUT
+// TestComposedAgentModelMutationThroughRealRoster proves the set_model edit
 // over the real roster: a builtin type that needs no explicit user entry is
 // addressable and the written override lands in the owning agents file,
 // while an unknown type fails invalid without creating a bare entry.
@@ -134,9 +134,18 @@ func TestComposedAgentModelMutationThroughRealRoster(t *testing.T) {
 	before, err := os.ReadFile(agentsPath)
 	testassert.NoError(t, err)
 
-	mutation, err := runtime.SetAgentTypeModelForTest(r, "primary", "prov/m")
+	mutation, err := runtime.SetAgentDefinitionModelForTest(r, "primary", "prov/m")
 	testassert.NoError(t, err)
-	testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Model == "prov/m" && mutation.Result.Name == "primary", "mutation = %+v, want the primary override at generation 2", mutation)
+	testassert.Require(t, mutation.ConfigurationRevision.Generation == "2", "mutation = %+v, want the primary override at generation 2", mutation)
+	view, err := runtime.GetConfigurationForTest(r)
+	testassert.NoError(t, err)
+	primaryFound := false
+	for _, agent := range view.Agents {
+		if agent.Definition.DefinitionId == "primary" && agent.Model == "prov/m" {
+			primaryFound = true
+		}
+	}
+	testassert.Require(t, primaryFound, "roster = %+v, want the primary model override", view.Agents)
 	var root struct {
 		Extensions map[string]struct {
 			Definitions map[string]json.RawMessage `json:"definitions"`
@@ -158,7 +167,7 @@ func TestComposedAgentModelMutationThroughRealRoster(t *testing.T) {
 	testassert.Equal(t, compactComposed(t, after.Extensions["agents"].Definitions["primary"]), `{"model":"prov/m"}`)
 
 	{
-		_, err := runtime.SetAgentTypeModelForTest(r, "ghost", "prov/m")
+		_, err := runtime.SetAgentDefinitionModelForTest(r, "ghost", "prov/m")
 		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "unknown type = %v, want the shared invalid failure", err)
 	}
 	final, err := os.ReadFile(agentsPath)

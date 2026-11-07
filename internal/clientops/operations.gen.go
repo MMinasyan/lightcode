@@ -335,18 +335,6 @@ var operationDescriptors = map[string]descriptor{
 			return c.RevertSessionCodeWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
-	"SetAgentTypeModel": {
-		query:  memberRequired,
-		body:   memberRequired,
-		status: 200,
-		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var query protocol.SetAgentTypeModelParams
-			if err := bindQuery(env.query, []string{"agent_type"}, &query); err != nil {
-				return nil, err
-			}
-			return c.SetAgentTypeModelWithBody(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
-		},
-	},
 	"SetSessionAgentType": {
 		session: memberRequired,
 		body:    memberRequired,

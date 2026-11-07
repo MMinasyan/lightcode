@@ -93,9 +93,8 @@ func compactPrepWith(t *testing.T, agentsDoc, configDoc, endpoint string) (confi
 	enableFixturePlugin(t, sh.configPath, "compacttools")
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin())
-	obs := newObservation()
-	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs, nil)
+	compact := compactToolsPlugin()
+	svc := sh.preparedService(owner, compact, fixtureAgentPlugin(compact))
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	return captured, newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
@@ -130,7 +129,20 @@ func compactPrepSelection(t *testing.T, captured configurationCapture, agentName
 	t.Cleanup(func() { _ = sc.close() })
 	selected := append([]string(nil), agent.Capabilities...)
 	selected = append(selected, agent.Tools...)
-	return selection{agent: agent, scopes: []*scope{sc}, selected: selected, invocation: Invocation{snapshot: captured.snapshot}, credentials: captured.credentials}
+	return selection{
+		inputs: harness.AgentInputs{
+			Model:        agent.Model,
+			Instructions: agent.Prompt,
+			AssemblyMode: agent.SystemPrompt,
+			Tools:        agent.Tools,
+			Capabilities: agent.Capabilities,
+			Constraints:  harness.ToolConstraints{Readonly: agent.Readonly, WriteDir: agent.WriteDir},
+		}.Owned(),
+		scopes:      []*scope{sc},
+		selected:    selected,
+		invocation:  Invocation{snapshot: captured.snapshot},
+		credentials: captured.credentials,
+	}
 }
 
 // TestConcretePrepareCompactCapture pins every capture field the compaction

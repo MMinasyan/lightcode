@@ -160,7 +160,7 @@ func (e *ownerEnv) options(natives ...extension.Native) options {
 			found = found || native.Declaration.ID == "agents"
 		}
 		if !found {
-			natives = append(natives, fixtureAgentPlugin())
+			natives = append(natives, fixtureAgentPlugin(natives...))
 		}
 	}
 	return options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: natives}

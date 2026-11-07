@@ -288,18 +288,6 @@
     "body": "required",
     "query_members": {}
   },
-  "SetAgentTypeModel": {
-    "session_id": "forbidden",
-    "field": "forbidden",
-    "query": "required",
-    "body": "required",
-    "query_members": {
-      "agent_type": {
-        "required": true,
-        "type": "string"
-      }
-    }
-  },
   "SetSessionAgentType": {
     "session_id": "required",
     "field": "forbidden",

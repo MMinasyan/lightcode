@@ -282,7 +282,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		health, err := client.GetHealthWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, health.JSON200 != nil && health.HTTPResponse.StatusCode == http.StatusOK, "health = (%d, %v), want the 200 typed body", health.HTTPResponse.StatusCode, health.JSON200)
-		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N10, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N10)
+		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N11, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N11)
 
 		workspace := filepath.Join(e.home, "mounted")
 		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentSelection: wireSelection("solo")})
@@ -1056,7 +1056,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 		// The settings write returns the published settings under the
 		// mutation envelope.
 		archiveDays := 30
-		settings, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: protocol.Settings{
+		settings, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &protocol.Settings{
 			Sessions: protocol.SessionsSettings{
 				AutoArchive:            true,
 				ArchiveAfterDays:       archiveDays,
@@ -1093,7 +1093,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			{"malformed document", protocol.ExtensionsSettings{"core": `{not json`}},
 			{"invalid active definition", protocol.ExtensionsSettings{"agents": `{"enabled":true,"definitions":{"bad":{"model":"noslash"}}}`}},
 		} {
-			response, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: protocol.Settings{
+			response, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &protocol.Settings{
 				Sessions:   protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: archiveDays, DeleteAfterArchiveDays: archiveDays},
 				Tools:      json.RawMessage("{}"),
 				Jobs:       json.RawMessage("{}"),
@@ -1108,7 +1108,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			assertRuntimeMutationRefused(t, r, refusalSub, refusalFile, refusalGeneration, refusalWarnRev,
 				fmt.Errorf("mounted settings refusal %s: %w", row.name, ErrConfiguration), ErrConfiguration)
 		}
-		retained, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: protocol.Settings{
+		retained, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &protocol.Settings{
 			Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: archiveDays, DeleteAfterArchiveDays: archiveDays},
 			Tools:    json.RawMessage(`{}`), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`),
 			Extensions: protocol.ExtensionsSettings{"ghost": `{"enabled":true}`, "core": `1`},
@@ -1443,14 +1443,31 @@ func TestProtocolServerAgentModelEdit(t *testing.T) {
 	client := protocolClient(t, ps)
 	ctx := context.Background()
 
-	mutation, err := client.SetAgentTypeModelWithResponse(ctx, &protocol.SetAgentTypeModelParams{AgentType: ".."}, protocol.SetAgentTypeModelRequest{Model: "prov/m"})
+	arguments, err := json.Marshal(map[string]string{"definition_id": "..", "model": "prov/m"})
 	testassert.NoError(t, err)
-	if mutation.JSON200 == nil || mutation.JSON200.Result.Name != ".." || mutation.JSON200.Result.Model != "prov/m" {
-		body, _ := json.Marshal(mutation.JSON200)
-		t.Fatalf("agent model edit = %s, want the %q roster entry's new model", body, "..")
+	mutation, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
+		ExtensionId: "agents",
+		EditId:      "set_model",
+		Arguments:   string(arguments),
+	}})
+	testassert.NoError(t, err)
+	testassert.Require(t, mutation.JSON200 != nil && mutation.JSON200.ConfigurationRevision.InstanceId == ps.instance, "agent model edit = %+v, want the published mutation", mutation.JSON200)
+	configuration, err := client.GetConfigurationWithResponse(ctx)
+	testassert.NoError(t, err)
+	edited := false
+	for _, agent := range configuration.JSON200.Agents {
+		if agent.Definition.DefinitionId == ".." && agent.Model == "prov/m" {
+			edited = true
+		}
 	}
-	testassert.Equal(t, mutation.JSON200.ConfigurationRevision.InstanceId, ps.instance)
-	unknown, err := client.SetAgentTypeModelWithResponse(ctx, &protocol.SetAgentTypeModelParams{AgentType: "ghost"}, protocol.SetAgentTypeModelRequest{Model: "prov/m"})
+	testassert.Require(t, edited, "roster = %+v, want the directory-like definition's new model", configuration.JSON200.Agents)
+	unknownArguments, err := json.Marshal(map[string]string{"definition_id": "ghost", "model": "prov/m"})
+	testassert.NoError(t, err)
+	unknown, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
+		ExtensionId: "agents",
+		EditId:      "set_model",
+		Arguments:   string(unknownArguments),
+	}})
 	testassert.NoError(t, err)
 	testassert.Require(t, unknown.JSONDefault != nil && unknown.JSONDefault.Code == protocol.Invalid, "unknown agent type edit = %+v, want the typed invalid refusal", unknown.JSONDefault)
 }

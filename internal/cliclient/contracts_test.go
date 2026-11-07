@@ -212,7 +212,18 @@ func TestForkBoundaryMenusUserOwnedCopiedRuntimeAndPlugin(t *testing.T) {
 	testassert.Require(t, len(c.menu.items) == 2, "non-user input became a fork boundary")
 	c.mu.Unlock()
 	press(c, terminal.KeyMsg{Special: terminal.KeyDown})
+	c.mu.Lock()
+	t.Logf("after down menu=%v selected=%d", c.menu != nil, func() int {
+		if c.menu == nil {
+			return -1
+		}
+		return c.menu.selected
+	}())
+	c.mu.Unlock()
 	press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
+	c.mu.Lock()
+	t.Logf("after enter menu=%v", c.menu != nil)
+	c.mu.Unlock()
 	c.mu.Lock()
 	testassert.Require(t, c.menu == nil && c.forkBoundary.OperationId == nil && !c.forkRewind, "copied input invented a source restore boundary")
 	c.forkBoundary = nil
@@ -283,7 +294,18 @@ func TestChildListOldConnectionSuccessAndErrorAreSuperseded(t *testing.T) {
 func TestFutureAgentAndTypeWideModelUseGeneratedScope(t *testing.T) {
 	c, transport := fixture(t)
 	settledReader(t, c, transport)
+	transport.mu.Lock()
+	transport.globals = true
+	transport.mu.Unlock()
 	c.command("/agent planner")
+	roster := receive(t, transport.requests)
+	testassert.Require(t, roster.req.URL.Path == "/v1/configuration", "name shorthand did not read the source-qualified roster: %s", roster.req.URL)
+	transport.mu.Lock()
+	transport.globals = false
+	transport.mu.Unlock()
+	rosterView := configuration("1")
+	rosterView.Agents = []protocol.Agent{{Name: "planner", Definition: *fixtureSelection("planner").Definition, Description: "planner", Tools: []string{}, Capabilities: []string{}}}
+	roster.respond(rosterView)
 	req := receive(t, transport.requests)
 	testassert.Require(t, strings.Contains(req.req.URL.Path, rootA) && string(req.body) == `{"agent_selection":{"definition":{"capability_id":"agents.definitions","definition_id":"planner","extension_id":"agents"}}}`, "wrong Session Agent edit: %s %s", req.req.URL, req.body)
 	req.respond(protocol.Session{SessionId: rootA, AgentSelection: fixtureSelection("planner")})
@@ -294,8 +316,8 @@ func TestFutureAgentAndTypeWideModelUseGeneratedScope(t *testing.T) {
 	settleTasks(t, c)
 	c.command("/model provider/next")
 	req = receive(t, transport.requests)
-	testassert.Require(t, req.req.URL.Query().Get("agent_type") == "planner" && string(req.body) == `{"model":"provider/next"}` && !strings.Contains(req.req.URL.Path, rootA), "model was not a type-wide future edit: %s %s", req.req.URL, req.body)
-	req.respond(protocol.RevisionResponse{ConfigurationRevision: configuration("2").ConfigurationRevision})
+	testassert.Require(t, req.req.URL.Path == "/v1/configuration/settings" && string(req.body) == `{"extension_edit":{"arguments":"{\"definition_id\":\"planner\",\"model\":\"provider/next\"}","edit_id":"set_model","extension_id":"agents"}}`, "model was not the supplied type-wide extension edit: %s %s", req.req.URL, req.body)
+	req.respond(protocol.SettingsMutation{ConfigurationRevision: configuration("2").ConfigurationRevision, Result: protocol.Settings{}})
 	next.SessionRevision = revision("3")
 	next.SelectedModel = pointer("provider/next")
 	receive(t, transport.requests).respond(next)
@@ -330,14 +352,23 @@ func TestResolvedSessionModelUsesSessionOwner(t *testing.T) {
 }
 
 func TestCreateRequiresValidRoster(t *testing.T) {
+	supplied := `{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	foreignPrimary := `{"name":"primary","definition":{"extension_id":"guest","capability_id":"guest.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	foreignTwin := `{"name":"twin","definition":{"extension_id":"guest","capability_id":"guest.definitions","definition_id":"twin"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	ownTwin := `{"name":"twin","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"twin"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
 	for _, row := range []struct {
-		name       string
-		body       string
-		wantCreate bool
+		name     string
+		body     string
+		wantBody string
 	}{
-		{"no agents", `{"agents":[]}`, true},
-		{"malformed roster", `{"agents":null}`, false},
-		{"malformed entry", `{"agents":[{"name":"primary"}]}`, false},
+		{"no agents", `{"agents":[]}`, `{"workspace":"/workspace"}`},
+		{"supplied primary", `{"agents":[` + supplied + `]}`, `{"agent_selection":{"definition":{"capability_id":"agents.definitions","definition_id":"primary","extension_id":"agents"}},"workspace":"/workspace"}`},
+		{"foreign-only primary", `{"agents":[` + foreignPrimary + `]}`, `{"workspace":"/workspace"}`},
+		{"foreign-only without primary", `{"agents":[` + foreignTwin + `]}`, `{"workspace":"/workspace"}`},
+		{"duplicate names without supplied primary", `{"agents":[` + ownTwin + `,` + foreignTwin + `]}`, `{"workspace":"/workspace"}`},
+		{"duplicate full references", `{"agents":[` + supplied + `,` + supplied + `]}`, ``},
+		{"malformed roster", `{"agents":null}`, ``},
+		{"malformed entry", `{"agents":[{"name":"primary"}]}`, ``},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			c, transport := fixture(t)
@@ -351,9 +382,9 @@ func TestCreateRequiresValidRoster(t *testing.T) {
 			roster := receive(t, transport.requests)
 			testassert.Equal(t, roster.req.URL.Path, "/v1/configuration")
 			roster.respondBody(row.body)
-			if row.wantCreate {
+			if row.wantBody != "" {
 				created := receive(t, transport.requests)
-				testassert.Require(t, created.req.URL.Path == "/v1/sessions" && string(created.body) == `{"workspace":"/workspace"}`, "baseline create = %s %s", created.req.URL, created.body)
+				testassert.Require(t, created.req.URL.Path == "/v1/sessions" && string(created.body) == row.wantBody, "create = %s %s, want %s", created.req.URL, created.body, row.wantBody)
 				created.reject(400, protocol.Error{Code: protocol.Invalid, Message: "rejected"})
 			}
 			settleTasks(t, c)
@@ -367,9 +398,6 @@ func TestCreateRequiresValidRoster(t *testing.T) {
 	}
 }
 
-// One failed Create is reported only for its current captured intent; a fresh
-// explicit Workspace-selection intent composes once for the new address, and
-// an old-Workspace completion neither adopts nor publishes a stale error.
 func TestCreateFailureCapturedAddressAndExplicitWorkspaceIntent(t *testing.T) {
 	c, transport := fixture(t)
 	c.mu.Lock()
@@ -665,4 +693,116 @@ func TestRuntimeCurrentSnapshotsAndPartialRestoreRemainReachable(t *testing.T) {
 	settleTasks(t, c)
 	text := outputs(c)
 	testassert.Require(t, strings.Contains(text, "one.go") && strings.Contains(text, "two.go") && strings.Contains(text, "partial restore"), "/runtime dropped complete partial restore")
+}
+
+// TestAgentNameShorthandRequiresExactlyOneMatch proves the CLI name shorthand
+// sends a selection only for exactly one displayed match: zero matches and
+// ambiguous matches report and never send a selection.
+func TestAgentNameShorthandRequiresExactlyOneMatch(t *testing.T) {
+	for _, row := range []struct {
+		name   string
+		roster []protocol.Agent
+	}{
+		{name: "zero matches", roster: []protocol.Agent{{Name: "primary", Definition: *fixtureSelection("primary").Definition, Tools: []string{}, Capabilities: []string{}}}},
+		{name: "ambiguous matches", roster: []protocol.Agent{
+			{Name: "twin", Definition: protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: "twin"}, Tools: []string{}, Capabilities: []string{}},
+			{Name: "twin", Definition: protocol.DefinitionRef{ExtensionId: "guest", CapabilityId: "guest.definitions", DefinitionId: "twin"}, Tools: []string{}, Capabilities: []string{}},
+		}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			c, transport := fixture(t)
+			settledReader(t, c, transport)
+			transport.mu.Lock()
+			transport.globals = true
+			transport.mu.Unlock()
+			c.command("/agent twin")
+			roster := receive(t, transport.requests)
+			testassert.Equal(t, roster.req.URL.Path, "/v1/configuration")
+			view := configuration("1")
+			view.Agents = row.roster
+			roster.respond(view)
+			settleTasks(t, c)
+			transport.mu.Lock()
+			calls := append([]string(nil), transport.calls...)
+			transport.mu.Unlock()
+			for _, call := range calls {
+				testassert.Require(t, strings.HasPrefix(call, "GET "), "shorthand %s sent a selection: %v", row.name, calls)
+			}
+			testassert.Require(t, calls[len(calls)-1] == "GET /v1/configuration", "shorthand %s calls = %v, want the roster read last", row.name, calls)
+			c.requestExit(nil)
+		})
+	}
+}
+
+// TestAgentMenuLabelsSourceAndDispatchesExactDuplicate proves same-name,
+// same-description providers are distinguishable in the existing menu detail
+// text and that selecting the second row dispatches its exact full reference.
+func TestAgentMenuLabelsSourceAndDispatchesExactDuplicate(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	transport.mu.Lock()
+	transport.globals = true
+	transport.mu.Unlock()
+	c.command("/agent")
+	menuRead := receive(t, transport.requests)
+	testassert.Equal(t, menuRead.req.URL.Path, "/v1/configuration")
+	view := configuration("1")
+	own := protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: "twin"}
+	guest := protocol.DefinitionRef{ExtensionId: "guest", CapabilityId: "guest.definitions", DefinitionId: "twin"}
+	view.Agents = []protocol.Agent{
+		{Name: "twin", Definition: own, Description: "same description", Tools: []string{}, Capabilities: []string{}},
+		{Name: "twin", Definition: guest, Description: "same description", Tools: []string{}, Capabilities: []string{}},
+	}
+	menuRead.respond(view)
+	settleTasks(t, c)
+	c.mu.Lock()
+	testassert.Require(t, c.menu != nil && len(c.menu.items) == 2, "duplicate menu = %+v", c.menu)
+	testassert.Require(t, c.menu.items[0].Label == "twin" && c.menu.items[1].Label == "twin", "menu labels = %+v", c.menu.items)
+	testassert.Require(t, strings.Contains(c.menu.items[0].Detail, "agents/agents.definitions") && strings.Contains(c.menu.items[1].Detail, "guest/guest.definitions") && strings.Contains(c.menu.items[0].Detail, "same description") && strings.Contains(c.menu.items[1].Detail, "same description"), "menu details do not identify the source: %+v", c.menu.items)
+	testassert.Require(t, c.menu.items[0].Extra == own && c.menu.items[1].Extra == guest, "menu extras = %#v/%#v, want full refs", c.menu.items[0].Extra, c.menu.items[1].Extra)
+	c.mu.Unlock()
+	// Post-selection global and reader refreshes are ordinary reads; the
+	// selection command itself remains the one scripted request below.
+	transport.mu.Lock()
+	transport.globals = false
+	transport.mu.Unlock()
+	go func() {
+		press(c, terminal.KeyMsg{Special: terminal.KeyDown})
+		press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
+	}()
+	selected := receive(t, transport.requests)
+	testassert.Require(t, selected.req.URL.Path == "/v1/sessions/"+rootA+"/agent-type" && string(selected.body) == `{"agent_selection":{"definition":{"capability_id":"guest.definitions","definition_id":"twin","extension_id":"guest"}}}`, "selected duplicate dispatch = %s %s", selected.req.URL, selected.body)
+	selected.respond(protocol.Session{SessionId: rootA, AgentSelection: protocol.AgentSelection{Definition: &guest}})
+	settleAnswering(t, c, transport)
+	c.requestExit(nil)
+}
+
+// TestReadOnlyNamedModelReportsUnavailableAndSendsNothing proves a foreign or
+// read-only named resolver's /model path reports the desktop-equivalent
+// unavailable-edit meaning, sends no command and never falls back to mutating
+// resolved Inputs.
+func TestReadOnlyNamedModelReportsUnavailableAndSendsNothing(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	transport.mu.Lock()
+	before := len(transport.calls)
+	transport.mu.Unlock()
+	guest := protocol.DefinitionRef{ExtensionId: "guest", CapabilityId: "guest.definitions", DefinitionId: "readonly"}
+	c.mu.Lock()
+	c.root.hydration.Session.AgentSelection = protocol.AgentSelection{Definition: &guest}
+	c.mu.Unlock()
+
+	c.command("/model provider/next")
+	settleTasks(t, c)
+	text := outputs(c)
+	testassert.Require(t, strings.Contains(text, "This definition does not offer a model edit."), "read-only model refusal = %q, want the desktop-equivalent message", text)
+	transport.mu.Lock()
+	calls := len(transport.calls)
+	transport.mu.Unlock()
+	testassert.Require(t, calls == before, "read-only model path sent %d commands, want none beyond the %d retained reads", calls-before, before)
+	c.mu.Lock()
+	selection := c.root.hydration.Session.AgentSelection
+	c.mu.Unlock()
+	testassert.Require(t, selection.Definition == &guest || (selection.Definition != nil && *selection.Definition == guest), "read-only model path detached the named selection: %+v", selection)
+	c.requestExit(nil)
 }

@@ -1,10 +1,8 @@
-// Package tasks declares the child-session task tool: it composes the
-// subagent roster description, validates the requested subagent type, and
-// launches one child Session through the declared child-launch host service,
-// returning the child session ID immediately. It is an ordinary
-// Harness-scoped native extension with one named-service binding and no
-// additional Runtime authority.
-package tasks
+// Package agents owns the Agents extension: the custom Agent definition
+// format, its read-only schema-bound resolver, the supplied model
+// configuration edit, and the child-session task tool. Every contribution is
+// one ordinary Harness-scoped native component over public contracts.
+package agents
 
 import (
 	"bytes"
@@ -24,8 +22,18 @@ import (
 )
 
 const (
-	pluginID = "agents"
-	toolID   = "task"
+	// ExtensionID is the supplied extension identity.
+	ExtensionID = "agents"
+	// DefinitionsCapabilityID is the concrete resolver capability the task
+	// tool and every named selection address.
+	DefinitionsCapabilityID = "agents.definitions"
+	// ConfigurationCapabilityID is the supplied pure configuration-edit
+	// service.
+	ConfigurationCapabilityID = "agents.configuration"
+	// TaskCapabilityID is the model-visible child-session tool.
+	TaskCapabilityID = "task"
+	// ModelEditID is the supplied set_model configuration edit.
+	ModelEditID = "set_model"
 )
 
 // taskDescriptionPrefix is the fixed model-facing introduction every task
@@ -85,11 +93,11 @@ func decodeSettings(raw json.RawMessage) (settings, error) {
 // launchData is the tool's opaque ToolPlan payload: the validated call facts
 // needed by Execute after authorization.
 type launchData struct {
-	CallID         string `json:"call_id"`
-	Prompt         string `json:"prompt"`
-	SubagentType   string `json:"subagent_type"`
-	MaxConcurrent  int    `json:"max_concurrent"`
-	MaxOutputBytes int    `json:"max_output_bytes"`
+	CallID         string                `json:"call_id"`
+	Prompt         string                `json:"prompt"`
+	Definition     harness.DefinitionRef `json:"definition"`
+	MaxConcurrent  int                   `json:"max_concurrent"`
+	MaxOutputBytes int                   `json:"max_output_bytes"`
 }
 
 // taskTool is the task contribution: unavailable to child Sessions, its
@@ -106,13 +114,13 @@ func (taskTool) describe(_ context.Context, input extension.DescribeInput) (exte
 	b.WriteString(taskDescriptionPrefix)
 	b.WriteString("\n\nAvailable subagent types:\n")
 	for _, at := range input.AgentTypes {
-		if at.Subagent {
+		if at.Subagent && ownDefinition(at.Definition) {
 			fmt.Fprintf(&b, "- %s: %s\n", at.Name, at.Description)
 		}
 	}
 	return extension.ToolDescription{
 		Definition: model.ToolDefinition{
-			Name:        toolID,
+			Name:        TaskCapabilityID,
 			Description: b.String(),
 			Parameters:  json.RawMessage(taskParameters),
 		},
@@ -140,15 +148,16 @@ func (t taskTool) Prepare(_ context.Context, tc extension.ToolContext, call mode
 	if !ok {
 		return immediateError(call.ID, errors.New("missing 'subagent_type' parameter"))
 	}
-	if err := resolveSubagent(subagentType, tc.AgentTypes); err != nil {
+	definition, err := resolveSubagent(subagentType, tc.AgentTypes)
+	if err != nil {
 		return immediateError(call.ID, fmt.Errorf("unknown subagent type %q: %w", subagentType, err))
 	}
-	data, err := json.Marshal(launchData{CallID: call.ID, Prompt: prompt, SubagentType: subagentType, MaxConcurrent: s.MaxConcurrent, MaxOutputBytes: s.MaxOutputBytes})
+	data, err := json.Marshal(launchData{CallID: call.ID, Prompt: prompt, Definition: definition, MaxConcurrent: s.MaxConcurrent, MaxOutputBytes: s.MaxOutputBytes})
 	if err != nil {
 		return immediateError(call.ID, err)
 	}
 	return extension.ToolPlan{
-		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: subagentType}},
+		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: definition.DefinitionID}},
 		Data:        data,
 	}
 }
@@ -164,13 +173,13 @@ func (taskTool) Execute(ctx context.Context, tc extension.ToolContext, plan exte
 		return launchOutcome(callID, err)
 	}
 	arguments, err := json.Marshal(struct {
-		AgentType     string `json:"agent_type"`
-		Prompt        string `json:"prompt"`
-		OperationID   string `json:"operation_id"`
-		MaxConcurrent int    `json:"max_concurrent"`
-		OutputLimit   int    `json:"output_limit"`
+		Definition    harness.DefinitionRef `json:"definition"`
+		Prompt        string                `json:"prompt"`
+		OperationID   string                `json:"operation_id"`
+		MaxConcurrent int                   `json:"max_concurrent"`
+		OutputLimit   int                   `json:"output_limit"`
 	}{
-		AgentType:     data.SubagentType,
+		Definition:    data.Definition,
 		Prompt:        data.Prompt,
 		OperationID:   operationID,
 		MaxConcurrent: data.MaxConcurrent,
@@ -199,20 +208,32 @@ func (taskTool) Execute(ctx context.Context, tc extension.ToolContext, plan exte
 	}}
 }
 
-// resolveSubagent checks the captured roster for the exactly-named Subagent
-// entry: an absent name and a present non-subagent type produce the retained
-// inner errors the caller wraps.
-func resolveSubagent(name string, roster []protocol.Agent) error {
+// ownDefinition reports whether one roster projection was supplied by this
+// extension's own resolver. The task tool advertises and launches only its
+// own definitions, even when another provider uses the same display name.
+func ownDefinition(ref protocol.DefinitionRef) bool {
+	return ref.ExtensionId == ExtensionID && ref.CapabilityId == DefinitionsCapabilityID
+}
+
+// resolveSubagent checks the captured roster for the exactly-named own
+// Subagent entry and returns its complete source-qualified reference: an
+// absent name and a present non-subagent type produce the retained inner
+// errors the caller wraps.
+func resolveSubagent(name string, roster []protocol.Agent) (harness.DefinitionRef, error) {
 	for _, at := range roster {
-		if at.Name != name {
+		if at.Name != name || !ownDefinition(at.Definition) {
 			continue
 		}
 		if !at.Subagent {
-			return errors.New("agent type is not available as a subagent")
+			return harness.DefinitionRef{}, errors.New("agent type is not available as a subagent")
 		}
-		return nil
+		return harness.DefinitionRef{
+			ExtensionID:  at.Definition.ExtensionId,
+			CapabilityID: at.Definition.CapabilityId,
+			DefinitionID: at.Definition.DefinitionId,
+		}, nil
 	}
-	return fmt.Errorf("unknown agent type %q", name)
+	return harness.DefinitionRef{}, fmt.Errorf("unknown agent type %q", name)
 }
 
 // launchOutcome renders one launch failure through the uniform tool-error
@@ -270,44 +291,4 @@ func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) 
 		return nil, err
 	}
 	return json.Marshal(normalized)
-}
-
-// Native returns the Harness-scoped native whose single export is the task
-// tool and whose one declared binding is the child-launch host service.
-func Native() extension.Native {
-	childLaunch, _ := extension.HostCapability(extension.ContractChildLaunch)
-	return extension.Native{
-		Declaration: extension.Declaration{
-			ID:           pluginID,
-			Version:      "1",
-			ConfigSchema: []byte(configSchema),
-			Components: []extension.Component{{
-				ID:       pluginID,
-				Lifetime: extension.LifetimeHarness,
-				Provides: []string{toolID},
-				Requires: []extension.Binding{{
-					Name:         "child_launch",
-					Provider:     extension.HostProvider,
-					CapabilityID: extension.ContractChildLaunch,
-					Definition:   childLaunch,
-				}},
-			}},
-			Capabilities: []extension.Capability{extension.ToolCapability(toolID)},
-		},
-		Describe: map[string]extension.ToolDescribe{toolID: taskTool{}.describe},
-		Open:     open,
-	}
-}
-
-func open(ctx context.Context, instance extension.InstanceContext) (extension.Instance, error) {
-	if err := ctx.Err(); err != nil {
-		return extension.Instance{}, err
-	}
-	s, err := decodeSettings(instance.Section)
-	if err != nil {
-		return extension.Instance{}, err
-	}
-	return extension.Instance{Capabilities: map[string]extension.Implementation{
-		toolID: {Tool: taskTool{settings: s}},
-	}}, nil
 }

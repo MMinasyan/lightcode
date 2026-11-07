@@ -1,11 +1,13 @@
 <script>
   import { openDialog } from './dialogs';
-  // The target Session-type picker: definitions come from the ConfigurationView
-  // agent roster and are displayed uniformly; the server remains the accepting
-  // owner of any chosen type.
+  // The target Session-type picker: every row is addressed by its complete
+  // source-qualified definition reference; names are display text only. The
+  // server remains the accepting owner of any chosen definition.
   import { createEventDispatcher } from 'svelte';
-  export let agents = []; // [{ name, description, subagent }]
-  export let current = '';
+  export let agents = []; // [{ name, definition, description, subagent }]
+  export let current = null; // the current full DefinitionRef, or null
+  const refKey = (ref) => JSON.stringify([ref?.extension_id ?? '', ref?.capability_id ?? '', ref?.definition_id ?? '']);
+  const sameRef = (left, right) => !!left && !!right && left.extension_id === right.extension_id && left.capability_id === right.capability_id && left.definition_id === right.definition_id;
   const dispatch = createEventDispatcher();
   let dialog;
 
@@ -23,10 +25,12 @@
       {#if agents.length === 0}
         <div class="empty">(no agent definitions)</div>
       {:else}
-        {#each agents as agent (agent.name)}
-          <button class="row" class:cur={agent.name === current} on:click={() => dispatch('select', agent.name)}
-            aria-label={`Set session agent type ${agent.name}`}>
+        {#each agents as agent (refKey(agent.definition))}
+          <button class="row" class:cur={sameRef(agent.definition, current)} on:click={() => dispatch('select', agent.definition)}
+            data-ref={refKey(agent.definition)}
+            aria-label={`Set session agent type ${agent.name} from ${agent.definition?.extension_id}/${agent.definition?.capability_id}`}>
             <span class="name">{agent.name}</span>
+            <span class="desc">{agent.definition?.extension_id}/{agent.definition?.capability_id}</span>
             {#if agent.description}<span class="desc">{agent.description}</span>{/if}
           </button>
         {/each}

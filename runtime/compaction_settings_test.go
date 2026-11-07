@@ -56,7 +56,7 @@ func TestParseCompactionSettings(t *testing.T) {
 func TestCandidateRejectsInvalidBaselineSections(t *testing.T) {
 	valid := `{"providers":{}}`
 	{
-		_, err := assembleConfiguration(1, valid, `{}`, nil)
+		_, err := assembleConfiguration(t, 1, valid, `{}`, nil)
 		testassert.NoError(t, err)
 	}
 	for _, tc := range []struct{ name, document string }{
@@ -70,7 +70,7 @@ func TestCandidateRejectsInvalidBaselineSections(t *testing.T) {
 		{"compaction empty prompt", `{"providers":{},"compaction":{"prompt":""}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := assembleConfiguration(1, tc.document, `{}`, nil)
+			_, err := assembleConfiguration(t, 1, tc.document, `{}`, nil)
 			testassert.Require(t, err != nil && strings.Contains(err.Error(), "captured configuration"), "candidate %s = %v, want a captured-configuration rejection", tc.document, err)
 		})
 	}

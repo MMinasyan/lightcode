@@ -288,7 +288,7 @@ const (
 // with every unavailable resolution reporting 0. The capture of that window
 // from a durably current Operation is the composed view's own observation.
 func TestSessionContextWindowPureClocks(t *testing.T) {
-	captured, err := assembleConfiguration(2, usageWindowConfig, usageWindowAgents, nil)
+	captured, err := assembleConfiguration(t, 2, usageWindowConfig, usageWindowAgents, nil)
 	testassert.NoError(t, err)
 	window := func(view harness.SessionReadView) int {
 		return sessionContextWindow(view, resolveSessionSelection(view.Header.AgentSelection, captured))

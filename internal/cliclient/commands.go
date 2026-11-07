@@ -313,20 +313,15 @@ func (c *CLI) create(s stamp) {
 		return
 	}
 	var selection *protocol.AgentSelection
-	if len(agents) != 0 {
-		var primary *protocol.DefinitionRef
-		for _, agent := range agents {
-			if agent.Name == "primary" {
-				ref := agent.Definition
-				primary = &ref
-				break
-			}
+	// Root creation selects only the supplied application definition; a
+	// foreign-only roster or a roster without it creates a resolved Session.
+	suppliedPrimary := protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: "primary"}
+	for _, agent := range agents {
+		if agent.Definition == suppliedPrimary {
+			ref := agent.Definition
+			selection = &protocol.AgentSelection{Definition: &ref}
+			break
 		}
-		if primary == nil {
-			c.navigationReport(s, terminal.RenderErrorMsg("invalid agent roster: primary is absent"))
-			return
-		}
-		selection = &protocol.AgentSelection{Definition: primary}
 	}
 	var session protocol.Session
 	raw, err := call(s, "CreateSession", "", protocol.CreateSessionRequest{AgentSelection: selection, Workspace: s.workspace}, nil, &session)

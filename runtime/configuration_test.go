@@ -1,15 +1,15 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
+	agents "github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
-	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -20,7 +20,7 @@ import (
 const testConfigDocument = `{
   "providers": {
     "prov": {
-      "transport": {"base_url": "https://api.prov.test/v1", "api_key_env": ""},
+      "transport": {"base_url": "https://api.prov.test/v1", "api_key_env": ""},"discovery": false,
       "models": {"m": {"name": "M", "context_window": 9007199254740993}}
     }
   },
@@ -75,20 +75,28 @@ func testCapabilities() []string { return []string{"cap-a", "cap-b"} }
 // testToolUniverse is the compiled tool universe of the test documents.
 func testToolUniverse() []string { return []string{"plan_tool", "read_file"} }
 
-// assembleConfiguration drives the factored snapshot entries exactly as a
-// caller with one captured document set does: decode once, assemble the
-// captured providers with the pure build, then hand both to newConfiguration.
-func assembleConfiguration(generation uint64, configData, agentsData string, capabilityIDs []string) (*configuration, error) {
-	doc, err := decodeCapturedConfig([]byte(configData))
+// assembleConfiguration publishes one captured document set through the real
+// candidate path with the supplied Agents extension, so the roster is the
+// resolver projection and the carrier fields are the retained test values.
+func assembleConfiguration(t *testing.T, generation uint64, configData, agentsData string, capabilities []string) (*configuration, error) {
+	t.Helper()
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, configData)
+	if agentsData != "" {
+		writeAgentDefinitions(t, h.configPath, agentsData)
+	}
+	svc := h.preparedService(context.Background(), agentsTestNativeIDs(append(capabilities, agents.StandardTools...), testToolUniverse(), nil))
+	captured, err := svc.publish(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	return newConfiguration(generation, doc, catalog.Build(catalog.BuildInputs{UserRaw: doc.Providers}), []byte(agentsData), capabilityIDs, testToolUniverse(), nil, nil)
+	captured.snapshot.generation = generation
+	return captured.snapshot, nil
 }
 
 func testSnapshot(t *testing.T) *configuration {
 	t.Helper()
-	snapshot, err := assembleConfiguration(3, testConfigDocument, testAgentsDocument, testCapabilities())
+	snapshot, err := assembleConfiguration(t, 3, testConfigDocument, testAgentsDocument, testCapabilities())
 	testassert.NoError(t, err)
 	return snapshot
 }
@@ -123,19 +131,16 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 		testassert.Require(t, isNumber && number.String() == "9007199254740993", "plugin threshold = %#v, want the exact json.Number preserved", pluginFields["threshold"])
 	}
 
-	reference, err := agents.ParseWithCapabilities([]byte(testAgentsDocument), testCapabilities(), testToolUniverse(), nil)
-	testassert.NoError(t, err)
-	{
-		want := reference.All()
-		testassert.Require(t, reflect.DeepEqual(snapshot.definitions, want), "definitions = %+v, want the retained roster with inherited fields, built-in overlays and prompt bytes", snapshot.definitions)
-	}
-	for _, def := range snapshot.definitions { // the complete private fields stay for their owning later phases
-		if def.Name != "plan" {
+	// The roster is the supplying resolver's immutable projection; the
+	// extension-owned parse/format assertions live with the extension suite.
+	testassert.Require(t, len(snapshot.definitions) == 6, "definitions = %+v, want the five built-ins and the configured plan", snapshot.definitions)
+	for _, def := range snapshot.definitions {
+		if def.name != "plan" {
 			continue
 		}
-		testassert.Require(t, def.Readonly && def.WriteDir == "/tmp/plan" && def.Description == "planner" && def.Subagent && !def.Builtin, "resolved plan lost its retained fields: %+v", def)
+		testassert.Require(t, def.inputs.Constraints.Readonly && def.inputs.Constraints.WriteDir == "/tmp/plan" && def.description == "planner" && def.subagent, "resolved plan lost its retained fields: %+v", def)
 	}
-	testassert.Require(t, len(snapshot.catalogWarnings) == 0 && len(snapshot.agentWarnings) == 0, "valid input produced warnings: catalog %+v agents %+v", snapshot.catalogWarnings, snapshot.agentWarnings)
+	testassert.Require(t, len(snapshot.catalogWarnings) == 0, "valid input produced catalog warnings: %+v", snapshot.catalogWarnings)
 }
 
 // TestNewConfigurationNullAndDefaults proves the target documents accept one
@@ -145,15 +150,10 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 // permission decoding) never reject the captured bytes.
 func TestNewConfigurationNullAndDefaults(t *testing.T) {
 	for _, doc := range []string{`{}`, `{"sessions":null,"extensions":null,"providers":null}`} {
-		snapshot, err := assembleConfiguration(1, doc, `null`, nil)
+		snapshot, err := assembleConfiguration(t, 1, doc, "", nil)
 		testassert.Require(t, err == nil, "newConfiguration(%s): %v", doc, err)
 		testassert.Require(t, snapshot.sessions.AutoArchive && snapshot.sessions.ArchiveAfterDays == 7 && snapshot.sessions.DeleteAfterArchiveDays == 7 && snapshot.extensions == nil, "sessions under %s = %+v, want true/7/7; extensions under %s = %+v, want none", doc, snapshot.sessions, doc, snapshot.extensions)
-		wantBuiltins := []string{"primary", "secondary", "explore", "review", "compact"}
-		gotNames := make([]string, len(snapshot.definitions))
-		for i, def := range snapshot.definitions {
-			gotNames[i] = def.Name
-		}
-		testassert.Require(t, reflect.DeepEqual(gotNames, wantBuiltins), "definitions under %s = %q, want the five built-ins", doc, gotNames)
+		testassert.Require(t, len(snapshot.definitions) == 0, "definitions under %s = %+v, want none without a resolver", doc, snapshot.definitions)
 	}
 }
 
@@ -167,33 +167,34 @@ func TestNewConfigurationRejectsCandidates(t *testing.T) {
 		configData string
 		agentsData string
 	}{
-		{name: "config not an object", configData: `[]`, agentsData: `{}`},
-		{name: "config trailing value", configData: `{} {}`, agentsData: `{}`},
-		{name: "config truncated", configData: `{"providers":`, agentsData: `{}`},
-		{name: "sessions malformed", configData: `{"sessions":{"auto_archive":}}`, agentsData: `{}`},
-		{name: "sessions not an object", configData: `{"sessions":5}`, agentsData: `{}`},
-		{name: "sessions day overflow", configData: `{"sessions":{"archive_after_days":106752}}`, agentsData: `{}`},
-		{name: "delete day overflow", configData: `{"sessions":{"delete_after_archive_days":106752}}`, agentsData: `{}`},
-		{name: "extensions not an object", configData: `{"extensions":[]}`, agentsData: `{}`},
+		{name: "config not an object", configData: `[]`, agentsData: ``},
+		{name: "config trailing value", configData: `{} {}`, agentsData: ``},
+		{name: "config truncated", configData: `{"providers":`, agentsData: ``},
+		{name: "sessions malformed", configData: `{"sessions":{"auto_archive":}}`, agentsData: ``},
+		{name: "sessions not an object", configData: `{"sessions":5}`, agentsData: ``},
+		{name: "sessions day overflow", configData: `{"sessions":{"archive_after_days":106752}}`, agentsData: ``},
+		{name: "delete day overflow", configData: `{"sessions":{"delete_after_archive_days":106752}}`, agentsData: ``},
+		{name: "extensions not an object", configData: `{"extensions":[]}`, agentsData: ``},
 		{name: "agents not an object", configData: `{}`, agentsData: `[]`},
 	} {
 		{
-			snapshot, err := assembleConfiguration(1, row.configData, row.agentsData, nil)
+			snapshot, err := assembleConfiguration(t, 1, row.configData, row.agentsData, nil)
 			testassert.Require(t, err != nil, "%s produced %+v, want rejection", row.name, snapshot)
 		}
 	}
 }
 
-// TestNewConfigurationKeepsExistingWarningTypes proves non-fatal catalog and
-// definition problems are retained in the existing warning types instead of
-// failing the candidate.
+// TestNewConfigurationKeepsExistingWarningTypes proves non-fatal catalog
+// problems are retained in the existing warning type instead of failing the
+// candidate. Definition-format rejection belongs to the owning extension's
+// opening path.
 func TestNewConfigurationKeepsExistingWarningTypes(t *testing.T) {
-	snapshot, err := assembleConfiguration(0,
+	snapshot, err := assembleConfiguration(t, 0,
 		`{"providers":{"broken":5}}`,
-		`{"ghost":{"capabilities":["not-declared"]}}`,
+		`{}`,
 		nil)
 	testassert.NoError(t, err)
-	testassert.Require(t, len(snapshot.catalogWarnings) == 1 && snapshot.catalogWarnings[0].Kind == "user_config_skip" && len(snapshot.agentWarnings) == 1 && snapshot.agentWarnings[0].Kind == "invalid_agent_type" && snapshot.agentWarnings[0].Name == "ghost", "catalog warnings = %+v, want the retained catalog warning type; agent warnings = %+v, want the retained invalid-agent drop", snapshot.catalogWarnings, snapshot.agentWarnings)
+	testassert.Require(t, len(snapshot.catalogWarnings) == 1 && snapshot.catalogWarnings[0].Kind == "user_config_skip", "catalog warnings = %+v, want the retained catalog warning type", snapshot.catalogWarnings)
 }
 
 // TestConfigurationAgentTypesProjection proves the per-Agent view over the
@@ -230,12 +231,12 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 	// WriteDir is trimmed exactly once at projection, preserving the legacy
 	// whitespace-as-unset behavior: padded paths arrive clean and a
 	// whitespace-only path arrives as unset.
-	padded, err := assembleConfiguration(4, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "  /tmp/plan  "`, 1), testCapabilities())
+	padded, err := assembleConfiguration(t, 4, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "  /tmp/plan  "`, 1), testCapabilities())
 	testassert.NoError(t, err)
 	paddedPlan, err := resolveAgentType("plan", padded.agentTypes())
 	testassert.NoError(t, err)
 	testassert.Equal(t, paddedPlan.WriteDir, "/tmp/plan")
-	blank, err := assembleConfiguration(5, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "   "`, 1), testCapabilities())
+	blank, err := assembleConfiguration(t, 5, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "   "`, 1), testCapabilities())
 	testassert.NoError(t, err)
 	blankPlan, err := resolveAgentType("plan", blank.agentTypes())
 	testassert.NoError(t, err)
@@ -311,7 +312,7 @@ func TestConfigurationPermissionCapture(t *testing.T) {
 	const workspaceDeny = `{"rules":[{"permission":"file.write","target":"*","access":"deny"}]}`
 	const globalDoc = `{"providers":{"prov":{"transport":{"base_url":"https://api.prov.test/v1","api_key_env":""},"models":{"m":{"name":"M","context_window":100}}}},"permissions":` + globalAllow + `}`
 
-	snapshot, err := assembleConfiguration(2, globalDoc, `{"agent":{"model":"prov/m"}}`, nil)
+	snapshot, err := assembleConfiguration(t, 2, globalDoc, `{"agent":{"model":"prov/m"}}`, nil)
 	testassert.NoError(t, err)
 	testassert.Require(t, string(snapshot.permissions) == globalAllow, "captured global member = %q, want the raw bytes unchanged", snapshot.permissions)
 	wsID, err := config.WorkspacePermissionDirID("/ws")

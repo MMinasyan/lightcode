@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -162,8 +161,8 @@ func openTools(t *testing.T, dataDir string) map[string]Tool {
 
 // TestStandardToolsCompiledIntoComposition proves the baseline tool universe:
 // the seven standard tool declarations compile into every composition without
-// any registration, they are the capability universe's fixed prefix beside the
-// tool universe, an optional export naming one collides as a duplicate
+// any registration, each resolves through the one export table as an ordinary
+// standard provider, an optional export naming one collides as a duplicate
 // provider, and an ordinary dependency on one resolves through the same
 // provider rules as any other capability.
 func TestStandardToolsCompiledIntoComposition(t *testing.T) {
@@ -174,12 +173,13 @@ func TestStandardToolsCompiledIntoComposition(t *testing.T) {
 	for _, declaration := range declarations {
 		baseline = append(baseline, declaration.id)
 	}
-	testassert.Require(t, slices.Equal(c.capabilityIDs[:len(baseline)], baseline), "capability universe prefix = %v, want the seven standard tools first", c.capabilityIDs)
-	testassert.Require(t, slices.Equal(c.toolIDs[:len(baseline)], baseline), "tool universe prefix = %v, want the seven standard tools first", c.toolIDs)
+	for _, id := range baseline {
+		export, ok := c.exports[id]
+		testassert.Require(t, ok && export.standard && export.standardDescribe != nil, "tool %q has no compiled baseline export", id)
+	}
 	for _, id := range toolExportIDs {
 		spec, ok := c.toolSpec(id)
 		testassert.Require(t, ok && spec.id == id && spec.standardDescribe != nil, "tool %q has no compiled baseline declaration", id)
-		testassert.Require(t, slices.Contains(c.capabilityIDs, id), "capability universe = %q, want %q selectable", c.capabilityIDs, id)
 	}
 	byID, _ := openToolsComposed(t, t.TempDir(), &fakeJobs{}, nil)
 	testassert.Equal(t, len(byID), 7)

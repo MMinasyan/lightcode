@@ -726,12 +726,12 @@ func resolveSessionSelection(selection harness.AgentSelection, captured *configu
 	var selected model.ModelRef
 	if selection.Inputs != nil {
 		selected = selection.Inputs.Model
-	} else if selection.Definition != nil && selection.Definition.ExtensionID == "agents" && selection.Definition.CapabilityID == "agents.definitions" {
-		agent, err := resolveAgentType(selection.Definition.DefinitionID, captured.agentTypes())
-		if err != nil {
+	} else if selection.Definition != nil {
+		definition, ok := captured.projectedDefinition(*selection.Definition)
+		if !ok {
 			return sessionSelection{}
 		}
-		selected = agent.Model
+		selected = definition.inputs.Model
 	}
 	if selected.IsZero() {
 		return sessionSelection{}

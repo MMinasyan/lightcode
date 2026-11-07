@@ -75,7 +75,6 @@ const sdk: Record<string, ReturnType<typeof vi.fn>> = {
   ResetProviderField: vi.fn(),
   ResetProviderModelField: vi.fn(),
   RevertSessionCode: vi.fn(),
-  SetAgentTypeModel: vi.fn(),
   SetSessionAgentType: vi.fn(),
   SetSessionModel: vi.fn(),
   StopSession: vi.fn(),
@@ -240,7 +239,7 @@ describe('initial composition', () => {
     expect(vi.mocked(sdk.ListSessions)).toHaveBeenCalledWith('{"query":{"workspace":"/ws","lifecycle":"open"}}');
     expect(vi.mocked(sdk.GetSessionHydration)).toHaveBeenCalledWith('{"session_id":"root1"}');
     expect(vi.mocked(sdk.ListModels)).not.toHaveBeenCalled();
-    expect(vi.mocked(sdk.SetAgentTypeModel)).not.toHaveBeenCalled();
+    expect(vi.mocked(sdk.SetSessionModel)).not.toHaveBeenCalled();
     expect(target.textContent).toContain('root1');
   });
 
@@ -396,6 +395,10 @@ describe('initial composition', () => {
   it.each([
     json(200, { configuration_revision: { instance_id: INSTANCE, generation: '1' }, agents: null }),
     json(200, { configuration_revision: { instance_id: INSTANCE, generation: '1' }, agents: [{ name: 'primary' }] }),
+    json(200, { configuration_revision: { instance_id: INSTANCE, generation: '1' }, agents: [
+      { name: 'primary', ...definitionSelection('primary'), description: '', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] },
+      { name: 'primary', ...definitionSelection('primary'), description: '', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] },
+    ] }),
     json(500, { code: 'storage', message: 'failed' }),
   ])('does not create a session after a failed or malformed roster read', async (result) => {
     const connection = fakeConnection();
@@ -405,6 +408,48 @@ describe('initial composition', () => {
     await mountAppNoWait(connection);
     await settle();
     expect(vi.mocked(sdk.CreateSession)).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['foreign primary', [{ name: 'primary', definition: { extension_id: 'guest', capability_id: 'guest.definitions', definition_id: 'primary' }, description: '', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] }]],
+    ['read-only foreign reviewer', [{ name: 'reviewer', definition: { extension_id: 'guest', capability_id: 'guest.definitions', definition_id: 'reviewer' }, description: '', subagent: false, model: '', readonly: true, write_dir: '', tools: [], capabilities: [] }]],
+    ['duplicate names without supplied primary', [
+      { name: 'twin', definition: { extension_id: 'agents', capability_id: 'agents.definitions', definition_id: 'twin' }, description: '', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] },
+      { name: 'twin', definition: { extension_id: 'guest', capability_id: 'guest.definitions', definition_id: 'twin' }, description: '', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] },
+    ]],
+  ])('creates a resolved root for a roster with no supplied primary: %s', async (_name, agents) => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.ListSessions).mockResolvedValue(json(200, []));
+    vi.mocked(sdk.GetConfiguration).mockResolvedValue(json(200, {
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, extensions: {} },
+      agents,
+      providers: [],
+    }));
+    vi.mocked(sdk.CreateSession).mockResolvedValue(json(200, session('baseline', NEWER)));
+    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(json(200, hydration({ session: session('baseline', NEWER) })));
+    await mountApp(connection);
+    expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledWith('{"body":{"workspace":"/ws"}}');
+  });
+
+  it('selects the supplied application primary beside a duplicate foreign name', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    vi.mocked(sdk.ListSessions).mockResolvedValue(json(200, []));
+    vi.mocked(sdk.GetConfiguration).mockResolvedValue(json(200, {
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, extensions: {} },
+      agents: [
+        { name: 'primary', definition: { extension_id: 'guest', capability_id: 'guest.definitions', definition_id: 'primary' }, description: '', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] },
+        { name: 'primary', ...definitionSelection('primary'), description: '', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] },
+      ],
+      providers: [],
+    }));
+    vi.mocked(sdk.CreateSession).mockResolvedValue(json(200, session('primary1', NEWER)));
+    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(json(200, hydration({ session: session('primary1', NEWER) })));
+    await mountApp(connection);
+    expect(vi.mocked(sdk.CreateSession)).toHaveBeenCalledWith('{"body":{"workspace":"/ws","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"}}}}');
   });
 });
 
@@ -892,19 +937,19 @@ describe('keyboard pickers', () => {
     (target.querySelector('.mp .item') as HTMLElement).click();
     await settle();
     expect(vi.mocked(sdk.SetSessionModel)).toHaveBeenCalledWith('{"session_id":"root1","body":{"model":"prov/a"}}');
-    expect(vi.mocked(sdk.SetAgentTypeModel)).not.toHaveBeenCalled();
+    expect(vi.mocked(sdk.UpdateConfigurationSettings)).not.toHaveBeenCalled();
   });
 
-  it('Ctrl+M reads models and applies a type-wide SetAgentTypeModel', async () => {
+  it('Ctrl+M reads models and applies the supplied set_model extension edit', async () => {
     vi.mocked(sdk.ListModels).mockResolvedValue(json(200, {
       configuration_revision: { instance_id: INSTANCE, generation: '1' },
       models: [
         { ref: 'prov/a', provider: 'prov', provider_name: 'Provider', model: 'a', display_name: 'Model A', context_window: 1000, max_output_tokens: 10, hidden: false, provider_hidden: false, incomplete: false, source: 'user' },
       ],
     }));
-    vi.mocked(sdk.SetAgentTypeModel).mockResolvedValue(json(200, {
+    vi.mocked(sdk.UpdateConfigurationSettings).mockResolvedValue(json(200, {
       configuration_revision: { instance_id: INSTANCE, generation: '2' },
-      result: { name: 'primary', ...definitionSelection('primary'), description: '', subagent: false, model: 'prov/a', readonly: false, write_dir: '', tools: [], capabilities: [] },
+      result: { sessions: { auto_archive: false, archive_after_days: 0, delete_after_archive_days: 0 }, tools: {}, jobs: {}, compaction: {}, extensions: {} },
     }));
     const { target } = await mountBasic();
     // After the mutation the Runtime publishes the newer configuration clock in
@@ -926,7 +971,7 @@ describe('keyboard pickers', () => {
     await settle();
     (target.querySelector('.mp .item') as HTMLElement).click();
     await settle();
-    expect(vi.mocked(sdk.SetAgentTypeModel)).toHaveBeenCalledWith('{"query":{"agent_type":"primary"},"body":{"model":"prov/a"}}');
+    expect(vi.mocked(sdk.UpdateConfigurationSettings)).toHaveBeenCalledWith('{"body":{"extension_edit":{"extension_id":"agents","edit_id":"set_model","arguments":"{\\"definition_id\\":\\"primary\\",\\"model\\":\\"prov/a\\"}"}}}');
     // Correction 5: the success is reported, and the current configuration view
     // is refreshed through its OWN generated read (not by force-adopting the
     // mutation's returned clock).
@@ -944,7 +989,7 @@ describe('keyboard pickers', () => {
         { ref: 'prov/available', provider: 'prov', provider_name: 'Provider', model: 'available', display_name: 'Available', context_window: 1000, max_output_tokens: 10, hidden: false, provider_hidden: false, incomplete: false, source: 'user' },
       ],
     }));
-    vi.mocked(sdk.SetAgentTypeModel).mockResolvedValue(json(404, { code: 'not_found', message: 'model not available' }));
+    vi.mocked(sdk.UpdateConfigurationSettings).mockResolvedValue(json(404, { code: 'not_found', message: 'model not available' }));
     const { target } = await mountApp(connection);
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true }));
     await settle();
@@ -953,7 +998,7 @@ describe('keyboard pickers', () => {
     // list does not automatically replace it.
     expect(target.textContent).toContain('Currently selected model:');
     expect(target.textContent).toContain('prov/missing');
-    expect(vi.mocked(sdk.SetAgentTypeModel)).not.toHaveBeenCalled();
+    expect(vi.mocked(sdk.UpdateConfigurationSettings)).not.toHaveBeenCalled();
     (target.querySelector('.mp-btn') as HTMLElement).click();
     await settle();
     (target.querySelector('.mp .item') as HTMLElement).click();
@@ -961,7 +1006,7 @@ describe('keyboard pickers', () => {
     await settle();
     // The generated rejection is displayed and the accepted selection is not
     // changed by the client.
-    expect(vi.mocked(sdk.SetAgentTypeModel)).toHaveBeenCalledWith('{"query":{"agent_type":"primary"},"body":{"model":"prov/available"}}');
+    expect(vi.mocked(sdk.UpdateConfigurationSettings)).toHaveBeenCalledWith('{"body":{"extension_edit":{"extension_id":"agents","edit_id":"set_model","arguments":"{\\"definition_id\\":\\"primary\\",\\"model\\":\\"prov/available\\"}"}}}');
     expect(target.querySelector('.note.outcome')?.textContent).toContain('Model selection failed');
     expect(target.querySelector('.note.outcome')?.textContent).toContain('model not available');
     expect(target.textContent).toContain('prov/missing');
@@ -973,7 +1018,7 @@ describe('keyboard pickers', () => {
       models: [{ ref: 'prov/a', provider: 'prov', provider_name: 'Provider', model: 'a', display_name: 'Model A', context_window: 1000, max_output_tokens: 10, hidden: false, provider_hidden: false, incomplete: false, source: 'user' }],
     }));
     const { promise: modelGate, resolve: resolveModel } = Promise.withResolvers();
-    vi.mocked(sdk.SetAgentTypeModel).mockImplementation(() => modelGate);
+    vi.mocked(sdk.UpdateConfigurationSettings).mockImplementation(() => modelGate);
     const { target } = await mountBasic();
     const opensBefore = target ? 0 : 0;
     void opensBefore;
@@ -989,7 +1034,7 @@ describe('keyboard pickers', () => {
     // The old-owner response finally lands carrying a foreign clock.
     resolveModel(json(200, {
       configuration_revision: { instance_id: 'ffffffffffffffffffffffffffffffff', generation: '9' },
-      result: { name: 'primary', ...definitionSelection('primary'), description: '', subagent: false, model: 'prov/a', readonly: false, write_dir: '', tools: [], capabilities: [] },
+      result: { sessions: { auto_archive: false, archive_after_days: 0, delete_after_archive_days: 0 }, tools: {}, jobs: {}, compaction: {}, extensions: {} },
     }));
     await settle();
     await settle();
@@ -2641,24 +2686,57 @@ describe('agent type ownership', () => {
     expect(choices.some((text) => text?.includes('primary'))).toBe(true);
     expect(choices.some((text) => text?.includes('compact'))).toBe(true);
     expect(choices.some((text) => text?.includes('reviewer'))).toBe(true);
-    (target.querySelector('[aria-label="Set session agent type compact"]') as HTMLElement).click();
+    (target.querySelector('[aria-label="Set session agent type compact from agents/agents.definitions"]') as HTMLElement).click();
     await settle();
     await settle();
     expect(vi.mocked(sdk.SetSessionAgentType)).toHaveBeenCalledWith('{"session_id":"root1","body":{"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"compact"}}}}');
     // A second returned definition dispatches its own actual name as well.
     await openAgentPicker();
-    (target.querySelector('[aria-label="Set session agent type reviewer"]') as HTMLElement).click();
+    (target.querySelector('[aria-label="Set session agent type reviewer from agents/agents.definitions"]') as HTMLElement).click();
     await settle();
     await settle();
     expect(vi.mocked(sdk.SetSessionAgentType).mock.calls.at(-1)?.[0]).toEqual('{"session_id":"root1","body":{"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"reviewer"}}}}');
     // The server stays the accepting owner: a generated rejection is displayed.
     vi.mocked(sdk.SetSessionAgentType).mockResolvedValue(json(400, { code: 'invalid', message: 'unknown agent type' }));
     await openAgentPicker();
-    (target.querySelector('[aria-label="Set session agent type compact"]') as HTMLElement).click();
+    (target.querySelector('[aria-label="Set session agent type compact from agents/agents.definitions"]') as HTMLElement).click();
     await settle();
     await settle();
     expect(target.textContent).toContain('Agent type change failed');
     expect(target.textContent).toContain('unknown agent type');
+  });
+
+  it('addresses duplicate display names by full reference and marks the exact current entry', async () => {
+    const connection = fakeConnection();
+    basicMocks(connection);
+    const ownTwin = { name: 'twin', definition: { extension_id: 'agents', capability_id: 'agents.definitions', definition_id: 'twin' }, description: 'same description', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] };
+    const guestTwin = { name: 'twin', definition: { extension_id: 'guest', capability_id: 'guest.definitions', definition_id: 'twin' }, description: 'same description', subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] };
+    vi.mocked(sdk.GetConfiguration).mockResolvedValue(json(200, {
+      configuration_revision: { instance_id: INSTANCE, generation: '1' },
+      settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, extensions: {} },
+      agents: [ownTwin, guestTwin],
+      providers: [],
+    }));
+    vi.mocked(sdk.GetSessionHydration).mockResolvedValue(json(200, hydration({
+      session: { ...session('root1', NEWER), agent_selection: { definition: guestTwin.definition } },
+    })));
+    vi.mocked(sdk.SetSessionAgentType).mockResolvedValue(json(200, session('root1', NEWER)));
+    const { target } = await mountApp(connection);
+    await openSettings(target);
+    (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
+    await settle();
+    const twins = [...target.querySelectorAll('dialog .row')] as HTMLElement[];
+    expect(twins.length).toBe(2);
+    expect(twins[0].textContent).toContain('agents/agents.definitions');
+    expect(twins[1].textContent).toContain('guest/guest.definitions');
+    expect(twins[0].getAttribute('aria-label')).toBe('Set session agent type twin from agents/agents.definitions');
+    expect(twins[1].getAttribute('aria-label')).toBe('Set session agent type twin from guest/guest.definitions');
+    expect(twins[0].classList.contains('cur')).toBe(false);
+    expect(twins[1].classList.contains('cur')).toBe(true);
+    twins[1].click();
+    await settle();
+    await settle();
+    expect(vi.mocked(sdk.SetSessionAgentType).mock.calls.at(-1)?.[0]).toEqual('{"session_id":"root1","body":{"agent_selection":{"definition":{"extension_id":"guest","capability_id":"guest.definitions","definition_id":"twin"}}}}');
   });
 });
 
@@ -2783,9 +2861,9 @@ describe('settings editor', () => {
       configuration_revision: { instance_id: INSTANCE, generation: '1' },
       models: [{ ref: 'prov/compact-model', provider: 'prov', provider_name: 'Provider', model: 'compact-model', display_name: 'Compact model', context_window: 1000, max_output_tokens: 10, hidden: false, provider_hidden: false, incomplete: false, source: 'user' }],
     }));
-    vi.mocked(sdk.SetAgentTypeModel).mockResolvedValue(json(200, {
+    vi.mocked(sdk.UpdateConfigurationSettings).mockResolvedValue(json(200, {
       configuration_revision: { instance_id: INSTANCE, generation: '2' },
-      result: { name: 'compact', ...definitionSelection('compact'), description: 'Compaction', subagent: false, model: 'prov/compact-model', readonly: true, write_dir: '', tools: [], capabilities: [] },
+      result: { sessions: { auto_archive: false, archive_after_days: 0, delete_after_archive_days: 0 }, tools: {}, jobs: {}, compaction: {}, extensions: {} },
     }));
     const { target } = await mountApp(connection);
     await openSettings(target);
@@ -2806,15 +2884,14 @@ describe('settings editor', () => {
     });
     expect(body).toContain('"tools":{"max_output_bytes":9007199254740993}');
     expect(body).toContain('"extensions":{}');
-    expect(vi.mocked(sdk.SetAgentTypeModel)).not.toHaveBeenCalled();
 
-    // The actual compact Agent selection and its type-wide model action use
-    // SetSessionAgentType and SetAgentTypeModel only; they never write the
-    // baseline settings owner.
+    // The actual compact Agent selection uses SetSessionAgentType, and its
+    // type-wide model action uses the supplied set_model extension edit; the
+    // edit never writes the baseline settings owner.
     (target.querySelector('[aria-label="Agent type"]') as HTMLElement).click();
     await settle();
     selectedCompact = true;
-    (target.querySelector('[aria-label="Set session agent type compact"]') as HTMLElement).click();
+    (target.querySelector('[aria-label="Set session agent type compact from agents/agents.definitions"]') as HTMLElement).click();
     await settle();
     await settle();
     expect(vi.mocked(sdk.SetSessionAgentType)).toHaveBeenCalledWith('{"session_id":"root1","body":{"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"compact"}}}}');
@@ -2825,8 +2902,8 @@ describe('settings editor', () => {
     await settle();
     (target.querySelector('.mp .item') as HTMLElement).click();
     await settle();
-    expect(vi.mocked(sdk.SetAgentTypeModel)).toHaveBeenCalledWith('{"query":{"agent_type":"compact"},"body":{"model":"prov/compact-model"}}');
-    expect(vi.mocked(sdk.UpdateConfigurationSettings)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sdk.UpdateConfigurationSettings)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(sdk.UpdateConfigurationSettings).mock.calls.at(-1)?.[0]).toBe('{"body":{"extension_edit":{"extension_id":"agents","edit_id":"set_model","arguments":"{\\"definition_id\\":\\"compact\\",\\"model\\":\\"prov/compact-model\\"}"}}}');
   });
 
   it('resets only the tools section to defaults', async () => {

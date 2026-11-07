@@ -17,10 +17,10 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/extension"
+	taskplugin "github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
-	taskplugin "github.com/MMinasyan/lightcode/internal/plugins/tasks"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -115,7 +115,7 @@ func TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments(t *testin
 	// Read-to-save: the whole plugins member round-trips its documents
 	// and the unowned provider lexeme survives the owning write.
 	{
-		_, err := r.updateSettings(ctx, view.Settings)
+		_, err := updateSettingsOnly(r, ctx, view.Settings)
 		testassert.NoError(t, err)
 	}
 	nextConfigurationEvent(t, sub, "2")
@@ -530,12 +530,16 @@ func TestConfigurationMutateEverySuccessfulEditWritesAndPublishes(t *testing.T) 
 // separate Agent file is created.
 func TestConfigurationMutateWritesOwningFileOnly0600(t *testing.T) {
 	h := newServiceHarness(t)
-	svc := h.service(context.Background(), fixtureAgentPlugin())
+	svc := h.preparedService(context.Background(), fixtureAgentPlugin())
 	agentsPath := filepath.Join(h.dataDir, "agents.json")
+	{
+		_, err := svc.publish(context.Background())
+		testassert.NoError(t, err)
+	}
 
 	candidate, err := svc.mutate(context.Background(), svc.editAgentModel("primary", "prov/m"))
 	testassert.NoError(t, err)
-	testassert.Equal(t, candidate.snapshot.generation, 1)
+	testassert.Equal(t, candidate.snapshot.generation, 2)
 	info, err := os.Stat(h.configPath)
 	testassert.NoError(t, err)
 	if info.Mode().Perm() != 0o600 {
@@ -575,7 +579,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
 	writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
-	svc := h.service(context.Background(), fixtureAgentPlugin())
+	svc := h.preparedService(context.Background(), fixtureAgentPlugin())
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -661,8 +665,8 @@ func TestConfigurationMutateAgentModelPreservesConcurrentSettings(t *testing.T) 
 		}
 	}
 	t.Cleanup(func() { candidateBarrier = nil })
-	plugin := servicePlugin("agents", &h.opens, acceptValidator)
-	svc := h.service(context.Background(), plugin)
+	alpha := servicePlugin("alpha", &h.opens, acceptValidator)
+	svc := h.preparedService(context.Background(), alpha, fixtureAgentPlugin(alpha))
 	initial, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	settings := projectSettings(initial.snapshot.sessions, initial.snapshot.tools, initial.snapshot.jobs, initial.snapshot.compaction, initial.snapshot.extensions)
@@ -709,7 +713,7 @@ func TestConfigurationMutateAgentModelClearAlwaysWritesAndPublishes(t *testing.T
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
 	writeAgentDefinitions(t, h.configPath, `{}`)
-	svc := h.service(context.Background(), fixtureAgentPlugin())
+	svc := h.preparedService(context.Background(), fixtureAgentPlugin())
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -743,7 +747,7 @@ func TestConfigurationMutateUnknownAgentTypeFailsWithoutBareEntry(t *testing.T) 
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
 	writeAgentDefinitions(t, h.configPath, `{}`)
-	svc := h.service(context.Background(), fixtureAgentPlugin())
+	svc := h.preparedService(context.Background(), fixtureAgentPlugin())
 	svc.attachWarnings(newWarningStore())
 	{
 		_, err := svc.publish(context.Background())
@@ -777,7 +781,7 @@ func TestConfigurationMutateMalformedModelRefFailsWithoutWrite(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
 	writeAgentDefinitions(t, h.configPath, `{"worker":{"model":"prov/m"}}`)
-	svc := h.service(context.Background(), fixtureAgentPlugin())
+	svc := h.preparedService(context.Background(), fixtureAgentPlugin())
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -947,13 +951,10 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 			h := newServiceHarness(t)
 			writeServiceFile(t, h.configPath, mutationConfigDocument())
 			writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
-			svc := h.service(context.Background(),
-				servicePlugin("capowner", &h.opens, acceptValidator),
-				func() extension.Native {
-					plugin := servicePlugin("alpha", &h.opens, acceptValidator)
-					plugin.Declaration.ConfigSchema = json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"},"invalid":{"not":{"const":true}}},"required":["enabled"]}`)
-					return plugin
-				}(), fixtureAgentPlugin())
+			capowner := servicePlugin("capowner", &h.opens, acceptValidator)
+			alpha := servicePlugin("alpha", &h.opens, acceptValidator)
+			alpha.Declaration.ConfigSchema = json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"},"invalid":{"not":{"const":true}}},"required":["enabled"]}`)
+			svc := h.preparedService(context.Background(), capowner, alpha, fixtureAgentPlugin(capowner, alpha))
 			{
 				_, err := svc.publish(context.Background())
 				testassert.NoError(t, err)
@@ -1236,13 +1237,13 @@ func TestRuntimeSettingsMutationLastWriterWins(t *testing.T) {
 
 		first := view.Settings
 		first.Sessions.ArchiveAfterDays = 9
-		mutation, err := r.updateSettings(ctx, first)
+		mutation, err := updateSettingsOnly(r, ctx, first)
 		testassert.NoError(t, err)
 		testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Sessions.ArchiveAfterDays == 9, "client 1 mutation = %+v, want generation 2 with the written value", mutation)
 
 		// Client 2 submits its older whole-section document:
 		// last-writer-wins, not a conflict.
-		mutation, err = r.updateSettings(ctx, stale)
+		mutation, err = updateSettingsOnly(r, ctx, stale)
 		testassert.NoError(t, err)
 		testassert.Require(t, mutation.ConfigurationRevision.Generation == "3" && mutation.Result.Sessions.ArchiveAfterDays == 3, "client 2 mutation = %+v, want generation 3 with the stale value", mutation)
 		fresh, err := r.getConfiguration(ctx)
@@ -1263,7 +1264,7 @@ func TestRuntimeSettingsMutationOwnershipAndResult(t *testing.T) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
-		mutation, err := r.updateSettings(ctx, mutationSettings())
+		mutation, err := updateSettingsOnly(r, ctx, mutationSettings())
 		testassert.NoError(t, err)
 		testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.ConfigurationRevision.InstanceId == "", "mutation revision = %+v, want generation 2 with the empty pre-server instance", mutation.ConfigurationRevision)
 		mutation.Result.Sessions.ArchiveAfterDays = 999
@@ -1303,7 +1304,7 @@ func TestRuntimeAgentModelMutationAffectsNextAdmissions(t *testing.T) {
 
 		mutation, err := r.setAgentTypeModel(ctx, "worker", "prov/wide")
 		testassert.NoError(t, err)
-		testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Model == "prov/wide" && mutation.Result.Name == "worker", "mutation = %+v, want the new model projected from the returned candidate at generation 2", mutation)
+		testassert.Require(t, mutation.ConfigurationRevision.Generation == "2", "mutation = %+v, want the new model at generation 2", mutation)
 
 		// Session B is idle: its next admission commits the new model at the
 		// new generation, and the active Operation has not re-captured. The
@@ -1369,7 +1370,7 @@ func TestRuntimeOwnerCloseAfterWriteBeginsFinishesPublication(t *testing.T) {
 		}
 		done := make(chan result, 1)
 		go func() {
-			mutation, err := r.updateSettings(ctx, mutationSettings())
+			mutation, err := updateSettingsOnly(r, ctx, mutationSettings())
 			done <- result{mutation, err}
 		}()
 		probe.awaitWriteStarted(t)
@@ -1500,9 +1501,20 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 // publication of the given generation.
 func nextConfigurationEvent(t *testing.T, sub *Subscription, generation string) {
 	t.Helper()
-	event, ok := nextEvent(t, sub)
-	if !ok || eventKind(t, event) != "configuration_changed" || eventGeneration(t, event) != generation {
-		t.Fatalf("event = %s (ok=%v), want the generation %s configuration event", eventJSON(t, event), ok, generation)
+	for {
+		event, ok := nextEvent(t, sub)
+		if !ok {
+			t.Fatalf("stream closed, want the generation %s configuration event", generation)
+		}
+		// Candidate and retired resource sets publish their own scope events
+		// ahead of the configuration event.
+		if strings.HasPrefix(eventKind(t, event), "scope_") {
+			continue
+		}
+		if eventKind(t, event) != "configuration_changed" || eventGeneration(t, event) != generation {
+			t.Fatalf("event = %s (ok=%v), want the generation %s configuration event", eventJSON(t, event), ok, generation)
+		}
+		return
 	}
 }
 
@@ -1575,11 +1587,11 @@ func TestConfigurationSettingsRejectNonIntegerTaskLexemes(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			h := newServiceHarness(t)
 			writeServiceFile(t, h.configPath, mutationConfigDocument())
-			svc := h.service(context.Background(), taskplugin.Native())
+			svc := h.service(context.Background(), taskplugin.Native(taskplugin.Options{}))
 			// The isolated service harness normally skips resource opening; this
 			// row owns the real publication boundary, so attach the owner graph
 			// and data root the Runtime wires in production.
-			graph, err := newNativeComposition([]extension.Native{taskplugin.Native()})
+			graph, err := newNativeComposition([]extension.Native{taskplugin.Native(taskplugin.Options{})})
 			testassert.NoError(t, err)
 			svc.composition = graph
 			svc.dataDir = t.TempDir()
@@ -1602,5 +1614,42 @@ func TestConfigurationSettingsRejectNonIntegerTaskLexemes(t *testing.T) {
 			testassert.Require(t, string(after) == string(before), "rejected settings changed the owning bytes")
 			testassert.Equal(t, svc.current().generation, generation)
 		})
+	}
+}
+
+// TestConfigurationMutateExtensionEditRequiresPreparedProvider proves the
+// nearest sibling of an inactive owner: an externally enabled section whose
+// provider was not prepared in the published revision refuses the edit before
+// any write instead of opening a provider on demand.
+func TestConfigurationMutateExtensionEditRequiresPreparedProvider(t *testing.T) {
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, `{"extensions":{"agents":{"enabled":false}}}`)
+	svc := h.preparedService(context.Background(), fixtureAgentPlugin())
+	before, err := svc.publish(context.Background())
+	testassert.NoError(t, err)
+	testassert.Require(t, before.snapshot.resources.runtime.capabilities["agents.configuration"] == nil, "disabled Agents prepared a configuration provider")
+
+	// An external writer enables the section without a reload; the latest raw
+	// state says enabled but the published resource set has no provider.
+	writeServiceFile(t, h.configPath, `{"extensions":{"agents":{"enabled":true,"definitions":{"worker":{"system_prompt":"simple"}}}}}`)
+	bytesBefore := mustRead(t, h.configPath)
+	_, err = svc.mutate(context.Background(), svc.editAgentModel("worker", "prov/m"))
+	testassert.Require(t, err != nil && svc.current() == before.snapshot && bytes.Equal(bytesBefore, mustRead(t, h.configPath)), "unprepared provider edit = %v, want no write or publication", err)
+}
+
+// TestConfigurationMutateExtensionEditRejectsMalformedArguments proves the
+// declared edit's argument document is caller input: a non-JSON or
+// wrong-shaped document fails invalid before any write.
+func TestConfigurationMutateExtensionEditRejectsMalformedArguments(t *testing.T) {
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, `{"extensions":{"agents":{"enabled":true,"definitions":{"worker":{"system_prompt":"simple"}}}}}`)
+	svc := h.preparedService(context.Background(), fixtureAgentPlugin())
+	before, err := svc.publish(context.Background())
+	testassert.NoError(t, err)
+	bytesBefore := mustRead(t, h.configPath)
+	for _, arguments := range []string{`{`, `{"definition_id":"worker"}`, `[]`} {
+		_, err := svc.mutate(context.Background(), svc.editExtension(context.Background(), "agents", "set_model", json.RawMessage(arguments)))
+		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "arguments %s = %v, want harness.ErrInvalid", arguments, err)
+		testassert.Require(t, svc.current() == before.snapshot && bytes.Equal(bytesBefore, mustRead(t, h.configPath)), "arguments %s changed publication or source", arguments)
 	}
 }
