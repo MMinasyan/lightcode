@@ -22,7 +22,7 @@ const (
 	ContractPrompt           = "melta.prompt"
 	ContractData             = "melta.data"
 	ContractSessionCleanup   = "melta.session_cleanup"
-	ContractCredentials      = "melta.credentials"
+	ContractCredentials      = "melta.credentials" // #nosec G101 -- Protocol contract identifier, not a credential value.
 	ContractCommands         = "melta.commands"
 
 	// ContractVersion is the one accepted version of every fixed contract.
