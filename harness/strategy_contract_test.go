@@ -1159,7 +1159,7 @@ func TestMaintenanceRequestMessageDomain(t *testing.T) {
 					store := emptyStore(t)
 					prepared := compactPrepared(captureForHandoff(), exec)
 					h := newCompactHarness(t, store, prepared)
-					session, serr := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+					session, serr := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 					testassert.NoError(t, serr)
 					c := leaseCoordinator(t, h, session.Identity.SessionID)
 					runErr = runManualCompact(t, h, c, session.Identity.SessionID, "compact-1")
@@ -1256,7 +1256,7 @@ func TestMaintenanceMalformedRequestAfterOpeningCancellation(t *testing.T) {
 					store = emptyStore(t)
 					prepared := compactPrepared(captureForHandoff(), exec)
 					h := newCompactHarness(t, store, prepared)
-					created, serr := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+					created, serr := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 					testassert.NoError(t, serr)
 					c := leaseCoordinator(t, h, created.Identity.SessionID)
 					session, opID = created.Identity.SessionID, "compact-1"

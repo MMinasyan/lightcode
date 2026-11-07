@@ -29,19 +29,16 @@ type editedFile int
 
 const (
 	editMainConfig editedFile = iota + 1
-	editAgentsFile
 	// editConnection owns no file: the existing-provider connect and
 	// disconnect publish one ready next-generation candidate and event while
-	// leaving the main and agents bytes untouched. Every successful
+	// leaving the main document untouched. Every successful
 	// connection edit therefore consumes a generation.
 	editConnection
 )
 
-// rawRoots carries the owned decoded root maps of the latest raw input
-// files one edit applies to.
+// rawRoots carries the owned decoded root map one edit applies to.
 type rawRoots struct {
 	config map[string]json.RawMessage
-	agents map[string]json.RawMessage
 }
 
 // connectionKeyAction is the one managed-env key action a connection-bearing
@@ -98,9 +95,9 @@ type configurationEdit struct {
 // capture of the ready revision is taken under the publication/capture mutex
 // and released again before the candidate build, so the edit's subject and
 // credential decisions never compose live getters and a slow build never
-// holds the capture path. The latest owning and companion raw user files are
-// read inside that hold — never a stale published snapshot — and decoded as
-// root objects whose raw members keep their exact bytes; a missing file
+// holds the capture path. The latest main document is read inside that hold —
+// never a stale published snapshot — and decoded as a root object whose raw
+// members keep their exact bytes; a missing file
 // contributes its skeleton bytes in memory and is created by no read. The
 // edit's owning file — and only that file — is atomically rewritten mode 0600
 // after the candidate validates, the edit's candidate check passes, and the
@@ -144,22 +141,12 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 		s.buildMu.Unlock()
 		return configurationCapture{}, configurationFailure(fmt.Errorf("read main configuration: %w", err))
 	}
-	agentsData, _, err := readCapturedBytes(s.agentsPath, agentsSkeleton)
-	if err != nil {
-		s.buildMu.Unlock()
-		return configurationCapture{}, configurationFailure(fmt.Errorf("read agent definitions: %w", err))
-	}
 	configRoot, err := decodeRoot(configData)
 	if err != nil {
 		s.buildMu.Unlock()
 		return configurationCapture{}, configurationFailure(err)
 	}
-	agentsRoot, err := decodeRoot(agentsData)
-	if err != nil {
-		s.buildMu.Unlock()
-		return configurationCapture{}, configurationFailure(err)
-	}
-	owning, err := edit.apply(rawRoots{config: configRoot, agents: agentsRoot}, seed)
+	owning, err := edit.apply(rawRoots{config: configRoot}, seed)
 	if err != nil {
 		s.buildMu.Unlock()
 		return configurationCapture{}, err
@@ -169,7 +156,7 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 		s.buildMu.Unlock()
 		return configurationCapture{}, err
 	}
-	configCandidate, agentsCandidate := configData, agentsData
+	configCandidate := configData
 	var owningPath string
 	var complete []byte
 	switch owning {
@@ -180,13 +167,6 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 			return configurationCapture{}, configurationFailure(err)
 		}
 		configCandidate = complete
-	case editAgentsFile:
-		owningPath = s.agentsPath
-		if complete, err = marshalRoot(agentsRoot); err != nil {
-			s.buildMu.Unlock()
-			return configurationCapture{}, configurationFailure(err)
-		}
-		agentsCandidate = complete
 	case editConnection:
 		// No owning file: the candidate publishes over the untouched bytes.
 	}
@@ -205,7 +185,7 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 			conn.discovered = nil
 		}
 	}
-	candidate, err := s.buildCaptured(ctx, generation, configCandidate, agentsCandidate, conn)
+	candidate, err := s.buildCaptured(ctx, generation, configCandidate, conn)
 	if err != nil {
 		s.buildMu.Unlock()
 		return configurationCapture{}, err
@@ -334,13 +314,13 @@ func restoreOwningBytes(path string, prior []byte, existed bool) error {
 
 // editSettings builds the settings edit: the whole sessions member, the
 // top-level baseline tools, jobs and compaction sections, and the whole
-// plugins member are written as the generated target shape — each baseline
-// section as its exact JSON object bytes and each plugin ID's opaque document
-// string becomes that plugin's owned raw section, and an ID absent from the
+// extensions member are written as the generated target shape — each baseline
+// section as its exact JSON object bytes and each extension ID's opaque document
+// string becomes its raw section, and an ID absent from the
 // target removes any newer section, exactly one object per document — and
 // every other top-level root member is unowned and kept untouched. Never
 // merged per field. The selected declaration's validator, not this edit,
-// interprets each plugin document; the candidate construction validates the
+// interprets each active document; candidate construction validates the
 // baseline sections with their owning services' validators.
 func editSettings(settings protocol.Settings) configurationEdit {
 	return configurationEdit{apply: func(roots rawRoots, _ configurationCapture) (editedFile, error) {
@@ -348,8 +328,8 @@ func editSettings(settings protocol.Settings) configurationEdit {
 		if err != nil {
 			return 0, err
 		}
-		plugins := make(map[string]json.RawMessage, len(settings.Plugins))
-		for id, document := range settings.Plugins {
+		plugins := make(map[string]json.RawMessage, len(settings.Extensions))
+		for id, document := range settings.Extensions {
 			plugins[id] = json.RawMessage(document) // string→[]byte conversion owns the bytes
 		}
 		pluginsRaw, err := marshalRawObject(plugins, true)
@@ -357,7 +337,7 @@ func editSettings(settings protocol.Settings) configurationEdit {
 			return 0, configurationFailure(fmt.Errorf("encode plugins documents: %w", err))
 		}
 		roots.config["sessions"] = sessions
-		roots.config["plugins"] = pluginsRaw
+		roots.config["extensions"] = pluginsRaw
 		roots.config["tools"] = settingsSection(settings.Tools)
 		roots.config["jobs"] = settingsSection(settings.Jobs)
 		roots.config["compaction"] = settingsSection(settings.Compaction)
@@ -375,8 +355,8 @@ func settingsSection(raw json.RawMessage) json.RawMessage {
 	return append(json.RawMessage(nil), raw...)
 }
 
-// editAgentModel copies the retained owning model-field mutation onto the
-// latest agents root: a nonempty ref replaces the user model override, an
+// editAgentModel applies the retained model-field mutation to the latest
+// extensions.agents.definitions member: a nonempty ref replaces the user model override, an
 // empty ref clears it. Every successful set or clear — absent override and
 // identical bytes included — is a real edit that writes the owning file and
 // publishes the next generation; the retained public field reset operator
@@ -388,7 +368,27 @@ func settingsSection(raw json.RawMessage) json.RawMessage {
 // addressable.
 func (s *configurationService) editAgentModel(agentType, ref string) configurationEdit {
 	return configurationEdit{apply: func(roots rawRoots, _ configurationCapture) (editedFile, error) {
-		agentsRoot := roots.agents
+		if len(roots.config["extensions"]) == 0 {
+			return 0, fmt.Errorf("agents extension is unavailable: %w", harness.ErrInvalid)
+		}
+		extensions, err := decodeRoot(roots.config["extensions"])
+		if err != nil {
+			return 0, configurationFailure(err)
+		}
+		if !s.pluginIDs["agents"] || !sectionEnabled(extensions["agents"]) {
+			return 0, fmt.Errorf("agents extension is unavailable: %w", harness.ErrInvalid)
+		}
+		section, err := decodeRoot(extensions["agents"])
+		if err != nil {
+			return 0, configurationFailure(err)
+		}
+		agentsRoot := map[string]json.RawMessage{}
+		if len(section["definitions"]) != 0 {
+			agentsRoot, err = decodeRoot(section["definitions"])
+			if err != nil {
+				return 0, configurationFailure(err)
+			}
+		}
 		if ref != "" {
 			if _, err := model.Parse(ref); err != nil {
 				return 0, fmt.Errorf("model ref %q: %v: %w", ref, err, harness.ErrInvalid)
@@ -402,7 +402,7 @@ func (s *configurationService) editAgentModel(agentType, ref string) configurati
 		if err != nil {
 			return 0, configurationFailure(err)
 		}
-		if _, err := harness.ResolveAgentType(agentType, projectAgentTypes(parsed.All())); err != nil {
+		if _, err := resolveAgentType(agentType, projectAgentTypes(parsed.All())); err != nil {
 			return 0, err
 		}
 		var fields map[string]json.RawMessage
@@ -423,7 +423,19 @@ func (s *configurationService) editAgentModel(agentType, ref string) configurati
 		if agentsRoot[agentType], err = json.Marshal(fields); err != nil {
 			return 0, err
 		}
-		return editAgentsFile, nil
+		section["definitions"], err = json.Marshal(agentsRoot)
+		if err != nil {
+			return 0, err
+		}
+		extensions["agents"], err = json.Marshal(section)
+		if err != nil {
+			return 0, err
+		}
+		roots.config["extensions"], err = marshalRawObject(extensions, true)
+		if err != nil {
+			return 0, err
+		}
+		return editMainConfig, nil
 	}}
 }
 
@@ -459,7 +471,7 @@ func decodeRoot(data []byte) (map[string]json.RawMessage, error) {
 }
 
 // marshalRoot serializes one edited root map as the owning file's complete
-// bytes: sorted members, plugin sections retained verbatim, and other JSON
+// bytes: sorted members, extension sections retained verbatim, and other JSON
 // values indented without changing numeric lexemes. A trailing newline matches
 // the retained writers.
 func marshalRoot(root map[string]json.RawMessage) ([]byte, error) {
@@ -487,7 +499,7 @@ func marshalRawObject(root map[string]json.RawMessage, preserveAll bool) ([]byte
 		out.WriteString("  ")
 		out.Write(name)
 		out.WriteString(": ")
-		if preserveAll || key == "plugins" {
+		if preserveAll || key == "extensions" {
 			out.Write(value)
 		} else {
 			var indented bytes.Buffer

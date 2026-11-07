@@ -618,7 +618,7 @@ func TestRunCompactionEmptySnapshotFailsNothingToCompact(t *testing.T) {
 	}, nil)
 	prepared := compactPrepared(testCapture(), exec)
 	h := newCompactHarness(t, store, prepared)
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	c := leaseCoordinator(t, h, session.Identity.SessionID)
 	err = runManualCompact(t, h, c, session.Identity.SessionID, "compact-1")
@@ -867,7 +867,7 @@ func TestMaintenanceNonComparableCauseSettlesWithoutPanic(t *testing.T) {
 					store := emptyStore(t)
 					prepared := compactPrepared(capture, exec)
 					h = newCompactHarness(t, store, prepared)
-					session, serr := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+					session, serr := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 					testassert.NoError(t, serr)
 					sessionID = session.Identity.SessionID
 					c = leaseCoordinator(t, h, sessionID)
@@ -913,7 +913,7 @@ func TestMaintenanceInterruptionPublicationFailureWins(t *testing.T) {
 	}, nil)
 	prepared := compactPrepared(causeCapture(), exec)
 	h := newCompactHarness(t, store, prepared)
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	sessionID := session.Identity.SessionID
 	c := leaseCoordinator(t, h, sessionID)

@@ -820,7 +820,8 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 			close(canceled)
 			return Instance{Values: map[string]any{"waiter.value": 1}, Close: func() error { workspaceClosed.Add(1); return nil }}, nil
 		}}
-		writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":1}}}`)
+		writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"extensions":{"alpha":{"enabled":true,"v":1},"waiter":{"enabled":true}}}`)
+		writeAgentDefinitions(t, e.configPath, ownerAgentsDocument)
 		r, err := e.open(context.Background(), runtimePlugin, ws)
 		testassert.NoError(t, err)
 		defer r.Close(context.Background())
@@ -843,7 +844,8 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 			t.Fatal("waiter cancellation canceled the shared builder")
 		default:
 		}
-		writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":2}}}`)
+		writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"extensions":{"alpha":{"enabled":true,"v":2},"waiter":{"enabled":true}}}`)
+		writeAgentDefinitions(t, e.configPath, ownerAgentsDocument)
 		_, err = r.Reload(context.Background())
 		testassert.NoError(t, err)
 		select {
@@ -1105,7 +1107,7 @@ func TestRuntimeRetirementRetainsAbandonedWorkspaceCleanup(t *testing.T) {
 		<-ctx.Done()
 		return Instance{}, errFactory
 	}}
-	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":1}}}`)
+	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"v":1}`, `,"prefix":{"enabled":true},"later":{"enabled":true}`))
 	r, err := e.open(context.Background(), runtimePlugin, prefix, later)
 	testassert.NoError(t, err)
 	defer r.Close(context.Background())
@@ -1120,7 +1122,7 @@ func TestRuntimeRetirementRetainsAbandonedWorkspaceCleanup(t *testing.T) {
 	<-entered
 	cancel()
 	testassert.Require(t, errors.Is(<-done, context.Canceled), "waiter did not cancel")
-	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":2}}}`)
+	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"v":2}`, `,"prefix":{"enabled":true},"later":{"enabled":true}`))
 	_, err = r.Reload(context.Background())
 	testassert.NoError(t, err)
 	err = r.Close(context.Background())
@@ -1186,11 +1188,11 @@ func TestInvocationCarriesOneRevisionAcrossNestedDependencyCalls(t *testing.T) {
 		testassert.Check(t, errors.Is(err, ErrComposition), "select unknown capability: %v, want ErrComposition", err)
 	}
 
-	revisionOne := &configuration{generation: 1, plugins: map[string]json.RawMessage{
+	revisionOne := &configuration{generation: 1, extensions: map[string]json.RawMessage{
 		"alpha": json.RawMessage(`{"x":1}`),
 		"beta":  json.RawMessage(`{"y":2}`),
 	}}
-	revisionTwo := &configuration{generation: 2, plugins: map[string]json.RawMessage{
+	revisionTwo := &configuration{generation: 2, extensions: map[string]json.RawMessage{
 		"alpha": json.RawMessage(`{"x":9}`),
 	}}
 	invOne := Invocation{snapshot: revisionOne}
@@ -1210,7 +1212,7 @@ func TestInvocationCarriesOneRevisionAcrossNestedDependencyCalls(t *testing.T) {
 	}
 	handed := invOne.Config("alpha")
 	handed[2] = '0'
-	testassert.Require(t, string(revisionOne.plugins["alpha"]) == `{"x":1}`, "Config handout aliases the snapshot: %s", revisionOne.plugins["alpha"])
+	testassert.Require(t, string(revisionOne.extensions["alpha"]) == `{"x":1}`, "Config handout aliases the snapshot: %s", revisionOne.extensions["alpha"])
 	if invOne.Config("missing") != nil {
 		t.Errorf("Config for an unconfigured plugin = %v, want nil", invOne.Config("missing"))
 	}

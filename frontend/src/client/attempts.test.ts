@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { AttemptLedger, mintOperationID } from './attempts';
 import type { RestoreOutcome } from './restore';
-import { hydration, session } from './test-fixtures';
+import { definitionSelection, hydration, session } from './test-fixtures';
 
 describe('mintOperationID', () => {
   it('mints exactly 16 crypto-random bytes in lowercase hex', () => {
@@ -50,7 +50,7 @@ describe('AttemptLedger', () => {
     ledger.markUnknown(unseen.id);
     const accepted = ledger.adoptHydration('s1', hydration({
       session: session('s1', '0'),
-      operations: [{ operation_id: admitted.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
+      operations: [{ operation_id: admitted.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_selection: definitionSelection('primary'), model: 'p/m', usage: { totals: { by_model: [] } } }],
       pending: {
         steering: [{ operation_id: steered.id, origin: 'user', content: [] }],
         queued: [{ operation_id: queued.id, origin: 'user', content: [] }],
@@ -72,7 +72,7 @@ describe('AttemptLedger', () => {
     ledger.markUnknown(other.id);
     const accepted = ledger.adoptHydration('s1', hydration({
       session: session('s1', '0'),
-      operations: [{ operation_id: other.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
+      operations: [{ operation_id: other.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_selection: definitionSelection('primary'), model: 'p/m', usage: { totals: { by_model: [] } } }],
     }));
     expect(accepted).toHaveLength(0);
     expect(ledger.getAttempts().find((attempt) => attempt.id === other.id)?.status).toBe('unknown');
@@ -115,7 +115,7 @@ describe('AttemptLedger', () => {
     ledger.markUnknown(attempt.id);
     ledger.adoptHydration('s1', hydration({
       session: session('s1', '0'),
-      operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
+      operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_selection: definitionSelection('primary'), model: 'p/m', usage: { totals: { by_model: [] } } }],
     }));
     expect(ledger.getAttempts()).toHaveLength(0);
     expect(seen.length - start).toBeGreaterThanOrEqual(3);
@@ -175,7 +175,7 @@ describe('fork attempts', () => {
     ledger.markUnknown(attempt.id);
     const accepted = ledger.adoptHydration('dest1', hydration({
       session: { ...session('dest1', '0'), source_session_id: 's1' },
-      operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
+      operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_selection: definitionSelection('primary'), model: 'p/m', usage: { totals: { by_model: [] } } }],
     }));
     expect(accepted.map((entry) => entry.id)).toEqual([attempt.id]);
     expect(ledger.getAttempts()).toHaveLength(0);
@@ -188,7 +188,7 @@ describe('fork attempts', () => {
     // Another destination without the lineage does not accept.
     const unrelated = ledger.adoptHydration('dest2', hydration({
       session: session('dest2', '0'),
-      operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
+      operations: [{ operation_id: attempt.id, request_kind: 'message', status: 'running', admitted_at: '0', agent_selection: definitionSelection('primary'), model: 'p/m', usage: { totals: { by_model: [] } } }],
     }));
     expect(unrelated).toHaveLength(0);
     // The source Session's own hydration absence proves nothing.

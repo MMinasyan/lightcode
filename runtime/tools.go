@@ -19,15 +19,6 @@ import (
 // function is mandatory.
 var toolType = reflect.TypeFor[Tool]()
 
-// ToolConstraints carries the selected Agent's hard capability constraints:
-// only the readonly/write-dir boundary. Description receives the resolved
-// Agent definition's values and execution the values from its validated
-// capture; tools supply neither and cannot loosen them.
-type ToolConstraints struct {
-	Readonly bool
-	WriteDir string
-}
-
 // ToolDescription is one static tool description: the model-visible
 // definition and whether the tool is available under the hard constraints
 // (never a permission filter).
@@ -142,7 +133,7 @@ func (b *boundBackground) LaunchChild(req ChildRequest) (string, error) {
 	}
 	result, err := b.bridge.h.LaunchChildSession(ctx, harness.LaunchChildRequest{
 		ParentSessionID: b.sessionID,
-		AgentType:       req.AgentType,
+		AgentSelection:  suppliedDefinition(req.AgentType),
 		Content:         req.Content,
 		OperationID:     req.OperationID,
 		MaxConcurrent:   req.MaxConcurrent,
@@ -210,7 +201,7 @@ type ToolContext struct {
 	Workspace     string
 	AdmittedEntry harness.EntryRef
 	Invocation    Invocation
-	Constraints   ToolConstraints
+	Constraints   harness.ToolConstraints
 	Background    BackgroundServices
 
 	// SubprocessEnv is invoked at each concrete process start — foreground
@@ -242,14 +233,14 @@ type Tool interface {
 // no execution instance is constructed to obtain the declaration's metadata.
 // A nil description function records a declaration lacking one, which
 // composition rejects.
-func ToolSpec(id string, describe func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error)) CapabilitySpec {
+func ToolSpec(id string, describe func(Invocation, harness.ToolConstraints, harness.SessionIdentity) (ToolDescription, error)) CapabilitySpec {
 	if describe == nil {
 		return CapabilitySpec{id: id, typ: toolType}
 	}
 	return CapabilitySpec{
 		id:  id,
 		typ: toolType,
-		describe: func(invocation Invocation, constraints ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
+		describe: func(invocation Invocation, constraints harness.ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
 			description, err := describe(invocation, constraints, identity)
 			if err != nil {
 				return ToolDescription{}, err

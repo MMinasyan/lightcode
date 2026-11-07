@@ -280,7 +280,7 @@ type harnessBackground struct {
 func (b *harnessBackground) LaunchChild(req ChildRequest) (string, error) {
 	result, err := b.h.LaunchChildSession(context.Background(), harness.LaunchChildRequest{
 		ParentSessionID: b.sessionID,
-		AgentType:       req.AgentType,
+		AgentSelection:  suppliedDefinition(req.AgentType),
 		Content:         req.Content,
 		OperationID:     req.OperationID,
 		MaxConcurrent:   req.MaxConcurrent,
@@ -525,7 +525,7 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 
 func (th *toolsHarness) createSession() string {
 	th.t.Helper()
-	rec, err := th.h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: th.workspace, AgentType: "coder"})
+	rec, err := th.h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: th.workspace, AgentSelection: suppliedDefinition("coder")})
 	if err != nil {
 		th.t.Fatalf("CreateSession: %v", err)
 	}

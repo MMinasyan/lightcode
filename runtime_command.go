@@ -14,6 +14,14 @@ import (
 //go:embed runtime_identity.md
 var runtimeIdentity string
 
+func installedExtensions() ([]string, []string) {
+	var ids []string
+	for _, plugin := range builtin.Plugins() {
+		ids = append(ids, plugin.ID)
+	}
+	return ids, builtin.DefaultCapabilityIDs()
+}
+
 // runRuntime runs the shared managed Runtime owner in the foreground for the
 // lifetime of the signal context. It opens the owner over the normalized
 // paths with the shipped plugin set, attaches the protocol and publishes the

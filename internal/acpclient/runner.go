@@ -445,9 +445,30 @@ func (r *Runner) composeSelection(conn *connection) *rpcError {
 		r.adoptSelection(conn, stamp, newest.SessionId, newest.Workspace)
 		return nil
 	}
-	createParams, _ := json.Marshal(map[string]any{
-		"body": map[string]any{"workspace": workspace, "agent_type": "primary"},
-	})
+	raw, err = clientops.Call(conn.ctx, conn.client, "GetConfiguration", nil)
+	if err != nil {
+		return callError(err)
+	}
+	agents, err := clientops.AgentRoster(raw)
+	if err != nil {
+		return &rpcError{Code: codeTransport, Message: "invalid agent roster"}
+	}
+	body := protocol.CreateSessionRequest{Workspace: workspace}
+	if len(agents) != 0 {
+		var primary *protocol.DefinitionRef
+		for _, agent := range agents {
+			if agent.Name == "primary" {
+				ref := agent.Definition
+				primary = &ref
+				break
+			}
+		}
+		if primary == nil {
+			return &rpcError{Code: codeTransport, Message: "invalid agent roster: primary is absent"}
+		}
+		body.AgentSelection = &protocol.AgentSelection{Definition: primary}
+	}
+	createParams, _ := json.Marshal(map[string]any{"body": body})
 	raw, err = clientops.Call(conn.ctx, conn.client, "CreateSession", createParams)
 	if err != nil {
 		return callError(err)

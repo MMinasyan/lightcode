@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -79,15 +78,16 @@ func TestBackgroundBridgeArmingAcrossPublication(t *testing.T) {
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, chainCommandConfigDocument(server.URL))
-	writeServiceFile(t, agents.PathForConfig(configPath),
+	writeAgentDefinitions(t, configPath,
 		`{"prober": {"model": "prov/m", "system_prompt": "simple", "tools": ["bg_probe"]}}`)
+	enableFixturePlugin(t, configPath, "bgprobe")
 	workspace := filepath.Join(home, "probe-ws")
 	testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 
 	probe := &backgroundProbe{}
 	useFixtureStore(t, store)
 	r, err := Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []Plugin{
-		backgroundProbePlugin(probe),
+		backgroundProbePlugin(probe), fixtureAgentPlugin(),
 	}})
 	testassert.NoError(t, err)
 	// The unarmed-to-armed window ends before publication: construction

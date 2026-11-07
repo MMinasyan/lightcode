@@ -19,11 +19,12 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/toolargs"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
 const (
-	pluginID = "tasks"
+	pluginID = "agents"
 	toolID   = "task"
 )
 
@@ -40,7 +41,7 @@ const taskParameters = `{"type":"object","properties":{"prompt":{"type":"string"
 const taskStartedTemplate = "Task started in the background with session ID: `%s`. You will be notified when it completes. Continue with your next steps; the result will arrive as a message when it is ready."
 
 // settings is the plugin's private configuration, decoded with json.Unmarshal
-// from the plugins.tasks section. Nil input and missing or null-valued
+// from the extensions.agents.task section. Nil input and missing or null-valued
 // members keep the defaults; unknown members are ignored; every consumed
 // field is range-checked against the retained bounds.
 type settings struct {
@@ -52,14 +53,22 @@ func defaultSettings() settings {
 	return settings{MaxConcurrent: 4, MaxOutputBytes: 15360}
 }
 
-// decodeSettings decodes one supplied plugins.tasks section on top of the
+// decodeSettings decodes the task member of extensions.agents on top of the
 // defaults and enforces the retained ranges. ValidateConfig and per-call
 // preparation share it.
 func decodeSettings(raw json.RawMessage) (settings, error) {
 	s := defaultSettings()
 	if len(bytes.TrimSpace(raw)) != 0 {
-		if err := json.Unmarshal(raw, &s); err != nil {
+		var section struct {
+			Task json.RawMessage `json:"task"`
+		}
+		if err := json.Unmarshal(raw, &section); err != nil {
 			return settings{}, fmt.Errorf("tasks: invalid settings: %w", err)
+		}
+		if len(section.Task) != 0 {
+			if err := json.Unmarshal(section.Task, &s); err != nil {
+				return settings{}, fmt.Errorf("tasks: invalid settings: %w", err)
+			}
 		}
 	}
 	switch {
@@ -76,7 +85,7 @@ func decodeSettings(raw json.RawMessage) (settings, error) {
 // preparation validates the call before declaring the one child.launch pair.
 type taskTool struct{}
 
-func (taskTool) describe(inv runtime.Invocation, _ runtime.ToolConstraints, identity harness.SessionIdentity) (runtime.ToolDescription, error) {
+func (taskTool) describe(inv runtime.Invocation, _ harness.ToolConstraints, identity harness.SessionIdentity) (runtime.ToolDescription, error) {
 	var b strings.Builder
 	b.WriteString(taskDescriptionPrefix)
 	b.WriteString("\n\nAvailable subagent types:\n")
@@ -150,7 +159,7 @@ func (taskTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.To
 // resolveSubagent checks the captured roster for the exactly-named Subagent
 // entry: an absent name and a present non-subagent type produce the retained
 // inner errors the caller wraps.
-func resolveSubagent(name string, roster []harness.AgentType) error {
+func resolveSubagent(name string, roster []protocol.Agent) error {
 	for _, at := range roster {
 		if at.Name != name {
 			continue
@@ -225,7 +234,7 @@ func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) 
 }
 
 // Plugin returns the Runtime-scoped plugin whose single export is the task
-// tool. ValidateConfig validates the owned plugins.tasks section; Open
+// tool. ValidateConfig validates the owned extensions.agents.task section; Open
 // constructs the stateless tool value — settings and the roster arrive per
 // call through the Invocation, launches through the ToolContext's background
 // bridge.

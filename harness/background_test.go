@@ -70,7 +70,7 @@ func TestAdmitBackgroundMemberInitializesGroup(t *testing.T) {
 // site starts the background lifecycle open.
 func TestCreateSessionStartsOpenLifecycle(t *testing.T) {
 	h := newTestHarness(t, emptyStore(t), nil)
-	rec, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	rec, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	h.mu.Lock()
 	c := h.sessions[rec.Identity.SessionID]

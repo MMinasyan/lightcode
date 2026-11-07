@@ -329,6 +329,33 @@ func TestGlobalsAndAgentMenuOpaqueOverflowConfiguration(t *testing.T) {
 		c.mu.Unlock()
 		settleTasks(t, c)
 	})
+	t.Run("/agent with empty roster does not open a menu", func(t *testing.T) {
+		c, transport := fixture(t)
+		transport.globals = true
+		c.command("/agent")
+		config := configuration("1")
+		config.Agents = []protocol.Agent{}
+		receive(t, transport.requests).respond(config)
+		settleTasks(t, c)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		testassert.Require(t, c.menu == nil && c.configuration == nil, "empty roster changed selector or global state")
+		select {
+		case output := <-c.outputs:
+			t.Fatalf("empty roster reported output: %+v", output)
+		default:
+		}
+	})
+	t.Run("/model with empty roster still opens a menu", func(t *testing.T) {
+		c, transport := fixture(t)
+		transport.globals = true
+		c.command("/model")
+		receive(t, transport.requests).respond(protocol.ModelList{Models: []protocol.ModelListEntry{}})
+		settleTasks(t, c)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		testassert.Require(t, c.menu != nil && c.menu.kind == "/model", "empty model menu was suppressed")
+	})
 	t.Run("/agent lists the valid opaque configuration without a repair loop", func(t *testing.T) {
 		c, transport := fixture(t)
 		transport.globals = true

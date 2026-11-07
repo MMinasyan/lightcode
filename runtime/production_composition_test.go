@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -46,7 +45,7 @@ func chainAgentsDocument(body string) string {
 // hookPlugin requires, and no sessions section.
 func chainPlainConfigDocument(endpoint string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "PRODUCTION_TEST_KEY",
-		`{"gpt-5.5":{"name":"G","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":"T1"}}}`
+		`{"gpt-5.5":{"name":"G","context_window":262144}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":"T1"},"arghooks":{"enabled":true},"adaptation":{"enabled":true}}}`
 }
 
 // chainCommandConfigDocument is the readonly-git row's provider document: no
@@ -60,7 +59,7 @@ func chainCommandConfigDocument(endpoint string) string {
 // tag to one provider document for the public-Open initial-sweep row.
 func chainSweepConfigDocument(endpoint string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
-		`{"m":{"name":"M","context_window":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}},"sessions":{"archive_after_days":1,"delete_after_archive_days":1}}`
+		`{"m":{"name":"M","context_window":4096}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":"T1"}},"sessions":{"archive_after_days":1,"delete_after_archive_days":1}}`
 }
 
 // chainModelsConfigDocument declares the two models the capability-ID row
@@ -333,7 +332,7 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		dataDir := t.TempDir()
 		configPath := filepath.Join(dataDir, "config.json")
 		writeServiceFile(t, configPath, chainPlainConfigDocument(server.URL))
-		writeServiceFile(t, agents.PathForConfig(configPath), chainAgentsDocument("first body"))
+		writeAgentDefinitions(t, configPath, chainAgentsDocument("first body"))
 
 		workspace := filepath.Join(home, "chain-ws")
 		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
@@ -348,7 +347,7 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		openChained := func(ctx context.Context, hook *recordHook, argHook *rewriteWriteHook) (*Runtime, error) {
 			return Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []Plugin{
 				hookPlugin(hook),
-				argumentHookPlugin("arg.rewrite", argHook), ShippedAdaptationPlugin(),
+				argumentHookPlugin("arg.rewrite", argHook), ShippedAdaptationPlugin(), fixtureAgentPlugin(),
 			}})
 		}
 		owner, ownerCancel := context.WithCancel(ctx)
@@ -378,7 +377,7 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		admitted := readOperation(t, r, sessionID, "op-1").Admission.AdmittedEntry.EntryID
 
 		// 2. The reload publishes a changed prompt while the operation runs.
-		writeServiceFile(t, agents.PathForConfig(configPath), chainAgentsDocument("reloaded body"))
+		writeAgentDefinitions(t, configPath, chainAgentsDocument("reloaded body"))
 		{
 			revision, err := r.Reload(ctx)
 			testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
@@ -585,7 +584,7 @@ func TestProductionReadonlyGitHookSeesOriginalArguments(t *testing.T) {
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 		)
 		writeServiceFile(t, e.configPath, chainCommandConfigDocument(server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath),
+		writeAgentDefinitions(t, e.configPath,
 			`{"rogit": {"model": "prov/m", "system_prompt": "simple", "tools": ["run_command"], "readonly": true, "capabilities": ["arg.noop"]}}`)
 
 		hook := &noopArgumentHook{}
@@ -639,7 +638,7 @@ func TestProductionCapabilityIDsModelIndependent(t *testing.T) {
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 		)
 		writeServiceFile(t, e.configPath, chainModelsConfigDocument(server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), `{
+		writeAgentDefinitions(t, e.configPath, `{
   "gptagent": {"model": "prov/gpt-5.5", "system_prompt": "full", "tools": ["read_file", "write_file", "edit_file", "apply_patch"], "capabilities": ["model_adaptation"]},
   "vanillaagent": {"model": "prov/vanilla", "system_prompt": "full", "tools": ["read_file", "write_file", "edit_file", "apply_patch"], "capabilities": ["model_adaptation"]}
 }`)
@@ -709,7 +708,7 @@ func TestProductionOpenInitialSweepCleansArtifacts(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		writeServiceFile(t, e.configPath, chainSweepConfigDocument(e.server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), productionAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, productionAgentsDocument)
 
 		deletable := seedStaleArchivedSession(t, e.store, filepath.Join(e.dataDir, "sweep-a"), 100*time.Hour)
 		young := seedStaleArchivedSession(t, e.store, filepath.Join(e.dataDir, "sweep-b"), 1*time.Hour)

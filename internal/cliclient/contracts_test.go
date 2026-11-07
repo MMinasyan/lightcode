@@ -285,11 +285,11 @@ func TestFutureAgentAndTypeWideModelUseGeneratedScope(t *testing.T) {
 	settledReader(t, c, transport)
 	c.command("/agent planner")
 	req := receive(t, transport.requests)
-	testassert.Require(t, strings.Contains(req.req.URL.Path, rootA) && string(req.body) == `{"agent_type":"planner"}`, "wrong Session Agent edit: %s %s", req.req.URL, req.body)
-	req.respond(protocol.Session{SessionId: rootA, AgentType: "planner"})
+	testassert.Require(t, strings.Contains(req.req.URL.Path, rootA) && string(req.body) == `{"agent_selection":{"definition":{"capability_id":"agents.definitions","definition_id":"planner","extension_id":"agents"}}}`, "wrong Session Agent edit: %s %s", req.req.URL, req.body)
+	req.respond(protocol.Session{SessionId: rootA, AgentSelection: fixtureSelection("planner")})
 	next := hydration(rootA, "2", inputs(1, 1), nil)
-	next.Session.AgentType = "planner"
-	next.ActiveOperation = &protocol.Operation{OperationId: "active", AgentType: "captured-old", Model: "captured/model", RequestKind: "message"}
+	next.Session.AgentSelection = fixtureSelection("planner")
+	next.ActiveOperation = &protocol.Operation{OperationId: "active", AgentSelection: fixtureSelection("captured-old"), Model: "captured/model", RequestKind: "message"}
 	receive(t, transport.requests).respond(next)
 	settleTasks(t, c)
 	c.command("/model provider/next")
@@ -310,6 +310,61 @@ func TestFutureAgentAndTypeWideModelUseGeneratedScope(t *testing.T) {
 	text := strings.ReplaceAll(screen.text(), "\n", "")
 	testassert.Require(t, strings.Contains(text, "Future: planner / provider/next") && strings.Contains(text, "captured-old / captured/model"), "future selection overwrote active capture")
 	c.requestExit(nil)
+}
+
+func TestResolvedSessionModelUsesSessionOwner(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	c.mu.Lock()
+	c.root.hydration.Session.AgentSelection = protocol.AgentSelection{Inputs: &protocol.AgentInputs{AssemblyMode: protocol.AgentAssemblyFull, Instructions: "keep", Tools: []string{"read_file"}}}
+	c.mu.Unlock()
+	c.command("/model provider/next")
+	req := receive(t, transport.requests)
+	testassert.Require(t, strings.HasSuffix(req.req.URL.Path, "/v1/sessions/"+rootA+"/model") && string(req.body) == `{"model":"provider/next"}`, "resolved model edit = %s %s", req.req.URL, req.body)
+	req.respond(protocol.Session{SessionId: rootA})
+	next := hydration(rootA, "2", inputs(1, 1), nil)
+	next.Session.AgentSelection = protocol.AgentSelection{Inputs: &protocol.AgentInputs{AssemblyMode: protocol.AgentAssemblyFull, Instructions: "keep", Tools: []string{"read_file"}}}
+	receive(t, transport.requests).respond(next)
+	settleTasks(t, c)
+	c.requestExit(nil)
+}
+
+func TestCreateRequiresValidRoster(t *testing.T) {
+	for _, row := range []struct {
+		name       string
+		body       string
+		wantCreate bool
+	}{
+		{"no agents", `{"agents":[]}`, true},
+		{"malformed roster", `{"agents":null}`, false},
+		{"malformed entry", `{"agents":[{"name":"primary"}]}`, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			c, transport := fixture(t)
+			transport.mu.Lock()
+			transport.globals = true
+			transport.mu.Unlock()
+			c.mu.Lock()
+			s := c.stampLocked()
+			c.mu.Unlock()
+			c.task(func() { c.create(s) })
+			roster := receive(t, transport.requests)
+			testassert.Equal(t, roster.req.URL.Path, "/v1/configuration")
+			roster.respondBody(row.body)
+			if row.wantCreate {
+				created := receive(t, transport.requests)
+				testassert.Require(t, created.req.URL.Path == "/v1/sessions" && string(created.body) == `{"workspace":"/workspace"}`, "baseline create = %s %s", created.req.URL, created.body)
+				created.reject(400, protocol.Error{Code: protocol.Invalid, Message: "rejected"})
+			}
+			settleTasks(t, c)
+			select {
+			case unexpected := <-transport.requests:
+				t.Fatalf("unexpected request after roster: %s", unexpected.req.URL)
+			default:
+			}
+			c.requestExit(nil)
+		})
+	}
 }
 
 // One failed Create is reported only for its current captured intent; a fresh
@@ -339,7 +394,7 @@ func TestCreateFailureCapturedAddressAndExplicitWorkspaceIntent(t *testing.T) {
 		err := json.Unmarshal(newCreate.body, &sent)
 		testassert.Require(t, err == nil && sent.Workspace == "/different", "explicit Workspace composition create = %s (%v)", newCreate.body, err)
 	}
-	newCreate.reject(201, protocol.Session{SessionId: rootB, Workspace: "/different", AgentType: "primary"})
+	newCreate.reject(201, protocol.Session{SessionId: rootB, Workspace: "/different", AgentSelection: fixtureSelection("primary")})
 	fresh := hydration(rootB, "1", nil, nil)
 	fresh.Session.Workspace = "/different"
 	receive(t, transport.requests).respond(fresh)
@@ -503,7 +558,7 @@ func TestFailedRootNavigationKeepsTheAcceptedSelection(t *testing.T) {
 		destination := receive(t, transport.requests)
 		destination.respond(hydration(rootB, "1", nil, nil))
 		receive(t, transport.requests).respond(hydration(rootB, "2", nil, nil))
-		parkedCreate.reject(201, protocol.Session{SessionId: childA, Workspace: "/workspace", AgentType: "primary"})
+		parkedCreate.reject(201, protocol.Session{SessionId: childA, Workspace: "/workspace", AgentSelection: fixtureSelection("primary")})
 		parkedError.reject(404, protocol.Error{Code: "not_found", Message: "stale destination error"})
 		settleTasks(t, c)
 		c.mu.Lock()

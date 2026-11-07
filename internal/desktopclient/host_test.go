@@ -19,7 +19,6 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/linux"
 
 	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -41,7 +40,7 @@ const (
 // recordContent builds one private discovery document pointing at the
 // fixture endpoint.
 func recordContent(endpoint string) string {
-	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"8","credential":%q}`,
+	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"9","credential":%q}`,
 		endpoint, testInstance, testCredential)
 }
 
@@ -70,7 +69,7 @@ func newFixture(t *testing.T, health, events http.HandlerFunc, extra ...map[stri
 func jsonHealth() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"8"}`, testInstance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"9"}`, testInstance)
 	}
 }
 
@@ -975,7 +974,7 @@ func TestDesktopHostLateTerminalCleanupCannotCancelPendingOpen(t *testing.T) {
 
 // The mounted smoke fixture: the real production Runtime over isolated HOME,
 // data and config paths, matching the client integration fixture.
-const smokeConfigDocument = `{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"DESKTOP_TEST_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096,"max_output_tokens":512}}}}}`
+const smokeConfigDocument = `{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"DESKTOP_TEST_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096,"max_output_tokens":512}}}},"extensions":{"agents":{"enabled":true,"definitions":%s},"adaptation":{"enabled":true}}}`
 
 const smokeAgentsDocument = `{"integrated":{"model":"prov/m","system_prompt":"simple"}}`
 
@@ -1028,8 +1027,7 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 	isolateBundledCredentials(t)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
-	writeServiceFile(t, configPath, fmt.Sprintf(smokeConfigDocument, baseURL))
-	writeServiceFile(t, agents.PathForConfig(configPath), smokeAgentsDocument)
+	writeServiceFile(t, configPath, fmt.Sprintf(smokeConfigDocument, baseURL, smokeAgentsDocument))
 	owner, err := runtime.Open(context.Background(), runtime.Options{
 		DataDir:    dataDir,
 		ConfigPath: configPath,
@@ -1059,9 +1057,9 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 	testassert.Equal(t, response.Status, http.StatusOK)
 	var health protocol.Health
 	testassert.NoError(t, json.Unmarshal([]byte(response.Body), &health))
-	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N8, "health = %+v, want the connected owner", health)
+	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N9, "health = %+v, want the connected owner", health)
 
-	create, err := host.Call(info.Generation, "CreateSession", `{"body":{"workspace":"/ws/smoke","agent_type":"integrated"}}`)
+	create, err := host.Call(info.Generation, "CreateSession", `{"body":{"workspace":"/ws/smoke","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"integrated"}}}}`)
 	testassert.NoError(t, err)
 	testassert.Require(t, create.Status == http.StatusCreated, "create status = %d: %s", create.Status, create.Body)
 	var created protocol.Session

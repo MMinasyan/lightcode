@@ -799,6 +799,8 @@ func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
 		// The real provider serves this row through the owning configuration:
 		// the endpoint change publishes before any admission runs.
 		writeServiceFile(t, bg.e.configPath, backgroundLifecycleConfigDocument(stream.URL))
+		writeAgentDefinitions(t, bg.e.configPath, lifecycleAgentsDocument)
+		enableFixturePlugin(t, bg.e.configPath, "bgtools")
 		{
 			_, err := bg.r.Reload(context.Background())
 			testassert.NoError(t, err)

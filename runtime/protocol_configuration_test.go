@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -293,7 +292,9 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 func openConfigurationRuntimeWithEnv(t *testing.T, store harness.Storage, e *ownerEnv, configDoc, agentsDoc string, extra ...Plugin) (*Runtime, *ownerEnv) {
 	t.Helper()
 	writeServiceFile(t, e.configPath, configDoc)
-	writeServiceFile(t, agents.PathForConfig(e.configPath), agentsDoc)
+	if agentsDoc != "" {
+		writeAgentDefinitions(t, e.configPath, agentsDoc)
+	}
 	e.fixtureStore(store)
 	r, err := e.open(context.Background(), extra...)
 	testassert.NoError(t, err)
@@ -317,11 +318,11 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 		testassert.Require(t, compactJSON(t, view.Settings.Tools) == `{"max_output_bytes":42}`, "tools = %s, want the exact top-level object", view.Settings.Tools)
 		testassert.Require(t, compactJSON(t, view.Settings.Jobs) == `{"max_background_processes":20}`, "jobs = %s, want the exact top-level object", view.Settings.Jobs)
 		wantDocs := map[string]string{
-			"tasks": `{}`,
+			"agents": `{"definitions":` + compactJSON(t, []byte(configurationAgentsDocument)) + `,"enabled":true}`,
 		}
-		testassert.Require(t, len(view.Settings.Plugins) == len(wantDocs), "plugins = %v, want exactly the owned sections %v", view.Settings.Plugins, wantDocs)
+		testassert.Require(t, len(view.Settings.Extensions) == len(wantDocs), "extensions = %v, want exactly the owned sections %v", view.Settings.Extensions, wantDocs)
 		for id, wantDoc := range wantDocs {
-			got, ok := view.Settings.Plugins[id]
+			got, ok := view.Settings.Extensions[id]
 			testassert.Require(t, ok, "plugins.%s missing, want the owned document %s", id, wantDoc)
 			{
 				got := compactJSON(t, []byte(got))
@@ -331,11 +332,11 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 
 		// Absent sections stay omitted: a configuration without the plugin
 		// sections projects an empty complete map.
-		absent, _ := openConfigurationRuntime(t, store, `{"providers":{}}`, configurationAgentsDocument, settingsPlugins()...)
+		absent, _ := openConfigurationRuntime(t, store, `{"providers":{}}`, "", settingsPlugins()...)
 		defer closeProjectionRuntime(absent)
 		absentView, err := absent.getConfiguration(context.Background())
 		testassert.NoError(t, err)
-		testassert.Require(t, len(absentView.Settings.Plugins) == 0, "absent plugin sections projected = %+v, want none", absentView.Settings.Plugins)
+		testassert.Require(t, len(absentView.Settings.Extensions) == 0, "absent extension sections projected = %+v, want none", absentView.Settings.Extensions)
 		testassert.Require(t, string(absentView.Settings.Tools) == `{}` && string(absentView.Settings.Jobs) == `{}` && string(absentView.Settings.Compaction) == `{}`, "absent baseline sections = %s/%s/%s, want empty objects", absentView.Settings.Tools, absentView.Settings.Jobs, absentView.Settings.Compaction)
 
 		// The Agent roster: the primary model selection and the worker's
@@ -349,8 +350,8 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 				worker = &view.Agents[i]
 			}
 		}
-		testassert.Require(t, primary != nil && primary.Model == "prov/m", "primary roster entry = %+v, want the configured model", primary)
-		testassert.Require(t, worker != nil && worker.Subagent && worker.Readonly && worker.Description == "w" && worker.WriteDir == "/ws", "worker roster entry = %+v, want the public definition fields with the trimmed write dir", worker)
+		testassert.Require(t, primary != nil && primary.Model == "prov/m" && primary.Definition == (protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: "primary"}), "primary roster entry = %+v, want the configured model and full reference", primary)
+		testassert.Require(t, worker != nil && worker.Subagent && worker.Readonly && worker.Description == "w" && worker.WriteDir == "/ws" && worker.Definition == (protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: "worker"}), "worker roster entry = %+v, want the public definition fields with the trimmed write dir and full reference", worker)
 	})
 }
 
@@ -377,7 +378,8 @@ func TestConfigurationReadsRemainAvailableDuringParkedBuild(t *testing.T) {
 		<-ungate
 		return nil
 	})
-	r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, append(settingsPlugins(), gate)...)
+	configDoc := strings.TrimSuffix(configurationProvidersDocument, "}") + `,"extensions":{"gate":{"enabled":true}}}`
+	r, _ := openConfigurationRuntime(t, store, configDoc, configurationAgentsDocument, append(settingsPlugins(), gate)...)
 	defer func() {
 		releaseGate()
 		closeProjectionRuntime(r)
@@ -554,7 +556,7 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 		(*model.ExtraBody)["side"] = "mutated"
 		model.InputModalities[0] = "mutated"
 		baseline.Settings.Sessions.ArchiveAfterDays = 999
-		baseline.Settings.Plugins["tasks"] = `{"mutated":true}`
+		baseline.Settings.Extensions["agents"] = `{"mutated":true}`
 		if len(baseline.Settings.Tools) > 0 {
 			baseline.Settings.Tools[0] = 'x'
 		}
@@ -638,7 +640,8 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		unsetenv(t, "UNSET_SETUP_KEY")
 		e := newOwnerEnv(t)
 		disconnectedDoc := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"UNSET_SETUP_KEY"},"discovery":false,"models":{"m":{"context_window":4096}}}}}`
-		r, _ := openConfigurationRuntimeWithEnv(t, store, e, disconnectedDoc, configurationAgentsDocument)
+		definitions := `{"primary":{"model":"prov/m"}}`
+		r, _ := openConfigurationRuntimeWithEnv(t, store, e, disconnectedDoc, definitions)
 		defer closeProjectionRuntime(r)
 		setupSub, err := r.Subscribe(64)
 		testassert.NoError(t, err)
@@ -706,6 +709,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		// provider also restores the setup group.
 		brokenDoc := strings.Replace(disconnectedDoc, `"base_url":"https://prov.test/v1"`, `"base_url":""`, 1)
 		writeServiceFile(t, e.configPath, brokenDoc)
+		writeAgentDefinitions(t, e.configPath, definitions)
 		{
 			_, err := r.Reload(context.Background())
 			testassert.NoError(t, err)
@@ -723,7 +727,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 				setupSeen = true
 			}
 		}
-		testassert.Require(t, slices.IsSorted(sources) && len(sources) >= 2 && sources[0] == "runtime:agents", "broken-reload warning order = %v, want the lexical global groups with the agents group first", sources)
+		testassert.Require(t, slices.IsSorted(sources) && len(sources) >= 2 && sources[0] == "runtime:catalog", "broken-reload warning order = %v, want lexical global groups", sources)
 		testassert.Require(t, catalogSeen && setupSeen, "broken-reload warnings = %+v, want both the catalog and setup groups", broken.Warnings)
 	})
 }

@@ -11,7 +11,7 @@ import (
 
 // TestFirstRunCreationPreservesExistingFiles verifies the retained first-run
 // creator uses create-if-absent semantics: an existing user file is never
-// overwritten. First-run config.json and agents.json creation is owned by the
+// overwritten. First-run config.json creation is owned by the
 // Runtime configuration service and its own skeleton tests.
 func TestFirstRunCreationPreservesExistingFiles(t *testing.T) {
 	t.Run("first_run_refuses_overwrite/env", func(t *testing.T) {

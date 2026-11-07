@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/clientops"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
@@ -27,7 +26,7 @@ import (
 // one parked OpenAI-compatible model endpoint whose admitted work proves the
 // departing bridge cancels nothing.
 
-const mountedConfigDocument = `{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"ACP_MOUNTED_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096,"max_output_tokens":512}}}}}`
+const mountedConfigDocument = `{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"ACP_MOUNTED_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096,"max_output_tokens":512}}}},"extensions":{"agents":{"enabled":true,"definitions":%s},"adaptation":{"enabled":true}}}`
 
 const mountedAgentsDocument = `{"integrated":{"model":"prov/m","system_prompt":"simple"}}`
 
@@ -78,8 +77,7 @@ func newMountedRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string, 
 	isolateBundledCredentials(t)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
-	writeServiceFile(t, configPath, fmt.Sprintf(mountedConfigDocument, baseURL))
-	writeServiceFile(t, agents.PathForConfig(configPath), mountedAgentsDocument)
+	writeServiceFile(t, configPath, fmt.Sprintf(mountedConfigDocument, baseURL, mountedAgentsDocument))
 	r, err := runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: builtin.Plugins()})
 	testassert.NoError(t, err)
 	t.Cleanup(func() {
@@ -176,7 +174,7 @@ func TestACPMountedRuntimeDepartureKeepsAcceptedWork(t *testing.T) {
 		t.Fatalf("initialize runtime instance = %q, want the mounted owner %q", description.Runtime.InstanceId, direct.InstanceID())
 	}
 
-	created := b.call(t, "2", "runtime/CreateSession", fmt.Sprintf(`{"body":{"workspace":%q,"agent_type":"integrated"}}`, workspace))
+	created := b.call(t, "2", "runtime/CreateSession", fmt.Sprintf(`{"body":{"workspace":%q,"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"integrated"}}}}`, workspace))
 	var session struct {
 		SessionID string `json:"session_id"`
 	}

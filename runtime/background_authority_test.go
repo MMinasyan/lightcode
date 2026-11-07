@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -27,7 +26,7 @@ import (
 // rule for the probe's declared child target.
 func childLaunchConfig(endpoint string, deny bool) string {
 	doc := `{"providers":{"prov":` + nominalProvMember(endpoint, "",
-		`{"m":{"name":"M","context_window":262144}}`) + `}`
+		`{"m":{"name":"M","context_window":262144}}`) + `},"extensions":{"probe":{"enabled":true}}`
 	if deny {
 		doc += `,"permissions":{"rules":[{"permission":"child.launch","target":"child_agent","access":"deny"}]}`
 	}
@@ -266,7 +265,7 @@ func TestBackgroundAuthorityThroughComposedRuntime(t *testing.T) {
 				return toolCallTurnEvents("probe-call", "probe", `{}`)
 			})
 			writeServiceFile(t, e.configPath, childLaunchConfig(e.server.URL, row.deny))
-			writeServiceFile(t, agents.PathForConfig(e.configPath), childLaunchAgents)
+			writeAgentDefinitions(t, e.configPath, childLaunchAgents)
 			e.fixtureStore(store)
 			r, err := e.open(ctx, childProbePlugin(probe))
 			testassert.NoError(t, err)
@@ -332,7 +331,7 @@ func TestBackgroundAuthorityRefusesCanceledOrigin(t *testing.T) {
 		return toolCallTurnEvents("probe-call", "probe", `{}`)
 	})
 	writeServiceFile(t, e.configPath, childLaunchConfig(e.server.URL, false))
-	writeServiceFile(t, agents.PathForConfig(e.configPath), childLaunchAgents)
+	writeAgentDefinitions(t, e.configPath, childLaunchAgents)
 	e.fixtureStore(store)
 	r, err := e.open(ctx, childProbePlugin(probe))
 	testassert.NoError(t, err)
@@ -433,7 +432,7 @@ func TestBackgroundLaunchKeepsCommittedChild(t *testing.T) {
 				return toolCallTurnEvents("probe-call", "probe", `{}`)
 			})
 			writeServiceFile(t, e.configPath, childLaunchConfig(e.server.URL, false))
-			writeServiceFile(t, agents.PathForConfig(e.configPath), childLaunchAgents)
+			writeAgentDefinitions(t, e.configPath, childLaunchAgents)
 			e.fixtureStore(store)
 			r, err := e.open(ctx, childProbePlugin(probe))
 			testassert.NoError(t, err)

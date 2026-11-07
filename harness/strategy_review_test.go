@@ -142,7 +142,7 @@ func TestReviewNoneAfterModelWork(t *testing.T) {
 		store := emptyStore(t)
 		prepared := compactPrepared(captureForHandoff(), exec)
 		h := newCompactHarness(t, store, prepared)
-		session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+		session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 		testassert.NoError(t, err)
 		c := leaseCoordinator(t, h, session.Identity.SessionID)
 		testassert.NoError(t, runManualCompact(t, h, c, session.Identity.SessionID, "compact-1"))

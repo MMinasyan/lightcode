@@ -64,7 +64,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 		// bad credential answers unauthorized and creates nothing.
 		workspace := filepath.Join(e.home, "auth")
 		creation := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/sessions"), "bad",
-			fmt.Sprintf(`{"workspace":%q,"agent_type":"solo"}`, workspace))
+			fmt.Sprintf(`{"workspace":%q,"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"solo"}}}`, workspace))
 		testassert.Equal(t, creation.StatusCode, http.StatusUnauthorized)
 		sessions, err := r.listSessions(ctx, protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
 		testassert.NoError(t, err)
@@ -104,7 +104,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 			t.Fatalf("decode versioned health: %v", err)
 		}
 		versionedResponse.Body.Close()
-		testassert.Equal(t, health.ProtocolVersion, protocol.N8)
+		testassert.Equal(t, health.ProtocolVersion, protocol.N9)
 	})
 }
 
@@ -138,12 +138,12 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 			testassert.Require(t, err == nil, "list after %s: %v", name, err)
 			testassert.Require(t, len(sessions) == 0, "%s created a session, want no mutation before validation", name)
 		}
-		reject("unknown top member", fmt.Sprintf(`{"workspace":%q,"agent_type":"solo","note":"x"}`, workspace))
-		reject("missing required member", fmt.Sprintf(`{"workspace":%q}`, workspace))
-		reject("null declared member", `{"workspace":null,"agent_type":"solo"}`)
-		reject("two concatenated documents", fmt.Sprintf(`{"workspace":%q,"agent_type":"solo"} {"workspace":%q}`, workspace, workspace))
-		reject("trailing scalar", fmt.Sprintf(`{"workspace":%q,"agent_type":"solo"} 5`, workspace))
-		reject("wrong member content", fmt.Sprintf(`{"workspace":%q,"agent_type":5}`, workspace))
+		reject("unknown top member", fmt.Sprintf(`{"workspace":%q,"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"solo"}},"note":"x"}`, workspace))
+		reject("missing required member", `{}`)
+		reject("null declared member", `{"workspace":null}`)
+		reject("two concatenated documents", fmt.Sprintf(`{"workspace":%q} {"workspace":%q}`, workspace, workspace))
+		reject("trailing scalar", fmt.Sprintf(`{"workspace":%q} 5`, workspace))
+		reject("wrong member content", fmt.Sprintf(`{"workspace":%q,"agent_selection":5}`, workspace))
 		reject("top-level null", "null")
 		reject("top-level array", "[]")
 
@@ -152,7 +152,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		// is rejected, and an invalid mode enum fails the generated
 		// validator. A valid session exists for these rows.
 		client := protocolClient(t, ps)
-		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "solo"})
+		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentSelection: wireSelection("solo")})
 		testassert.Require(t, err == nil && created.JSON201 != nil, "create: %v", err)
 		session := created.JSON201.SessionId
 		gate := make(chan struct{})
@@ -336,7 +336,7 @@ func TestProtocolServerRoutingDispositions(t *testing.T) {
 		ps := openProtocolServer(t, r)
 		client := protocolClient(t, ps)
 		ctx := context.Background()
-		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(e.home, "unclean"), AgentType: "solo"})
+		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(e.home, "unclean"), AgentSelection: wireSelection("solo")})
 		testassert.Require(t, err == nil && created.JSON201 != nil, "create session for the unclean-path row: %v", err)
 		session := created.JSON201.SessionId
 
@@ -516,7 +516,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 				}
 			}
 			if plugins != "" {
-				parts = append(parts, `"plugins":`+plugins)
+				parts = append(parts, `"extensions":`+plugins)
 			}
 			if extra != "" {
 				parts = append(parts, extra)
@@ -533,7 +533,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		testassert.Equal(t, invalidSettings.StatusCode, http.StatusBadRequest)
 		{
 			typed := decodeProtocolError(t, invalidSettings)
-			testassert.Require(t, typed.Code == protocol.Invalid && strings.Contains(typed.Message, "plugins"), "invalid settings shape error = %+v, want invalid naming plugins", typed)
+			testassert.Require(t, typed.Code == protocol.Invalid && strings.Contains(typed.Message, "extensions"), "invalid settings shape error = %+v, want invalid naming extensions", typed)
 		}
 		after, err := client.GetConfigurationWithResponse(ctx)
 		testassert.Require(t, err == nil && after.JSON200 != nil, "read after invalid settings: %v", err)
@@ -547,7 +547,7 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 		defer unknownSub.Close()
 		unknownBaseline, unknownGeneration, unknownWarn := runtimeMutationBaseline(t, r)
 		unknownPlugin := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/configuration/settings"), ps.credential,
-			buildSettings(baseSettingsValues(), `{"unknown-plugin":"{}"}`, ""))
+			buildSettings(baseSettingsValues(), `{"agents":"{\"enabled\":true,\"definitions\":{\"bad\":{\"model\":\"noslash\"}}}"}`, ""))
 		testassert.Equal(t, unknownPlugin.StatusCode, http.StatusUnprocessableEntity)
 		{
 			typed := decodeProtocolError(t, unknownPlugin)
@@ -575,9 +575,9 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 			}
 		}
 		for _, row := range []struct{ name, body, member string }{
-			{"missing plugins member", buildSettings(baseSettingsValues(), "", ""), "plugins"},
-			{"null plugins member", buildSettings(baseSettingsValues(), "null", ""), "plugins"},
-			{"wrong-typed plugins member", buildSettings(baseSettingsValues(), "[]", ""), "plugins"},
+			{"missing extensions member", buildSettings(baseSettingsValues(), "", ""), "extensions"},
+			{"null extensions member", buildSettings(baseSettingsValues(), "null", ""), "extensions"},
+			{"wrong-typed extensions member", buildSettings(baseSettingsValues(), "[]", ""), "extensions"},
 			{"null document value", buildSettings(baseSettingsValues(), `{"alpha":null}`, ""), "alpha"},
 			{"unknown settings member", buildSettings(baseSettingsValues(), "{}", `"forged":1`), "forged"},
 		} {
@@ -606,8 +606,10 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 			"jobs":       `{"max_background_processes":5,"max_output_bytes":8192,"read_line_max_chars":4000,"unknown_null":null,"unknown_array":[],"unknown_scalar":false,"big":1e400}`,
 			"compaction": `{"unknown_null":null,"unknown_array":[{"deep":null}],"unknown_scalar":1,"exact":9007199254740993,"big":1e400}`,
 		}
+		retainedExtensions, err := json.Marshal(before.JSON200.Settings.Extensions)
+		testassert.NoError(t, err)
 		accepted := rawProtocol(t, http.MethodPut, protocolTarget(ps, "/v1/configuration/settings"), ps.credential,
-			buildSettings(opaqueValues, "{}", ""))
+			buildSettings(opaqueValues, string(retainedExtensions), ""))
 		testassert.Equal(t, accepted.StatusCode, http.StatusOK)
 		acceptedBody, err := io.ReadAll(accepted.Body)
 		accepted.Body.Close()
@@ -786,12 +788,12 @@ func TestProtocolServerForkAndHydrationRefuseWarmMarkedCorruptSession(t *testing
 		client := protocolClient(t, ps)
 
 		source, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{
-			Workspace: filepath.Join(e.home, "marked-src"), AgentType: "solo",
+			Workspace: filepath.Join(e.home, "marked-src"), AgentSelection: wireSelection("solo"),
 		})
 		testassert.Require(t, err == nil && source.JSON201 != nil, "create source over HTTP: %v (typed %+v)", err, source.JSONDefault)
 		sourceID := source.JSON201.SessionId
 		sibling, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{
-			Workspace: filepath.Join(e.home, "marked-sibling"), AgentType: "solo",
+			Workspace: filepath.Join(e.home, "marked-sibling"), AgentSelection: wireSelection("solo"),
 		})
 		testassert.Require(t, err == nil && sibling.JSON201 != nil, "create sibling over HTTP: %v (typed %+v)", err, sibling.JSONDefault)
 		siblingID := sibling.JSON201.SessionId
@@ -975,8 +977,8 @@ func TestProtocolServerIntervalProtectionAndAvailability(t *testing.T) {
 		}
 
 		// The metadata-only transition stays available inside the interval.
-		changed, err := client.SetSessionAgentTypeWithResponse(ctx, session, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
-		testassert.Require(t, err == nil && changed.JSON200 != nil && changed.JSON200.AgentType == "worker", "mounted agent-type change during a parked restore = (%v, %+v), want the changed selection", err, changed.JSON200)
+		changed, err := client.SetSessionAgentTypeWithResponse(ctx, session, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
+		testassert.Require(t, err == nil && changed.JSON200 != nil && changed.JSON200.AgentSelection.Definition.DefinitionId == "worker", "mounted agent-type change during a parked restore = (%v, %+v), want the changed selection", err, changed.JSON200)
 
 		// The parked mounted restore completes with its own result.
 		park.release("restored")

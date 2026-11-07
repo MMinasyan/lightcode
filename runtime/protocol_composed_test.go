@@ -28,7 +28,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
 	"github.com/MMinasyan/lightcode/internal/plugins/tasks"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -55,7 +54,8 @@ func composedFlowConfigDocument(modelEndpoint string) string {
   "providers": {
     "prov": {"transport": {"base_url": "` + modelEndpoint + `", "api_key_env": "COMPOSED_TEST_KEY"}, "discovery": false, "models": {"m": {"name": "M", "context_window": 262144}}},
     "connprov": {"transport": {"base_url": "https://conn.test/v1", "api_key_env": "` + composedConnectKeyEnv + `"}, "discovery": false, "models": {"cm": {"name": "CM", "context_window": 8192}}}
-  }
+  },
+  "extensions": {"custom": {"enabled": true, "threshold": 9007199254740993}, "adaptation": {"enabled": true}}
 }`
 }
 
@@ -71,7 +71,7 @@ const composedCustomPluginID = "custom"
 
 // composedCustomSettingsDocument is the custom plugin's own opaque document;
 // the exact integer lexeme must survive the whole mounted round-trip.
-const composedCustomSettingsDocument = `{"threshold":9007199254740993}`
+const composedCustomSettingsDocument = `{"enabled":true,"threshold":9007199254740993}`
 
 // composedCustomPlugin is the selected custom plugin of the flow: its absent
 // settings section uses the plugin's defaults, its own validator owns the
@@ -298,6 +298,10 @@ func composedWriteFile(t *testing.T, path, content string) {
 	}
 }
 
+func composedSelection(name string) *protocol.AgentSelection {
+	return &protocol.AgentSelection{Definition: &protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: name}}
+}
+
 // composedDiscriminator reads one event's discriminator.
 func composedDiscriminator(t *testing.T, event protocol.Event) string {
 	t.Helper()
@@ -510,7 +514,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		dataDir := t.TempDir()
 		configPath := filepath.Join(dataDir, "config.json")
 		composedWriteFile(t, configPath, composedFlowConfigDocument(model.URL))
-		composedWriteFile(t, agents.PathForConfig(configPath), composedFlowAgentsDocument)
+		runtime.WriteAgentDefinitionsForTest(t, configPath, composedFlowAgentsDocument)
 
 		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: plugins})
 		testassert.NoError(t, err)
@@ -527,7 +531,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// endpoint is no usable owner.
 		foreign := filepath.Join(t.TempDir(), "foreign.json")
 		wrongCredential := strings.Repeat("0", 64)
-		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N8, wrongCredential))
+		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N9, wrongCredential))
 		{
 			_, err := client.Connect(ctx, foreign)
 			testassert.Require(t, errors.Is(err, client.ErrNoRuntime), "wrong-credential connect = %v, want ErrNoRuntime", err)
@@ -539,7 +543,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 
 		// 1. Create and the real model/tool turn with a captured code group.
 		wsMain := filepath.Join(home, "main-ws")
-		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsMain, AgentType: "main"})
+		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsMain, AgentSelection: composedSelection("main")})
 		testassert.NoError(t, err)
 		testassert.Require(t, created.JSON201 != nil, "CreateSession = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		main := created.JSON201.SessionId
@@ -799,7 +803,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 			testassert.Require(t, strings.Join(got, ",") == strings.Join(olderIDs, ","), "older page after the append = %v, want the anchored %v", got, olderIDs)
 		}
 		wsB := filepath.Join(home, "b-ws")
-		createdB, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsB, AgentType: "main"})
+		createdB, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsB, AgentSelection: composedSelection("main")})
 		testassert.NoError(t, err)
 		testassert.Require(t, createdB.JSON201 != nil, "CreateSession(B) = status %d: %s", createdB.HTTPResponse.StatusCode, createdB.Body)
 		sessionB := createdB.JSON201.SessionId
@@ -816,10 +820,12 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// opaque document with its exact integer lexeme; the invalid
 		// candidate never publishes.
 		settingsADocument := `{"command_timeout":60,"max_output_bytes":2048,"read_line_max_chars":3000,"read_max_lines":100,"opaque":9007199254740993}`
-		settingsA := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 3, DeleteAfterArchiveDays: 0}, Tools: json.RawMessage(settingsADocument), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`), Plugins: protocol.PluginsSettings{
+		settingsA := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 3, DeleteAfterArchiveDays: 0}, Tools: json.RawMessage(settingsADocument), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`), Extensions: protocol.ExtensionsSettings{
 			composedCustomPluginID: composedCustomSettingsDocument,
+			"agents":               `{"enabled":true,"definitions":` + compactComposed(t, []byte(composedFlowAgentsDocument)) + `}`,
+			"adaptation":           `{"enabled":true}`,
 		}}
-		settingsB := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 9, DeleteAfterArchiveDays: 5}, Tools: json.RawMessage(`{}`), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`), Plugins: protocol.PluginsSettings{}}
+		settingsB := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 9, DeleteAfterArchiveDays: 5}, Tools: json.RawMessage(`{}`), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`), Extensions: protocol.ExtensionsSettings{}}
 		put := func(settings protocol.Settings) *protocol.UpdateConfigurationSettingsResponse {
 			t.Helper()
 			resp, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: settings})
@@ -827,26 +833,26 @@ func TestProtocolComposedFlow(t *testing.T) {
 			return resp
 		}
 		firstPut := put(settingsA)
-		testassert.Require(t, firstPut.JSON200 != nil && firstPut.JSON200.Result.Sessions.AutoArchive && firstPut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && compactComposed(t, firstPut.JSON200.Result.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(firstPut.JSON200.Result.Plugins[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "settings write A = %+v (status %d, body %s), want the published A section with every plugin's exact document", firstPut.JSON200, firstPut.HTTPResponse.StatusCode, firstPut.Body)
+		testassert.Require(t, firstPut.JSON200 != nil && firstPut.JSON200.Result.Sessions.AutoArchive && firstPut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && compactComposed(t, firstPut.JSON200.Result.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(firstPut.JSON200.Result.Extensions[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "settings write A = %+v (status %d, body %s), want the published A section with every plugin's exact document", firstPut.JSON200, firstPut.HTTPResponse.StatusCode, firstPut.Body)
 		secondPut := put(settingsB)
-		testassert.Require(t, secondPut.JSON200 != nil && !secondPut.JSON200.Result.Sessions.AutoArchive && len(secondPut.JSON200.Result.Plugins) == 0, "settings write B = %+v, want the published B section with every plugin section removed", secondPut.JSON200)
+		testassert.Require(t, secondPut.JSON200 != nil && !secondPut.JSON200.Result.Sessions.AutoArchive && len(secondPut.JSON200.Result.Extensions) == 0, "settings write B = %+v, want the published B section with every plugin section removed", secondPut.JSON200)
 		stalePut := put(settingsA)
-		testassert.Require(t, stalePut.JSON200 != nil && stalePut.JSON200.Result.Sessions.AutoArchive && stalePut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays == 0 && compactComposed(t, stalePut.JSON200.Result.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(stalePut.JSON200.Result.Plugins[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "stale whole-section save = %+v, want the wholesale replacement back to A", stalePut.JSON200)
+		testassert.Require(t, stalePut.JSON200 != nil && stalePut.JSON200.Result.Sessions.AutoArchive && stalePut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays == 0 && compactComposed(t, stalePut.JSON200.Result.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(stalePut.JSON200.Result.Extensions[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "stale whole-section save = %+v, want the wholesale replacement back to A", stalePut.JSON200)
 		publishedGeneration := stalePut.JSON200.ConfigurationRevision.Generation
-		invalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Plugins: protocol.PluginsSettings{"tasks": `{"max_concurrent":99,"max_output_bytes":4096}`}}
+		invalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Extensions: protocol.ExtensionsSettings{"agents": `{"enabled":true,"task":{"max_concurrent":99,"max_output_bytes":4096}}`}}
 		refused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: invalid})
 		testassert.NoError(t, err)
 		testassert.Require(t, refused.JSONDefault != nil && refused.JSONDefault.Code == protocol.Configuration, "invalid settings response = %+v (status %d), want the typed configuration refusal", refused.JSONDefault, refused.HTTPResponse.StatusCode)
 		// The selected custom plugin's own validator refuses its invalid
 		// document with the same configuration class.
-		customInvalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Plugins: protocol.PluginsSettings{composedCustomPluginID: `{"threshold":0}`}}
+		customInvalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Extensions: protocol.ExtensionsSettings{composedCustomPluginID: `{"enabled":true,"threshold":0}`}}
 		customRefused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: customInvalid})
 		testassert.NoError(t, err)
 		testassert.Require(t, customRefused.JSONDefault != nil && customRefused.JSONDefault.Code == protocol.Configuration, "invalid custom settings response = %+v (status %d), want the typed configuration refusal", customRefused.JSONDefault, customRefused.HTTPResponse.StatusCode)
 		view, err := c.GetConfigurationWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, view.JSON200 != nil, "GetConfiguration = status %d: %s", view.HTTPResponse.StatusCode, view.Body)
-		testassert.Require(t, view.JSON200.ConfigurationRevision.Generation == publishedGeneration && view.JSON200.Settings.Sessions.AutoArchive && view.JSON200.Settings.Sessions.ArchiveAfterDays == 3 && compactComposed(t, view.JSON200.Settings.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(view.JSON200.Settings.Plugins[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "configuration after the refused write = %+v, want the unchanged last publication", view.JSON200)
+		testassert.Require(t, view.JSON200.ConfigurationRevision.Generation == publishedGeneration && view.JSON200.Settings.Sessions.AutoArchive && view.JSON200.Settings.Sessions.ArchiveAfterDays == 3 && compactComposed(t, view.JSON200.Settings.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(view.JSON200.Settings.Extensions[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "configuration after the refused write = %+v, want the unchanged last publication", view.JSON200)
 
 		// The custom plugin's neutral warning: the Runtime-scoped factory's
 		// report carries its own registered source through the mounted
@@ -1232,10 +1238,9 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		dataDir := t.TempDir()
 		configPath := filepath.Join(dataDir, "config.json")
 		composedWriteFile(t, configPath, heldConfigDocument(model.URL, heldOldKeyEnv, false))
-		agentsPath := agents.PathForConfig(configPath)
-		composedWriteFile(t, agentsPath, heldAgentsMain)
+		runtime.WriteAgentDefinitionsForTest(t, configPath, heldAgentsMain)
 
-		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath})
+		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []runtime.Plugin{tasks.Plugin()}})
 		testassert.NoError(t, err)
 		store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
 		testassert.NoError(t, err)
@@ -1249,7 +1254,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		testassert.NoError(t, err)
 
 		ws := filepath.Join(home, "held-ws")
-		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: ws, AgentType: "main"})
+		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: ws, AgentSelection: composedSelection("main")})
 		testassert.NoError(t, err)
 		testassert.Require(t, created.JSON201 != nil, "CreateSession = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		sessionID := created.JSON201.SessionId
@@ -1273,7 +1278,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		// and publish the changed configuration — whose command policy denies
 		// every later command.
 		composedWriteFile(t, configPath, heldConfigDocument(model.URL, heldNewKeyEnv, true))
-		composedWriteFile(t, agentsPath, heldAgentsRetargeted)
+		runtime.WriteAgentDefinitionsForTest(t, configPath, heldAgentsRetargeted)
 		connectKey := heldManagedValue
 		connected, err := c.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "connprov"}, protocol.ConnectRequest{ApiKey: &connectKey})
 		testassert.NoError(t, err)

@@ -317,7 +317,7 @@ func seedRunningOperationCounted(t *testing.T, store harness.Storage, workspace 
 		},
 	})
 	testassert.NoError(t, err)
-	rec, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: workspace, AgentType: "seeded"})
+	rec, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: workspace, AgentSelection: suppliedDefinition("seeded")})
 	testassert.NoError(t, err)
 	{
 		_, err := h.Submit(context.Background(), harness.SubmitRequest{

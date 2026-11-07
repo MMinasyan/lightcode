@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,7 +17,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -42,9 +42,9 @@ func mutationConfigDocument() string {
 // sessions policy beside the top-level tools object and no plugin documents.
 func mutationSettings() protocol.Settings {
 	return protocol.Settings{
-		Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 5, DeleteAfterArchiveDays: 2},
-		Tools:    json.RawMessage(`{"command_timeout":60,"max_output_bytes":2048,"read_line_max_chars":3000,"read_max_lines":100}`),
-		Plugins:  protocol.PluginsSettings{},
+		Sessions:   protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 5, DeleteAfterArchiveDays: 2},
+		Tools:      json.RawMessage(`{"command_timeout":60,"max_output_bytes":2048,"read_line_max_chars":3000,"read_max_lines":100}`),
+		Extensions: protocol.ExtensionsSettings{},
 	}
 }
 
@@ -73,7 +73,7 @@ func opaqueSettingsDocument() string {
 		`{"m":{"name":"One","context_window":9007199254740993}}`) +
 		`},"sessions":{"archive_after_days":3},` +
 		`"tools":{"max_output_bytes":42,"exact":9007199254740993},` +
-		`"plugins":{"alpha":{"kept":1,"exact":9007199254740993},"tasks":{}}}`
+		`"extensions":{"alpha":{"enabled":true,"kept":1,"exact":9007199254740993},"tasks":{}}}`
 }
 
 // TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments proves
@@ -94,10 +94,11 @@ func TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments(t *testin
 
 	view, err := r.getConfiguration(ctx)
 	testassert.NoError(t, err)
-	read := view.Settings.Plugins
+	read := view.Settings.Extensions
 	want := map[string]string{
-		"alpha": `{"kept":1,"exact":9007199254740993}`,
-		"tasks": `{}`,
+		"alpha":  `{"enabled":true,"kept":1,"exact":9007199254740993}`,
+		"tasks":  `{}`,
+		"agents": `{"definitions":` + compactJSON(t, []byte(configurationAgentsDocument)) + `,"enabled":true}`,
 	}
 	testassert.Require(t, len(read) == len(want), "settings plugins = %v, want exactly the owned sections %v", read, want)
 	for id, wantDoc := range want {
@@ -118,7 +119,7 @@ func TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments(t *testin
 	nextConfigurationEvent(t, sub, "2")
 	root := fileRoot(t, e.configPath)
 	var plugins map[string]json.RawMessage
-	testassert.NoError(t, json.Unmarshal(root["plugins"], &plugins))
+	testassert.NoError(t, json.Unmarshal(root["extensions"], &plugins))
 	testassert.Require(t, len(plugins) == len(want), "written plugins = %v, want exactly %v", plugins, want)
 	for id, wantDoc := range want {
 		{
@@ -153,6 +154,16 @@ func fileRoot(t *testing.T, path string) map[string]json.RawMessage {
 		testassert.Require(t, err == nil, "decode %s: %v", path, err)
 	}
 	return root
+}
+
+func definitionsRoot(t *testing.T, path string) map[string]json.RawMessage {
+	t.Helper()
+	root := fileRoot(t, path)
+	var extensions, agents, definitions map[string]json.RawMessage
+	testassert.NoError(t, json.Unmarshal(root["extensions"], &extensions))
+	testassert.NoError(t, json.Unmarshal(extensions["agents"], &agents))
+	testassert.NoError(t, json.Unmarshal(agents["definitions"], &definitions))
+	return definitions
 }
 
 // writeSyncProbe is the process-global atomicfs.SyncFileFunc seam scoped to
@@ -269,7 +280,7 @@ func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testi
 	if candidate.snapshot.generation != 2 || svc.current() != candidate.snapshot {
 		t.Fatalf("mutate = generation %d (current published %v), want generation 2 published", candidate.snapshot.generation, svc.current() == candidate.snapshot)
 	}
-	testassert.Equal(t, projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.plugins).Sessions, wantSettings.Sessions)
+	testassert.Equal(t, projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.extensions).Sessions, wantSettings.Sessions)
 
 	// The owning file: the written members are the marshaled shape, the
 	// unowned members and their exact numeric lexeme survive.
@@ -279,7 +290,7 @@ func TestConfigurationMutateSettingsReplacesWholeShapeAndRetainsUnowned(t *testi
 		testassert.Equal(t, got, want)
 	}
 	var plugins map[string]json.RawMessage
-	testassert.NoError(t, json.Unmarshal(root["plugins"], &plugins))
+	testassert.NoError(t, json.Unmarshal(root["extensions"], &plugins))
 	{
 		got, want := compactJSON(t, root["tools"]), compactJSON(t, wantSettings.Tools)
 		testassert.Equal(t, got, want)
@@ -390,9 +401,7 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	var mu sync.Mutex
 	// The fixture document carries the old alpha section the stale save must
 	// remove wholesale.
-	writeServiceFile(t, h.configPath, strings.TrimSuffix(mutationConfigDocument(), "}")+`,"tools":{"max_output_bytes":42},"plugins":{"alpha":{"kept":1}}}`)
-	testassert.NoError(t, os.MkdirAll(h.dataDir, 0o700))
-	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), workerAgentsDocument)
+	writeServiceFile(t, h.configPath, strings.TrimSuffix(mutationConfigDocument(), "}")+`,"tools":{"max_output_bytes":42},"plugins":{"legacy":{"value":9007199254740993}},"extensions":{"alpha":{"enabled":true,"kept":1}}}`)
 	svc := h.service(context.Background(),
 		servicePlugin("alpha", &h.opens, func(raw json.RawMessage) error {
 			mu.Lock()
@@ -410,25 +419,22 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	sub, err := svc.obs.subscribe(8)
 	testassert.NoError(t, err)
 	t.Cleanup(sub.Close)
-	agentsPath := filepath.Join(h.dataDir, "agents.json")
-	agentsBefore, err := os.ReadFile(agentsPath)
-	testassert.NoError(t, err)
 
 	// The omission domain: the target carries the tools object and no plugin
 	// documents; the old alpha section is removed wholesale even though it is
 	// valid.
 	stale := protocol.Settings{
-		Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 7, DeleteAfterArchiveDays: 7},
-		Tools:    json.RawMessage(`{"command_timeout":30,"max_output_bytes":1024,"read_line_max_chars":2000,"read_max_lines":50}`),
-		Plugins:  protocol.PluginsSettings{},
+		Sessions:   protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 7, DeleteAfterArchiveDays: 7},
+		Tools:      json.RawMessage(`{"command_timeout":30,"max_output_bytes":1024,"read_line_max_chars":2000,"read_max_lines":50}`),
+		Extensions: protocol.ExtensionsSettings{},
 	}
 	candidate, err := svc.mutate(context.Background(), editSettings(stale))
 	testassert.NoError(t, err)
-	published := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.plugins)
-	testassert.Require(t, len(published.Plugins) == 0 && compactJSON(t, published.Tools) == compactJSON(t, stale.Tools), "published plugins = %v, tools = %s, want no plugin documents and the written tools object", published.Plugins, published.Tools)
+	published := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.extensions)
+	testassert.Require(t, len(published.Extensions) == 0 && compactJSON(t, published.Tools) == compactJSON(t, stale.Tools), "published extensions = %v, tools = %s, want no extension documents and the written tools object", published.Extensions, published.Tools)
 	root := fileRoot(t, h.configPath)
 	var plugins map[string]json.RawMessage
-	testassert.NoError(t, json.Unmarshal(root["plugins"], &plugins))
+	testassert.NoError(t, json.Unmarshal(root["extensions"], &plugins))
 	{
 		got, want := compactJSON(t, root["tools"]), compactJSON(t, stale.Tools)
 		testassert.Equal(t, got, want)
@@ -451,22 +457,16 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 		testassert.Require(t, string(got) == "true", "unowned unknown member = %s, want true", got)
 	}
 	testassert.Require(t, string(root["providers"]) != "", "unowned providers member missing")
+	testassert.Equal(t, compactJSON(t, root["plugins"]), `{"legacy":{"value":9007199254740993}}`)
 	{
 		_, ok := root["alpha"]
 		testassert.Require(t, !ok, "a removed plugin section leaked to the root")
 	}
-	agentsAfter, err := os.ReadFile(agentsPath)
-	testassert.Require(t, err == nil && string(agentsBefore) == string(agentsAfter), "the settings edit changed the agents file (%v)", err)
-	// The removed section is gone for its plugin too: the edit build's alpha
-	// validator received nil, so defaults govern.
+	// The removed section is inactive and its validator does not run.
 	mu.Lock()
 	alphaCalls := len(received)
-	var alphaEditRaw json.RawMessage
-	if alphaCalls == 2 {
-		alphaEditRaw = received[1]
-	}
 	mu.Unlock()
-	testassert.Require(t, alphaCalls == 2 && alphaEditRaw == nil, "alpha validator calls = %d (edit build received %s), want nil defaults on the omitted section", alphaCalls, alphaEditRaw)
+	testassert.Require(t, alphaCalls == 1, "alpha validator calls = %d, want no call for omitted section", alphaCalls)
 	nextConfigurationEvent(t, sub, "2")
 
 	// The refusal domain: an unknown ID, invalid inner JSON, and a valid but
@@ -475,29 +475,37 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
 	for _, row := range []struct {
 		name    string
-		plugins protocol.PluginsSettings
+		plugins protocol.ExtensionsSettings
 	}{
-		{"unknown id", protocol.PluginsSettings{"ghost": `{}`}},
-		{"invalid document", protocol.PluginsSettings{"alpha": `{not json`}},
-		{"non-object document", protocol.PluginsSettings{"alpha": `1`}},
-		{"null document", protocol.PluginsSettings{"alpha": `null`}},
+		{"invalid document", protocol.ExtensionsSettings{"alpha": `{not json`}},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			_, err := svc.mutate(context.Background(), editSettings(protocol.Settings{Sessions: stale.Sessions, Plugins: row.plugins}))
+			_, err := svc.mutate(context.Background(), editSettings(protocol.Settings{Sessions: stale.Sessions, Extensions: row.plugins}))
 			assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
 		})
 	}
 
 	// An empty complete map is valid: it removes every owned section.
-	candidate, err = svc.mutate(context.Background(), editSettings(protocol.Settings{Sessions: stale.Sessions, Plugins: protocol.PluginsSettings{}}))
+	candidate, err = svc.mutate(context.Background(), editSettings(protocol.Settings{Sessions: stale.Sessions, Extensions: protocol.ExtensionsSettings{}}))
 	testassert.NoError(t, err)
 	{
-		got := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.plugins).Plugins
+		got := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.extensions).Extensions
 		testassert.Require(t, len(got) == 0, "published plugins after the empty map = %v, want none", got)
 	}
 	root = fileRoot(t, h.configPath)
-	testassert.Equal(t, compactJSON(t, root["plugins"]), `{}`)
+	testassert.Equal(t, compactJSON(t, root["extensions"]), `{}`)
 	nextConfigurationEvent(t, sub, "3")
+
+	retained := protocol.ExtensionsSettings{"ghost": `{"enabled":true,"unknown":1}`, "alpha": `1`}
+	candidate, err = svc.mutate(context.Background(), editSettings(protocol.Settings{Sessions: stale.Sessions, Extensions: retained}))
+	testassert.NoError(t, err)
+	got := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.extensions).Extensions
+	testassert.Require(t, reflect.DeepEqual(got, retained), "inactive documents = %v, want %v", got, retained)
+	mu.Lock()
+	alphaCalls = len(received)
+	mu.Unlock()
+	testassert.Equal(t, alphaCalls, 1)
+	nextConfigurationEvent(t, sub, "4")
 }
 
 // TestConfigurationMutateEverySuccessfulEditWritesAndPublishes pins the one
@@ -532,35 +540,31 @@ func TestConfigurationMutateEverySuccessfulEditWritesAndPublishes(t *testing.T) 
 // --- owning file identity, mode, and no side effects ---
 
 // TestConfigurationMutateWritesOwningFileOnly0600 proves the write contract:
-// exactly the owning file is atomically rewritten at mode 0600, a missing
-// input file contributes its skeleton bytes in memory without creating it,
-// and the companion file is never written as a side effect.
+// the main configuration is atomically rewritten at mode 0600 and no
+// separate Agent file is created.
 func TestConfigurationMutateWritesOwningFileOnly0600(t *testing.T) {
 	h := newServiceHarness(t)
-	// No input files exist yet: the mutation must not create the non-owning
-	// file, and the owning file is born at mode 0600.
-	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), fixtureAgentPlugin())
 	agentsPath := filepath.Join(h.dataDir, "agents.json")
 
 	candidate, err := svc.mutate(context.Background(), svc.editAgentModel("primary", "prov/m"))
 	testassert.NoError(t, err)
 	testassert.Equal(t, candidate.snapshot.generation, 1)
-	info, err := os.Stat(agentsPath)
+	info, err := os.Stat(h.configPath)
 	testassert.NoError(t, err)
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("owning file mode = %o, want 600", info.Mode().Perm())
 	}
 	{
-		_, err := os.Stat(h.configPath)
-		testassert.Require(t, os.IsNotExist(err), "the companion main configuration was created as a side effect: %v", err)
+		_, err := os.Stat(agentsPath)
+		testassert.Require(t, os.IsNotExist(err), "agents.json was created: %v", err)
 	}
 
-	// The settings PUT owns the main configuration only: agents.json keeps
-	// its bytes and the main file is born at 0600 from the skeleton root.
-	agentsBefore, err := os.ReadFile(agentsPath)
-	testassert.NoError(t, err)
+	// The settings PUT retains the Agent document carried by the caller.
+	settings := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.extensions)
+	settings.Sessions = mutationSettings().Sessions
 	{
-		_, err := svc.mutate(context.Background(), editSettings(mutationSettings()))
+		_, err := svc.mutate(context.Background(), editSettings(settings))
 		testassert.NoError(t, err)
 	}
 	info, err = os.Stat(h.configPath)
@@ -568,8 +572,8 @@ func TestConfigurationMutateWritesOwningFileOnly0600(t *testing.T) {
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("owning file mode = %o, want 600", info.Mode().Perm())
 	}
-	agentsAfter, err := os.ReadFile(agentsPath)
-	testassert.Require(t, err == nil && string(agentsBefore) == string(agentsAfter), "the companion agents file changed: %v", err)
+	root := definitionsRoot(t, h.configPath)
+	testassert.Require(t, compactJSON(t, root["primary"]) == `{"model":"prov/m"}`, "settings lost the agent model: %s", root["primary"])
 }
 
 // --- agent model edit ---
@@ -584,8 +588,8 @@ func TestConfigurationMutateWritesOwningFileOnly0600(t *testing.T) {
 func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), workerAgentsDocument)
-	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, acceptValidator))
+	writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
+	svc := h.service(context.Background(), fixtureAgentPlugin())
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -593,7 +597,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	sub, err := svc.obs.subscribe(16)
 	testassert.NoError(t, err)
 	t.Cleanup(sub.Close)
-	agentsPath := filepath.Join(h.dataDir, "agents.json")
+	agentsPath := h.configPath
 
 	// Set: the override lands on the existing entry and resolves.
 	candidate, err := svc.mutate(context.Background(), svc.editAgentModel("worker", "prov/m"))
@@ -604,7 +608,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	}
 	nextConfigurationEvent(t, sub, "2")
 	{
-		root := fileRoot(t, agentsPath)
+		root := definitionsRoot(t, agentsPath)
 		testassert.Require(t, compactJSON(t, root["worker"]) == `{"model":"prov/m","system_prompt":"simple"}`, "worker entry = %s, want the model added beside the kept member", root["worker"])
 	}
 
@@ -622,7 +626,7 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	}
 	nextConfigurationEvent(t, sub, "4")
 	{
-		root := fileRoot(t, agentsPath)
+		root := definitionsRoot(t, agentsPath)
 		testassert.Require(t, compactJSON(t, root["worker"]) == `{"system_prompt":"simple"}`, "worker entry = %s, want the model member removed", root["worker"])
 	}
 
@@ -653,9 +657,59 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 	}
 	nextConfigurationEvent(t, sub, "6")
 	{
-		root := fileRoot(t, agentsPath)
+		root := definitionsRoot(t, agentsPath)
 		testassert.Require(t, compactJSON(t, root["primary"]) == `{"model":"prov/m"}`, "primary entry = %s, want the bare model-only overlay", root["primary"])
 	}
+}
+
+func TestConfigurationMutateAgentModelPreservesConcurrentSettings(t *testing.T) {
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, mutationConfigDocument())
+	writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
+	var armed atomic.Bool
+	entered, release := make(chan struct{}), make(chan struct{})
+	plugin := servicePlugin("agents", &h.opens, func(json.RawMessage) error {
+		if armed.CompareAndSwap(true, false) {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	svc := h.service(context.Background(), plugin)
+	initial, err := svc.publish(context.Background())
+	testassert.NoError(t, err)
+	settings := projectSettings(initial.snapshot.sessions, initial.snapshot.tools, initial.snapshot.jobs, initial.snapshot.compaction, initial.snapshot.extensions)
+	settings.Extensions["agents"] = `{"enabled":true,"task":{"max_concurrent":7},"definitions":{"worker":{"system_prompt":"simple","description":"latest","tools":[]}}}`
+	settings.Extensions["uninstalled"] = `{"enabled":true,"unknown":9007199254740993}`
+	armed.Store(true)
+	settingsDone := make(chan error, 1)
+	go func() { _, err := svc.mutate(context.Background(), editSettings(settings)); settingsDone <- err }()
+	<-entered
+	modelStarted, modelDone := make(chan struct{}), make(chan error, 1)
+	go func() {
+		close(modelStarted)
+		_, err := svc.mutate(context.Background(), svc.editAgentModel("worker", "prov/m"))
+		modelDone <- err
+	}()
+	<-modelStarted
+	select {
+	case err := <-modelDone:
+		t.Fatalf("model edit escaped the held settings build: %v", err)
+	default:
+	}
+	close(release)
+	testassert.NoError(t, <-settingsDone)
+	testassert.NoError(t, <-modelDone)
+	definitions := definitionsRoot(t, h.configPath)
+	testassert.Equal(t, compactJSON(t, definitions["worker"]), `{"description":"latest","model":"prov/m","system_prompt":"simple","tools":[]}`)
+	root := fileRoot(t, h.configPath)
+	var extensions map[string]json.RawMessage
+	testassert.NoError(t, json.Unmarshal(root["extensions"], &extensions))
+	testassert.Equal(t, compactJSON(t, extensions["uninstalled"]), `{"enabled":true,"unknown":9007199254740993}`)
+	var section map[string]json.RawMessage
+	testassert.NoError(t, json.Unmarshal(extensions["agents"], &section))
+	testassert.Equal(t, compactJSON(t, section["task"]), `{"max_concurrent":7}`)
+	testassert.Equal(t, svc.current().generation, uint64(3))
 }
 
 // TestConfigurationMutateAgentModelClearAlwaysWritesAndPublishes proves the
@@ -667,8 +721,8 @@ func TestConfigurationMutateAgentModelEditsLatestRoot(t *testing.T) {
 func TestConfigurationMutateAgentModelClearAlwaysWritesAndPublishes(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), "{}\n")
-	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, acceptValidator))
+	writeAgentDefinitions(t, h.configPath, `{}`)
+	svc := h.service(context.Background(), fixtureAgentPlugin())
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -676,7 +730,7 @@ func TestConfigurationMutateAgentModelClearAlwaysWritesAndPublishes(t *testing.T
 	sub, err := svc.obs.subscribe(8)
 	testassert.NoError(t, err)
 	t.Cleanup(sub.Close)
-	agentsPath := filepath.Join(h.dataDir, "agents.json")
+	agentsPath := h.configPath
 	probe := installOwningSyncProbe(t, agentsPath)
 	defer probe.restore()
 
@@ -688,7 +742,7 @@ func TestConfigurationMutateAgentModelClearAlwaysWritesAndPublishes(t *testing.T
 	}
 	testassert.Equal(t, probe.count(), 2)
 	{
-		root := fileRoot(t, agentsPath)
+		root := definitionsRoot(t, agentsPath)
 		testassert.Require(t, compactJSON(t, root["primary"]) == `{}`, "primary entry = %s, want the retained WriteModel bare-entry semantics", root["primary"])
 	}
 }
@@ -701,8 +755,8 @@ func TestConfigurationMutateAgentModelClearAlwaysWritesAndPublishes(t *testing.T
 func TestConfigurationMutateUnknownAgentTypeFailsWithoutBareEntry(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{"broken":{"tools":["ghost_tool"]},"badmodel":{"model":"noslash"}}`)
-	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, nil))
+	writeAgentDefinitions(t, h.configPath, `{}`)
+	svc := h.service(context.Background(), fixtureAgentPlugin())
 	svc.attachWarnings(newWarningStore())
 	{
 		_, err := svc.publish(context.Background())
@@ -711,15 +765,23 @@ func TestConfigurationMutateUnknownAgentTypeFailsWithoutBareEntry(t *testing.T) 
 	sub, err := svc.obs.subscribe(4)
 	testassert.NoError(t, err)
 	t.Cleanup(sub.Close)
-	agentsPath := filepath.Join(h.dataDir, "agents.json")
+	agentsPath := h.configPath
 	before, published, warnRev := metadataBaseline(t, svc, h.configPath)
 	agentsBefore := mustRead(t, agentsPath)
 
-	for _, agentType := range []string{"ghost", "broken", "badmodel"} {
+	for _, agentType := range []string{"ghost"} {
 		_, err := svc.mutate(context.Background(), svc.editAgentModel(agentType, "prov/m"))
 		assertMetadataRefused(t, svc, sub, h.configPath, before, published, warnRev, err, harness.ErrInvalid)
 	}
 	testassert.Require(t, string(mustRead(t, agentsPath)) == string(agentsBefore), "a failed agent mutate changed the owning agents file")
+	for _, invalid := range []string{`{"broken":{"tools":["ghost_tool"]}}`, `{"badmodel":{"model":"noslash"}}`} {
+		writeAgentDefinitions(t, h.configPath, invalid)
+		invalidBytes := mustRead(t, h.configPath)
+		_, err := svc.publish(context.Background())
+		testassert.Require(t, errors.Is(err, ErrConfiguration), "invalid active definitions = %v", err)
+		testassert.Require(t, svc.current() == published && string(mustRead(t, h.configPath)) == string(invalidBytes), "invalid reload changed publication or source")
+		assertNoEvent(t, sub)
+	}
 }
 
 // TestConfigurationMutateMalformedModelRefFailsWithoutWrite proves a
@@ -727,13 +789,13 @@ func TestConfigurationMutateUnknownAgentTypeFailsWithoutBareEntry(t *testing.T) 
 func TestConfigurationMutateMalformedModelRefFailsWithoutWrite(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, mutationConfigDocument())
-	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{"worker":{"model":"prov/m"}}`)
-	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, nil))
+	writeAgentDefinitions(t, h.configPath, `{"worker":{"model":"prov/m"}}`)
+	svc := h.service(context.Background(), fixtureAgentPlugin())
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
 	}
-	agentsPath := filepath.Join(h.dataDir, "agents.json")
+	agentsPath := h.configPath
 	before, err := os.ReadFile(agentsPath)
 	testassert.NoError(t, err)
 	{
@@ -743,6 +805,32 @@ func TestConfigurationMutateMalformedModelRefFailsWithoutWrite(t *testing.T) {
 	after, err := os.ReadFile(agentsPath)
 	testassert.Require(t, err == nil && string(before) == string(after), "a malformed ref changed the owning file (%v)", err)
 	testassert.Equal(t, svc.current().generation, 1)
+}
+
+func TestConfigurationMutateAgentModelRejectsInactiveOwner(t *testing.T) {
+	for _, row := range []struct {
+		name      string
+		config    string
+		installed bool
+	}{
+		{"disabled", `{"extensions":{"agents":{"enabled":false,"definitions":{"primary":{"model":"p/old"}}}}}`, true},
+		{"uninstalled", `{"extensions":{"agents":{"enabled":true,"definitions":{"primary":{"model":"p/old"}}}}}`, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h := newServiceHarness(t)
+			writeServiceFile(t, h.configPath, row.config)
+			var plugins []Plugin
+			if row.installed {
+				plugins = append(plugins, fixtureAgentPlugin())
+			}
+			svc := h.service(context.Background(), plugins...)
+			before, err := svc.publish(context.Background())
+			testassert.NoError(t, err)
+			bytesBefore := mustRead(t, h.configPath)
+			_, err = svc.mutate(context.Background(), svc.editAgentModel("primary", "p/new"))
+			testassert.Require(t, errors.Is(err, harness.ErrInvalid) && svc.current() == before.snapshot && bytes.Equal(bytesBefore, mustRead(t, h.configPath)), "inactive edit = %v, want no write or publication", err)
+		})
+	}
 }
 
 // --- invalid candidate: nothing changes ---
@@ -768,7 +856,7 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 	// plugin section, so a row can target one specific plugin settings owner.
 	withSection := func(id, document string) protocol.Settings {
 		settings := mutationSettings()
-		settings.Plugins[id] = document
+		settings.Extensions[id] = document
 		return settings
 	}
 	// withTools replaces the written top-level tools object.
@@ -795,7 +883,7 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 			name:       "an unrelated plugin validator rejects its own written section",
 			validate:   rejectWritten,
 			external:   mutationConfigDocument(),
-			settings:   withSection("capowner", `{"kept":2048}`),
+			settings:   withSection("capowner", `{"enabled":true,"kept":2048}`),
 			wantSource: "written settings invalid",
 		},
 		{
@@ -843,12 +931,10 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 }
 
 // TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged
-// pins the same candidate-failure rule through the Agent-model edit, whose
-// owning file is agents.json and whose main configuration is only the
-// companion: an external editor's bad unowned members — a wrong-typed
-// providers or sessions member, an unknown plugin section with no compiled
-// plugin — stay in the latest raw layer and reject the candidate with the
-// typed failure, both files byte-unchanged from the post-bad-write baseline,
+// pins the same candidate-failure rule through the Agent-model edit: an
+// external editor's bad provider, session or enabled-extension member stays
+// in the latest raw layer and rejects the candidate with the typed failure,
+// with the owning file byte-unchanged from the post-bad-write baseline,
 // the same published pointer, generation, and warning revision, and event
 // silence. The inverse probe proves the oracles flip: restoring a valid
 // companion makes the same edit succeed with its generation and event.
@@ -869,19 +955,24 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 			wantSource: "sessions",
 		},
 		{
-			name:       "unknown plugin section",
-			config:     `{"providers":{},"plugins":{"ghost":{}}}`,
-			wantSource: "ghost",
+			name:       "invalid active extension",
+			config:     `{"providers":{},"extensions":{"alpha":{"enabled":true,"invalid":true}}}`,
+			wantSource: "invalid alpha",
 		},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
 			h := newServiceHarness(t)
 			writeServiceFile(t, h.configPath, mutationConfigDocument())
-			writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), workerAgentsDocument)
+			writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
 			svc := h.service(context.Background(),
 				servicePlugin("capowner", &h.opens, acceptValidator),
-				servicePlugin("alpha", &h.opens, acceptValidator))
+				servicePlugin("alpha", &h.opens, func(raw json.RawMessage) error {
+					if strings.Contains(string(raw), `"invalid":true`) {
+						return errors.New("invalid alpha")
+					}
+					return nil
+				}), fixtureAgentPlugin())
 			{
 				_, err := svc.publish(context.Background())
 				testassert.NoError(t, err)
@@ -894,8 +985,9 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 			// The external bad state is the baseline: the oracles compare
 			// against the latest bytes on disk, not the last valid file.
 			writeServiceFile(t, h.configPath, row.config)
+			writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
 			before, published, warnRev := metadataBaseline(t, svc, h.configPath)
-			agentsPath := filepath.Join(h.dataDir, "agents.json")
+			agentsPath := h.configPath
 			agentsBefore := mustRead(t, agentsPath)
 			candidate, err := svc.mutate(context.Background(), svc.editAgentModel("worker", "prov/m"))
 			testassert.Require(t, candidate.snapshot == nil, "agent edit = %+v, want a rejected candidate", candidate)
@@ -906,6 +998,7 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 			// The inverse probe: with the bad member gone the same edit
 			// succeeds, proving the file/generation/event oracles flip.
 			writeServiceFile(t, h.configPath, mutationConfigDocument())
+			writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
 			candidate, err = svc.mutate(context.Background(), svc.editAgentModel("worker", "prov/m"))
 			testassert.Require(t, err == nil && candidate.snapshot.generation == 2 && svc.current() == candidate.snapshot, "inverse edit = (%v, generation %d), want a successful publication at 2", err, candidate.snapshot.generation)
 			nextConfigurationEvent(t, sub, "2")
@@ -946,7 +1039,7 @@ func TestConfigurationMutateMalformedPermissionsFallbackPublishes(t *testing.T) 
 func TestConfigurationMutateCancelsBeforeWrite(t *testing.T) {
 	t.Run("caller canceled after validation", func(t *testing.T) {
 		h := newServiceHarness(t)
-		writeServiceFile(t, h.configPath, mutationConfigDocument())
+		writeServiceFile(t, h.configPath, strings.TrimSuffix(mutationConfigDocument(), "}")+`,"extensions":{"capowner":{"enabled":true}}}`)
 		ctx, cancel := context.WithCancel(context.Background())
 		svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, func(json.RawMessage) error {
 			cancel()
@@ -961,7 +1054,9 @@ func TestConfigurationMutateCancelsBeforeWrite(t *testing.T) {
 		t.Cleanup(sub.Close)
 		data, err := os.ReadFile(h.configPath)
 		testassert.NoError(t, err)
-		candidate, err := svc.mutate(ctx, editSettings(mutationSettings()))
+		settings := mutationSettings()
+		settings.Extensions["capowner"] = `{"enabled":true}`
+		candidate, err := svc.mutate(ctx, editSettings(settings))
 		testassert.Require(t, candidate.snapshot == nil && errors.Is(err, context.Canceled), "mutate = (%v, %v), want the caller context error before the write", candidate, err)
 		after, rerr := os.ReadFile(h.configPath)
 		testassert.Require(t, rerr == nil && string(data) == string(after), "the canceled mutation changed the owning file (%v)", rerr)
@@ -1074,7 +1169,7 @@ func TestConfigurationMutateWriteFailureLeavesEverythingUnchanged(t *testing.T) 
 // with the next generation, and the events keep publication order.
 func TestConfigurationMutateSerializesWithReload(t *testing.T) {
 	h := newServiceHarness(t)
-	writeServiceFile(t, h.configPath, mutationConfigDocument())
+	writeServiceFile(t, h.configPath, strings.TrimSuffix(mutationConfigDocument(), "}")+`,"extensions":{"capowner":{"enabled":true}}}`)
 	var builds atomic.Int64
 	gate := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -1099,7 +1194,9 @@ func TestConfigurationMutateSerializesWithReload(t *testing.T) {
 	}
 	mutation := make(chan result, 1)
 	go func() {
-		cfg, err := svc.mutate(context.Background(), editSettings(mutationSettings()))
+		settings := mutationSettings()
+		settings.Extensions["capowner"] = `{"enabled":true}`
+		cfg, err := svc.mutate(context.Background(), editSettings(settings))
 		if err != nil {
 			mutation <- result{err: err}
 			return
@@ -1206,7 +1303,7 @@ func TestRuntimeAgentModelMutationAffectsNextAdmissions(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember(e.server.URL, "",
 			`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096},"wide":{"name":"W","context_window":262144,"max_output_tokens":4096}}`)+`}}`)
-		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo":{"model":"prov/m","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`)
+		writeAgentDefinitions(t, e.configPath, `{"solo":{"model":"prov/m","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`)
 		e.fixtureStore(store)
 		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
@@ -1245,7 +1342,7 @@ func TestRuntimeAgentModelMutationAffectsNextAdmissions(t *testing.T) {
 
 		// The forbidden siblings: an unknown type and a malformed ref fail
 		// invalid and never touch the owning file.
-		agentsPath := agents.PathForConfig(e.configPath)
+		agentsPath := e.configPath
 		before, err := os.ReadFile(agentsPath)
 		testassert.NoError(t, err)
 		{
@@ -1353,7 +1450,9 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		cfg, err := svc.mutate(context.Background(), editSettings(mutationSettings()))
+		settings := mutationSettings()
+		settings.Extensions["capowner"] = `{"enabled":true}`
+		cfg, err := svc.mutate(context.Background(), editSettings(settings))
 		done <- result{cfg, err}
 	}()
 	// Failure cleanup: release the parked validation and join the worker
@@ -1411,7 +1510,7 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 	}
 
 	// The published projection: the same winning candidate's settings.
-	view := projectSettings(svc.current().sessions, svc.current().tools, svc.current().jobs, svc.current().compaction, svc.current().plugins)
+	view := projectSettings(svc.current().sessions, svc.current().tools, svc.current().jobs, svc.current().compaction, svc.current().extensions)
 	testassert.Require(t, view.Sessions == mutationSettings().Sessions && compactJSON(t, view.Tools) == compactJSON(t, mutationSettings().Tools), "published settings = %+v, want the requested shape", view)
 }
 

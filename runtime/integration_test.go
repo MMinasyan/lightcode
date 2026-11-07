@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -31,15 +30,14 @@ import (
 
 func assembledConfigDocument(endpoint, tag, label string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "ASSEMBLED_TEST_KEY",
-		`{"m":{"name":"M","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `},"depper":{"label":` + fixtureString(label) + `}}}`
+		`{"m":{"name":"M","context_window":262144}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":` + fixtureString(tag) + `},"depper":{"enabled":true,"label":` + fixtureString(label) + `},"base":{"enabled":true},"probe":{"enabled":true}}}`
 }
 
 // The "leaky" definition selects the Core storage export by ID: raw storage
 // is not in the ordinary capability universe, so the definition drops and the
 // type is unknown at admission — raw storage is never exported into execution.
 const assembledAgentsDocument = `{
-  "integrated": {"model": "prov/m", "system_prompt": "simple", "tools": ["probe"], "capabilities": ["hook.first", "dep.worker"]},
-  "leaky": {"model": "prov/m", "system_prompt": "simple", "capabilities": ["session_store"]}
+  "integrated": {"model": "prov/m", "system_prompt": "simple", "tools": ["probe"], "capabilities": ["hook.first", "dep.worker"]}
 }`
 
 type combinedBase struct{ closed *atomic.Bool }
@@ -343,7 +341,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		server := newProductionModelServer(t, "probe", "{}")
 		t.Setenv("ASSEMBLED_TEST_KEY", "assembled-key-1")
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T1", "L1"))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), assembledAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, assembledAgentsDocument)
 		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(in PreparationInput) PreparationConsequence {
 			prompt := in.Prompt + "|hooked"
 			return PreparationConsequence{Prompt: &prompt}
@@ -453,6 +451,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 
 		// Reload publishes the next revision over the blocked Operation.
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T2", "L2"))
+		writeAgentDefinitions(t, e.configPath, assembledAgentsDocument)
 		{
 			revision, err := r.Reload(ctx)
 			testassert.Require(t, err == nil && revision == "2", "Reload over the blocked Operation = (%q, %v), want 2", revision, err)

@@ -102,7 +102,7 @@ type dispatchCase struct {
 var dispatchCases = []dispatchCase{
 	{
 		name: "GetHealth", operation: "GetHealth",
-		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"8"}`,
+		status: 200, response: `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"9"}`,
 		method: "GET", path: "/v1/health",
 	},
 	{
@@ -119,10 +119,10 @@ var dispatchCases = []dispatchCase{
 	},
 	{
 		name: "CreateSession", operation: "CreateSession",
-		params: `{"body":{"workspace":"/ws","agent_type":"primary","opaque":9007199254740993}}`,
+		params: `{"body":{"workspace":"/ws","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"}},"opaque":9007199254740993}}`,
 		status: 201, response: `{"session_id":"s1","durable_revision":"9007199254740993"}`,
 		method: "POST", path: "/v1/sessions",
-		body: `{"workspace":"/ws","agent_type":"primary","opaque":9007199254740993}`,
+		body: `{"workspace":"/ws","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"}},"opaque":9007199254740993}`,
 	},
 	{
 		name: "DeleteSession", operation: "DeleteSession",
@@ -165,10 +165,17 @@ var dispatchCases = []dispatchCase{
 	},
 	{
 		name: "SetSessionAgentType", operation: "SetSessionAgentType",
-		params: `{"session_id":"s1","body":{"agent_type":"integrated"}}`,
-		status: 200, response: `{"session_id":"s1","agent_type":"integrated"}`,
+		params: `{"session_id":"s1","body":{"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"integrated"}}}}`,
+		status: 200, response: `{"session_id":"s1"}`,
 		method: "PUT", path: "/v1/sessions/s1/agent-type",
-		body: `{"agent_type":"integrated"}`,
+		body: `{"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"integrated"}}}`,
+	},
+	{
+		name: "SetSessionModel", operation: "SetSessionModel",
+		params: `{"session_id":"s1","body":{"model":"prov/m"}}`,
+		status: 200, response: `{"session_id":"s1"}`,
+		method: "PUT", path: "/v1/sessions/s1/model",
+		body: `{"model":"prov/m"}`,
 	},
 	{
 		name: "InterruptSession", operation: "InterruptSession",
@@ -243,10 +250,10 @@ var dispatchCases = []dispatchCase{
 	},
 	{
 		name: "UpdateConfigurationSettings", operation: "UpdateConfigurationSettings",
-		params: `{"body":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"plugins":{"raw":"{\"n\":9007199254740993}"}}}`,
-		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"3"},"result":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"plugins":{"raw":"{\"n\":9007199254740993}"}}}`,
+		params: `{"body":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"extensions":{"raw":"{\"n\":9007199254740993}"}}}`,
+		status: 200, response: `{"configuration_revision":{"instance_id":"0123456789abcdef0123456789abcdef","generation":"3"},"result":{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"extensions":{"raw":"{\"n\":9007199254740993}"}}}`,
 		method: "PUT", path: "/v1/configuration/settings",
-		body: `{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"plugins":{"raw":"{\"n\":9007199254740993}"}}`,
+		body: `{"sessions":{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"extensions":{"raw":"{\"n\":9007199254740993}"}}`,
 	},
 	{
 		name: "SetAgentTypeModel", operation: "SetAgentTypeModel",
@@ -376,6 +383,30 @@ var dispatchCases = []dispatchCase{
 	},
 }
 
+func TestAgentRosterValidation(t *testing.T) {
+	valid := `{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	for _, row := range []struct {
+		name  string
+		raw   string
+		want  int
+		valid bool
+	}{
+		{"empty", `{"agents":[]}`, 0, true},
+		{"supplied", `{"agents":[` + valid + `]}`, 1, true},
+		{"absent", `{}`, 0, false},
+		{"null", `{"agents":null}`, 0, false},
+		{"incomplete", `{"agents":[{"name":"primary"}]}`, 0, false},
+		{"null tool", `{"agents":[{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[null],"capabilities":[]}]}`, 0, false},
+		{"duplicate", `{"agents":[` + valid + `,` + valid + `]}`, 0, false},
+		{"unknown", `{"agents":[{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[],"unknown":true}]}`, 0, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			got, err := clientops.AgentRoster(json.RawMessage(row.raw))
+			testassert.Require(t, (err == nil) == row.valid && (!row.valid || len(got) == row.want), "roster = %+v, %v", got, err)
+		})
+	}
+}
+
 // TestCallDispatchesEveryOperation drives every supported invocation name
 // through one connected client with a capturing transport and asserts the
 // exact generated method, path, query, raw body, and returned response bytes.
@@ -416,7 +447,7 @@ func TestCallAcceptsEmptyEnvelopePositives(t *testing.T) {
 	for _, params := range []json.RawMessage{nil, json.RawMessage(`{}`)} {
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
-			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"8"}`), nil
+			return scriptedResponse(http.StatusOK, `{"instance_id":"0123456789abcdef0123456789abcdef","protocol_version":"9"}`), nil
 		}
 		result, err := clientops.Call(context.Background(), c, "GetHealth", params)
 		testassert.Require(t, err == nil, "Call(GetHealth, %q) = %v", params, err)

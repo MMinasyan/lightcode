@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -34,15 +33,16 @@ func baselineSettingsPrep(t *testing.T, agentsDoc, endpoint string) (configurati
 	sh := newServiceHarness(t)
 	t.Setenv("PREP_COMPACT_KEY", "compact-secret")
 	writeServiceFile(t, sh.configPath, baselineSettingsConfigDocument(endpoint))
-	writeServiceFile(t, agents.PathForConfig(sh.configPath), agentsDoc)
+	writeAgentDefinitions(t, sh.configPath, agentsDoc)
+	enableFixturePlugin(t, sh.configPath, "compacttools")
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	comp := mustComposition(t, compactToolsPlugin())
+	comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin())
 	obs := newObservation()
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs, nil)
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return captured, newPreparation(svc, comp, sh.home, "", "", nil, nil, nil, nil)
+	return captured, newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
 }
 
 // TestBaselineSettingsDriveToolsJobsAndCompaction proves the top-level
@@ -55,7 +55,7 @@ func TestBaselineSettingsDriveToolsJobsAndCompaction(t *testing.T) {
 
 	// The five builtin Agent positions remain, and the compact definition
 	// keeps its own overlay.
-	var compact harness.AgentType
+	var compact agentType
 	roster := snapshot.agentTypes()
 	var builtinNames []string
 	for _, agent := range roster {
@@ -127,10 +127,10 @@ func TestBaselineCompactionAndCompactAgentEditIndependently(t *testing.T) {
 	sh := newServiceHarness(t)
 	configDoc := strings.Replace(baselineSettingsConfigDocument("https://prov.test/v1"), `"prompt":"baseline summary"`, `"prompt":"baseline edit"`, 1)
 	writeServiceFile(t, sh.configPath, configDoc)
-	writeServiceFile(t, agents.PathForConfig(sh.configPath), prepAgentsDocument)
+	writeAgentDefinitions(t, sh.configPath, `{}`)
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	comp := mustComposition(t)
+	comp := mustComposition(t, fixtureAgentPlugin())
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, newObservation(), nil)
 	{
 		_, err := svc.publish(context.Background())
@@ -149,7 +149,7 @@ func TestBaselineCompactionAndCompactAgentEditIndependently(t *testing.T) {
 	testassert.Require(t, compactAgent(snapshot.agentTypes()).Model == (model.ModelRef{Provider: "prov", Model: "m3"}), "compact Agent model = %s, want the saved definition override", compactAgent(snapshot.agentTypes()).Model.String())
 	testassert.Require(t, snapshot.compactionValues.model == (model.ModelRef{Provider: "prov", Model: "m2"}) && snapshot.compactionValues.prompt == "baseline edit", "compaction after the Agent edit = %+v, want the baseline values unchanged", snapshot.compactionValues)
 
-	settings := projectSettings(snapshot.sessions, snapshot.tools, snapshot.jobs, snapshot.compaction, snapshot.plugins)
+	settings := projectSettings(snapshot.sessions, snapshot.tools, snapshot.jobs, snapshot.compaction, snapshot.extensions)
 	settings.Compaction = json.RawMessage(`{"model":"prov/mzero","prompt":"settings edit"}`)
 	{
 		_, err := svc.mutate(context.Background(), editSettings(settings))
@@ -160,13 +160,13 @@ func TestBaselineCompactionAndCompactAgentEditIndependently(t *testing.T) {
 	testassert.Require(t, compactAgent(snapshot.agentTypes()).Model == (model.ModelRef{Provider: "prov", Model: "m3"}), "compact Agent model after the settings save = %s, want the saved override unchanged", compactAgent(snapshot.agentTypes()).Model.String())
 }
 
-func compactAgent(roster []harness.AgentType) harness.AgentType {
+func compactAgent(roster []agentType) agentType {
 	for _, agent := range roster {
 		if agent.Name == "compact" {
 			return agent
 		}
 	}
-	return harness.AgentType{}
+	return agentType{}
 }
 
 // TestCompactionSettingsResetRestoresFallbackDefaults proves a settings save
@@ -177,15 +177,16 @@ func TestCompactionSettingsResetRestoresFallbackDefaults(t *testing.T) {
 	sh := newServiceHarness(t)
 	t.Setenv("PREP_COMPACT_KEY", "compact-secret")
 	writeServiceFile(t, sh.configPath, baselineSettingsConfigDocument("https://prov.test/v1"))
-	writeServiceFile(t, agents.PathForConfig(sh.configPath), prepAgentsDocument)
+	writeAgentDefinitions(t, sh.configPath, compactAgentsDocument)
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	comp := mustComposition(t, compactToolsPlugin())
+	enableFixturePlugin(t, sh.configPath, "compacttools")
+	comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin())
 	obs := newObservation()
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs, nil)
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	prep := newPreparation(svc, comp, sh.home, "", "", nil, nil, nil, nil)
+	prep := newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
 
 	prepare := func(t *testing.T, captured configurationCapture) harness.ExecutionCapture {
 		t.Helper()
@@ -198,7 +199,7 @@ func TestCompactionSettingsResetRestoresFallbackDefaults(t *testing.T) {
 	before := prepare(t, captured)
 	testassert.Require(t, before.Compact.Model.String() == "prov/m2" && before.Compact.SystemPrompt == "baseline summary", "custom compaction capture = %+v, want the configured model and prompt", before.Compact)
 
-	settings := projectSettings(svc.current().sessions, svc.current().tools, svc.current().jobs, svc.current().compaction, svc.current().plugins)
+	settings := projectSettings(svc.current().sessions, svc.current().tools, svc.current().jobs, svc.current().compaction, svc.current().extensions)
 	settings.Compaction = json.RawMessage(`{}`)
 	{
 		_, err := svc.mutate(context.Background(), editSettings(settings))
@@ -219,15 +220,16 @@ func newBaselineSettingsService(t *testing.T, configDoc string) (*serviceHarness
 	sh := newServiceHarness(t)
 	t.Setenv("PREP_COMPACT_KEY", "compact-secret")
 	writeServiceFile(t, sh.configPath, configDoc)
-	writeServiceFile(t, agents.PathForConfig(sh.configPath), prepAgentsDocument)
+	writeAgentDefinitions(t, sh.configPath, compactAgentsDocument)
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	comp := mustComposition(t, compactToolsPlugin())
+	enableFixturePlugin(t, sh.configPath, "compacttools")
+	comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin())
 	obs := newObservation()
 	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs, nil)
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return sh, svc, newPreparation(svc, comp, sh.home, "", "", nil, nil, nil, nil), captured
+	return sh, svc, newPreparation(svc, sh.home, "", "", nil, nil, nil, nil), captured
 }
 
 // prepareCompactCapture runs one concrete preparation over a selection built
@@ -296,11 +298,10 @@ func TestBaselineCapturesStayFrozenAcrossSettingsPublication(t *testing.T) {
 	oldCompact := prepareCompactCapture(t, prep, oldCaptured)
 	testassert.Require(t, oldCompact.Compact.Model.String() == "prov/m2" && oldCompact.Compact.SystemPrompt == "baseline summary", "old compact = %+v, want the retained revision", oldCompact.Compact)
 
-	settings := projectSettings(oldCaptured.snapshot.sessions, oldCaptured.snapshot.tools, oldCaptured.snapshot.jobs, oldCaptured.snapshot.compaction, oldCaptured.snapshot.plugins)
+	settings := projectSettings(oldCaptured.snapshot.sessions, oldCaptured.snapshot.tools, oldCaptured.snapshot.jobs, oldCaptured.snapshot.compaction, oldCaptured.snapshot.extensions)
 	settings.Tools = json.RawMessage(`{"read_max_lines":88}`)
 	settings.Jobs = json.RawMessage(`{"max_output_bytes":2048}`)
 	settings.Compaction = json.RawMessage(`{"model":"prov/m","prompt":"fresh prompt"}`)
-	settings.Plugins = nil
 	{
 		_, err := svc.mutate(context.Background(), editSettings(settings))
 		testassert.NoError(t, err)
@@ -329,11 +330,10 @@ func TestBaselineCapturesStayFrozenAcrossSettingsPublication(t *testing.T) {
 // bound, and an omitted compaction prompt/model.
 func TestBaselinePartialObjectSettingsUseAbsentDefaults(t *testing.T) {
 	sh, svc, prep, captured := newBaselineSettingsService(t, baselineSettingsConfigDocument("https://prov.test/v1"))
-	settings := projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.plugins)
+	settings := projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.extensions)
 	settings.Tools = json.RawMessage(`{"max_output_bytes":2048}`)
 	settings.Jobs = json.RawMessage(`{"max_background_processes":5}`)
 	settings.Compaction = json.RawMessage(`{"model":"prov/m2"}`)
-	settings.Plugins = nil
 	{
 		_, err := svc.mutate(context.Background(), editSettings(settings))
 		testassert.NoError(t, err)
@@ -371,9 +371,8 @@ func TestBaselinePartialObjectSettingsUseAbsentDefaults(t *testing.T) {
 	testassert.Require(t, compact.Compact.Model.String() == "prov/m2" && compact.Compact.SystemPrompt == prompt.DefaultSummarizerPrompt, "omitted compaction prompt capture = %+v, want the builtin default", compact.Compact)
 
 	// Omit model independently while retaining a custom prompt.
-	settings = projectSettings(fresh.snapshot.sessions, fresh.snapshot.tools, fresh.snapshot.jobs, fresh.snapshot.compaction, fresh.snapshot.plugins)
+	settings = projectSettings(fresh.snapshot.sessions, fresh.snapshot.tools, fresh.snapshot.jobs, fresh.snapshot.compaction, fresh.snapshot.extensions)
 	settings.Compaction = json.RawMessage(`{"prompt":"custom retained"}`)
-	settings.Plugins = nil
 	{
 		_, err := svc.mutate(context.Background(), editSettings(settings))
 		testassert.NoError(t, err)

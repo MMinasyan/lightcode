@@ -51,7 +51,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '8';
+    protocol_version: '9';
 };
 
 /**
@@ -181,7 +181,7 @@ export type Session = {
     parent_session_id?: string;
     source_session_id?: string;
     lifecycle: SessionLifecycle;
-    agent_type: string;
+    agent_selection: AgentSelection;
     current_operation_id?: string;
     created_at: string;
     last_activity: string;
@@ -191,7 +191,7 @@ export type Session = {
 
 export type CreateSessionRequest = {
     workspace: string;
-    agent_type: string;
+    agent_selection?: AgentSelection;
 };
 
 export type Operation = {
@@ -200,7 +200,7 @@ export type Operation = {
     status: 'running' | 'success' | 'failure' | 'interruption';
     admitted_at: string;
     settled_at?: string;
-    agent_type: string;
+    agent_selection: AgentSelection;
     model: ModelRef;
     detail?: string;
     usage: UsageTotals;
@@ -400,7 +400,42 @@ export type ForkResult = {
 };
 
 export type SetSessionAgentTypeRequest = {
-    agent_type: string;
+    agent_selection: AgentSelection;
+};
+
+export type SetSessionModelRequest = {
+    model: ModelRef;
+};
+
+export type AgentSelection = {
+    inputs?: AgentInputs;
+    definition?: DefinitionRef;
+};
+
+export type DefinitionRef = {
+    extension_id: string;
+    capability_id: string;
+    definition_id: string;
+};
+
+export type AgentInputs = {
+    model: ModelRef;
+    instructions: string;
+    assembly_mode: 'full' | 'simple' | 'none';
+    tools: Array<string>;
+    capabilities: Array<string>;
+    constraints: ToolConstraints;
+    strategy: StrategySelection;
+};
+
+export type ToolConstraints = {
+    readonly: boolean;
+    write_dir: string;
+};
+
+export type StrategySelection = {
+    id: string;
+    settings: string;
 };
 
 export type RevertCodeRequest = {
@@ -475,15 +510,15 @@ export type CompactionSettings = {
 };
 
 /**
- * One compiled plugin's own configuration document: the exact JSON object text the selected plugin declaration owns, carried as a string so the transport never interprets, renumbers or drops its members.
+ * One extension configuration document as exact JSON text.
  */
-export type PluginConfigDocument = string;
+export type ExtensionConfigDocument = string;
 
 /**
- * Every owned plugin section as its JSON document string, keyed by the compiled plugin ID; an absent ID uses that plugin's own defaults.
+ * Extension sections as JSON document strings, keyed by extension ID.
  */
-export type PluginsSettings = {
-    [key: string]: PluginConfigDocument;
+export type ExtensionsSettings = {
+    [key: string]: ExtensionConfigDocument;
 };
 
 export type Settings = {
@@ -491,11 +526,12 @@ export type Settings = {
     tools: ToolsSettings;
     jobs: JobsSettings;
     compaction: CompactionSettings;
-    plugins: PluginsSettings;
+    extensions: ExtensionsSettings;
 };
 
 export type Agent = {
     name: string;
+    definition: DefinitionRef;
     description: string;
     subagent: boolean;
     model: ModelRef;
@@ -1154,6 +1190,33 @@ export type SetSessionAgentTypeResponses = {
 };
 
 export type SetSessionAgentTypeResponse = SetSessionAgentTypeResponses[keyof SetSessionAgentTypeResponses];
+
+export type SetSessionModelData = {
+    body: SetSessionModelRequest;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sessions/{id}/model';
+};
+
+export type SetSessionModelErrors = {
+    /**
+     * One schema-defined typed error.
+     */
+    default: Error;
+};
+
+export type SetSessionModelError = SetSessionModelErrors[keyof SetSessionModelErrors];
+
+export type SetSessionModelResponses = {
+    /**
+     * The updated Session header.
+     */
+    200: Session;
+};
+
+export type SetSessionModelResponse = SetSessionModelResponses[keyof SetSessionModelResponses];
 
 export type GetSessionHydrationData = {
     body?: never;

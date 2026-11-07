@@ -88,8 +88,8 @@ func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error)
 		return ForkResult{}, fmt.Errorf("%w: %v", ErrStorage, err)
 	}
 	prepared, capture, prepCtx, cleanup, err := h.prepareExecution(ctx, PreparationSession{
-		Identity:  SessionIdentity{SessionID: destID, Workspace: view.Identity.Workspace},
-		AgentType: view.State.CurrentAgentType,
+		Identity:       SessionIdentity{SessionID: destID, Workspace: view.Identity.Workspace},
+		AgentSelection: view.State.AgentSelection,
 	}, RequestKindMessage)
 	if err != nil {
 		return ForkResult{}, err
@@ -256,10 +256,10 @@ func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRec
 			SourceBoundaryEntryID: req.BoundaryEntryID,
 		},
 		State: SessionState{
-			Lifecycle:        LifecycleOpen,
-			CurrentAgentType: source.State.CurrentAgentType,
-			Usage:            UsageTotals{},
-			LastActivity:     now,
+			Lifecycle:      LifecycleOpen,
+			AgentSelection: ownAgentSelection(source.State.AgentSelection),
+			Usage:          UsageTotals{},
+			LastActivity:   now,
 		},
 	}
 	destPayload, err := encodeSessionRegister(dest)

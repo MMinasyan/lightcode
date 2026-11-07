@@ -174,7 +174,7 @@ func TestFrameFollowsAcceptedReaderAssignments(t *testing.T) {
 	c, transport := fixture(t)
 	r, done := c.startReader()
 	h := hydration(rootA, "1", inputs(2, 2), pointer("oldest"))
-	h.ActiveOperation = &protocol.Operation{OperationId: "active", RequestKind: "message", Status: "running", AgentType: "primary", Model: "provider/model"}
+	h.ActiveOperation = &protocol.Operation{OperationId: "active", RequestKind: "message", Status: "running", AgentSelection: fixtureSelection("primary"), Model: "provider/model"}
 	receive(t, transport.requests).respond(h)
 	barrier(t, done)
 	frame := func(content string) string {
@@ -260,7 +260,7 @@ func TestActualWriterProvisionalBoundedNoncanonicalAndReset(t *testing.T) {
 	c, transport := fixture(t)
 	r, done := c.startReader()
 	h := hydration(rootA, "1", inputs(1, 1), nil)
-	h.ActiveOperation = &protocol.Operation{OperationId: "active", RequestKind: "compact", Model: "captured/model", AgentType: "captured-type"}
+	h.ActiveOperation = &protocol.Operation{OperationId: "active", RequestKind: "compact", Model: "captured/model", AgentSelection: fixtureSelection("captured-type")}
 	h.SelectedModel = pointer("future/model")
 	receive(t, transport.requests).respond(h)
 	barrier(t, done)
@@ -361,7 +361,7 @@ func TestActualClipboardRefusalAndNoLoadedAssistant(t *testing.T) {
 			c, transport := fixture(t)
 			_, done := c.startReader()
 			h := hydration(rootA, "1", append(inputs(1, 1), test.tail...), pointer("unloaded-older"))
-			h.ActiveOperation = &protocol.Operation{OperationId: "active", RequestKind: "message", Status: "running", AgentType: "primary", Model: "provider/model"}
+			h.ActiveOperation = &protocol.Operation{OperationId: "active", RequestKind: "message", Status: "running", AgentSelection: fixtureSelection("primary"), Model: "provider/model"}
 			receive(t, transport.requests).respond(h)
 			barrier(t, done)
 			screen := newScreen(80)
@@ -390,7 +390,7 @@ func TestProgressTupleUnmatchedOperationRepairsWithoutReplay(t *testing.T) {
 	c, transport := fixture(t)
 	r, done := c.startReader()
 	h := hydration(rootA, "1", inputs(1, 1), nil)
-	h.ActiveOperation = &protocol.Operation{OperationId: "first", RequestKind: "message", Status: "running", AgentType: "primary", Model: "provider/model"}
+	h.ActiveOperation = &protocol.Operation{OperationId: "first", RequestKind: "message", Status: "running", AgentSelection: fixtureSelection("primary"), Model: "provider/model"}
 	receive(t, transport.requests).respond(h)
 	barrier(t, done)
 	tool := func(session, operation string) protocol.Event {

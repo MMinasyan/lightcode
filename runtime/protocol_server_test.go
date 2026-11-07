@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,11 +17,11 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -281,10 +282,10 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		health, err := client.GetHealthWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, health.JSON200 != nil && health.HTTPResponse.StatusCode == http.StatusOK, "health = (%d, %v), want the 200 typed body", health.HTTPResponse.StatusCode, health.JSON200)
-		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N8, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N8)
+		testassert.Require(t, health.JSON200.InstanceId == ps.instance && health.JSON200.ProtocolVersion == protocol.N9, "health = %+v, want instance %q and protocol version %q", health.JSON200, ps.instance, protocol.N9)
 
 		workspace := filepath.Join(e.home, "mounted")
-		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "solo"})
+		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentSelection: wireSelection("solo")})
 		testassert.NoError(t, err)
 		testassert.Require(t, created.HTTPResponse.StatusCode == http.StatusCreated && created.JSON201 != nil, "create = (%d, %v), want 201 with the typed header", created.HTTPResponse.StatusCode, created.JSON201)
 		session := created.JSON201.SessionId
@@ -403,7 +404,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 
 		// An unresolvable Agent type yields the required null selection over
 		// the mounted wire, never a fallback model.
-		ghostSession, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "ghost"})
+		ghostSession, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentSelection: wireSelection("ghost")})
 		testassert.Require(t, err == nil && ghostSession.JSON201 != nil, "create unresolved-type session: %v", err)
 		ghostHydration, err := client.GetSessionHydrationWithResponse(ctx, ghostSession.JSON201.SessionId)
 		testassert.Require(t, err == nil && ghostHydration.JSON200 != nil, "hydration of an unresolved type = (%d, %v), want a typed body", ghostHydration.HTTPResponse.StatusCode, err)
@@ -501,11 +502,11 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		assertQualifiedInstance(t, "fork header", forked.JSON200.Session.SessionRevision, ps.instance)
 		awaitIdleSession(t, r, forked.JSON200.Session.SessionId)
 
-		agentType, err := client.SetSessionAgentTypeWithResponse(ctx, session, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
+		agentType, err := client.SetSessionAgentTypeWithResponse(ctx, session, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
 		if err != nil || agentType.JSON200 == nil {
 			t.Fatalf("agent-type change = (%v, %+v)", err, agentType.JSON200)
-		} else if agentType.JSON200.AgentType != "worker" {
-			t.Fatalf("agent-type header = %q, want worker", agentType.JSON200.AgentType)
+		} else if agentType.JSON200.AgentSelection.Definition.DefinitionId != "worker" {
+			t.Fatalf("agent-type header = %q, want worker", agentType.JSON200.AgentSelection.Definition.DefinitionId)
 		}
 
 		history, err := client.GetSessionHistoryWithResponse(ctx, session, &protocol.GetSessionHistoryParams{})
@@ -610,7 +611,7 @@ func TestProtocolServerHistoryRoundTripsOpaqueNumbers(t *testing.T) {
 		ctx := context.Background()
 
 		workspace := filepath.Join(e.home, "exact")
-		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "solo"})
+		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentSelection: wireSelection("solo")})
 		testassert.Require(t, err == nil && created.JSON201 != nil, "create: %v", err)
 		session := created.JSON201.SessionId
 		submitted, err := client.SubmitSessionWithResponse(ctx, session, protocol.SubmitRequest{
@@ -683,7 +684,7 @@ func TestProtocolServerCredentialFlowRawWireSecretFree(t *testing.T) {
 		const nulSecret = "sk-raw\x00-refused"
 		stderr := captureSweepStderr(t)
 		e := newOwnerEnv(t)
-		writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, projectionAgentsDocument)
 		// One malformed line makes the startup LoadDotEnv diagnostic run, so
 		// the captured stderr sink is genuinely exercised before the scan.
 		writeDotEnv(t, e.home, "MALFORMED LINE\n")
@@ -1064,7 +1065,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			Tools:      json.RawMessage("{}"),
 			Jobs:       json.RawMessage("{}"),
 			Compaction: json.RawMessage("{}"),
-			Plugins:    protocol.PluginsSettings{},
+			Extensions: protocol.ExtensionsSettings{},
 		}})
 		testassert.NoError(t, err)
 		if settings.JSON200 == nil || !settings.JSON200.Result.Sessions.AutoArchive || settings.JSON200.Result.Sessions.ArchiveAfterDays != archiveDays {
@@ -1087,18 +1088,17 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 		refusalFile, refusalGeneration, refusalWarnRev := runtimeMutationBaseline(t, r)
 		for _, row := range []struct {
 			name    string
-			plugins protocol.PluginsSettings
+			plugins protocol.ExtensionsSettings
 		}{
-			{"unknown plugin id", protocol.PluginsSettings{"ghost": `{}`}},
-			{"malformed document", protocol.PluginsSettings{"core": `{not json`}},
-			{"non-object document", protocol.PluginsSettings{"core": `1`}},
+			{"malformed document", protocol.ExtensionsSettings{"core": `{not json`}},
+			{"invalid active definition", protocol.ExtensionsSettings{"agents": `{"enabled":true,"definitions":{"bad":{"model":"noslash"}}}`}},
 		} {
 			response, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: protocol.Settings{
 				Sessions:   protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: archiveDays, DeleteAfterArchiveDays: archiveDays},
 				Tools:      json.RawMessage("{}"),
 				Jobs:       json.RawMessage("{}"),
 				Compaction: json.RawMessage("{}"),
-				Plugins:    row.plugins,
+				Extensions: row.plugins,
 			}})
 			testassert.Require(t, err == nil, "%s: UpdateConfigurationSettings: %v", row.name, err)
 			if response.HTTPResponse.StatusCode != http.StatusUnprocessableEntity || response.JSONDefault == nil || response.JSONDefault.Code != protocol.Configuration {
@@ -1108,6 +1108,12 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			assertRuntimeMutationRefused(t, r, refusalSub, refusalFile, refusalGeneration, refusalWarnRev,
 				fmt.Errorf("mounted settings refusal %s: %w", row.name, ErrConfiguration), ErrConfiguration)
 		}
+		retained, err := client.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: protocol.Settings{
+			Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: archiveDays, DeleteAfterArchiveDays: archiveDays},
+			Tools:    json.RawMessage(`{}`), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`),
+			Extensions: protocol.ExtensionsSettings{"ghost": `{"enabled":true}`, "core": `1`},
+		}})
+		testassert.Require(t, err == nil && retained.JSON200 != nil && retained.JSON200.Result.Extensions["ghost"] == `{"enabled":true}` && retained.JSON200.Result.Extensions["core"] == `1`, "inactive extensions were not retained: %+v, %v", retained, err)
 
 		// The one publication operation makes a real hand-edit current: the
 		// config file gains a second model and the agents file selects it,
@@ -1118,7 +1124,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 		testassert.Require(t, err == nil && before.JSON200 != nil, "read before reload: %v", err)
 		configPath := filepath.Join(r.dataDir, "config.json")
 		writeServiceFile(t, configPath, `{"providers":{"prov":`+nominalProvMember("https://prov.test/v1", "", `{"m":{"name":"M","context_window":4096},"m2":{"name":"M2","context_window":8192}}`)+`}}`)
-		writeServiceFile(t, agents.PathForConfig(configPath), `{"solo":{"model":"prov/m2","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`)
+		writeAgentDefinitions(t, configPath, `{"solo":{"model":"prov/m2","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`)
 		reload, err := client.ReloadConfigurationWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, reload.JSON200 != nil && reload.JSON200.ConfigurationRevision.InstanceId == ps.instance, "reload revision = %+v", reload.JSON200)
@@ -1132,7 +1138,7 @@ func TestProtocolServerConfigurationFamily(t *testing.T) {
 			}
 		}
 		testassert.Require(t, selectionChanged, "the hand-edited agents selection is not current after reload")
-		session, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(r.dataDir, "reload-ws"), AgentType: "solo"})
+		session, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(r.dataDir, "reload-ws"), AgentSelection: wireSelection("solo")})
 		testassert.Require(t, err == nil && session.JSON201 != nil, "create after reload: %v", err)
 		submitted, err := client.SubmitSessionWithResponse(ctx, session.JSON201.SessionId, protocol.SubmitRequest{
 			OperationId: "op-reload",
@@ -1311,9 +1317,124 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 // TestProtocolServerAgentModelEdit pins the agent-model operation and the
 // identity-query round trip for one agent type whose name carries the
 // retained directory-like spelling.
+func TestProtocolServerResolvedSessionModel(t *testing.T) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember(e.server.URL, "", `{"m":{"context_window":262144,"max_output_tokens":4096},"m2":{"context_window":262144,"max_output_tokens":4096}}`)+`},"extensions":{"wsprobe":{"enabled":true}}}`)
+		e.fixtureStore(store)
+		var workspaceOpens atomic.Int64
+		r, err := e.open(ctx, countingWorkspacePlugin(&workspaceOpens))
+		testassert.NoError(t, err)
+		defer closeProjectionRuntime(r)
+		ps := openProtocolServer(t, r)
+		client := protocolClient(t, ps)
+		cfg, err := client.GetConfigurationWithResponse(ctx)
+		testassert.Require(t, err == nil && cfg.JSON200 != nil && len(cfg.JSON200.Agents) == 0, "no-Agents roster = %+v, %v", cfg.JSON200, err)
+		unavailable := protocol.AgentInputs{Model: "prov/m", AssemblyMode: protocol.AgentAssemblyFull, Tools: []string{}, Capabilities: []string{"not.installed"}}
+		badCreate, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(e.home, "unavailable"), AgentSelection: &protocol.AgentSelection{Inputs: &unavailable}})
+		testassert.Require(t, err == nil && badCreate.JSON201 != nil, "unavailable selection create = %+v, %v", badCreate, err)
+		badSubmit, err := client.SubmitSessionWithResponse(ctx, badCreate.JSON201.SessionId, protocol.SubmitRequest{OperationId: "unavailable", Mode: protocol.SubmitRequestModeRegular, Content: []protocol.ContentPart{textContentPart(t, "hello", nil)}})
+		testassert.Require(t, err == nil && badSubmit.HTTPResponse.StatusCode == http.StatusBadRequest && workspaceOpens.Load() == 0, "unavailable capability reached Workspace construction: %+v, %v", badSubmit, err)
+		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(e.home, "resolved")})
+		testassert.Require(t, err == nil && created.JSON201 != nil && created.JSON201.AgentSelection.Inputs != nil, "baseline create = %+v, %v", created, err)
+		id := created.JSON201.SessionId
+		initial := *created.JSON201.AgentSelection.Inputs
+		testassert.Require(t, initial.Model == "" && initial.AssemblyMode == protocol.AgentAssemblyFull && len(initial.Tools) == 7, "default inputs = %+v", initial)
+		initial.Model = "prov/m"
+		initial.Instructions = "keep instructions"
+		initial.Tools = []string{"read_file"}
+		initial.Constraints = protocol.ToolConstraints{Readonly: true, WriteDir: "sub"}
+		initial.Strategy.Settings = " \n{\"exact\":9007199254740993} \n"
+		changed, err := client.SetSessionAgentTypeWithResponse(ctx, id, protocol.SetSessionAgentTypeRequest{AgentSelection: protocol.AgentSelection{Inputs: &initial}})
+		testassert.Require(t, err == nil && changed.JSON200 != nil, "set inputs = %+v, %v", changed, err)
+		gate := make(chan struct{})
+		var release sync.Once
+		defer release.Do(func() { close(gate) })
+		e.server.setHold(gate)
+		submitted, err := client.SubmitSessionWithResponse(ctx, id, protocol.SubmitRequest{OperationId: "old-model", Mode: protocol.SubmitRequestModeRegular, Content: []protocol.ContentPart{textContentPart(t, "hello", nil)}})
+		testassert.Require(t, err == nil && submitted.JSON200 != nil && submitted.JSON200.Operation != nil, "first admission = %+v, %v", submitted, err)
+		select {
+		case <-e.server.arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("first model did not arrive")
+		}
+		updated, err := client.SetSessionModelWithResponse(ctx, id, protocol.SetSessionModelRequest{Model: "prov/m2"})
+		testassert.Require(t, err == nil && updated.JSON200 != nil, "session model edit = %+v, %v", updated, err)
+		want := initial
+		want.Model = "prov/m2"
+		testassert.Require(t, reflect.DeepEqual(updated.JSON200.AgentSelection.Inputs, &want), "model edit changed other inputs: %+v", updated.JSON200.AgentSelection.Inputs)
+		first := readOperation(t, r, id, "old-model")
+		testassert.Equal(t, first.Admission.Execution.Model.String(), "prov/m")
+		testassert.Equal(t, string(first.Admission.Execution.Strategy.Settings), initial.Strategy.Settings)
+		release.Do(func() { close(gate) })
+		awaitOperation(t, r, id, "old-model", harness.OperationSuccess)
+		awaitIdleSession(t, r, id)
+		submitConvergedThroughRuntime(t, r, id, "new-model", "later", harness.OperationSuccess)
+		second := readOperation(t, r, id, "new-model")
+		testassert.Equal(t, second.Admission.Execution.Model.String(), "prov/m2")
+		testassert.Equal(t, first.Admission.AgentSelection.Inputs.Model.String(), "prov/m")
+		testassert.Equal(t, second.Admission.AgentSelection.Inputs.Model.String(), "prov/m2")
+		awaitIdleSession(t, r, id)
+		view := sessionViewThroughRuntime(t, r, id)
+		facts := historyFactsOf(view.History)
+		testassert.Require(t, len(facts) > 0, "source has no fork boundary")
+		forked, err := client.ForkSessionWithResponse(ctx, id, protocol.ForkRequest{BoundaryItemId: projectItemID(id, facts[0].EntryID), OperationId: "fork-resolved", Content: []protocol.ContentPart{textContentPart(t, "fork", nil)}})
+		testassert.Require(t, err == nil && forked.JSON200 != nil && reflect.DeepEqual(forked.JSON200.Session.AgentSelection.Inputs, &want) && reflect.DeepEqual(forked.JSON200.Operation.AgentSelection.Inputs, &want), "fork selection = %+v, %v", forked, err)
+		forkID := forked.JSON200.Session.SessionId
+		forkOperation := awaitOperation(t, r, forkID, "fork-resolved", harness.OperationSuccess)
+		testassert.Equal(t, forkOperation.Admission.Execution.Model.String(), "prov/m2")
+		invalidModel, err := client.SetSessionModelWithResponse(ctx, id, protocol.SetSessionModelRequest{Model: "noslash"})
+		testassert.Require(t, err == nil && invalidModel.HTTPResponse.StatusCode == http.StatusBadRequest, "malformed model edit = %+v, %v", invalidModel, err)
+		unchanged, err := client.GetSessionHydrationWithResponse(ctx, id)
+		testassert.Require(t, err == nil && unchanged.JSON200 != nil && reflect.DeepEqual(unchanged.JSON200.Session.AgentSelection.Inputs, &want), "malformed model edit changed inputs: %+v, %v", unchanged, err)
+		cleared, err := client.SetSessionModelWithResponse(ctx, id, protocol.SetSessionModelRequest{Model: ""})
+		want.Model = ""
+		testassert.Require(t, err == nil && cleared.JSON200 != nil && reflect.DeepEqual(cleared.JSON200.AgentSelection.Inputs, &want), "clear model changed other inputs: %+v, %v", cleared, err)
+		bad, err := client.SetSessionAgentTypeWithResponse(ctx, id, protocol.SetSessionAgentTypeRequest{AgentSelection: protocol.AgentSelection{Inputs: &initial, Definition: wireSelection("solo").Definition}})
+		testassert.Require(t, err == nil && bad.HTTPResponse.StatusCode == http.StatusBadRequest, "both selection branches = %+v, %v", bad, err)
+		partial, err := client.SetSessionAgentTypeWithResponse(ctx, id, protocol.SetSessionAgentTypeRequest{AgentSelection: protocol.AgentSelection{Definition: &protocol.DefinitionRef{ExtensionId: "agents"}}})
+		testassert.Require(t, err == nil && partial.HTTPResponse.StatusCode == http.StatusBadRequest, "partial definition = %+v, %v", partial, err)
+		named, err := client.SetSessionAgentTypeWithResponse(ctx, id, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("solo")})
+		testassert.Require(t, err == nil && named.JSON200 != nil, "named selection = %+v, %v", named, err)
+		conflict, err := client.SetSessionModelWithResponse(ctx, id, protocol.SetSessionModelRequest{Model: "prov/m"})
+		testassert.Require(t, err == nil && conflict.HTTPResponse.StatusCode == http.StatusConflict, "model edit after named selection = %+v, %v", conflict, err)
+		current, err := client.GetSessionHydrationWithResponse(ctx, id)
+		testassert.Require(t, err == nil && current.JSON200 != nil && reflect.DeepEqual(current.JSON200.Session.AgentSelection, named.JSON200.AgentSelection), "conflict changed selection = %+v, %v", current, err)
+		missing, err := client.SubmitSessionWithResponse(ctx, id, protocol.SubmitRequest{OperationId: "missing-definition", Mode: protocol.SubmitRequestModeRegular, Content: []protocol.ContentPart{textContentPart(t, "hello", nil)}})
+		testassert.Require(t, err == nil && missing.HTTPResponse.StatusCode == http.StatusBadRequest, "missing definition admission = %+v, %v", missing, err)
+	})
+}
+
+func TestNamedAdmissionAfterOwnerDisabled(t *testing.T) {
+	ctx := context.Background()
+	e := newOwnerEnv(t)
+	provider := nominalProvMember(e.server.URL, "", `{"m":{"context_window":262144,"max_output_tokens":4096}}`)
+	config := func(enabled string) string {
+		return `{"providers":{"prov":` + provider + `},"extensions":{"agents":{"enabled":` + enabled + `,"definitions":{"solo":{"model":"prov/m","system_prompt":"simple"}}}}}`
+	}
+	writeServiceFile(t, e.configPath, config("true"))
+	e.fixtureStore(storage.NewMemory())
+	r, err := e.open(ctx, fixtureAgentPlugin())
+	testassert.NoError(t, err)
+	defer closeProjectionRuntime(r)
+	client := protocolClient(t, openProtocolServer(t, r))
+	created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(e.home, "named"), AgentSelection: wireSelection("solo")})
+	testassert.Require(t, err == nil && created.JSON201 != nil, "create named session = %+v, %v", created, err)
+	id := created.JSON201.SessionId
+	submitConvergedThroughRuntime(t, r, id, "before-disable", "hello", harness.OperationSuccess)
+	awaitIdleSession(t, r, id)
+	writeServiceFile(t, e.configPath, config("false"))
+	_, err = r.Reload(ctx)
+	testassert.NoError(t, err)
+	response, err := client.SubmitSessionWithResponse(ctx, id, protocol.SubmitRequest{OperationId: "after-disable", Mode: protocol.SubmitRequestModeRegular, Content: []protocol.ContentPart{textContentPart(t, "hello", nil)}})
+	testassert.Require(t, err == nil && response.HTTPResponse.StatusCode == http.StatusBadRequest, "disabled owner admission = %+v, %v", response, err)
+	testassert.Require(t, errors.Is(readOperationError(ctx, r, id, "after-disable"), harness.ErrNotFound), "disabled owner published an operation")
+}
+
 func TestProtocolServerAgentModelEdit(t *testing.T) {
 	e := newOwnerEnv(t)
-	writeServiceFile(t, agents.PathForConfig(e.configPath), `{"solo": {"model": "prov/m", "system_prompt": "simple"}, "..": {"model": "prov/m", "system_prompt": "simple"}}`)
+	writeAgentDefinitions(t, e.configPath, `{"solo": {"model": "prov/m", "system_prompt": "simple"}, "..": {"model": "prov/m", "system_prompt": "simple"}}`)
 	e.fixtureStore(storage.NewMemory())
 	r, err := e.open(context.Background())
 	testassert.NoError(t, err)

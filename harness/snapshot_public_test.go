@@ -1045,7 +1045,7 @@ func TestPublicSnapshotChildStopRevisions(t *testing.T) {
 
 		res, err := h.LaunchChildSession(ctx, harness.LaunchChildRequest{
 			ParentSessionID: root,
-			AgentType:       "coder",
+			AgentSelection:  publicSelection("coder"),
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "child work"}},
 			OperationID:     "child-op-1",
 			MaxConcurrent:   1,
@@ -1559,7 +1559,7 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		mutated.TotalUsage.ByModel[0].Model.Provider = "mutated"
 		mutated.TotalUsage.ByModel[0].Usage.InputTokens = 999
 		mutated.TotalUsage.ByModel = append(mutated.TotalUsage.ByModel, harness.ModelUsage{})
-		mutated.Header.CurrentAgentType = "mutated"
+		mutated.Header.AgentSelection.Definition.DefinitionID = "mutated"
 		for i := range mutated.Operations {
 			op := &mutated.Operations[i]
 			op.Model.Provider = "mutated"
@@ -1738,7 +1738,7 @@ func TestPublicListSessionsRowOwnership(t *testing.T) {
 		*mutated[0].ArchivedAt = mutated[0].ArchivedAt.Add(time.Hour)
 		mutated[0].Identity.Workspace = "mutated"
 		mutated[0].Lifecycle = "mutated"
-		mutated[0].CurrentAgentType = "mutated"
+		mutated[0].AgentSelection.Definition.DefinitionID = "mutated"
 		mutated = append(mutated, harness.SessionHeader{})
 
 		fresh, err := f.h.ListSessions(ctx)

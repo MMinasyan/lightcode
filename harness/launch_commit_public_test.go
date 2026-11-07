@@ -37,7 +37,7 @@ func TestLaunchChildCommitPointOwnsAdmittedChild(t *testing.T) {
 			}, nil)
 			t.Cleanup(func() { testassert.NoError(t, converge(t, f)) })
 			ctx := context.Background()
-			session, err := f.h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+			session, err := f.h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: publicSelection("coder")})
 			testassert.NoError(t, err)
 			launchCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
@@ -51,7 +51,7 @@ func TestLaunchChildCommitPointOwnsAdmittedChild(t *testing.T) {
 					}
 				}
 			}
-			res, lerr := f.h.LaunchChildSession(launchCtx, harness.LaunchChildRequest{ParentSessionID: session.Identity.SessionID, AgentType: "child-agent", Content: []model.ContentPart{{Kind: model.PartText, Text: "child task"}}, OperationID: "child-op", MaxConcurrent: 4, OutputLimit: 4096})
+			res, lerr := f.h.LaunchChildSession(launchCtx, harness.LaunchChildRequest{ParentSessionID: session.Identity.SessionID, AgentSelection: publicSelection("child-agent"), Content: []model.ContentPart{{Kind: model.PartText, Text: "child task"}}, OperationID: "child-op", MaxConcurrent: 4, OutputLimit: 4096})
 			testassert.Equal(t, lerr != nil, row.wantErr)
 			testassert.Equal(t, res.ChildSessionID != "", row.wantChild && !row.wantErr)
 			ids, err := inner.ListSessionIDs(ctx)

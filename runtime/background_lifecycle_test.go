@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -36,7 +35,7 @@ const lifecycleAgentsDocument = `{
 // the selected preparation hook validates.
 func backgroundLifecycleConfigDocument(endpoint string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
-		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}}}`
+		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":"T1"}}}`
 }
 
 // newLifecycleID mints one fresh 32-lowercase-hex identity.
@@ -324,7 +323,7 @@ func seedLifecycleRoot(t *testing.T, store harness.Storage, sessionID string) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	payload := fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q},`+
-			`"state":{"lifecycle":"open","current_agent_type":"solo","usage":{"by_model":[]},"last_activity":%q}}`,
+			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"solo"}},"usage":{"by_model":[]},"last_activity":%q}}`,
 		sessionID, now, now)
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}, payload)
 }
@@ -338,7 +337,7 @@ func seedLifecycleChild(t *testing.T, store harness.Storage, parentID, childID, 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	sessionPayload := fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q,"parent_session_id":%q},`+
-			`"state":{"lifecycle":"open","current_agent_type":"worker","current_operation_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
+			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"worker"}},"current_operation_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
 		childID, now, parentID, operationID, now)
 	entryID := newLifecycleID(t)
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: childID, Kind: harness.RegisterSession}, sessionPayload)
@@ -423,7 +422,8 @@ func openBackgroundRuntime(t *testing.T, store harness.Storage, stopper jobsServ
 	t.Helper()
 	e := newOwnerEnv(t)
 	writeServiceFile(t, e.configPath, backgroundLifecycleConfigDocument(e.server.URL))
-	writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
+	writeAgentDefinitions(t, e.configPath, lifecycleAgentsDocument)
+	enableFixturePlugin(t, e.configPath, "bgtools")
 	hook := &recordHook{name: "hook.first", events: &traceLog{}}
 	tools := &lifecycleTools{}
 	e.fixtureStore(store)
@@ -456,7 +456,7 @@ func (b *bgRuntime) launchChild(parent, prompt, operationID string, maxConcurren
 	err := b.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 		res, err := h.LaunchChildSession(ctx, harness.LaunchChildRequest{
 			ParentSessionID: parent,
-			AgentType:       "worker",
+			AgentSelection:  suppliedDefinition("worker"),
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: prompt}},
 			OperationID:     operationID,
 			MaxConcurrent:   maxConcurrent,

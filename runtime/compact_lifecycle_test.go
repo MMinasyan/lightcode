@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -57,7 +56,7 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, compactObservationAgentsDocument)
 		e.fixtureStore(store)
 		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
@@ -198,7 +197,8 @@ func TestCompactLifecycleNativeCompactionAgentScopeCount(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, compactObservationAgentsDocument)
+		enableFixturePlugin(t, e.configPath, "probe-agent")
 		var agOpens atomic.Int64
 		e.fixtureStore(store)
 		r, err := e.open(context.Background(),
@@ -287,7 +287,7 @@ func rawMessageAdmission(sessionID, operationID, entryID string, v rawAdmissionV
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	return fmt.Sprintf(
 		`{"session_id":%q,"operation_id":%q,"request_kind":"message",`+
-			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":%q,`+
+			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":%q}},`+
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":%q,"model":%q},`+
 			`"context_window":4096,"output_reserve":%d,`+
 			`"system_prompt":%q,"tools":%s,"readonly":false,"write_dir":"",`+
@@ -398,7 +398,7 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		// The freed phase runs on its own hook instance, so the first
 		// instance's visible contribution is never overwritten.
 		freedHook := &recordHook{name: "hook.freed", events: &traceLog{}}
-		writeServiceFile(t, agents.PathForConfig(e.configPath), productionAgentsWithFreedHook())
+		writeAgentDefinitions(t, e.configPath, productionAgentsWithFreedHook())
 		r, err := e.openWithPlugins(ctx, hook, &parkingHook{}, freedHookPlugin(freedHook))
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
@@ -519,7 +519,6 @@ func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
 		"Subscription":                       true,
 		"Tool":                               true,
 		"ToolArgumentsHook":                  true,
-		"ToolConstraints":                    true,
 		"ToolContext":                        true,
 		"ToolDescription":                    true,
 		"ToolSpec":                           true,

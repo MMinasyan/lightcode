@@ -10,7 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -22,25 +21,21 @@ import (
 // stays unwrapped.
 var ErrConfiguration = errors.New("runtime: configuration failure")
 
-// The first-run skeletons match what the retained catalog and agent loaders
-// create, so a captured build on a fresh machine leaves the same editable
-// files behind.
+// The first-run document enables the supplied optional extensions without
+// choosing a model. Existing configuration files are never rewritten here.
 const (
 	mainConfigSkeleton = `{
-  "providers": {}
+  "providers": {},
+  "extensions": {"agents": {"enabled": true}, "adaptation": {"enabled": true}}
 }
 `
-	agentsSkeleton = "{}\n"
 )
 
 // configurationService is the private Runtime configuration service. It
-// receives the owned compiled plugin declarations from composition before any
-// factory runs, captures the main and agents bytes once per build, delegates
-// provider assembly to Loader.LoadCaptured, parses sessions and agent
-// definitions against the ordinary visible export IDs, and validates the
-// plugin JSON against the declarations itself. The catalog receives no plugin
-// types or validators, and declarations, not constructed instances, define
-// the capability universe.
+// owns plugin registrations, captures the main document once per build and
+// composes only enabled installed plugins. Provider assembly uses
+// Loader.LoadCaptured; active Agent definitions and extension settings are
+// validated before factories run and the candidate can publish.
 //
 // One service-local build mutex serializes initial load and reload from input
 // reads through publication. The current snapshot is one atomic pointer that
@@ -53,7 +48,6 @@ const (
 type configurationService struct {
 	loader        *catalog.Loader
 	configPath    string
-	agentsPath    string
 	plugins       []Plugin
 	pluginIDs     map[string]bool
 	capabilityIDs []string
@@ -120,7 +114,6 @@ func newConfigurationService(owner context.Context, c *composition, loader *cata
 	return &configurationService{
 		loader:               loader,
 		configPath:           configPath,
-		agentsPath:           agents.PathForConfig(configPath),
 		plugins:              c.plugins,
 		pluginIDs:            pluginIDs,
 		capabilityIDs:        c.capabilityIDs,
@@ -314,23 +307,17 @@ func (s *configurationService) canceled(ctx context.Context) error {
 	return nil
 }
 
-// build reads and interprets exactly one input set: the main and agents bytes
-// are captured once (preserving the first-run skeletons), then the shared
-// candidate construction consumes those captured bytes.
+// build captures the main document once and passes it to candidate construction.
 func (s *configurationService) build(ctx context.Context, generation uint64) (*configuration, error) {
 	configData, err := captureConfiguredFile(s.configPath, mainConfigSkeleton)
 	if err != nil {
 		return nil, configurationFailure(fmt.Errorf("read main configuration: %w", err))
 	}
-	agentsData, err := captureConfiguredFile(s.agentsPath, agentsSkeleton)
-	if err != nil {
-		return nil, configurationFailure(fmt.Errorf("read agent definitions: %w", err))
-	}
-	return s.buildCaptured(ctx, generation, configData, agentsData, nil)
+	return s.buildCaptured(ctx, generation, configData, nil)
 }
 
 // buildCaptured is the one candidate construction every publisher — Reload's
-// capture and a mutation's edited bytes — runs: the captured documents are
+// capture and a mutation's edited bytes — runs: the captured document is
 // decoded once, the captured providers layer is delegated to the Loader so
 // provider assembly and every cost protection use that one read, sessions
 // and agent definitions are parsed against the ordinary visible export IDs
@@ -343,10 +330,33 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 // LoadCapturedConnection entry, optionally overlaying the fetched discovery
 // for that one provider — a connection candidate is fully validated before
 // its caller's first persistence and is never rebuilt after it.
-func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData, agentsData []byte, conn *connectionEffects) (*configuration, error) {
+func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData []byte, conn *connectionEffects) (*configuration, error) {
 	doc, err := decodeCapturedConfig(configData)
 	if err != nil {
 		return nil, configurationFailure(err)
+	}
+	var active []Plugin
+	for _, p := range s.plugins {
+		if sectionEnabled(doc.Extensions[p.ID]) {
+			active = append(active, p)
+		}
+	}
+	graph, err := newComposition(active)
+	if err != nil {
+		return nil, configurationFailure(err)
+	}
+	agentsActive := s.pluginIDs["agents"] && sectionEnabled(doc.Extensions["agents"])
+	agentsData := []byte("{}")
+	if agentsActive {
+		var section struct {
+			Definitions json.RawMessage `json:"definitions"`
+		}
+		if err := json.Unmarshal(doc.Extensions["agents"], &section); err != nil {
+			return nil, configurationFailure(err)
+		}
+		if len(section.Definitions) != 0 {
+			agentsData = section.Definitions
+		}
 	}
 	var built catalog.BuildResult
 	if conn == nil {
@@ -364,7 +374,14 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 	if err != nil {
 		return nil, configurationFailure(err)
 	}
-	if err := s.validatePlugins(ctx, doc.Plugins); err != nil {
+	if !agentsActive {
+		snapshot.definitions = nil
+		snapshot.agentWarnings = nil
+	} else if len(snapshot.agentWarnings) != 0 {
+		return nil, configurationFailure(snapshot.agentWarnings[0])
+	}
+	snapshot.composition = graph
+	if err := s.validatePlugins(ctx, doc.Extensions); err != nil {
 		return nil, err
 	}
 	if err := s.prepareResources(ctx, snapshot); err != nil {
@@ -406,26 +423,28 @@ func captureWorkspacePermissions() map[string]json.RawMessage {
 	return captured
 }
 
-// validatePlugins checks the captured plugins section against the compiled
-// declarations: it is an object keyed by plugin ID (absent passes nil), every
-// value must be a JSON object, an unknown ID rejects the candidate, and each
-// declared plugin receives step 3's no-settings rule or has its owned input
-// validated unchanged, constructing and mutating no instance. Cancellation
-// observed between validators prevents later validation and publication;
-// validation starts no service work.
+// sectionEnabled recognizes the host-owned participation flag without
+// interpreting other members of an inactive document.
+func sectionEnabled(raw json.RawMessage) bool {
+	return config.SectionEnabled(raw)
+}
+
+// validatePlugins invokes only active installed validators before publication.
 func (s *configurationService) validatePlugins(ctx context.Context, plugins map[string]json.RawMessage) error {
-	for pluginID, raw := range plugins {
-		if !s.pluginIDs[pluginID] {
-			return configurationFailure(fmt.Errorf("plugins entry %q is not a compiled plugin", pluginID))
-		}
-		var object map[string]any
-		if err := json.Unmarshal(raw, &object); err != nil || object == nil {
-			return configurationFailure(fmt.Errorf("plugins entry %q is not a JSON object", pluginID))
-		}
-	}
 	for _, p := range s.plugins {
+		if !sectionEnabled(plugins[p.ID]) {
+			continue
+		}
 		if err := s.canceled(ctx); err != nil {
 			return err
+		}
+		if p.ValidateConfig == nil {
+			var members map[string]json.RawMessage
+			_ = json.Unmarshal(plugins[p.ID], &members)
+			delete(members, "enabled")
+			if len(members) == 0 {
+				continue
+			}
 		}
 		if err := acceptSettings(p, plugins[p.ID]); err != nil {
 			return configurationFailure(err)

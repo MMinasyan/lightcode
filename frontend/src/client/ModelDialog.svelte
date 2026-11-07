@@ -21,13 +21,17 @@
   on:close={() => dispatch('close')}>
   <div class="dialog-body">
     <div id="model-dialog-title" class="hdr">
-      <span>Model for agent type <span class="type">{agentType || '-'}</span></span>
+      <span>{#if agentType}Model for agent type <span class="type">{agentType}</span>{:else}Model for this session{/if}</span>
       <button class="close" on:click={() => dialog.close()} aria-label="Close model picker">×</button>
     </div>
     <div class="scope">
-      Changes the model for future messages across <strong>all sessions using this agent type</strong>,
-      not only the current session. The selected model is shown separately from any model an
-      active operation captured.
+      {#if agentType}
+        Changes the model for future messages across <strong>all sessions using this agent type</strong>,
+        not only the current session.
+      {:else}
+        Changes the model for future messages in <strong>this session</strong>.
+      {/if}
+      The selected model is shown separately from any model an active operation captured.
     </div>
     {#if selectedModel}
       <div class="selected">Currently selected model: <span class="ref">{selectedModel}</span></div>

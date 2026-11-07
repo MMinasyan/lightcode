@@ -165,7 +165,7 @@ func newTaskHarness(t *testing.T, modelFn func(context.Context, model.Request) (
 
 func (th *taskHarness) createSession() string {
 	th.t.Helper()
-	rec, err := th.h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: th.workspace, AgentType: "coder"})
+	rec, err := th.h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: th.workspace, AgentSelection: harness.AgentSelection{Definition: &harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "coder"}}})
 	if err != nil {
 		th.t.Fatalf("CreateSession: %v", err)
 	}

@@ -10,10 +10,11 @@ import (
 // resourceSet owns one Runtime scope and its Workspace registry. Publication
 // holds one reference; preparations transfer their references to the Harness.
 type resourceSet struct {
-	owner      *configurationService
-	cancel     context.CancelFunc
-	runtime    *scope
-	workspaces *workspaceScopes
+	owner       *configurationService
+	cancel      context.CancelFunc
+	runtime     *scope
+	composition *composition
+	workspaces  *workspaceScopes
 
 	mu        sync.Mutex
 	holds     int
@@ -29,8 +30,13 @@ func (s *configurationService) prepareResources(caller context.Context, snapshot
 	if previous != nil {
 		equal := true
 		for _, p := range s.plugins {
-			a, aok := previous.plugins[p.ID]
-			b, bok := snapshot.plugins[p.ID]
+			a, aok := previous.extensions[p.ID]
+			b, bok := snapshot.extensions[p.ID]
+			aok = aok && sectionEnabled(a)
+			bok = bok && sectionEnabled(b)
+			if !aok && !bok {
+				continue
+			}
 			if aok != bok || !bytes.Equal(a, b) {
 				equal = false
 				break
@@ -38,12 +44,15 @@ func (s *configurationService) prepareResources(caller context.Context, snapshot
 		}
 		if equal {
 			snapshot.resources = previous.resources
+			snapshot.composition = previous.resources.composition
 			return nil
 		}
 	}
 	ctx, cancel := context.WithCancel(s.owner)
 	stopCaller := context.AfterFunc(caller, cancel)
-	r := &resourceSet{owner: s, cancel: cancel, holds: 1}
+	r := &resourceSet{owner: s, cancel: cancel, holds: 1, composition: snapshot.composition}
+	snapshot.composition.standardValues = s.composition.standardValues
+	snapshot.composition.reportWarning = s.composition.reportWarning
 	var report func(string, string, string)
 	if s.composition.reportWarning != nil {
 		report = func(id, kind, message string) {
@@ -57,7 +66,7 @@ func (s *configurationService) prepareResources(caller context.Context, snapshot
 			s.composition.reportWarning(id, kind, message)
 		}
 	}
-	runtime, err := s.composition.openScopeReporting(ctx, ScopeInfo{Kind: ScopeRuntime, DataDir: s.dataDir}, nil, report)
+	runtime, err := snapshot.composition.openScopeReporting(ctx, ScopeInfo{Kind: ScopeRuntime, DataDir: s.dataDir}, nil, report)
 	stopCaller()
 	if err != nil {
 		cancel()
@@ -71,7 +80,7 @@ func (s *configurationService) prepareResources(caller context.Context, snapshot
 		return errors.Join(err, runtime.cleanup())
 	}
 	r.runtime = runtime
-	r.workspaces = newWorkspaceScopes(ctx, s.composition, []*scope{runtime}, s.obs)
+	r.workspaces = newWorkspaceScopes(ctx, snapshot.composition, []*scope{runtime}, s.obs)
 	snapshot.resources = r
 	return nil
 }

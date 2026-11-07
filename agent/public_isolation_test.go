@@ -253,8 +253,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": internal/plugins/adaptation imports "+imp+"; the adaptation plugin may import only the standard library, "+runtimePkg+", "+modelPkg+", "+promptPkg+", and "+adaptationPkg)
 			}
 		case "internal/plugins/tasks":
-			if imp != modelPkg && imp != harnessPkg && imp != runtimePkg && imp != toolargsPkg && !std[imp] {
-				problems = append(problems, rel+": internal/plugins/tasks imports "+imp+"; the child-session tool plugin may import only the standard library, "+modelPkg+", "+harnessPkg+", "+runtimePkg+", and "+toolargsPkg)
+			if imp != modelPkg && imp != harnessPkg && imp != runtimePkg && imp != protocolPkg && imp != toolargsPkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/tasks imports "+imp+"; the child-session tool plugin may import only the standard library, "+modelPkg+", "+harnessPkg+", "+runtimePkg+", "+protocolPkg+", and "+toolargsPkg)
 			}
 		case "internal/toolargs":
 			if !std[imp] {
@@ -428,7 +428,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	{
 		problems := checkTrackedGoFile("internal/plugins/tasks/x.go", []string{
 			"encoding/json", "fmt",
-			publicModule + "/model", publicModule + "/harness", publicModule + "/runtime",
+			publicModule + "/model", publicModule + "/harness", publicModule + "/runtime", publicModule + "/protocol",
 			publicModule + "/internal/toolargs",
 		}, std)
 		testassert.Check(t, len(problems) == 0, "allowed internal/plugins/tasks imports flagged: %v", problems)

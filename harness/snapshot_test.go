@@ -48,10 +48,10 @@ func factFixtureGraph() *testGraph {
 
 	op2 := OperationRecord{
 		Admission: OperationAdmission{
-			SessionID:   testSessionID,
-			OperationID: "op-compact",
-			RequestKind: RequestKindCompact,
-			AgentType:   "coder",
+			SessionID:      testSessionID,
+			OperationID:    "op-compact",
+			RequestKind:    RequestKindCompact,
+			AgentSelection: testSelection("coder"),
 			Execution: func() ExecutionCapture {
 				capture := testCapture()
 				capture.Pricing = conversationPricing()

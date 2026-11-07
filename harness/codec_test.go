@@ -67,10 +67,10 @@ func validSessionRecord() SessionRecord {
 		Revision: 1,
 		Identity: SessionIdentity{SessionID: testSessionID, Workspace: "/tmp/works", CreatedAt: testTime},
 		State: SessionState{
-			Lifecycle:        LifecycleOpen,
-			CurrentAgentType: "coder",
-			Usage:            UsageTotals{},
-			LastActivity:     testTime,
+			Lifecycle:      LifecycleOpen,
+			AgentSelection: testSelection("coder"),
+			Usage:          UsageTotals{},
+			LastActivity:   testTime,
 		},
 	}
 }
@@ -79,13 +79,13 @@ func validOperationRecord() OperationRecord {
 	return OperationRecord{
 		Revision: 1,
 		Admission: OperationAdmission{
-			SessionID:     testSessionID,
-			OperationID:   testOpID,
-			RequestKind:   RequestKindMessage,
-			AdmittedEntry: EntryRef{SessionID: testSessionID, EntryID: hexID(1)},
-			AgentType:     "coder",
-			Execution:     testCapture(),
-			AdmittedAt:    testTime,
+			SessionID:      testSessionID,
+			OperationID:    testOpID,
+			RequestKind:    RequestKindMessage,
+			AdmittedEntry:  EntryRef{SessionID: testSessionID, EntryID: hexID(1)},
+			AgentSelection: testSelection("coder"),
+			Execution:      testCapture(),
+			AdmittedAt:     testTime,
 		},
 		State: OperationCurrentState{
 			Status:           OperationRunning,
@@ -766,7 +766,7 @@ func TestRegisterPayloadRoundTrip(t *testing.T) {
 	sessionReg := Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterSession}, Revision: 7, Payload: sessionRaw}
 	decoded, err := decodeSessionRegister(sessionReg)
 	testassert.NoError(t, err)
-	testassert.Require(t, decoded.Revision == 7 && decoded.Identity == session.Identity && (decoded.State.Lifecycle == session.State.Lifecycle && decoded.State.CurrentAgentType == session.State.CurrentAgentType && decoded.State.CurrentOperationID == session.State.CurrentOperationID && decoded.State.ArchivedAt == nil && decoded.State.LastActivity.Equal(session.State.LastActivity) && usageTotalsEqual(decoded.State.Usage, session.State.Usage)), "decoded session register %+v does not round-trip; decoded session state %+v does not round-trip", decoded, decoded.State)
+	testassert.Require(t, decoded.Revision == 7 && decoded.Identity == session.Identity && (decoded.State.Lifecycle == session.State.Lifecycle && reflect.DeepEqual(decoded.State.AgentSelection, session.State.AgentSelection) && decoded.State.CurrentOperationID == session.State.CurrentOperationID && decoded.State.ArchivedAt == nil && decoded.State.LastActivity.Equal(session.State.LastActivity) && usageTotalsEqual(decoded.State.Usage, session.State.Usage)), "decoded session register %+v does not round-trip; decoded session state %+v does not round-trip", decoded, decoded.State)
 	testassert.Require(t, !strings.Contains(string(sessionRaw), `"revision"`), "revision leaked into the session payload: %s", sessionRaw)
 
 	operation := validOperationRecord()
@@ -775,8 +775,104 @@ func TestRegisterPayloadRoundTrip(t *testing.T) {
 	opReg := Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Revision: 3, Payload: opRaw}
 	decodedOp, err := decodeOperationRegister(opReg)
 	testassert.NoError(t, err)
-	testassert.Require(t, decodedOp.Revision == 3 && decodedOp.Admission.SessionID == operation.Admission.SessionID && decodedOp.Admission.OperationID == operation.Admission.OperationID && decodedOp.Admission.AgentType == operation.Admission.AgentType && decodedOp.Admission.AdmittedAt.Equal(operation.Admission.AdmittedAt) && decodedOp.State.Status == operation.State.Status && len(decodedOp.State.PendingToolCalls) == len(operation.State.PendingToolCalls), "decoded operation register does not round-trip: %+v", decodedOp)
+	testassert.Require(t, decodedOp.Revision == 3 && decodedOp.Admission.SessionID == operation.Admission.SessionID && decodedOp.Admission.OperationID == operation.Admission.OperationID && reflect.DeepEqual(decodedOp.Admission.AgentSelection, operation.Admission.AgentSelection) && decodedOp.Admission.AdmittedAt.Equal(operation.Admission.AdmittedAt) && decodedOp.State.Status == operation.State.Status && len(decodedOp.State.PendingToolCalls) == len(operation.State.PendingToolCalls), "decoded operation register does not round-trip: %+v", decodedOp)
 	testassert.Require(t, !strings.Contains(string(opRaw), `"revision"`), "revision leaked into the operation payload: %s", opRaw)
+}
+
+func TestAgentInputsCanonicalModelInRegisters(t *testing.T) {
+	for _, row := range []struct {
+		name      string
+		ref       model.ModelRef
+		modelJSON string
+	}{
+		{"slash-bearing", model.ModelRef{Provider: "a/b", Model: "c/d"}, `"model":{"provider":"a/b","model":"c/d"}`},
+		{"absent", model.ModelRef{}, ""},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			selection := AgentSelection{Inputs: &AgentInputs{Model: row.ref, AssemblyMode: "full"}}
+			session := validSessionRecord()
+			session.State.AgentSelection = selection
+			sessionRaw, err := encodeSessionRegister(session)
+			testassert.NoError(t, err)
+			operation := validOperationRecord()
+			operation.Admission.AgentSelection = selection
+			opRaw, err := encodeOperationRegister(operation)
+			testassert.NoError(t, err)
+			for name, raw := range map[string]json.RawMessage{"session": sessionRaw, "operation": opRaw} {
+				obj := wireObject(t, raw)
+				owner := "state"
+				if name == "operation" {
+					owner = "admission"
+				}
+				parent, err := objectMember(obj, owner, true)
+				testassert.NoError(t, err)
+				selected, err := objectMember(parent, "agent_selection", true)
+				testassert.NoError(t, err)
+				inputs, err := objectMember(selected, "inputs", true)
+				testassert.NoError(t, err)
+				modelRaw, exists := inputs["model"]
+				if row.modelJSON == "" && exists {
+					t.Errorf("%s: absent model encoded as %s", name, modelRaw)
+				}
+				if row.modelJSON != "" && `"model":`+string(modelRaw) != row.modelJSON {
+					t.Errorf("%s: model = %s", name, modelRaw)
+				}
+			}
+			decoded, err := decodeSessionRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterSession}, Revision: 1, Payload: sessionRaw})
+			testassert.NoError(t, err)
+			if decoded.State.AgentSelection.Inputs.Model != row.ref {
+				t.Errorf("session model = %#v", decoded.State.AgentSelection.Inputs.Model)
+			}
+			decodedOp, err := decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Revision: 1, Payload: opRaw})
+			testassert.NoError(t, err)
+			if decodedOp.Admission.AgentSelection.Inputs.Model != row.ref {
+				t.Errorf("operation model = %#v", decodedOp.Admission.AgentSelection.Inputs.Model)
+			}
+		})
+	}
+}
+
+func TestAgentInputsCanonicalModelRejectsMalformed(t *testing.T) {
+	for name, raw := range map[string]string{
+		"null": `null`, "string": `"a/b"`, "empty": `{}`,
+		"partial": `{"provider":"a"}`, "empty field": `{"provider":"","model":"b"}`,
+		"unknown":  `{"provider":"a","model":"b","extra":1}`,
+		"miscased": `{"Provider":"a","model":"b"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			selection := json.RawMessage(`{"inputs":{"model":` + raw + `,"instructions":"","assembly_mode":"full","tools":[],"capabilities":[],"constraints":{"readonly":false,"write_dir":""},"strategy":{"id":""}}}`)
+			if _, err := decodeAgentSelection(selection); err == nil {
+				t.Fatalf("accepted model %s", raw)
+			}
+			validSelection := AgentSelection{Inputs: &AgentInputs{AssemblyMode: "full"}}
+			session := validSessionRecord()
+			session.State.AgentSelection = validSelection
+			sessionRaw, err := encodeSessionRegister(session)
+			testassert.NoError(t, err)
+			operation := validOperationRecord()
+			operation.Admission.AgentSelection = validSelection
+			opRaw, err := encodeOperationRegister(operation)
+			testassert.NoError(t, err)
+			validRaw, err := json.Marshal(validSelection)
+			testassert.NoError(t, err)
+			for kind, payload := range map[RegisterKind]json.RawMessage{RegisterSession: sessionRaw, RegisterOperation: opRaw} {
+				if !strings.Contains(string(payload), string(validRaw)) {
+					t.Fatalf("%s payload lacks selection: %s", kind, payload)
+				}
+				corrupt := json.RawMessage(strings.Replace(string(payload), string(validRaw), string(selection), 1))
+				reg := Register{Key: RegisterKey{SessionID: testSessionID, Kind: kind}, Revision: 1, Payload: corrupt}
+				if kind == RegisterSession {
+					_, err = decodeSessionRegister(reg)
+				} else {
+					reg.Key.OperationID = testOpID
+					_, err = decodeOperationRegister(reg)
+				}
+				if err == nil {
+					t.Errorf("%s accepted model %s", kind, raw)
+				}
+			}
+		})
+	}
 }
 
 // TestOperationStateEncodingShape pins the state section's encoding shape
@@ -857,7 +953,7 @@ func TestRegisterPayloadRejectsInvalidWire(t *testing.T) {
 		{"miscased key", renameKey(opRaw, "admission", "Admission")},
 		{"null admission", setKey(opRaw, "admission", json.RawMessage(`null`))},
 		{"wrong state container", setKey(opRaw, "state", json.RawMessage(`[]`))},
-		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_type":"coder","execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"context_window":4096,"output_reserve":2048,"system_prompt":"system","tools":[],"readonly":false,"write_dir":"","compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
+		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}},"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"context_window":4096,"output_reserve":2048,"system_prompt":"system","tools":[],"readonly":false,"write_dir":"","compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
 	}
 	for _, m := range opMutations {
 		t.Run("operation/"+m.name, func(t *testing.T) {
@@ -1556,7 +1652,7 @@ func TestCodecRejectsInvalidValues(t *testing.T) {
 		}},
 		{"session empty agent type", func() error {
 			v := validSessionRecord()
-			v.State.CurrentAgentType = ""
+			v.State.AgentSelection = AgentSelection{}
 			_, err := encodeSessionRegister(v)
 			return err
 		}},

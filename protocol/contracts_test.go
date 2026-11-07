@@ -80,13 +80,13 @@ const (
 // inline or structured replacement would silently re-interpret plugin
 // documents and fails here.
 func TestPluginsSettingsDocumentsStayNamedOpaqueStrings(t *testing.T) {
-	plugins := componentSchema(t, "PluginsSettings")
+	plugins := componentSchema(t, "ExtensionsSettings")
 	{
 		ref := plugins.AdditionalProperties.Schema
-		testassert.Require(t, ref != nil && ref.Ref == "#/components/schemas/PluginConfigDocument", "PluginsSettings additionalProperties = %+v, want the named PluginConfigDocument scalar", ref)
+		testassert.Require(t, ref != nil && ref.Ref == "#/components/schemas/ExtensionConfigDocument", "ExtensionsSettings additionalProperties = %+v, want the named ExtensionConfigDocument scalar", ref)
 	}
 	testassert.Require(t, len(plugins.Properties) == 0, "PluginsSettings declares named members %v, want the opaque map only", plugins.Properties)
-	document := componentSchema(t, "PluginConfigDocument")
+	document := componentSchema(t, "ExtensionConfigDocument")
 	testassert.Require(t, document.Type != nil && document.Type.Is("string"), "PluginConfigDocument type = %v, want string", document.Type)
 }
 

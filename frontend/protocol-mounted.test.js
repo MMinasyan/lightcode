@@ -42,7 +42,7 @@ mounted('generated SDK round-trips special identity query values over the mounte
   // 0600 mode; these are the record-shape checks it does not duplicate.
   expect(discovery.endpoint).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
   expect(discovery.instance_id).toMatch(/^[0-9a-f]{32}$/);
-  expect(discovery.protocol_version).toBe('8');
+  expect(discovery.protocol_version).toBe('9');
   // The credential is validated without an assertion diff: a mismatch must
   // never print the value this check exists to protect.
   if (typeof discovery.credential !== 'string' || !/^[0-9a-f]{64}$/.test(discovery.credential)) {
@@ -52,7 +52,7 @@ mounted('generated SDK round-trips special identity query values over the mounte
   const client = createClient({ baseUrl: discovery.endpoint, auth: discovery.credential });
   const health = await getHealth({ client });
   expect(health.error).toBeUndefined();
-  expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '8' });
+  expect(health.data).toEqual({ instance_id: discovery.instance_id, protocol_version: '9' });
 
   // The open warning source crosses the generated TypeScript boundary: the
   // mounted owner's real Runtime-scoped reporter plugin attributes its report
@@ -85,7 +85,7 @@ mounted('generated SDK round-trips special identity query values over the mounte
     tools: toolsObject,
     jobs: {},
     compaction: {},
-    plugins: {},
+    extensions: initial.data.settings.extensions,
   };
   const written = await updateConfigurationSettings({ client, body: { settings: settingsBody } });
   expect(written.error).toBeUndefined();
@@ -228,12 +228,12 @@ mounted('generated SDK round-trips special identity query values over the mounte
   // The Session hydration carries the required nullable next-admission
   // selection: a resolved Agent type names its configured model, and an
   // unresolvable type is null over the generated TypeScript boundary.
-  const configured = await createSession({ client, body: { workspace: '/tmp/mounted-ts', agent_type: 'solo' } });
+  const configured = await createSession({ client, body: { workspace: '/tmp/mounted-ts', agent_selection: { definition: { extension_id: 'agents', capability_id: 'agents.definitions', definition_id: 'solo' } } } });
   expect(configured.error).toBeUndefined();
   const configuredHydration = await getSessionHydration({ client, path: { id: configured.data.session_id } });
   expect(configuredHydration.error).toBeUndefined();
   expect(configuredHydration.data?.selected_model).toBe('prov/m');
-  const unresolved = await createSession({ client, body: { workspace: '/tmp/mounted-ts', agent_type: 'ghost' } });
+  const unresolved = await createSession({ client, body: { workspace: '/tmp/mounted-ts', agent_selection: { definition: { extension_id: 'agents', capability_id: 'agents.definitions', definition_id: 'ghost' } } } });
   expect(unresolved.error).toBeUndefined();
   const unresolvedHydration = await getSessionHydration({ client, path: { id: unresolved.data.session_id } });
   expect(unresolvedHydration.error).toBeUndefined();

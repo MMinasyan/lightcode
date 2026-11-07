@@ -294,9 +294,42 @@ func (c *CLI) compose(s stamp) {
 	c.mu.Unlock()
 	c.create(s)
 }
+func selectionName(selection protocol.AgentSelection) string {
+	if selection.Definition != nil {
+		return selection.Definition.DefinitionId
+	}
+	return ""
+}
+
 func (c *CLI) create(s stamp) {
+	rawRoster, err := call(s, "GetConfiguration", "", nil, nil, nil)
+	if err != nil {
+		c.navigationReport(s, terminal.RenderErrorMsg(err.Error()))
+		return
+	}
+	agents, err := clientops.AgentRoster(rawRoster)
+	if err != nil {
+		c.navigationReport(s, terminal.RenderErrorMsg(err.Error()))
+		return
+	}
+	var selection *protocol.AgentSelection
+	if len(agents) != 0 {
+		var primary *protocol.DefinitionRef
+		for _, agent := range agents {
+			if agent.Name == "primary" {
+				ref := agent.Definition
+				primary = &ref
+				break
+			}
+		}
+		if primary == nil {
+			c.navigationReport(s, terminal.RenderErrorMsg("invalid agent roster: primary is absent"))
+			return
+		}
+		selection = &protocol.AgentSelection{Definition: primary}
+	}
 	var session protocol.Session
-	raw, err := call(s, "CreateSession", "", protocol.CreateSessionRequest{AgentType: "primary", Workspace: s.workspace}, nil, &session)
+	raw, err := call(s, "CreateSession", "", protocol.CreateSessionRequest{AgentSelection: selection, Workspace: s.workspace}, nil, &session)
 	if err == nil {
 		c.adoptRoot(s, session.Workspace, session.SessionId)
 		c.report(s, resultText(raw, err), true)
@@ -332,7 +365,7 @@ func (c *CLI) refreshList(s stamp, lifecycle string, show bool) {
 	if show {
 		items := make([]terminal.MenuItem, 0, len(list)+1)
 		for _, session := range list {
-			items = append(items, terminal.MenuItem{Label: session.SessionId, Detail: session.AgentType, Selectable: true, Current: session.SessionId == c.rootID, Extra: session})
+			items = append(items, terminal.MenuItem{Label: session.SessionId, Detail: selectionName(session.AgentSelection), Selectable: true, Current: session.SessionId == c.rootID, Extra: session})
 		}
 		outstanding := false
 		for _, a := range c.attempts {

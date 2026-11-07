@@ -27,8 +27,8 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		json.RawMessage("  \n"),
 		json.RawMessage("null"),
 		json.RawMessage(`{}`),
-		json.RawMessage(`{"max_concurrent":null,"max_output_bytes":null}`),
-		json.RawMessage(`{"unknown_member":1,"max_output_bytes":null}`),
+		json.RawMessage(`{"task":{"max_concurrent":null,"max_output_bytes":null}}`),
+		json.RawMessage(`{"task":{"unknown_member":1,"max_output_bytes":null}}`),
 	}
 	for _, raw := range keepDefaults {
 		{
@@ -40,10 +40,10 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		testassert.Check(t, s == (settings{MaxConcurrent: 4, MaxOutputBytes: 15360}), "decodeSettings(%s) = %+v, want the defaults 4 and 15360", raw, s)
 	}
 	inRange := []json.RawMessage{
-		json.RawMessage(`{"max_concurrent":1,"max_output_bytes":1024}`),
-		json.RawMessage(`{"max_concurrent":20,"max_output_bytes":1048576}`),
-		json.RawMessage(`{"max_concurrent":7}`),
-		json.RawMessage(`{"max_output_bytes":2048}`),
+		json.RawMessage(`{"task":{"max_concurrent":1,"max_output_bytes":1024}}`),
+		json.RawMessage(`{"task":{"max_concurrent":20,"max_output_bytes":1048576}}`),
+		json.RawMessage(`{"task":{"max_concurrent":7}}`),
+		json.RawMessage(`{"task":{"max_output_bytes":2048}}`),
 	}
 	for _, raw := range inRange {
 		{
@@ -55,21 +55,21 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 		raw  json.RawMessage
 		want string
 	}{
-		{json.RawMessage(`{"max_concurrent":0}`), "tasks: max_concurrent must be between 1 and 20"},
-		{json.RawMessage(`{"max_concurrent":21}`), "tasks: max_concurrent must be between 1 and 20"},
-		{json.RawMessage(`{"max_output_bytes":1023}`), "tasks: max_output_bytes must be between 1024 and 1048576"},
-		{json.RawMessage(`{"max_output_bytes":1048577}`), "tasks: max_output_bytes must be between 1024 and 1048576"},
+		{json.RawMessage(`{"task":{"max_concurrent":0}}`), "tasks: max_concurrent must be between 1 and 20"},
+		{json.RawMessage(`{"task":{"max_concurrent":21}}`), "tasks: max_concurrent must be between 1 and 20"},
+		{json.RawMessage(`{"task":{"max_output_bytes":1023}}`), "tasks: max_output_bytes must be between 1024 and 1048576"},
+		{json.RawMessage(`{"task":{"max_output_bytes":1048577}}`), "tasks: max_output_bytes must be between 1024 and 1048576"},
 	}
 	for _, tc := range rejected {
 		err := validate(tc.raw)
 		testassert.Check(t, err != nil && err.Error() == tc.want, "ValidateConfig(%s) = %v, want exactly %q", tc.raw, err, tc.want)
 	}
 	wrongType := []json.RawMessage{
-		json.RawMessage(`{"max_output_bytes":"many"}`),
-		json.RawMessage(`{"max_concurrent":"4"}`),
-		json.RawMessage(`{"max_concurrent":4.5}`),
-		json.RawMessage(`{"max_concurrent":4.0}`),
-		json.RawMessage(`{"max_concurrent":4e0}`),
+		json.RawMessage(`{"task":{"max_output_bytes":"many"}}`),
+		json.RawMessage(`{"task":{"max_concurrent":"4"}}`),
+		json.RawMessage(`{"task":{"max_concurrent":4.5}}`),
+		json.RawMessage(`{"task":{"max_concurrent":4.0}}`),
+		json.RawMessage(`{"task":{"max_concurrent":4e0}}`),
 		json.RawMessage(`[]`),
 	}
 	for _, raw := range wrongType {
@@ -78,7 +78,7 @@ func TestValidateConfigSettingsRangesAndShapes(t *testing.T) {
 	}
 	// The ordinary JSON member-name rule stays case-insensitive.
 	{
-		s, err := decodeSettings(json.RawMessage(`{"MAX_CONCURRENT":1}`))
+		s, err := decodeSettings(json.RawMessage(`{"task":{"MAX_CONCURRENT":1}}`))
 		testassert.Require(t, err == nil, "decodeSettings with a mixed-case member name: %v", err)
 		testassert.Check(t, s.MaxConcurrent == 1, "MaxConcurrent = %d, want 1 from the mixed-case member name", s.MaxConcurrent)
 	}

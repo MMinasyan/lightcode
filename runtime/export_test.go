@@ -3,11 +3,23 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/protocol"
 )
+
+type ToolConstraints = harness.ToolConstraints
+
+func wireSelection(name string) *protocol.AgentSelection {
+	value := projectAgentSelection(suppliedDefinition(name))
+	return &value
+}
+
+func WriteAgentDefinitionsForTest(t *testing.T, configPath, content string) {
+	writeAgentDefinitions(t, configPath, content)
+}
 
 // OpenForTest is the test-build composition bridge used by the external
 // runtime_test integration tests to assemble the actual plugin set without a
@@ -36,7 +48,7 @@ func ConfiguredInvocationForTest(tools, jobs, compaction string, sections map[st
 		Tools:      json.RawMessage(tools),
 		Jobs:       json.RawMessage(jobs),
 		Compaction: json.RawMessage(compaction),
-		Plugins:    plugins,
+		Extensions: plugins,
 	}
 	snapshot, err := newConfiguration(1, doc, catalog.BuildResult{}, []byte("{}"), nil, nil, nil, nil)
 	if err != nil {
@@ -113,7 +125,7 @@ func (r *Runtime) createSession(ctx context.Context, workspace, agentType string
 	var record harness.SessionRecord
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 		var err error
-		record, err = r.createSessionRecord(ctx, h, workspace, agentType)
+		record, err = r.createSessionRecord(ctx, h, workspace, suppliedDefinition(agentType))
 		return err
 	}); err != nil {
 		return harness.SessionRecord{}, err

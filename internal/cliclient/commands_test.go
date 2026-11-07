@@ -164,7 +164,7 @@ func TestUnknownAttemptIdentityDraftRefreshRetryAndAbandon(t *testing.T) {
 			settleTasks(t, c)
 			c.command("/session")
 			list := receive(t, transport.requests)
-			list.respond([]protocol.Session{{SessionId: s.root, AgentType: "primary"}})
+			list.respond([]protocol.Session{{SessionId: s.root, AgentSelection: fixtureSelection("primary")}})
 			settleTasks(t, c)
 			press(c, terminal.KeyMsg{Special: terminal.KeyDown})
 			press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
@@ -522,7 +522,7 @@ func TestRootlessRepairNeverComposes(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodPost {
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(protocol.Session{SessionId: rootB, Workspace: "/workspace", AgentType: "primary"})
+			_ = json.NewEncoder(w).Encode(protocol.Session{SessionId: rootB, Workspace: "/workspace", AgentSelection: fixtureSelection("primary")})
 		} else {
 			_ = json.NewEncoder(w).Encode([]protocol.Session{})
 		}

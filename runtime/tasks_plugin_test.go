@@ -169,7 +169,7 @@ func TestTaskLaunchForwardsFields(t *testing.T) {
 		wantOutput     int
 	}{
 		{name: "defaults", sections: nil, wantConcurrent: 4, wantOutput: 15360},
-		{name: "configured", sections: map[string]string{"tasks": `{"max_concurrent":7,"max_output_bytes":2048}`}, wantConcurrent: 7, wantOutput: 2048},
+		{name: "configured", sections: map[string]string{"agents": `{"enabled":true,"task":{"max_concurrent":7,"max_output_bytes":2048}}`}, wantConcurrent: 7, wantOutput: 2048},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

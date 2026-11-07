@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -54,7 +53,7 @@ func runtimeNormalize(call model.ToolCall) (json.RawMessage, error) {
 func prepConfigDocument(endpoint, tag string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
 		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096,"cost":{"input":1.5,"output":3,"cache_read":0.5,"cache_write":0.25}},`+
-			`"zero":{"name":"Z","context_window":0}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `}}}`
+			`"zero":{"name":"Z","context_window":0}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":` + fixtureString(tag) + `},"caps":{"enabled":true},"ops":{"enabled":true},"ags":{"enabled":true}}}`
 }
 
 // prepPolicyConfigDocument adds one global deny rule for the declared
@@ -354,7 +353,7 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	e := &prepEnv{ownerEnv: newOwnerEnv(t), store: store, echo: &prepTool{}}
 	e.workspace = e.dataDir
 	writeServiceFile(t, e.configPath, prepConfigDocument(e.server.URL, "A"))
-	writeServiceFile(t, agents.PathForConfig(e.configPath), prepAgentsDocument)
+	writeAgentDefinitions(t, e.configPath, prepAgentsDocument)
 	e.hooks[0] = &recordHook{name: "hook.first", events: e.events, mutate: func(in PreparationInput) PreparationConsequence {
 		prompt := in.Prompt + "|first"
 		return PreparationConsequence{Prompt: &prompt}
@@ -782,10 +781,10 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 				reloadAgents := strings.Replace(prepAgentsDocument,
 					`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"]}`,
 					`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"], "readonly": true, "write_dir": "/tmp/reload"}`, 1)
-				writeServiceFile(t, agents.PathForConfig(e.configPath), reloadAgents)
 				writeServiceFile(t, e.configPath, strings.Replace(prepConfigDocument(e.server.URL, "A"),
 					`"cost":{"input":1.5,"output":3,"cache_read":0.5,"cache_write":0.25}`,
 					`"cost":{"input":9,"output":3,"cache_read":0.5,"cache_write":0.25}`, 1))
+				writeAgentDefinitions(t, e.configPath, reloadAgents)
 				{
 					_, err := e.reload()
 					testassert.NoError(t, err)
@@ -1359,7 +1358,7 @@ func TestPreparationDistinctSelectionsOverReusedInstances(t *testing.T) {
 		e.admitOrBuffer(solo, "op-3", "three")
 		third := e.awaitTerminal(solo, "op-3", harness.OperationSuccess)
 
-		testassert.Equal(t, first.Admission.AgentType, "dual")
+		testassert.Equal(t, first.Admission.AgentSelection.Definition.DefinitionID, "dual")
 		{
 			got := first.Admission.Execution.Capabilities
 			testassert.Require(t, slices.Equal(got, []string{"hook.first", "cap.shared"}), "dual committed capabilities = %v", got)
@@ -1368,7 +1367,7 @@ func TestPreparationDistinctSelectionsOverReusedInstances(t *testing.T) {
 			got := toolNames(first.Admission.Execution.Tools)
 			testassert.Require(t, slices.Equal(got, []string{"echo"}), "dual committed tools = %v", got)
 		}
-		testassert.Equal(t, second.Admission.AgentType, "dup")
+		testassert.Equal(t, second.Admission.AgentSelection.Definition.DefinitionID, "dup")
 		{
 			got := second.Admission.Execution.Capabilities
 			testassert.Require(t, slices.Equal(got, []string{"hook.second", "cap.other"}), "dup committed capabilities = %v", got)
@@ -1545,6 +1544,7 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 		e := newPrepEnv(t, store)
 		t.Cleanup(func() { e.converge() })
 		writeServiceFile(t, e.configPath, prepPolicyConfigDocument(e.server.URL, "A"))
+		writeAgentDefinitions(t, e.configPath, prepAgentsDocument)
 		{
 			_, err := e.reload()
 			testassert.NoError(t, err)

@@ -27,7 +27,7 @@ func spawnRecord(calls *[]string, err error) func(context.Context, string) error
 func launchRequest() LaunchChildRequest {
 	return LaunchChildRequest{
 		ParentSessionID: testSessionID,
-		AgentType:       "child-agent",
+		AgentSelection:  testSelection("child-agent"),
 		Content:         admissionContent("child task"),
 		OperationID:     "child-op-1",
 		MaxConcurrent:   2,
@@ -465,14 +465,14 @@ func TestLaunchChildSessionRevisionDrift(t *testing.T) {
 		h, store, stub, _ := newDriftHarness(t)
 		err := runLaunch(t, h, stub, func() {
 			{
-				_, err := h.ChangeAgentType(context.Background(), testSessionID, "other")
+				_, err := h.ChangeAgentType(context.Background(), testSessionID, testSelection("other"))
 				testassert.Check(t, err == nil, "ChangeAgentType: %v", err)
 			}
 		})
 		testassert.Require(t, errors.Is(err, ErrConflict), "drifted launch = %v, want the conflict class", err)
 		rec, err := h.ReadSessionHeader(context.Background(), testSessionID)
 		testassert.NoError(t, err)
-		testassert.Require(t, rec.Revision.DurableRevision == 2 && rec.CurrentAgentType == "other", "subsequent read = revision %d agent %q, want the rematerialized register", rec.Revision.DurableRevision, rec.CurrentAgentType)
+		testassert.Require(t, rec.Revision.DurableRevision == 2 && rec.AgentSelection.Definition.DefinitionID == "other", "subsequent read = revision %d agent %q, want the rematerialized register", rec.Revision.DurableRevision, rec.AgentSelection.Definition.DefinitionID)
 		{
 			n := durableRegisterCount(store)
 			testassert.Equal(t, n, 1)
@@ -693,13 +693,13 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 	testassert.Equal(t, call.req.RequestKind, RequestKindMessage)
 	ident := call.req.Session.Identity
 	testassert.Require(t, ident.SessionID == res.ChildSessionID && ident.ParentSessionID == testSessionID && ident.Workspace == "/tmp/works" && !ident.CreatedAt.IsZero() && ident.SourceSessionID == "" && ident.SourceBoundaryEntryID == "", "prepared identity = %+v, want the complete child lineage", ident)
-	testassert.Equal(t, call.req.Session.AgentType, "child-agent")
+	testassert.Equal(t, call.req.Session.AgentSelection.Definition.DefinitionID, "child-agent")
 
 	childRec, err := h.ReadSessionHeader(context.Background(), res.ChildSessionID)
 	testassert.NoError(t, err)
-	testassert.Require(t, childRec.Identity.ParentSessionID == testSessionID && childRec.Identity.Workspace == "/tmp/works" && childRec.Identity.CreatedAt.Equal(ident.CreatedAt) && childRec.Identity.SourceSessionID == "" && (childRec.Lifecycle == LifecycleOpen && childRec.CurrentAgentType == "child-agent" && childRec.CurrentOperationID == "child-op-1" && childRec.ArchivedAt == nil), "durable child identity = %+v, want the prepared identity; durable child state = %+v, want the initial launch state", childRec.Identity, childRec)
+	testassert.Require(t, childRec.Identity.ParentSessionID == testSessionID && childRec.Identity.Workspace == "/tmp/works" && childRec.Identity.CreatedAt.Equal(ident.CreatedAt) && childRec.Identity.SourceSessionID == "" && (childRec.Lifecycle == LifecycleOpen && childRec.AgentSelection.Definition.DefinitionID == "child-agent" && childRec.CurrentOperationID == "child-op-1" && childRec.ArchivedAt == nil), "durable child identity = %+v, want the prepared identity; durable child state = %+v, want the initial launch state", childRec.Identity, childRec)
 	op := settledOperation(t, store, res.ChildSessionID, "child-op-1")
-	testassert.Require(t, op.State.Status == OperationRunning && op.Admission.RequestKind == RequestKindMessage && op.Admission.AgentType == "child-agent", "durable child operation = %+v, want the running plugin admission", op)
+	testassert.Require(t, op.State.Status == OperationRunning && op.Admission.RequestKind == RequestKindMessage && op.Admission.AgentSelection.Definition.DefinitionID == "child-agent", "durable child operation = %+v, want the running plugin admission", op)
 	capture := op.Admission.Execution
 	want := testCapture()
 	testassert.Require(t, reflect.DeepEqual(capture, want), "durable child capture = %+v, want the sentinel capture %+v", capture, want)
@@ -737,5 +737,51 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 	case <-run.done:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("the child execution did not converge")
+	}
+}
+
+func TestLaunchChildPrepareOwnsSelection(t *testing.T) {
+	for _, form := range []string{"resolved", "definition"} {
+		t.Run(form, func(t *testing.T) {
+			store := freshSessionStore(t)
+			script := newModelScript()
+			script.gate = make(chan struct{})
+			prepared := modelPrepared(script.model)
+			settings := json.RawMessage(`{"setting":1}`)
+			prepared.Capture.Strategy.Settings = settings
+			h, cancel := newCancelableHarness(t, store, PreparedExecution{}, func(_ context.Context, req PreparationRequest) (PreparedExecution, error) {
+				if req.Session.AgentSelection.Inputs != nil {
+					i := req.Session.AgentSelection.Inputs
+					i.Tools[0], i.Capabilities[0], i.Strategy.Settings[2] = "changed", "changed", 'X'
+				} else {
+					req.Session.AgentSelection.Definition.DefinitionID = "changed"
+				}
+				return prepared, nil
+			})
+			defer cancel()
+			req := launchRequest()
+			if form == "resolved" {
+				req.AgentSelection = AgentSelection{Inputs: &AgentInputs{AssemblyMode: "full", Tools: []string{"read_file"}, Capabilities: []string{"cap"}, Strategy: StrategySelection{Settings: json.RawMessage(`{"selection":1}`)}}}
+			}
+			want := ownAgentSelection(req.AgentSelection)
+			result, err := h.LaunchChildSession(context.Background(), req)
+			testassert.NoError(t, err)
+			if req.AgentSelection.Inputs != nil {
+				req.AgentSelection.Inputs.Tools[0], req.AgentSelection.Inputs.Capabilities[0], req.AgentSelection.Inputs.Strategy.Settings[2] = "caller", "caller", 'Y'
+			} else {
+				req.AgentSelection.Definition.DefinitionID = "caller"
+			}
+			settings[2] = 'Z'
+			cold := newTestHarness(t, store, nil)
+			for name, reader := range map[string]*Harness{"warm": h, "cold": cold} {
+				header, err := reader.ReadSessionHeader(context.Background(), result.ChildSessionID)
+				testassert.NoError(t, err)
+				testassert.Require(t, reflect.DeepEqual(header.AgentSelection, want), "%s child selection = %+v, want %+v", name, header.AgentSelection, want)
+				op, err := reader.ReadOperation(context.Background(), result.ChildSessionID, req.OperationID)
+				testassert.NoError(t, err)
+				testassert.Require(t, reflect.DeepEqual(op.Admission.AgentSelection, want), "%s operation selection = %+v, want %+v", name, op.Admission.AgentSelection, want)
+				testassert.Equal(t, string(op.Admission.Execution.Strategy.Settings), `{"setting":1}`)
+			}
+		})
 	}
 }

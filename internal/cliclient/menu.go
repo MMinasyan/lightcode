@@ -120,6 +120,9 @@ func (c *CLI) selectionMenu(s stamp, name, arg string) {
 			c.report(s, terminal.RenderErrorMsg(err.Error()), false)
 			return
 		}
+		if len(configuration.Agents) == 0 {
+			return
+		}
 		for _, agent := range configuration.Agents {
 			items = append(items, terminal.MenuItem{Label: agent.Name, Detail: agent.Description, Selectable: true, Extra: agent.Name})
 		}
@@ -138,7 +141,14 @@ func (c *CLI) selectionMenu(s stamp, name, arg string) {
 	}
 	title := "This Session's future Agent type"
 	if name == "/model" {
-		title = "Type-wide future model — all Sessions using this type"
+		c.mu.Lock()
+		resolved := c.currentLocked(s) && c.root != nil && c.root.hydration != nil && c.root.hydration.Session.AgentSelection.Inputs != nil
+		c.mu.Unlock()
+		if resolved {
+			title = "This Session's future model"
+		} else {
+			title = "Type-wide future model — all Sessions using this type"
+		}
 	}
 	c.showMenu(s, name, title, items)
 }
@@ -148,20 +158,26 @@ func (c *CLI) setSelection(s stamp, name, value string) {
 		c.mu.Unlock()
 		return
 	}
-	agent := c.root.hydration.Session.AgentType
+	selection := c.root.hydration.Session.AgentSelection
 	c.mu.Unlock()
 	var raw []byte
 	var err error
 	if name == "/agent" {
-		raw, err = call(s, "SetSessionAgentType", s.root, protocol.SetSessionAgentTypeRequest{AgentType: value}, nil, nil)
+		raw, err = call(s, "SetSessionAgentType", s.root, protocol.SetSessionAgentTypeRequest{AgentSelection: protocol.AgentSelection{Definition: &protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: value}}}, nil, nil)
+	} else if selection.Inputs != nil {
+		raw, err = call(s, "SetSessionModel", s.root, protocol.SetSessionModelRequest{Model: value}, nil, nil)
+	} else if selection.Definition != nil && selection.Definition.ExtensionId == "agents" && selection.Definition.CapabilityId == "agents.definitions" {
+		raw, err = call(s, "SetAgentTypeModel", "", protocol.SetAgentTypeModelRequest{Model: value}, protocol.SetAgentTypeModelParams{AgentType: selection.Definition.DefinitionId}, nil)
 	} else {
-		raw, err = call(s, "SetAgentTypeModel", "", protocol.SetAgentTypeModelRequest{Model: value}, protocol.SetAgentTypeModelParams{AgentType: agent}, nil)
+		return
 	}
 	c.report(s, resultText(raw, err), true)
 	c.mu.Lock()
 	if c.currentLocked(s) {
-		c.globalsDirty = true
-		c.kickGlobalsLocked()
+		if name != "/model" || selection.Inputs == nil {
+			c.globalsDirty = true
+			c.kickGlobalsLocked()
+		}
 		c.refreshReadersLocked()
 	}
 	c.mu.Unlock()

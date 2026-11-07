@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -56,7 +55,7 @@ func productionConfigDocument(endpoint, tag string) string {
       "models": {"km": {"name": "K", "context_window": 262144}}
     }
   },
-  "plugins": {"hooks": {"tag": "` + tag + `"}}
+  "extensions": {"hooks": {"enabled": true, "tag": "` + tag + `"}}
 }`
 }
 
@@ -72,7 +71,6 @@ const productionAgentsDocument = `{
   "ro": {"model": "prov/m", "system_prompt": "simple", "tools": ["prod_write", "prod_read"], "readonly": true},
   "runner": {"model": "prov/m", "system_prompt": "simple", "tools": ["run_command"], "capabilities": []},
   "keyless": {"model": "open/km", "system_prompt": "simple", "tools": ["prod_write"]},
-  "adapted": {"model": "prov/m", "system_prompt": "simple", "tools": ["prod_write", "prod_read"], "capabilities": ["model_adaptation"]},
   "nomodel": {"system_prompt": "simple"},
   "absent": {"model": "prov/absent", "system_prompt": "simple"}
 }`
@@ -287,7 +285,7 @@ func newProductionEnv(t *testing.T, store harness.Storage) *productionEnv {
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, productionConfigDocument(server.URL, "T1"))
-	writeServiceFile(t, agents.PathForConfig(configPath), productionAgentsDocument)
+	writeAgentDefinitions(t, configPath, productionAgentsDocument)
 	return &productionEnv{t: t, home: home, dataDir: dataDir, configPath: configPath, server: server, store: store}
 }
 
@@ -300,6 +298,24 @@ func (e *productionEnv) open(ctx context.Context, hook *recordHook, park *parkin
 func (e *productionEnv) openPlugins(ctx context.Context, plugins ...Plugin) (*Runtime, error) {
 	e.t.Helper()
 	useFixtureStore(e.t, e.store)
+	data, err := os.ReadFile(e.configPath)
+	testassert.NoError(e.t, err)
+	var doc struct {
+		Extensions map[string]json.RawMessage `json:"extensions"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
+	}
+	hasAgents := false
+	for _, plugin := range plugins {
+		hasAgents = hasAgents || plugin.ID == "agents"
+		if _, exists := doc.Extensions[plugin.ID]; !exists {
+			enableFixturePlugin(e.t, e.configPath, plugin.ID)
+		}
+	}
+	if !hasAgents && sectionEnabled(doc.Extensions["agents"]) {
+		plugins = append(plugins, fixtureAgentPlugin())
+	}
 	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
 }
 
@@ -833,6 +849,9 @@ func TestProductionReloadCapture(t *testing.T) {
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "parked")
 		e.server.awaitRequests(1)
 		writeServiceFile(t, e.configPath, productionConfigDocument(e.server.URL, "T2"))
+		writeAgentDefinitions(t, e.configPath, productionAgentsDocument)
+		enableFixturePlugin(t, e.configPath, "prodtools")
+		enableFixturePlugin(t, e.configPath, "park")
 		{
 			revision, err := r.Reload(ctx)
 			testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
@@ -964,13 +983,13 @@ func TestProductionHookCapture(t *testing.T) {
 func TestProductionHostDefaultCapabilitiesSelectContribution(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
-		writeServiceFile(t, agents.PathForConfig(e.configPath), strings.TrimSuffix(productionAgentsDocument, "}")+`,
-  "defaulted": {"model": "prov/m", "system_prompt": "simple", "tools": ["prod_write"]}}`)
+		writeAgentDefinitions(t, e.configPath, `{"defaulted":{"model":"prov/m","system_prompt":"simple","tools":["prod_write"]}}`)
+		enableFixturePlugin(t, e.configPath, "prodtools")
 		useFixtureStore(t, e.store)
 		r, err := Open(ctx, Options{
 			DataDir:              e.dataDir,
 			ConfigPath:           e.configPath,
-			Plugins:              []Plugin{productionToolsPlugin(), hookPlugin(e.hookedHook())},
+			Plugins:              []Plugin{productionToolsPlugin(), hookPlugin(e.hookedHook()), fixtureAgentPlugin()},
 			DefaultCapabilityIDs: []string{"hook.first"},
 		})
 		testassert.NoError(t, err)
@@ -1011,7 +1030,7 @@ func countingWorkspacePlugin(opens *atomic.Int64) Plugin {
 func TestProductionUndeclaredDefaultCapabilityRejectedBeforeAdmission(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
-		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"primary": {"model": "prov/m"}}`)
+		writeAgentDefinitions(t, e.configPath, `{"primary": {"model": "prov/m"}}`)
 		hook := e.hookedHook()
 		var workspaceOpens atomic.Int64
 		useFixtureStore(t, e.store)
@@ -1163,7 +1182,7 @@ func TestProductionReadonlyAdvertisement(t *testing.T) {
 func TestProductionTransportConversion(t *testing.T) {
 	sh := newServiceHarness(t)
 	writeServiceFile(t, sh.configPath, conversionConfigDocument())
-	writeServiceFile(t, agents.PathForConfig(sh.configPath), "{}")
+	writeAgentDefinitions(t, sh.configPath, "{}")
 	owner, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := mustComposition(t)
@@ -1171,7 +1190,7 @@ func TestProductionTransportConversion(t *testing.T) {
 	svc := newConfigurationService(owner, c, sh.loader, sh.configPath, obs, nil)
 	snapshot, err := svc.publish(owner)
 	testassert.NoError(t, err)
-	p := newPreparation(svc, c, sh.home, "", "", nil, nil, nil, nil)
+	p := newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
 	ref := model.ModelRef{Provider: "prov", Model: "m"}
 	provider, entry, err := snapshot.snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
 	testassert.NoError(t, err)
@@ -1304,7 +1323,7 @@ func TestProductionPatchRow(t *testing.T) {
 			return string(raw)
 		}
 		writeServiceFile(t, e.configPath, chainCommandConfigDocument(e.server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), `{
+		writeAgentDefinitions(t, e.configPath, `{
    "patcher": {"model": "prov/m", "system_prompt": "simple", "tools": ["apply_patch"]},
    "patchro": {"model": "prov/m", "system_prompt": "simple", "tools": ["apply_patch"], "readonly": true},
    "patchdir": {"model": "prov/m", "system_prompt": "simple", "tools": ["apply_patch"], "readonly": true, "write_dir": "out"}
@@ -1451,10 +1470,9 @@ func TestProductionBaselineCapabilitySelection(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		writeServiceFile(t, e.configPath, chainCommandConfigDocument(e.server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), `{
+		writeAgentDefinitions(t, e.configPath, `{
    "capselect": {"model": "prov/m", "system_prompt": "simple", "tools": [], "capabilities": ["read_file"]},
-   "toolselect": {"model": "prov/m", "system_prompt": "simple", "tools": ["read_file"]},
-   "badcap": {"model": "prov/m", "system_prompt": "simple", "capabilities": ["nope.not.a.capability"]}
+   "toolselect": {"model": "prov/m", "system_prompt": "simple", "tools": ["read_file"]}
  }`)
 		e.server.setScript(func(_ context.Context, body string) []string {
 			return textTurnEvents("done") // every turn answers plain text: only the selection path is under test
@@ -1488,10 +1506,10 @@ func TestProductionBaselineCapabilitySelection(t *testing.T) {
 		// admission reports the missing Agent type.
 		badWorkspace := e.workspace("bad-ws")
 		testassert.NoError(t, os.MkdirAll(badWorkspace, 0o700))
-		bad, err := r.createSession(ctx, badWorkspace, "badcap")
+		bad, err := r.createSessionHeader(ctx, badWorkspace, &protocol.AgentSelection{Inputs: &protocol.AgentInputs{Model: "prov/m", AssemblyMode: protocol.AgentAssemblySimple, Tools: []string{}, Capabilities: []string{"nope.not.a.capability"}}})
 		testassert.NoError(t, err)
-		_, err = submitRawThroughRuntime(ctx, r, bad.Identity.SessionID, "op-bad", "hello", harness.MessageModeRegular)
-		testassert.Require(t, err != nil && strings.Contains(err.Error(), "badcap"), "unknown-capability admission = err %v, want the refused Agent type reported", err)
+		_, err = submitRawThroughRuntime(ctx, r, bad.SessionId, "op-bad", "hello", harness.MessageModeRegular)
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), "nope.not.a.capability"), "unknown-capability admission = err %v, want the refused capability reported", err)
 	})
 }
 
@@ -1545,6 +1563,7 @@ func TestProductionSuppliesExplicitPromptInputs(t *testing.T) {
 func TestProductionAdaptationComposes(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
+		writeAgentDefinitions(t, e.configPath, strings.TrimSuffix(productionAgentsDocument, "}")+`,"adapted":{"model":"prov/m","system_prompt":"simple","tools":["prod_write","prod_read"],"capabilities":["model_adaptation"]}}`)
 		r, err := e.openWithPlugins(ctx, e.hookedHook(), &parkingHook{}, prodAdaptationPlugin())
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
@@ -1577,7 +1596,7 @@ func TestProductionAdaptationComposes(t *testing.T) {
 func TestProductionPreparationHookReplacesAndRemovesPromptAfterAssembly(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
-		writeServiceFile(t, agents.PathForConfig(e.configPath), `{
+		writeAgentDefinitions(t, e.configPath, `{
   "fullagent": {"model": "prov/m", "system_prompt": "full", "prompt": "FULL_INSTRUCTIONS", "capabilities": ["hook.first"]},
   "simpleagent": {"model": "prov/m", "system_prompt": "simple", "prompt": "SIMPLE_INSTRUCTIONS", "capabilities": ["hook.first"]},
   "noneagent": {"model": "prov/m", "system_prompt": "none", "prompt": "NONE_INSTRUCTIONS", "capabilities": ["hook.first"]}

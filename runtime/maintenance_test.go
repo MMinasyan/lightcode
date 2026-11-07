@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -43,7 +42,7 @@ func ownerSweepDocument(sessions string) string {
 // instead of failing for absent metadata.
 func ownerSweepProbedDocument(endpoint, sessions string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
-		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}},"sessions":` + sessions + `}`
+		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":"T1"}},"sessions":` + sessions + `}`
 }
 
 // ownerSweepAgentsDocument selects the local model and the preparation hook
@@ -369,7 +368,7 @@ func seedStaleSession(t *testing.T, store harness.Storage, workspace string, sta
 		},
 	})
 	testassert.NoError(t, err)
-	rec, err := h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: workspace, AgentType: "seeded"})
+	rec, err := h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: workspace, AgentSelection: suppliedDefinition("seeded")})
 	testassert.NoError(t, err)
 	rewriteSessionRegister(t, store, rec.Identity.SessionID, func(state map[string]json.RawMessage) {
 		var last time.Time
@@ -389,7 +388,7 @@ func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":365}`))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), ownerSweepAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, ownerSweepAgentsDocument)
 		seeded := seedStaleSession(t, store, filepath.Join(e.dataDir, "seeded"), 100*time.Hour)
 		hook := &recordHook{name: "hook.first", events: &traceLog{}}
 		var opOpens, agOpens atomic.Int64
@@ -424,7 +423,7 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1}`))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), ownerSweepAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, ownerSweepAgentsDocument)
 		wrapped := newSweepStore(store)
 		hook := &recordHook{name: "hook.first", events: &traceLog{}}
 		var opOpens, agOpens atomic.Int64
@@ -700,6 +699,7 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
+		writeAgentDefinitions(t, e.configPath, ownerAgentsDocument)
 		wrapped := newSweepStore(store)
 		e.fixtureStore(wrapped)
 		r, ticks, err := e.openSwept(context.Background(), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
@@ -1526,6 +1526,7 @@ func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
+		writeAgentDefinitions(t, e.configPath, ownerAgentsDocument)
 		ctx := context.Background()
 		e.fixtureStore(store)
 		r, err := e.open(ctx, hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))

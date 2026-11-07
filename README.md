@@ -121,12 +121,18 @@ Lightcode ships with bundled provider metadata, but no credentials and no preset
 }
 ```
 
-Put model selections in `~/.lightcode/agents.json`:
+Add model selections to the same `~/.lightcode/config.json` document:
 
 ```json
 {
-  "primary": {
-    "model": "openrouter/z-ai/glm-5.1"
+  "extensions": {
+    "agents": {
+      "enabled": true,
+      "definitions": {
+        "primary": {"model": "openrouter/z-ai/glm-5.1"}
+      }
+    },
+    "adaptation": {"enabled": true}
   }
 }
 ```
@@ -197,8 +203,7 @@ diagnostics), `upgrade` (self-update; verifies the release's SHA-256 checksum be
 
 #### Data locations
 
-- `~/.lightcode/config.json` — user config: providers, session policy, plugin sections, and global permission rules
-- `~/.lightcode/agents.json` — agent types and their model selections
+- `~/.lightcode/config.json` — provider, baseline, extension and global permission settings, including Agent definitions
 - `~/.lightcode/.env` — local API keys
 - `~/.lightcode/lightcode.db` — durable session state (SQLite), owned by the Runtime
 - `~/.lightcode/runtime.json` — live Runtime owner record (present only while the owner runs)

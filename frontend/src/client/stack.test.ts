@@ -23,7 +23,7 @@ import { RuntimeConnection } from './connection';
 import { extractSettingsText } from './exactjson';
 import { invokeNative } from './results';
 import { assertNativeInvocations } from './nativecontract';
-import { INSTANCE, NEWER, OLDER, hydration, json, native, session } from './test-fixtures';
+import { INSTANCE, NEWER, OLDER, definitionSelection, hydration, json, native, session } from './test-fixtures';
 
 const mounted: Array<ReturnType<typeof mount>> = [];
 
@@ -88,13 +88,13 @@ function bridge(script: Script = {}) {
       }
       return json(200, {
         configuration_revision: { instance_id: INSTANCE, generation: '1' },
-        settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, tools: {}, jobs: {}, compaction: {}, plugins: {} },
+        settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, tools: {}, jobs: {}, compaction: {}, extensions: {} },
         agents: [],
         providers: [],
       });
     }
     if (operation === 'UpdateConfigurationSettings') {
-      return json(200, { configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: { sessions: {}, tools: {}, jobs: {}, compaction: {}, plugins: {} } });
+      return json(200, { configuration_revision: { instance_id: INSTANCE, generation: '2' }, result: { sessions: {}, tools: {}, jobs: {}, compaction: {}, extensions: {} } });
     }
     if (operation === 'ListProviders') {
       return json(200, {
@@ -131,7 +131,7 @@ function bridge(script: Script = {}) {
     if (operation === 'ForkSession') {
       return json(200, {
         session: session('dest1', NEWER),
-        operation: { operation_id: body.operation_id, request_kind: 'message', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'prov/m', usage: { totals: { by_model: [] } } },
+        operation: { operation_id: body.operation_id, request_kind: 'message', status: 'running', admitted_at: '0', agent_selection: definitionSelection('primary'), model: 'prov/m', usage: { totals: { by_model: [] } } },
       });
     }
     if (operation === 'GetWarnings') {
@@ -156,7 +156,7 @@ function bridge(script: Script = {}) {
       if (script.compact === 'throw' || (typeof script.compact === 'function' && script.compact(body) === 'throw')) {
         throw new Error('native bridge: connection lost mid-request');
       }
-      return json(200, { operation_id: body.operation_id, request_kind: 'compact', status: 'running', admitted_at: '0', agent_type: 'primary', model: 'prov/m', usage: { totals: { by_model: [] } } });
+      return json(200, { operation_id: body.operation_id, request_kind: 'compact', status: 'running', admitted_at: '0', agent_selection: definitionSelection('primary'), model: 'prov/m', usage: { totals: { by_model: [] } } });
     }
     if (operation === 'InterruptSession') {
       return native(204, '', false);
@@ -220,7 +220,7 @@ async function mountReal(script: Script = {}) {
 function configurationView(generation: string, agentName: string) {
   return {
     configuration_revision: { instance_id: INSTANCE, generation },
-    settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, tools: {}, jobs: {}, compaction: {}, plugins: {} },
+    settings: { sessions: { auto_archive: false, archive_after_days: 1, delete_after_archive_days: 1 }, tools: {}, jobs: {}, compaction: {}, extensions: {} },
     agents: [{ name: agentName, description: agentName, subagent: false, model: '', readonly: false, write_dir: '', tools: [], capabilities: [] }],
     providers: [],
   };
@@ -564,7 +564,7 @@ describe('real generated stack over the byte bridge', () => {
 describe('Step 8 real generated captures over the byte bridge', () => {
   const RAW_CONFIGURATION = '{"configuration_revision":{"instance_id":"' + INSTANCE + '","generation":"1"},'
     + '"settings":{"sessions":{"auto_archive":true,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1e400},'
-    + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"plugins":{}},"agents":[],"providers":[]}';
+    + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"extensions":{}},"agents":[],"providers":[]}';
 
   const forkInput = {
     item_id: 'i1',
@@ -579,7 +579,7 @@ describe('Step 8 real generated captures over the byte bridge', () => {
     request_kind: 'message',
     status: 'running',
     admitted_at: '0',
-    agent_type: 'primary',
+    agent_selection: definitionSelection('primary'),
     model: 'prov/m',
     usage: { totals: { by_model: [] } },
   };
@@ -608,7 +608,7 @@ describe('Step 8 real generated captures over the byte bridge', () => {
     const put = calls.find((call) => call.operation === 'UpdateConfigurationSettings');
     expect(put?.params).toBe(
       '{"body":{"settings":{"sessions":{"auto_archive":true,"archive_after_days":-9223372036854775808,"delete_after_archive_days":1e400},'
-      + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"plugins":{}}}}',
+      + '"tools":{"max_output_bytes":9007199254740993},"jobs":{},"compaction":{},"extensions":{}}}}',
     );
   });
 

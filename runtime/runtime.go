@@ -63,7 +63,7 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 
 // options are the private construction inputs of one managed Runtime. DataDir
 // is the sole data root: runtime.lock and the storage backend's own files
-// derive from it, while agents.json stays beside ConfigPath. Dotenv and the
+// derive from it. Dotenv and the
 // discovery cache keep their home-based paths: neither option relocates them
 // nor changes owner identity. sweepTicks optionally replaces the automatic
 // sweep scheduler's owned hourly ticker with a controlled tick stream whose
@@ -120,10 +120,9 @@ type Runtime struct {
 // open constructs the complete owner and publishes nothing until it has
 // finished. It requires nonempty paths, normalizes both
 // paths once with filepath.Abs, and validates the context before any
-// initialization. Startup order is fixed: validate declarations (definitions
-// and plugin capability declarations, all before any factory), acquire the
-// process-lifetime lock at <DataDir>/runtime.lock, load the managed dotenv and
-// validate the initial configuration, directly construct the included SQLite
+// initialization. Startup acquires the process-lifetime lock at
+// <DataDir>/runtime.lock, loads the managed dotenv, validates the active
+// composition and initial configuration, directly constructs the included SQLite
 // store and jobs service, then prepare and publish the initial resource set
 // with the standard tools bound before running restart recovery, and
 // construct the Harness with the bound preparation and the jobs stop seam.
@@ -161,10 +160,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve home dir: %w", err)
 	}
-	c, err := newComposition(options.Plugins)
-	if err != nil {
-		return nil, err
-	}
+	c := registeredComposition(options.Plugins)
 
 	lock, ok, err := atomicfs.TryAcquire(filepath.Join(dataDir, "runtime.lock"))
 	if err != nil {
@@ -277,7 +273,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: store,
 		Jobs:    jobsService,
-		Prepare: newPreparation(configService, c, home, options.Identity, options.GlobalRulesDir, background, adapter, artifacts, subprocessEnv).bind(),
+		Prepare: newPreparation(configService, home, options.Identity, options.GlobalRulesDir, background, adapter, artifacts, subprocessEnv).bind(),
 		Observe: adapter.observe,
 	})
 	if err != nil {
@@ -397,7 +393,7 @@ func (r *Runtime) withHarness(ctx context.Context, fn func(context.Context, *har
 // is normalized with filepath.Abs alone, and the Harness retains its
 // nonempty-only Agent-type selection. It executes inside the caller's
 // admission.
-func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, workspace, agentType string) (harness.SessionRecord, error) {
+func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, workspace string, selection harness.AgentSelection) (harness.SessionRecord, error) {
 	if workspace == "" {
 		return harness.SessionRecord{}, fmt.Errorf("workspace must be non-empty: %w", harness.ErrInvalid)
 	}
@@ -405,7 +401,7 @@ func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, w
 	if err != nil {
 		return harness.SessionRecord{}, fmt.Errorf("normalize workspace: %w", err)
 	}
-	return h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: normalized, AgentType: agentType})
+	return h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: normalized, AgentSelection: selection})
 }
 
 // deleteSession is the private canonical Session deletion: the whole body

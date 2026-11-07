@@ -7,7 +7,7 @@
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "8"
+  version: "9"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -208,6 +208,26 @@ paths:
       responses:
         "200":
           description: The Session header; only subsequent admissions use the new Agent type.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/model:
+    put:
+      operationId: SetSessionModel
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetSessionModelRequest"
+      responses:
+        "200":
+          description: The updated Session header.
           content:
             application/json:
               schema:
@@ -838,7 +858,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "8"
+            - "9"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -1129,7 +1149,7 @@ components:
         - session_id
         - workspace
         - lifecycle
-        - agent_type
+        - agent_selection
         - created_at
         - last_activity
         - session_revision
@@ -1147,8 +1167,8 @@ components:
           pattern: "^[0-9a-f]{32}$"
         lifecycle:
           $ref: "#/components/schemas/SessionLifecycle"
-        agent_type:
-          type: string
+        agent_selection:
+          $ref: "#/components/schemas/AgentSelection"
         current_operation_id:
           type: string
         created_at:
@@ -1167,12 +1187,11 @@ components:
       additionalProperties: false
       required:
         - workspace
-        - agent_type
       properties:
         workspace:
           type: string
-        agent_type:
-          type: string
+        agent_selection:
+          $ref: "#/components/schemas/AgentSelection"
     Operation:
       type: object
       additionalProperties: false
@@ -1181,7 +1200,7 @@ components:
         - request_kind
         - status
         - admitted_at
-        - agent_type
+        - agent_selection
         - model
         - usage
       properties:
@@ -1205,8 +1224,8 @@ components:
         settled_at:
           type: string
           format: date-time
-        agent_type:
-          type: string
+        agent_selection:
+          $ref: "#/components/schemas/AgentSelection"
         model:
           $ref: "#/components/schemas/ModelRef"
         detail:
@@ -1710,9 +1729,79 @@ components:
       type: object
       additionalProperties: false
       required:
-        - agent_type
+        - agent_selection
       properties:
-        agent_type:
+        agent_selection:
+          $ref: "#/components/schemas/AgentSelection"
+    SetSessionModelRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - model
+      properties:
+        model:
+          $ref: "#/components/schemas/ModelRef"
+    AgentSelection:
+      type: object
+      additionalProperties: false
+      properties:
+        inputs:
+          $ref: "#/components/schemas/AgentInputs"
+        definition:
+          $ref: "#/components/schemas/DefinitionRef"
+    DefinitionRef:
+      type: object
+      additionalProperties: false
+      required: [extension_id, capability_id, definition_id]
+      properties:
+        extension_id:
+          type: string
+        capability_id:
+          type: string
+        definition_id:
+          type: string
+    AgentInputs:
+      type: object
+      additionalProperties: false
+      required: [model, instructions, assembly_mode, tools, capabilities, constraints, strategy]
+      properties:
+        model:
+          $ref: "#/components/schemas/ModelRef"
+        instructions:
+          type: string
+        assembly_mode:
+          type: string
+          enum: [full, simple, none]
+          x-enum-varnames: [AgentAssemblyFull, AgentAssemblySimple, AgentAssemblyNone]
+        tools:
+          type: array
+          items:
+            type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+        constraints:
+          $ref: "#/components/schemas/ToolConstraints"
+        strategy:
+          $ref: "#/components/schemas/StrategySelection"
+    ToolConstraints:
+      type: object
+      additionalProperties: false
+      required: [readonly, write_dir]
+      properties:
+        readonly:
+          type: boolean
+        write_dir:
+          type: string
+    StrategySelection:
+      type: object
+      additionalProperties: false
+      required: [id, settings]
+      properties:
+        id:
+          type: string
+        settings:
           type: string
     RevertCodeRequest:
       type: object
@@ -1858,19 +1947,16 @@ components:
         consumption.
       additionalProperties: true
       x-go-type: json.RawMessage
-    PluginConfigDocument:
+    ExtensionConfigDocument:
       type: string
       description: >-
-        One compiled plugin's own configuration document: the exact JSON
-        object text the selected plugin declaration owns, carried as a string
-        so the transport never interprets, renumbers or drops its members.
-    PluginsSettings:
+        One extension configuration document as exact JSON text.
+    ExtensionsSettings:
       type: object
       description: >-
-        Every owned plugin section as its JSON document string, keyed by the
-        compiled plugin ID; an absent ID uses that plugin's own defaults.
+        Extension sections as JSON document strings, keyed by extension ID.
       additionalProperties:
-        $ref: "#/components/schemas/PluginConfigDocument"
+        $ref: "#/components/schemas/ExtensionConfigDocument"
     Settings:
       type: object
       additionalProperties: false
@@ -1879,7 +1965,7 @@ components:
         - tools
         - jobs
         - compaction
-        - plugins
+        - extensions
       properties:
         sessions:
           $ref: "#/components/schemas/SessionsSettings"
@@ -1889,13 +1975,14 @@ components:
           $ref: "#/components/schemas/JobsSettings"
         compaction:
           $ref: "#/components/schemas/CompactionSettings"
-        plugins:
-          $ref: "#/components/schemas/PluginsSettings"
+        extensions:
+          $ref: "#/components/schemas/ExtensionsSettings"
     Agent:
       type: object
       additionalProperties: false
       required:
         - name
+        - definition
         - description
         - subagent
         - model
@@ -1906,6 +1993,8 @@ components:
       properties:
         name:
           type: string
+        definition:
+          $ref: "#/components/schemas/DefinitionRef"
         description:
           type: string
         subagent:

@@ -294,6 +294,9 @@ func setupWarnings(c *configuration, credentials map[string]config.EnvValue) []p
 	if !anyConnected {
 		out = append(out, protocol.Warning{Source: setupSource, Kind: setupNoProviderKind, Message: setupNoProviderMessage})
 	}
+	if len(c.definitions) == 0 {
+		return out
+	}
 	// The primary selection comes from the same agentTypes normalization
 	// admission uses: its Model is the resolved ref, zero when the definition
 	// configures none — every accepted nonempty model is already parseable,

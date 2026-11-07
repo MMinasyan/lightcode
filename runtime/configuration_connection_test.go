@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -406,6 +405,7 @@ func TestConnectProviderUsableWindowRemovedRefuses(t *testing.T) {
 			`"staticp": {"transport": {"base_url": "https://static.test/v1", "api_key_env": "CONNECTION_STATIC_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}}`,
 			`"staticp": {"transport": {"base_url": "https://static.test/v1", "api_key_env": "CONNECTION_STATIC_KEY"}, "discovery": false, "models": {"m": {}}}`, 1)
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		fetches := server.requests()
 
@@ -526,6 +526,7 @@ func TestConnectProviderTransientKeyOverridesConfiguredAuthorization(t *testing.
 		edited := strings.Replace(doc, oldGroq, newGroq, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		{
 			_, err := r.Reload(ctx)
 			testassert.NoError(t, err)
@@ -568,6 +569,7 @@ func TestConnectProviderKeylessFetchKeepsConfiguredAuthorization(t *testing.T) {
 		edited := strings.Replace(doc, oldKeyless, newKeyless, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		{
 			_, err := r.Reload(ctx)
 			testassert.NoError(t, err)
@@ -1025,6 +1027,7 @@ func TestConnectProviderCacheUnsafeIdentityRefuses(t *testing.T) {
 			`"keylessp"`,
 			`"bad\\id": {"transport": {"base_url": "`+server.URL+`", "api_key_env": "CONNECTION_BAD_KEY"}, "discovery": true, "models": {"ghost": {}}}, "keylessp"`, 1)
 		writeServiceFile(t, r.config.configPath, raw)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		{
 			_, err := r.Reload(ctx)
 			testassert.NoError(t, err)
@@ -1543,6 +1546,7 @@ func TestDisconnectProviderLatestRawTransportChangePublishes(t *testing.T) {
 		edited := strings.Replace(doc, oldLine, newLine, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		before, _, _ := runtimeMutationBaseline(t, r)
 
 		mutation, err := r.disconnectProvider(ctx, "usablep")
@@ -1575,6 +1579,7 @@ func TestDisconnectProviderLatestRawEnvRebindKeepsExternalSibling(t *testing.T) 
 		edited := strings.Replace(doc, oldLine, newLine, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		before, _, _ := runtimeMutationBaseline(t, r)
 
 		mutation, err := r.disconnectProvider(ctx, "usablep")
@@ -1611,6 +1616,7 @@ func TestDisconnectProviderLatestCandidateRemovedRefuses(t *testing.T) {
 		edited := strings.Replace(doc, oldTransport, `"transport": {}`, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		_, err = r.disconnectProvider(ctx, "usablep")
@@ -2495,7 +2501,7 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 		writeServiceFile(t, e.configPath, `{"providers":{`+
 			`"prov":`+nominalProvMember(server.URL, "PRODUCTION_TEST_KEY", `{"m":{"name":"M","context_window":262144}}`)+`,`+
 			`"discp":`+nominalProvMember("https://disc.test/v1", "CONNECT_CHAIN_MANAGED", `{"m":{"name":"M","context_window":4096}}`)+`}}`)
-		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"runner": {"model": "prov/m", "system_prompt": "simple", "tools": ["env_echo"]}}`)
+		writeAgentDefinitions(t, e.configPath, `{"runner": {"model": "prov/m", "system_prompt": "simple", "tools": ["env_echo"]}}`)
 
 		r, err := e.openPlugins(ctx, connectEnvEchoPlugin())
 		testassert.NoError(t, err)
@@ -2550,6 +2556,7 @@ func TestConnectProviderSpecialIDsAndKeyless(t *testing.T) {
 			`"keylessp"`,
 			`"..": {"transport": {"base_url": "https://dots.test/v1", "api_key_env": "CONNECTION_DOTS_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}}, "keylessp"`, 1)
 		writeServiceFile(t, r.config.configPath, raw)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		{
 			_, err := r.Reload(ctx)
 			testassert.NoError(t, err)

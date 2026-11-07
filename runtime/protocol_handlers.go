@@ -30,7 +30,7 @@ func (rt *protocolHandlers) GetHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N8}
+	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N9}
 	rt.writeQualifiedJSON(w, http.StatusOK, &health)
 }
 
@@ -299,12 +299,26 @@ func (rt *protocolHandlers) CreateSession(w http.ResponseWriter, r *http.Request
 		writeProtocolError(w, err)
 		return
 	}
-	header, err := rt.createSessionHeader(r.Context(), body.Workspace, body.AgentType)
+	header, err := rt.createSessionHeader(r.Context(), body.Workspace, body.AgentSelection)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
 	rt.writeQualifiedJSON(w, http.StatusCreated, &header)
+}
+
+func (rt *protocolHandlers) SetSessionModel(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
+	var body protocol.SetSessionModelRequest
+	if err := decodeRequestBody(r, &body); err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	header, err := rt.setSessionModel(r.Context(), id, body)
+	if err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	rt.writeQualifiedJSON(w, http.StatusOK, &header)
 }
 
 // DeleteSession serves the archived-Session deletion with its idempotent

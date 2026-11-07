@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -39,7 +38,7 @@ func ownerConfigDocument(endpoint string) string {
 }
 
 func ownerGatedConfigDocument(endpoint string) string {
-	return strings.TrimSuffix(ownerConfigDocument(endpoint), "}") + `,"plugins":{"gate":{}}}`
+	return strings.TrimSuffix(ownerConfigDocument(endpoint), "}") + `,"extensions":{"gate":{"enabled":true}}}`
 }
 
 const ownerAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple"}}`
@@ -73,7 +72,7 @@ func newOwnerEnvIn(t *testing.T, home, dataDir string) *ownerEnv {
 	e.scopeDataDir.Store("")
 	e.scopeWorkspace.Store("")
 	writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
-	writeServiceFile(t, agents.PathForConfig(e.configPath), ownerAgentsDocument)
+	writeAgentDefinitions(t, e.configPath, ownerAgentsDocument)
 	return e
 }
 
@@ -149,6 +148,20 @@ func (e *ownerEnv) fixtureJobs(service jobsService) {
 }
 
 func (e *ownerEnv) options(plugins ...Plugin) options {
+	data, _ := os.ReadFile(e.configPath)
+	var doc struct {
+		Extensions map[string]json.RawMessage `json:"extensions"`
+	}
+	_ = json.Unmarshal(data, &doc)
+	if sectionEnabled(doc.Extensions["agents"]) {
+		found := false
+		for _, plugin := range plugins {
+			found = found || plugin.ID == "agents"
+		}
+		if !found {
+			plugins = append(plugins, servicePlugin("agents", &atomic.Int64{}, acceptValidator))
+		}
+	}
 	return options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins}
 }
 
@@ -436,7 +449,7 @@ func readOperationError(ctx context.Context, r *Runtime, sessionID, operationID 
 func committedAdmission(t *testing.T, r *Runtime, sessionID, operationID string) string {
 	t.Helper()
 	rec := readOperation(t, r, sessionID, operationID)
-	return rec.Admission.AgentType + "=" + rec.Admission.Execution.Model.String() + "@" + rec.Admission.Execution.ConfigurationRevision
+	return rec.Admission.AgentSelection.Definition.DefinitionID + "=" + rec.Admission.Execution.Model.String() + "@" + rec.Admission.Execution.ConfigurationRevision
 }
 
 // seedRunningOperation commits one running Operation through a standalone
@@ -478,7 +491,7 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 		},
 	})
 	testassert.NoError(t, err)
-	rec, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: workspace, AgentType: "seeded"})
+	rec, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: workspace, AgentSelection: suppliedDefinition("seeded")})
 	testassert.NoError(t, err)
 	{
 		_, err := h.Submit(context.Background(), harness.SubmitRequest{
@@ -526,6 +539,7 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 
 	t.Run("relative paths normalize through one filepath.Abs pass", func(t *testing.T) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "db")
 		cwd, err := os.Getwd()
 		testassert.NoError(t, err)
 		relData, err := filepath.Rel(cwd, e.dataDir)
@@ -557,14 +571,14 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		configDir := t.TempDir()
 		configPath := filepath.Join(configDir, "config.json")
 		writeServiceFile(t, configPath, ownerConfigDocument(e.server.URL))
-		writeServiceFile(t, agents.PathForConfig(configPath), ownerAgentsDocument)
+		writeAgentDefinitions(t, configPath, ownerAgentsDocument)
 		e.configPath = configPath
 		e.fixtureStore(storage.NewMemory())
 		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
 		{
 			_, err := os.Stat(filepath.Join(configDir, "agents.json"))
-			testassert.NoError(t, err)
+			testassert.Require(t, os.IsNotExist(err), "agents.json exists or cannot be checked: %v", err)
 		}
 		{
 			_, err := os.Stat(filepath.Join(e.home, ".lightcode", ".env"))
@@ -693,13 +707,15 @@ func TestRuntimeOwnershipLockSpansProcessExit(t *testing.T) {
 // --- startup failure stages ---
 
 func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
-	t.Run("invalid declarations reject before ownership", func(t *testing.T) {
+	t.Run("invalid active declarations reject before factories", func(t *testing.T) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "same")
 		duplicateA := e.ordinaryPlugin("same", ScopeRuntime, "a.cap")
 		duplicateB := e.ordinaryPlugin("same", ScopeRuntime, "b.cap")
 		e.fixtureStore(storage.NewMemory())
 		wantFailedOpen(t, e, []Plugin{duplicateA, duplicateB}, ErrComposition)
-		e.assertNoOwnershipSideEffects(t)
+		testassert.Require(t, len(e.events.all()) == 0, "invalid active graph ran a factory: %v", e.events.all())
+		e.assertLockReleased(t)
 	})
 
 	t.Run("configuration failure releases the lock with no factory", func(t *testing.T) {
@@ -717,6 +733,8 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 
 	t.Run("factory failure disposes the constructed prefix", func(t *testing.T) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "first")
+		enableFixturePlugin(t, e.configPath, "failing")
 		failing := e.ordinaryPlugin("failing", ScopeRuntime, "failing.cap")
 		failing.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
 			e.events.add("open:failing")
@@ -761,6 +779,8 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 
 	t.Run("cancellation during construction unwinds without publication", func(t *testing.T) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "signalled")
+		enableFixturePlugin(t, e.configPath, "waiting")
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		arrive := make(chan struct{}, 1)
@@ -892,6 +912,9 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "x")
+		enableFixturePlugin(t, e.configPath, "y")
+		enableFixturePlugin(t, e.configPath, "w")
 		errStorageClose := errors.New("test storage close failure")
 		errXClose := errors.New("test scope close failure")
 		blockClose := make(chan struct{})
@@ -1162,6 +1185,7 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 
 		t.Run("Runtime-context cancellation closes the whole owner without any Close", func(t *testing.T) {
 			e := newOwnerEnv(t)
+			enableFixturePlugin(t, e.configPath, "core")
 			disposed := make(chan struct{}, 1)
 			plugin := e.corePlugin("core", "session_store", store, func() error {
 				e.events.add("close:core")
@@ -1259,6 +1283,7 @@ func TestRuntimePublishOwnerBarrier(t *testing.T) {
 func TestRuntimeWorkspaceIdentityIsLexicalNormalization(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "ws")
 		opens := make(chan int64, 16)
 		ws := e.countedPlugin("ws", ScopeWorkspace, "ws.cap", opens)
 		e.fixtureStore(store)
@@ -1410,6 +1435,7 @@ func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
 
 	t.Run("a standard tool name is the rejected export identity", func(t *testing.T) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "shadow")
 		shadow := Plugin{
 			ID:    "shadow",
 			Scope: ScopeRuntime,
@@ -1421,7 +1447,8 @@ func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
 			},
 		}
 		wantFailedOpen(t, e, []Plugin{shadow}, ErrComposition)
-		e.assertNoOwnershipSideEffects(t)
+		testassert.Require(t, len(e.events.all()) == 0, "invalid active graph ran a factory: %v", e.events.all())
+		e.assertLockReleased(t)
 	})
 }
 
@@ -1434,6 +1461,7 @@ func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
 func TestRuntimeStandardToolsAreOwnerProvidedCapabilities(t *testing.T) {
 	t.Run("the owner's Runtime factory binds the actual read_file value", func(t *testing.T) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "consumer")
 		workspace := filepath.Join(e.home, "owner-tool-ws")
 		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "held.txt"), []byte("owner provided\n"), 0o600))
@@ -1506,13 +1534,16 @@ func TestRuntimeStandardToolsAreOwnerProvidedCapabilities(t *testing.T) {
 
 	t.Run("a wrongly typed dependency on a standard tool rejects before any factory", func(t *testing.T) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "consumer")
 		consumer := e.ordinaryPlugin("consumer", ScopeRuntime, "consumer.cap", Spec[greeter]("read_file"))
 		wantFailedOpen(t, e, []Plugin{consumer}, ErrComposition)
-		e.assertNoOwnershipSideEffects(t)
+		testassert.Require(t, len(e.events.all()) == 0, "invalid graph ran a factory: %v", e.events.all())
+		e.assertLockReleased(t)
 	})
 
 	t.Run("a duplicate export of a standard tool rejects before any factory", func(t *testing.T) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "shadow")
 		shadow := Plugin{
 			ID:    "shadow",
 			Scope: ScopeRuntime,
@@ -1524,7 +1555,8 @@ func TestRuntimeStandardToolsAreOwnerProvidedCapabilities(t *testing.T) {
 			},
 		}
 		wantFailedOpen(t, e, []Plugin{shadow}, ErrComposition)
-		e.assertNoOwnershipSideEffects(t)
+		testassert.Require(t, len(e.events.all()) == 0, "invalid graph ran a factory: %v", e.events.all())
+		e.assertLockReleased(t)
 	})
 }
 
@@ -1536,7 +1568,7 @@ func TestRuntimeSettingsSectionsHaveOneOwner(t *testing.T) {
 	e := newOwnerEnv(t)
 	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+
 		`,"tools":{"read_max_lines":7},"jobs":{"max_background_processes":3},`+
-		`"plugins":{"capowner":{"kept":1},"tools":{"kept":"plugin tools"},"jobs":{"kept":"plugin jobs"}}}`)
+		`"extensions":{"capowner":{"enabled":true,"kept":1},"tools":{"enabled":true,"kept":"plugin tools"},"jobs":{"enabled":true,"kept":"plugin jobs"}}}`)
 	received := map[string]json.RawMessage{}
 	validator := func(id string) func(json.RawMessage) error {
 		return func(raw json.RawMessage) error {
@@ -1557,16 +1589,16 @@ func TestRuntimeSettingsSectionsHaveOneOwner(t *testing.T) {
 	testassert.NoError(t, err)
 	defer func() { testassert.NoError(t, r.Close(context.Background())) }()
 
-	testassert.Equal(t, string(received["capowner"]), `{"kept":1}`)
-	testassert.Equal(t, string(received["tools"]), `{"kept":"plugin tools"}`)
-	testassert.Equal(t, string(received["jobs"]), `{"kept":"plugin jobs"}`)
+	testassert.Equal(t, string(received["capowner"]), `{"enabled":true,"kept":1}`)
+	testassert.Equal(t, string(received["tools"]), `{"enabled":true,"kept":"plugin tools"}`)
+	testassert.Equal(t, string(received["jobs"]), `{"enabled":true,"kept":"plugin jobs"}`)
 	snapshot := r.config.current()
 	testassert.Require(t, snapshot != nil, "no published configuration")
 	testassert.Equal(t, compactJSON(t, snapshot.tools), `{"read_max_lines":7}`)
 	testassert.Equal(t, compactJSON(t, snapshot.jobs), `{"max_background_processes":3}`)
 	invocation := Invocation{snapshot: snapshot}
-	testassert.Equal(t, string(invocation.Config("tools")), `{"kept":"plugin tools"}`)
-	testassert.Equal(t, string(invocation.Config("jobs")), `{"kept":"plugin jobs"}`)
+	testassert.Equal(t, string(invocation.Config("tools")), `{"enabled":true,"kept":"plugin tools"}`)
+	testassert.Equal(t, string(invocation.Config("jobs")), `{"enabled":true,"kept":"plugin jobs"}`)
 	testassert.Equal(t, compactJSON(t, invocation.toolsSettings()), `{"read_max_lines":7}`)
 	testassert.Equal(t, compactJSON(t, invocation.jobsSettings()), `{"max_background_processes":3}`)
 	testassert.Require(t, string(invocation.Config("tools")) != string(invocation.toolsSettings()), "the plugin and baseline tools channels share bytes")

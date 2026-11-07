@@ -432,6 +432,8 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 			}
 		}
 		e.fixtureStore(store)
+		enableFixturePlugin(t, e.configPath, "alpha")
+		enableFixturePlugin(t, e.configPath, "beta")
 		r, err := e.open(ctx, reporterPlugin("alpha"), reporterPlugin("beta"))
 		testassert.NoError(t, err)
 		defer func() {

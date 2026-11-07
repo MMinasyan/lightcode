@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -41,7 +40,7 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 		server := newProductionModelServer(t, "probe", "{}")
 		t.Setenv("ASSEMBLED_TEST_KEY", "assembled-key-1")
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T1", "L1"))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), assembledAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, assembledAgentsDocument)
 		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(PreparationInput) PreparationConsequence {
 			return PreparationConsequence{}
 		}}
@@ -92,7 +91,7 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 		// session_changed witness, and every frame consumed up to that
 		// witness carries only the fresh Session and Workspace identities.
 		freshWorkspace := filepath.Join(e.home, "loss-next")
-		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: freshWorkspace, AgentType: "integrated"})
+		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: freshWorkspace, AgentSelection: wireSelection("integrated")})
 		testassert.NoError(t, err)
 		testassert.Require(t, created.JSON201 != nil, "CreateSession(fresh) = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		fresh := created.JSON201.SessionId

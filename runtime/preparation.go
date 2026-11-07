@@ -37,7 +37,7 @@ type openInvocation func(context.Context, harness.OperationAdmission, selection,
 // whose supplying scope is not open yet is absent from the preparation view
 // and present in the execution view; neither selection is ever rebound.
 type selection struct {
-	agent      harness.AgentType
+	agent      agentType
 	bindings   Bindings
 	invocation Invocation
 
@@ -110,7 +110,7 @@ func protocolWarnings(sessionID string, warnings []model.ProtocolWarning) []prot
 type PreparationInput struct {
 	Session     harness.SessionIdentity
 	Model       model.ModelRef
-	Constraints ToolConstraints
+	Constraints harness.ToolConstraints
 	Assembly    prompt.AssemblyInput
 	Prompt      string
 	Catalog     []model.ToolDefinition
@@ -171,9 +171,8 @@ var toolArgumentsHookType = reflect.TypeFor[ToolArgumentsHook]()
 // immutable snapshot while borrowed bindings and the call context stay inside
 // the preparation guard.
 type preparation struct {
-	config      *configurationService
-	composition *composition
-	home        string
+	config *configurationService
+	home   string
 
 	// identity and globalRulesDir are the host-supplied prompt inputs: the
 	// application persona text and the explicit global rules directory. Their
@@ -201,7 +200,6 @@ type preparation struct {
 }
 
 // newPreparation wires the binder to the published configuration, the
-// composition whose scopes are owned by each configuration resource set, the
 // once-resolved home, the host-supplied prompt identity and global rules
 // directory, the background services bridge armed after harness.New
 // returns, the Runtime's passive publication adapter (nil in isolated
@@ -209,10 +207,9 @@ type preparation struct {
 // private artifact interval registry (nil without a Runtime), and the
 // Runtime's live managed-environment producer (nil without a retained
 // manager). One concrete preparation path serves every admission.
-func newPreparation(config *configurationService, c *composition, home, identity, globalRulesDir string, background *backgroundBridge, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
+func newPreparation(config *configurationService, home, identity, globalRulesDir string, background *backgroundBridge, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
 	return &preparation{
 		config:         config,
-		composition:    c,
 		home:           home,
 		identity:       identity,
 		globalRulesDir: globalRulesDir,
@@ -247,19 +244,43 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 			}()
 		}
 		if snapshot == nil {
-			return harness.PreparedExecution{}, fmt.Errorf("agent type %q has no published configuration: %w", req.Session.AgentType, harness.ErrInvalid)
+			return harness.PreparedExecution{}, fmt.Errorf("agent has no published configuration: %w", harness.ErrInvalid)
 		}
-		agent, err := harness.ResolveAgentType(req.Session.AgentType, snapshot.agentTypes())
-		if err != nil {
-			return harness.PreparedExecution{}, err
+		var agent agentType
+		chosen := req.Session.AgentSelection
+		if chosen.Definition != nil {
+			ref := chosen.Definition
+			if ref.ExtensionID != "agents" || ref.CapabilityID != "agents.definitions" {
+				return harness.PreparedExecution{}, fmt.Errorf("unknown definition resolver: %w", harness.ErrInvalid)
+			}
+			agent, err = resolveAgentType(ref.DefinitionID, snapshot.agentTypes())
+			if err != nil {
+				return harness.PreparedExecution{}, err
+			}
+		} else if chosen.Inputs != nil {
+			input := chosen.Inputs
+			agent = agentType{Model: input.Model, SystemPrompt: input.AssemblyMode, Prompt: input.Instructions, Tools: input.Tools, Capabilities: input.Capabilities, Readonly: input.Constraints.Readonly, WriteDir: input.Constraints.WriteDir}
+			if input.Strategy.ID != "" {
+				return harness.PreparedExecution{}, fmt.Errorf("unknown strategy %q: %w", input.Strategy.ID, harness.ErrInvalid)
+			}
+		} else {
+			return harness.PreparedExecution{}, fmt.Errorf("invalid agent selection: %w", harness.ErrInvalid)
+		}
+		if err := harness.ValidateAgentInputs(harness.AgentInputs{Model: agent.Model, AssemblyMode: agent.SystemPrompt, Tools: agent.Tools, Capabilities: agent.Capabilities}); err != nil {
+			return harness.PreparedExecution{}, fmt.Errorf("agent inputs: %v: %w", err, harness.ErrInvalid)
 		}
 		// Every selected capability must exist in the compiled export table
 		// before admission. A selected binding that belongs to a shorter
 		// lifetime is still compiled here and correctly binds only when its
 		// scope opens; only an ID that no declaration owns is rejected.
 		for _, id := range agent.Capabilities {
-			if _, ok := p.composition.exports[id]; !ok {
+			if _, ok := snapshot.composition.exports[id]; !ok {
 				return harness.PreparedExecution{}, fmt.Errorf("agent type %q selects undeclared capability %q: %w", agent.Name, id, harness.ErrInvalid)
+			}
+		}
+		for _, id := range agent.Tools {
+			if _, ok := snapshot.composition.toolSpec(id); !ok {
+				return harness.PreparedExecution{}, fmt.Errorf("selected tool %q is unavailable: %w", id, harness.ErrInvalid)
 			}
 		}
 		if err := requireCatalogModel(snapshot, agent.Model); err != nil {
@@ -344,7 +365,7 @@ func (p *preparation) preparationBindings(runtimeScope, workspaceScope *scope, s
 // after the opening succeeds does the collected prompt presentation publish,
 // so a failed fork or admission never creates warnings for an unpublished
 // Session and a successful opener publishes before any progress.
-func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, runtimeScope, workspaceScope *scope, agent harness.AgentType, snapshot *configuration, warnings *preparationWarnings, opener openInvocation, artifactRelease *func()) (harness.Execution, error) {
+func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, runtimeScope, workspaceScope *scope, agent agentType, snapshot *configuration, warnings *preparationWarnings, opener openInvocation, artifactRelease *func()) (harness.Execution, error) {
 	releaseArtifacts, err := p.artifacts.acquireExecution(ctx, sessionArtifactDir(runtimeScope.info.DataDir, admission.SessionID))
 	if err != nil {
 		return harness.Execution{}, err
@@ -352,7 +373,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	base := ScopeInfo{DataDir: runtimeScope.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID}
 	operationInfo := base
 	operationInfo.Kind = ScopeOperation
-	operation, err := p.composition.openScope(ctx, operationInfo, []*scope{runtimeScope, workspaceScope})
+	operation, err := snapshot.composition.openScope(ctx, operationInfo, []*scope{runtimeScope, workspaceScope})
 	if err != nil {
 		releaseArtifacts()
 		return harness.Execution{}, err
@@ -366,7 +387,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	agentInfo := base
 	agentInfo.Kind = ScopeAgent
 	openInvocation := func(ctx context.Context, request harness.InvocationRequest) (harness.InvocationExecution, error) {
-		agentScope, err := p.composition.openScope(ctx, agentInfo, []*scope{runtimeScope, workspaceScope, operation})
+		agentScope, err := snapshot.composition.openScope(ctx, agentInfo, []*scope{runtimeScope, workspaceScope, operation})
 		if err != nil {
 			return harness.InvocationExecution{}, err
 		}
@@ -527,7 +548,7 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 			}
 		}
 	}
-	specs, err := p.toolSpecs(sel.agent.Tools)
+	specs, err := snapshot.composition.toolSpecs(sel.agent.Tools)
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
 	}
@@ -539,7 +560,7 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 		promptSize:     prompt.Mode(sel.agent.SystemPrompt),
 		promptBody:     sel.agent.Prompt,
 		invocation:     sel.invocation,
-		constraints:    ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
+		constraints:    harness.ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
 		identity:       req.Session.Identity,
 		toolSpecs:      specs,
 	})
@@ -580,6 +601,9 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 			ID:                    productionStrategy.ID,
 			RequiresContextWindow: productionStrategy.RequiresContextWindow,
 		},
+	}
+	if req.Session.AgentSelection.Inputs != nil {
+		capture.Strategy.Settings = append(json.RawMessage(nil), req.Session.AgentSelection.Inputs.Strategy.Settings...)
 	}
 	workspace := req.Session.Identity.Workspace
 	// The prepared opener carries only the preparation-time credential
@@ -629,7 +653,7 @@ func finiteRate(v *float64) *float64 {
 // occurrence, to the composition's declarations in that order. The agent
 // parser intersects tool lists with the composed tool universe, so a miss
 // cannot occur in a published selection.
-func (p *preparation) toolSpecs(names []string) ([]CapabilitySpec, error) {
+func (c *composition) toolSpecs(names []string) ([]CapabilitySpec, error) {
 	specs := make([]CapabilitySpec, 0, len(names))
 	seen := make(map[string]bool, len(names))
 	for _, name := range names {
@@ -637,7 +661,7 @@ func (p *preparation) toolSpecs(names []string) ([]CapabilitySpec, error) {
 			continue
 		}
 		seen[name] = true
-		spec, ok := p.composition.toolSpec(name)
+		spec, ok := c.toolSpec(name)
 		if !ok {
 			return nil, fmt.Errorf("tool %q has no composed declaration: %w", name, ErrComposition)
 		}
@@ -791,7 +815,7 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 			Workspace:     workspace,
 			AdmittedEntry: admission.AdmittedEntry,
 			Invocation:    sel.invocation,
-			Constraints:   ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
+			Constraints:   harness.ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir},
 			Background:    &boundBackground{bridge: p.background, sessionID: sessionID},
 			SubprocessEnv: subprocessEnv,
 		}
@@ -859,7 +883,7 @@ func (v *preparationView) tools() []model.ToolDefinition {
 
 // input returns one contribution's owned copy of the current view plus the
 // supplying provider's own captured settings section.
-func (v *preparationView) input(session harness.SessionIdentity, ref model.ModelRef, constraints ToolConstraints, settings json.RawMessage) PreparationInput {
+func (v *preparationView) input(session harness.SessionIdentity, ref model.ModelRef, constraints harness.ToolConstraints, settings json.RawMessage) PreparationInput {
 	assembly := v.assembly
 	assembly.Rules.Warnings = slices.Clone(v.assembly.Rules.Warnings)
 	return PreparationInput{
@@ -932,7 +956,7 @@ func ownToolDefinitions(definitions []model.ToolDefinition) []model.ToolDefiniti
 // invalid consequence, error or observed cancellation aborts admission before
 // the next contribution runs, so no partial consequence is published.
 func runPreparationContributions(ctx context.Context, session harness.SessionIdentity, sel selection, view *preparationView) error {
-	constraints := ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir}
+	constraints := harness.ToolConstraints{Readonly: sel.agent.Readonly, WriteDir: sel.agent.WriteDir}
 	for _, id := range sel.agent.Capabilities {
 		entry, ok := sel.bindings.entries[id]
 		if !ok || !entry.declared.Implements(preparationHookType) {

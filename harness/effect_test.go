@@ -28,7 +28,7 @@ func newAdmittedHarness(t *testing.T, hctx context.Context, prepared PreparedExe
 		return prepared, nil
 	}})
 	testassert.NoError(t, err)
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	{
 		_, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello"))
@@ -718,7 +718,7 @@ func foreignEffectRace(t *testing.T, store *graphStorage, sessionID, operationID
 			return err
 		}
 		state := current.State
-		state.CurrentAgentType = agentType
+		state.AgentSelection = testSelection(agentType)
 		payload, err := encodeSessionRegister(SessionRecord{Identity: current.Identity, State: state})
 		if err != nil {
 			return err
@@ -763,7 +763,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		testassert.Require(t, errors.Is(err, ErrConflict), "intent over a foreign revision = %v, want the revision-race conflict", err)
 		{
 			session, err := h.ReadSessionHeader(context.Background(), sessionID)
-			testassert.Require(t, err == nil && session.CurrentAgentType == "foreign", "session after the race = %+v (%v), want the foreign agent type", session, err)
+			testassert.Require(t, err == nil && session.AgentSelection.Definition.DefinitionID == "foreign", "session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
 	t.Run("result transaction", func(t *testing.T) {
@@ -784,7 +784,7 @@ func TestEffectTransactionsRematerializeOnRevisionRace(t *testing.T) {
 		testassert.Require(t, errors.Is(err, ErrConflict), "result over a foreign revision = %v, want the revision-race conflict", err)
 		{
 			session, err := h.ReadSessionHeader(context.Background(), sessionID)
-			testassert.Require(t, err == nil && session.CurrentAgentType == "foreign", "session after the race = %+v (%v), want the foreign agent type", session, err)
+			testassert.Require(t, err == nil && session.AgentSelection.Definition.DefinitionID == "foreign", "session after the race = %+v (%v), want the foreign agent type", session, err)
 		}
 	})
 }
@@ -993,7 +993,7 @@ func TestExecuteOpensOnceWithCommittedAdmission(t *testing.T) {
 	testassert.Require(t, opens[0].ctx.Err() == context.Canceled, "opener context after retirement = %v, want the owner's cancellation", opens[0].ctx.Err())
 	testassert.Require(t, h.ctx.Err() == nil, "the Harness context was canceled by retirement: %v", h.ctx.Err())
 	adm := opens[0].adm
-	testassert.Require(t, adm.SessionID == sessionID && adm.OperationID == testOpID && adm.AgentType == "coder" && reflect.DeepEqual(adm.Execution, testCapture()), "opener admission = %+v, want the owned committed admission; opener capture = %+v, want the prepared capture", adm, adm.Execution)
+	testassert.Require(t, adm.SessionID == sessionID && adm.OperationID == testOpID && adm.AgentSelection.Definition.DefinitionID == "coder" && reflect.DeepEqual(adm.Execution, testCapture()), "opener admission = %+v, want the owned committed admission; opener capture = %+v, want the prepared capture", adm, adm.Execution)
 	rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 	testassert.NoError(t, err)
 	testassert.Equal(t, rec.State.Status, OperationSuccess)
@@ -3216,7 +3216,7 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 					return preparedExecuting(exec), nil
 				}})
 				testassert.NoError(t, err)
-				session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+				session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 				testassert.NoError(t, err)
 				c := leaseCoordinator(t, h, session.Identity.SessionID)
 				mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello"))
@@ -3646,10 +3646,10 @@ func TestSessionGraphReplaceOperation(t *testing.T) {
 	record := func(id string, revision int64) OperationRecord {
 		return OperationRecord{
 			Admission: OperationAdmission{
-				SessionID:   testSessionID,
-				OperationID: id,
-				RequestKind: RequestKindMessage,
-				AgentType:   "coder",
+				SessionID:      testSessionID,
+				OperationID:    id,
+				RequestKind:    RequestKindMessage,
+				AgentSelection: testSelection("coder"),
 			},
 			State: OperationCurrentState{
 				Status:    OperationRunning,

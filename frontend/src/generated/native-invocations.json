@@ -307,6 +307,13 @@
     "body": "required",
     "query_members": {}
   },
+  "SetSessionModel": {
+    "session_id": "required",
+    "field": "forbidden",
+    "query": "forbidden",
+    "body": "required",
+    "query_members": {}
+  },
   "StopSession": {
     "session_id": "required",
     "field": "forbidden",

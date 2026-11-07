@@ -85,7 +85,7 @@ type ScopeInfo struct {
 type CapabilitySpec struct {
 	id       string
 	typ      reflect.Type
-	describe func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error)
+	describe func(Invocation, harness.ToolConstraints, harness.SessionIdentity) (ToolDescription, error)
 }
 
 // Spec declares the capability contract named id for the Go type T. It serves
@@ -184,7 +184,7 @@ func (in Invocation) Config(pluginID string) json.RawMessage {
 	if in.snapshot == nil {
 		return nil
 	}
-	raw, ok := in.snapshot.plugins[pluginID]
+	raw, ok := in.snapshot.extensions[pluginID]
 	if !ok {
 		return nil
 	}
@@ -214,11 +214,11 @@ func (in Invocation) jobsSettings() json.RawMessage {
 // AgentTypes returns the captured snapshot's owned roster projection of the
 // loaded Agent definitions, preserving the snapshot's ordering. The zero
 // Invocation returns an empty roster.
-func (in Invocation) AgentTypes() []harness.AgentType {
+func (in Invocation) AgentTypes() []protocol.Agent {
 	if in.snapshot == nil {
 		return nil
 	}
-	return in.snapshot.agentTypes()
+	return projectAgents(in.snapshot)
 }
 
 // acceptSettings applies one declaration's configuration rule: a plugin with
@@ -304,6 +304,27 @@ type composition struct {
 	// opens; an isolated composition leaves it nil and every factory receives
 	// a nil ReportWarning.
 	reportWarning func(pluginID, kind, message string)
+}
+
+// registeredComposition owns registration data without composing inactive plugins.
+func registeredComposition(plugins []Plugin) *composition {
+	c := &composition{plugins: make([]Plugin, len(plugins))}
+	for _, spec := range standardToolSpecs() {
+		c.capabilityIDs = append(c.capabilityIDs, spec.id)
+		c.toolIDs = append(c.toolIDs, spec.id)
+	}
+	for i, p := range plugins {
+		p.Provides = append([]CapabilitySpec(nil), p.Provides...)
+		p.Requires = append([]CapabilitySpec(nil), p.Requires...)
+		c.plugins[i] = p
+		for _, spec := range p.Provides {
+			c.capabilityIDs = append(c.capabilityIDs, spec.id)
+			if spec.typ == toolType {
+				c.toolIDs = append(c.toolIDs, spec.id)
+			}
+		}
+	}
+	return c
 }
 
 // newComposition validates the complete selected plugin set before any

@@ -32,6 +32,7 @@ import (
 type configuration struct {
 	generation           uint64
 	resources            *resourceSet
+	composition          *composition
 	catalog              *catalog.Catalog
 	catalogWarnings      []catalog.Warning
 	definitions          []agents.Resolved
@@ -41,7 +42,7 @@ type configuration struct {
 	jobs                 json.RawMessage
 	compaction           json.RawMessage
 	compactionValues     compactionSettings
-	plugins              map[string]json.RawMessage
+	extensions           map[string]json.RawMessage
 	userProviders        map[string]any
 	permissions          json.RawMessage
 	workspacePermissions map[string]json.RawMessage
@@ -59,7 +60,7 @@ type capturedConfigDocument struct {
 	Tools       json.RawMessage            `json:"tools"`
 	Jobs        json.RawMessage            `json:"jobs"`
 	Compaction  json.RawMessage            `json:"compaction"`
-	Plugins     map[string]json.RawMessage `json:"plugins"`
+	Extensions  map[string]json.RawMessage `json:"extensions"`
 	Permissions json.RawMessage            `json:"permissions"`
 }
 
@@ -123,7 +124,7 @@ func newConfiguration(generation uint64, doc capturedConfigDocument, built catal
 		jobs:                 doc.Jobs,
 		compaction:           doc.Compaction,
 		compactionValues:     compaction,
-		plugins:              doc.Plugins,
+		extensions:           doc.Extensions,
 		userProviders:        doc.Providers,
 		permissions:          doc.Permissions,
 		workspacePermissions: workspacePermissions,
@@ -150,10 +151,10 @@ func projectSettings(sessions config.SessionConfig, tools, jobs, compaction json
 		Tools:      projectSettingsObject(tools),
 		Jobs:       projectSettingsObject(jobs),
 		Compaction: projectSettingsObject(compaction),
-		Plugins:    make(protocol.PluginsSettings, len(plugins)),
+		Extensions: make(protocol.ExtensionsSettings, len(plugins)),
 	}
 	for id, raw := range plugins {
-		out.Plugins[id] = string(raw)
+		out.Extensions[id] = string(raw)
 	}
 	return out
 }
@@ -184,7 +185,27 @@ func (c *configuration) permissionPolicy(workspace string) harness.PermissionPol
 
 // agentTypes projects the snapshot's resolved definitions onto the Harness
 // view.
-func (c *configuration) agentTypes() []harness.AgentType {
+type agentType struct {
+	Name         string
+	Model        model.ModelRef
+	SystemPrompt string
+	Prompt       string
+	Tools        []string
+	Capabilities []string
+	Readonly     bool
+	WriteDir     string
+}
+
+func resolveAgentType(name string, available []agentType) (agentType, error) {
+	for _, agent := range available {
+		if agent.Name == name {
+			return agent, nil
+		}
+	}
+	return agentType{}, fmt.Errorf("unknown agent type %q: %w", name, harness.ErrInvalid)
+}
+
+func (c *configuration) agentTypes() []agentType {
 	return projectAgentTypes(c.definitions)
 }
 
@@ -195,17 +216,15 @@ func (c *configuration) agentTypes() []harness.AgentType {
 // whitespace-as-unset behavior: no environment expansion, no new path
 // syntax), the subagent eligibility and roster description, and the complete
 // roster with no internal package type reaching the view.
-func projectAgentTypes(defs []agents.Resolved) []harness.AgentType {
-	out := make([]harness.AgentType, 0, len(defs))
+func projectAgentTypes(defs []agents.Resolved) []agentType {
+	out := make([]agentType, 0, len(defs))
 	for _, def := range defs {
-		at := harness.AgentType{
+		at := agentType{
 			Name:         def.Name,
 			SystemPrompt: def.SystemPrompt,
 			Prompt:       def.Prompt,
 			Readonly:     def.Readonly,
 			WriteDir:     strings.TrimSpace(def.WriteDir),
-			Subagent:     def.Subagent,
-			Description:  def.Description,
 		}
 		if def.Model != "" {
 			if ref, err := model.Parse(def.Model); err == nil {

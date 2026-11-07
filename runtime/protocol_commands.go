@@ -16,10 +16,18 @@ import (
 // coordinator's own publication. A failed fresh read propagates its typed
 // error; the committed creation is never rolled back and no synthetic
 // revision is invented.
-func (r *Runtime) createSessionHeader(ctx context.Context, workspace, agentType string) (protocol.Session, error) {
+func (r *Runtime) createSessionHeader(ctx context.Context, workspace string, requested *protocol.AgentSelection) (protocol.Session, error) {
+	selection := defaultAgentSelection()
+	if requested != nil {
+		var err error
+		selection, err = selectionFromProtocol(*requested)
+		if err != nil {
+			return protocol.Session{}, err
+		}
+	}
 	var header protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		record, err := r.createSessionRecord(ctx, h, workspace, agentType)
+		record, err := r.createSessionRecord(ctx, h, workspace, selection)
 		if err != nil {
 			return err
 		}
@@ -189,8 +197,35 @@ func forkBoundaryEntry(ctx context.Context, h *harness.Harness, sourceID string,
 // post-transition metadata read.
 func (r *Runtime) setSessionAgentType(ctx context.Context, sessionID string, req protocol.SetSessionAgentTypeRequest) (protocol.Session, error) {
 	var header protocol.Session
+	selection, err := selectionFromProtocol(req.AgentSelection)
+	if err != nil {
+		return header, err
+	}
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		if _, err := h.ChangeAgentType(ctx, sessionID, req.AgentType); err != nil {
+		if _, err := h.ChangeAgentType(ctx, sessionID, selection); err != nil {
+			return err
+		}
+		var err error
+		header, err = sessionHeaderAfter(ctx, h, sessionID)
+		return err
+	}); err != nil {
+		return protocol.Session{}, err
+	}
+	return header, nil
+}
+
+func (r *Runtime) setSessionModel(ctx context.Context, sessionID string, req protocol.SetSessionModelRequest) (protocol.Session, error) {
+	var ref model.ModelRef
+	if req.Model != "" {
+		var err error
+		ref, err = model.Parse(string(req.Model))
+		if err != nil {
+			return protocol.Session{}, fmt.Errorf("model: %v: %w", err, harness.ErrInvalid)
+		}
+	}
+	var header protocol.Session
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if _, err := h.SetSessionModel(ctx, sessionID, ref); err != nil {
 			return err
 		}
 		var err error

@@ -25,7 +25,7 @@ type surfaceRequest struct {
 	promptSize     prompt.Mode
 	promptBody     string
 	invocation     Invocation
-	constraints    ToolConstraints
+	constraints    harness.ToolConstraints
 	identity       harness.SessionIdentity
 	toolSpecs      []CapabilitySpec
 }

@@ -564,11 +564,11 @@ func newWaitPublicationRace(t *testing.T, store *graphStorage, aSessionID string
 	})
 	testassert.NoError(t, err)
 	if aSessionID == "" {
-		sessionA, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+		sessionA, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 		testassert.NoError(t, err)
 		aSessionID = sessionA.Identity.SessionID
 	}
-	sessionBRecord, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	sessionBRecord, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	sessionB = sessionBRecord.Identity.SessionID
 	return waitPublicationRace{
@@ -829,7 +829,7 @@ func TestExecutionAdoptsCommittedCapture(t *testing.T) {
 	h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
 		return prepared, nil
 	})
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	c := leaseCoordinator(t, h, session.Identity.SessionID)
 	rec, adopted := admitPrepared(t, h, c, session.Identity.SessionID, testOpID, prepared)
@@ -873,7 +873,7 @@ func TestPreparedPlanSnapshotFreezesMutableData(t *testing.T) {
 		h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
 			return prepared, nil
 		})
-		session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+		session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 		testassert.NoError(t, err)
 		c := leaseCoordinator(t, h, session.Identity.SessionID)
 		rec, adopted := admitPrepared(t, h, c, session.Identity.SessionID, testOpID, prepared)
@@ -909,7 +909,7 @@ func TestPreparedPlanSnapshotFreezesMutableData(t *testing.T) {
 		h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
 			return prepared, nil
 		})
-		session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+		session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 		testassert.NoError(t, err)
 		c := leaseCoordinator(t, h, session.Identity.SessionID)
 		rec, adopted := admitPrepared(t, h, c, session.Identity.SessionID, testOpID, prepared)

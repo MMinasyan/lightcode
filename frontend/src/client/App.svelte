@@ -140,7 +140,8 @@
       ownWarnings: hydration ? hydration.warnings.filter((warning) => warning.session_id === sessionID) : [],
       globalWarnings: hydration ? hydration.warnings.filter((warning) => !warning.session_id) : (globalWarnings ? globalWarnings.payload : []),
       model: hydration && hydration.selected_model ? hydration.selected_model : '',
-      agentType: hydration ? hydration.session.agent_type : '',
+      agentType: hydration ? hydration.session.agent_selection?.definition?.definition_id || '' : '',
+      agentSelection: hydration ? hydration.session.agent_selection : null,
       activity: activity.getState(),
       attempts: ledger.outstanding(sessionID),
     };
@@ -406,8 +407,19 @@
 
   // ONE Create task for a captured Workspace address; callers keep their own adoption.
   async function createSessionIn(addressed) {
+    const roster = await invoke('configuration', 'GetConfiguration', '{}', JSON.parse);
+    if (roster.kind !== 'ok') return roster;
+    const agents = roster.data.agents;
+    const seen = new Set();
+    if (!Array.isArray(agents) || !agents.every((agent) => {
+      const ref = agent?.definition;
+      if (!agent || typeof agent !== 'object' || Array.isArray(agent) || Object.keys(agent).length !== 9 || typeof agent.name !== 'string' || !agent.name || seen.has(agent.name) || !ref || typeof ref !== 'object' || Array.isArray(ref) || Object.keys(ref).length !== 3 || typeof ref.extension_id !== 'string' || !ref.extension_id || typeof ref.capability_id !== 'string' || !ref.capability_id || typeof ref.definition_id !== 'string' || !ref.definition_id || typeof agent.description !== 'string' || typeof agent.subagent !== 'boolean' || typeof agent.model !== 'string' || typeof agent.readonly !== 'boolean' || typeof agent.write_dir !== 'string' || !Array.isArray(agent.tools) || !agent.tools.every((value) => typeof value === 'string') || !Array.isArray(agent.capabilities) || !agent.capabilities.every((value) => typeof value === 'string')) return false;
+      seen.add(agent.name);
+      return true;
+    }) || (agents.length > 0 && !seen.has('primary'))) return { kind: 'rejection', message: 'Invalid agent roster' };
+    const selection = agents.length === 0 ? undefined : { definition: agents.find((agent) => agent.name === 'primary').definition };
     return invoke('session create', 'CreateSession', JSON.stringify({
-      body: { workspace: addressed, agent_type: 'primary' },
+      body: { workspace: addressed, ...(selection ? { agent_selection: selection } : {}) },
     }), JSON.parse);
   }
 
@@ -771,7 +783,7 @@
         outcomeNote = lists.error;
         return;
       }
-      const row = (session) => ({ id: session.session_id, agentType: session.agent_type, lastActivity: session.last_activity });
+      const row = (session) => ({ id: session.session_id, agentType: session.agent_selection?.definition?.definition_id || '', lastActivity: session.last_activity });
       pickerOpen = sortOpenRoots(lists.open).map(row);
       pickerArchived = sortOpenRoots(lists.archived).map(row);
     } finally {
@@ -869,10 +881,12 @@
     closeModal('agent');
     const addressed = rootID;
     if (!addressed || !type) return;
+    const definition = configuration?.payload?.find((agent) => agent.name === type)?.definition;
+    if (!definition) return;
     const cap = stampFor(addressed, 'root')();
     const classified = await invoke('agent type', 'SetSessionAgentType', JSON.stringify({
       session_id: addressed,
-      body: { agent_type: type },
+      body: { agent_selection: { definition } },
     }), JSON.parse);
     if (!reportAddressed(classified, 'Agent type change', `session ${addressed}`)) {
       return;
@@ -922,25 +936,32 @@
 
   // SetAgentTypeModel is type-wide and reports against the captured agent type.
   async function pickModel(ref) {
-    const addressedType = root.agentType;
-    if (!addressedType) return;
-    const cap = stampFor(rootID, 'root')();
-    const classified = await invoke('model selection', 'SetAgentTypeModel', JSON.stringify({
-      query: { agent_type: addressedType },
+    const addressedSession = rootID;
+    const selection = root.agentSelection;
+    const addressedType = selection?.definition?.definition_id;
+    if (!selection || (!selection.inputs && !addressedType)) return;
+    if (addressedType && (selection.definition.extension_id !== 'agents' || selection.definition.capability_id !== 'agents.definitions')) {
+      modelError = 'This definition does not offer a model edit.';
+      return;
+    }
+    const cap = stampFor(addressedSession, 'root')();
+    const classified = await invoke('model selection', addressedType ? 'SetAgentTypeModel' : 'SetSessionModel', JSON.stringify({
+      ...(addressedType ? { query: { agent_type: addressedType } } : { session_id: addressedSession }),
       body: { model: ref },
     }), JSON.parse);
-    if (!reportAddressed(classified, 'Model selection', `agent type ${addressedType}`)) {
+    if (!reportAddressed(classified, 'Model selection', addressedType ? `agent type ${addressedType}` : `session ${addressedSession}`)) {
       modelError = classified.message;
       return;
     }
-    outcomeNote = `Model selection applied for agent type ${addressedType}.`;
+    outcomeNote = addressedType ? `Model selection applied for agent type ${addressedType}.` : 'Model selection applied for this session.';
     if (!sameStamp(cap, stampFor(rootID, 'root')())) {
-      void refreshGlobal('configuration');
+      if (addressedType) void refreshGlobal('configuration');
       return;
     }
     closeModal('model');
     // Refresh configuration through its own read, not the mutation's clock.
-    void refreshGlobal('configuration');
+    if (addressedType) void refreshGlobal('configuration');
+    else if (rootReader) rootReader.markDirty();
   }
 
   // One ID-keyed union of lineage headers from both lists plus live membership; jobs stay separate.
@@ -964,7 +985,7 @@
       }
       byId.set(header.session_id, {
         id: header.session_id,
-        agentType: header.agent_type,
+        agentType: header.agent_selection?.definition?.definition_id || '',
         lifecycle: header.lifecycle,
         lastActivity: header.last_activity,
         live: false,
@@ -1140,7 +1161,7 @@
       on:close={() => closeModal('agent')} />
   {/if}
   {#if $modal === 'settings'}
-    <SettingsEditor getClient={clientNow} stamp={() => stampFor('', 'root')()}
+    <SettingsEditor getClient={clientNow} stamp={() => stampFor('', 'root')()} hasAgents={Array.isArray(configuration?.payload) && configuration.payload.length > 0}
       on:note={(e) => { outcomeNote = e.detail; }}
       on:changed={() => void refreshGlobal('configuration')}
       on:agent={() => openModal('agent')}

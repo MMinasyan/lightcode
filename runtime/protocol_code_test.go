@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -149,7 +148,7 @@ func openCodeRuntime(t *testing.T, store harness.Storage) *codeRuntime {
 	// composition provides no hooks or tools, and the rows need only ordinary
 	// text turns and manual compaction.
 	e := newOwnerEnv(t)
-	writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
+	writeAgentDefinitions(t, e.configPath, projectionAgentsDocument)
 	e.fixtureStore(store)
 	e.fixtureJobs(newLifecycleStopper())
 	r, _, err := e.openSwept(context.Background())
@@ -894,15 +893,15 @@ func TestCodeRestoreIntervalKeepsMetadataTransitionsAvailable(t *testing.T) {
 
 		defer park.flush()
 
-		changed, err := r.setSessionAgentType(context.Background(), session, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
+		changed, err := r.setSessionAgentType(context.Background(), session, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
 		testassert.NoError(t, err)
-		testassert.Equal(t, changed.AgentType, "worker")
+		testassert.Equal(t, changed.AgentSelection.Definition.DefinitionId, "worker")
 		archived, err := r.archiveSession(context.Background(), session)
 		testassert.NoError(t, err)
 		testassert.Equal(t, archived.Lifecycle, protocol.Archived)
 		reopened, err := r.reopenSession(context.Background(), session)
 		testassert.NoError(t, err)
-		testassert.Require(t, reopened.Lifecycle == protocol.Open && reopened.AgentType == "worker", "reopened header = %+v, want open with the changed selection", reopened)
+		testassert.Require(t, reopened.Lifecycle == protocol.Open && reopened.AgentSelection.Definition.DefinitionId == "worker", "reopened header = %+v, want open with the changed selection", reopened)
 
 		park.release("restored")
 		var out restoreOutcome
@@ -1379,7 +1378,7 @@ func TestQueuedDrainOpenerWaitsForRestoreInterval(t *testing.T) {
 func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, projectionAgentsDocument)
 		stopper := &stubStopper{events: e.events}
 		e.fixtureStore(store)
 		e.fixtureJobs(stopper)
@@ -1461,6 +1460,7 @@ func failingAgentFactoryPlugin(fail *atomic.Bool) Plugin {
 func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "failing-agent")
 		var fail atomic.Bool
 		fail.Store(true)
 		e.fixtureStore(store)
@@ -1515,6 +1515,7 @@ func parkingAgentClosePlugin(started chan struct{}, gate chan struct{}) Plugin {
 func TestExecutionCleanupReleasesIntervalLast(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "parking-agent")
 		closeGate := make(chan struct{})
 		closeStarted := make(chan struct{}, 1)
 		e.fixtureStore(store)

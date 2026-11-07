@@ -1,7 +1,6 @@
 package agents
 
 import (
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -213,12 +212,6 @@ func TestBuiltinNameWinsOverUserLockedFields(t *testing.T) {
 	explore, err := cfg.Resolve("explore")
 	testassert.NoError(t, err)
 	testassert.Require(t, explore.Prompt != "custom prompt" && explore.Description != "custom" && explore.Subagent, "builtin was overridden by colliding user entry: %+v", explore)
-}
-
-func TestPathForConfigUsesConfigDirectory(t *testing.T) {
-	got := PathForConfig(filepath.Join("/tmp", "lightcode-test", "config.json"))
-	want := filepath.Join("/tmp", "lightcode-test", "agents.json")
-	testassert.Equal(t, got, want)
 }
 
 func contains(values []string, want string) bool {

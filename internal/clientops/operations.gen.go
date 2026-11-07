@@ -359,6 +359,18 @@ var operationDescriptors = map[string]descriptor{
 			return c.SetSessionAgentTypeWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
+	"SetSessionModel": {
+		session: memberRequired,
+		body:    memberRequired,
+		status:  200,
+		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
+			var pathValue protocol.SessionID
+			if err := bindPath(env.session, &pathValue); err != nil {
+				return nil, err
+			}
+			return c.SetSessionModelWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
+		},
+	},
 	"StopSession": {
 		session: memberRequired,
 		status:  204,

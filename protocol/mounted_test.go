@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -24,7 +23,7 @@ import (
 // credential travels only through the discovery file. The runtime import is
 // test-only and intentional: the repository's dependency-isolation guard
 // rejects it from production files.
-const mountedOwnerConfig = `{"providers":{"prov":{"transport":{"base_url":"http://127.0.0.1:1/v1","api_key_env":"MOUNTED_PROTOCOL_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`
+const mountedOwnerConfig = `{"providers":{"prov":{"transport":{"base_url":"http://127.0.0.1:1/v1","api_key_env":"MOUNTED_PROTOCOL_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"extensions":{"agents":{"enabled":true,"definitions":` + mountedOwnerAgents + `},"adaptation":{"enabled":true},"mounted_reporter":{"enabled":true}}}`
 const mountedOwnerAgents = `{"solo":{"model":"prov/m","system_prompt":"simple"},"..":{"model":"prov/m","system_prompt":"simple"}}`
 
 // mountedDiscoveryEnv is the one handshake value the Node process receives:
@@ -112,7 +111,6 @@ func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeMountedFile(t, configPath, mountedOwnerConfig)
-	writeMountedFile(t, agents.PathForConfig(configPath), mountedOwnerAgents)
 	owner, err := runtime.Open(context.Background(), runtime.Options{
 		DataDir:    dataDir,
 		ConfigPath: configPath,

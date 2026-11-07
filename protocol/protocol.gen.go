@@ -20,6 +20,27 @@ import (
 	"github.com/oapi-codegen/runtime"
 )
 
+// Defines values for AgentInputsAssemblyMode.
+const (
+	AgentAssemblyFull   AgentInputsAssemblyMode = "full"
+	AgentAssemblyNone   AgentInputsAssemblyMode = "none"
+	AgentAssemblySimple AgentInputsAssemblyMode = "simple"
+)
+
+// Valid indicates whether the value is a known member of the AgentInputsAssemblyMode enum.
+func (e AgentInputsAssemblyMode) Valid() bool {
+	switch e {
+	case AgentAssemblyFull:
+		return true
+	case AgentAssemblyNone:
+		return true
+	case AgentAssemblySimple:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for AgentScopeKind.
 const (
 	AgentScopeKindAgent AgentScopeKind = "agent"
@@ -181,13 +202,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N8 HealthProtocolVersion = "8"
+	N9 HealthProtocolVersion = "9"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N8:
+	case N9:
 		return true
 	default:
 		return false
@@ -856,8 +877,9 @@ func (e WorkspaceScopeKind) Valid() bool {
 
 // Agent defines model for Agent.
 type Agent struct {
-	Capabilities []string `json:"capabilities"`
-	Description  string   `json:"description"`
+	Capabilities []string      `json:"capabilities"`
+	Definition   DefinitionRef `json:"definition"`
+	Description  string        `json:"description"`
 
 	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
 	Model    ModelRef `json:"model"`
@@ -867,6 +889,22 @@ type Agent struct {
 	Tools    []string `json:"tools"`
 	WriteDir string   `json:"write_dir"`
 }
+
+// AgentInputs defines model for AgentInputs.
+type AgentInputs struct {
+	AssemblyMode AgentInputsAssemblyMode `json:"assembly_mode"`
+	Capabilities []string                `json:"capabilities"`
+	Constraints  ToolConstraints         `json:"constraints"`
+	Instructions string                  `json:"instructions"`
+
+	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
+	Model    ModelRef          `json:"model"`
+	Strategy StrategySelection `json:"strategy"`
+	Tools    []string          `json:"tools"`
+}
+
+// AgentInputsAssemblyMode defines model for AgentInputs.AssemblyMode.
+type AgentInputsAssemblyMode string
 
 // AgentMutation defines model for AgentMutation.
 type AgentMutation struct {
@@ -885,6 +923,12 @@ type AgentScope struct {
 
 // AgentScopeKind defines model for AgentScope.Kind.
 type AgentScopeKind string
+
+// AgentSelection defines model for AgentSelection.
+type AgentSelection struct {
+	Definition *DefinitionRef `json:"definition,omitempty"`
+	Inputs     *AgentInputs   `json:"inputs,omitempty"`
+}
 
 // AssistantItem defines model for AssistantItem.
 type AssistantItem struct {
@@ -1027,8 +1071,15 @@ type CreateProviderRequest struct {
 
 // CreateSessionRequest defines model for CreateSessionRequest.
 type CreateSessionRequest struct {
-	AgentType string `json:"agent_type"`
-	Workspace string `json:"workspace"`
+	AgentSelection *AgentSelection `json:"agent_selection,omitempty"`
+	Workspace      string          `json:"workspace"`
+}
+
+// DefinitionRef defines model for DefinitionRef.
+type DefinitionRef struct {
+	CapabilityId string `json:"capability_id"`
+	DefinitionId string `json:"definition_id"`
+	ExtensionId  string `json:"extension_id"`
 }
 
 // DiscoveredModelCandidate defines model for DiscoveredModelCandidate.
@@ -1066,6 +1117,12 @@ type Event struct {
 
 // ExecutionEvidence One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
 type ExecutionEvidence string
+
+// ExtensionConfigDocument One extension configuration document as exact JSON text.
+type ExtensionConfigDocument = string
+
+// ExtensionsSettings Extension sections as JSON document strings, keyed by extension ID.
+type ExtensionsSettings map[string]ExtensionConfigDocument
 
 // ForkRequest defines model for ForkRequest.
 type ForkRequest struct {
@@ -1283,9 +1340,9 @@ type OpaquePartKind string
 
 // Operation defines model for Operation.
 type Operation struct {
-	AdmittedAt time.Time `json:"admitted_at"`
-	AgentType  string    `json:"agent_type"`
-	Detail     *string   `json:"detail,omitempty"`
+	AdmittedAt     time.Time      `json:"admitted_at"`
+	AgentSelection AgentSelection `json:"agent_selection"`
+	Detail         *string        `json:"detail,omitempty"`
 
 	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
 	Model       ModelRef             `json:"model"`
@@ -1342,12 +1399,6 @@ type PendingQueues struct {
 	Queued   []PendingInput `json:"queued"`
 	Steering []PendingInput `json:"steering"`
 }
-
-// PluginConfigDocument One compiled plugin's own configuration document: the exact JSON object text the selected plugin declaration owns, carried as a string so the transport never interprets, renumbers or drops its members.
-type PluginConfigDocument = string
-
-// PluginsSettings Every owned plugin section as its JSON document string, keyed by the compiled plugin ID; an absent ID uses that plugin's own defaults.
-type PluginsSettings map[string]PluginConfigDocument
 
 // ProtocolMetadata defines model for ProtocolMetadata.
 type ProtocolMetadata struct {
@@ -1487,7 +1538,7 @@ type ScopeEventKind string
 
 // Session defines model for Session.
 type Session struct {
-	AgentType          string           `json:"agent_type"`
+	AgentSelection     AgentSelection   `json:"agent_selection"`
 	ArchivedAt         *time.Time       `json:"archived_at,omitempty"`
 	CreatedAt          time.Time        `json:"created_at"`
 	CurrentOperationId *string          `json:"current_operation_id,omitempty"`
@@ -1549,7 +1600,13 @@ type SetAgentTypeModelRequest struct {
 
 // SetSessionAgentTypeRequest defines model for SetSessionAgentTypeRequest.
 type SetSessionAgentTypeRequest struct {
-	AgentType string `json:"agent_type"`
+	AgentSelection AgentSelection `json:"agent_selection"`
+}
+
+// SetSessionModelRequest defines model for SetSessionModelRequest.
+type SetSessionModelRequest struct {
+	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
+	Model ModelRef `json:"model"`
 }
 
 // Settings defines model for Settings.
@@ -1557,11 +1614,11 @@ type Settings struct {
 	// Compaction The baseline compaction configuration object: an optional independent summarizer model reference and an optional custom nonempty prompt, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults apply at consumption.
 	Compaction CompactionSettings `json:"compaction"`
 
-	// Jobs The baseline background jobs configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the jobs service applies at consumption.
-	Jobs JobsSettings `json:"jobs"`
+	// Extensions Extension sections as JSON document strings, keyed by extension ID.
+	Extensions ExtensionsSettings `json:"extensions"`
 
-	// Plugins Every owned plugin section as its JSON document string, keyed by the compiled plugin ID; an absent ID uses that plugin's own defaults.
-	Plugins  PluginsSettings  `json:"plugins"`
+	// Jobs The baseline background jobs configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the jobs service applies at consumption.
+	Jobs     JobsSettings     `json:"jobs"`
 	Sessions SessionsSettings `json:"sessions"`
 
 	// Tools The baseline standard tools' configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the tools apply at consumption.
@@ -1601,6 +1658,12 @@ type SkippedFile struct {
 type SnapshotFile struct {
 	Existed bool   `json:"existed"`
 	Path    string `json:"path"`
+}
+
+// StrategySelection defines model for StrategySelection.
+type StrategySelection struct {
+	Id       string `json:"id"`
+	Settings string `json:"settings"`
 }
 
 // SubmitRequest defines model for SubmitRequest.
@@ -1677,6 +1740,12 @@ type ToolCallView struct {
 	// ShapingFailure The bounded processing-failure diagnostic of an aborted pure output-shaping chain, present only beside a settled result whose shaping failed; the stored content then carries the original outcome.
 	ShapingFailure *string         `json:"shaping_failure,omitempty"`
 	Status         *ToolCallStatus `json:"status,omitempty"`
+}
+
+// ToolConstraints defines model for ToolConstraints.
+type ToolConstraints struct {
+	Readonly bool   `json:"readonly"`
+	WriteDir string `json:"write_dir"`
 }
 
 // ToolFinishedEvent defines model for ToolFinishedEvent.
@@ -1933,6 +2002,9 @@ type CompactSessionJSONRequestBody = CompactRequest
 
 // ForkSessionJSONRequestBody defines body for ForkSession for application/json ContentType.
 type ForkSessionJSONRequestBody = ForkRequest
+
+// SetSessionModelJSONRequestBody defines body for SetSessionModel for application/json ContentType.
+type SetSessionModelJSONRequestBody = SetSessionModelRequest
 
 // RevertSessionCodeJSONRequestBody defines body for RevertSessionCode for application/json ContentType.
 type RevertSessionCodeJSONRequestBody = RevertCodeRequest
@@ -3076,6 +3148,14 @@ type ClientInterface interface {
 	// InterruptSession performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request.
 	InterruptSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// SetSessionModelWithBody performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request,
+	// with any type of body and a specified content type.
+	SetSessionModelWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// SetSessionModel performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request.
+	// Takes a body of the `application/json` content type.
+	SetSessionModel(ctx context.Context, id SessionID, body SetSessionModelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// ReopenSession performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
 	ReopenSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -3684,6 +3764,34 @@ func (c *Client) GetSessionHydration(ctx context.Context, id SessionID, reqEdito
 // InterruptSession performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request.
 func (c *Client) InterruptSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewInterruptSessionRequest(c.Server, id)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// SetSessionModelWithBody performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request,
+// with any type of body and a specified content type.
+func (c *Client) SetSessionModelWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewSetSessionModelRequestWithBody(c.Server, id, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// SetSessionModel performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request.
+// Takes a body of the `application/json` content type.
+func (c *Client) SetSessionModel(ctx context.Context, id SessionID, body SetSessionModelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewSetSessionModelRequest(c.Server, id, body)
 	if err != nil {
 		return nil, err
 	}
@@ -5295,6 +5403,53 @@ func NewInterruptSessionRequest(server string, id SessionID) (*http.Request, err
 	return req, nil
 }
 
+// NewSetSessionModelRequest calls the generic SetSessionModel builder with application/json body
+func NewSetSessionModelRequest(server string, id SessionID, body SetSessionModelJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewSetSessionModelRequestWithBody(server, id, "application/json", bodyReader)
+}
+
+// NewSetSessionModelRequestWithBody constructs an http.Request for the SetSessionModel method, with any body, and a specified content type
+func NewSetSessionModelRequestWithBody(server string, id SessionID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "id", id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/sessions/%s/model", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPut, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewReopenSessionRequest constructs an http.Request for the ReopenSession method
 func NewReopenSessionRequest(server string, id SessionID) (*http.Request, error) {
 	var err error
@@ -5809,6 +5964,16 @@ type ClientWithResponsesInterface interface {
 	//
 	// Returns a wrapper object for the known response body format(s).
 	InterruptSessionWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*InterruptSessionResponse, error)
+
+	// SetSessionModelWithBodyWithResponse performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request,
+	// with any type of body and a specified content type.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	SetSessionModelWithBodyWithResponse(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetSessionModelResponse, error)
+
+	// SetSessionModelWithResponse performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request.
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	SetSessionModelWithResponse(ctx context.Context, id SessionID, body SetSessionModelJSONRequestBody, reqEditors ...RequestEditorFn) (*SetSessionModelResponse, error)
 
 	// ReopenSessionWithResponse performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
 	//
@@ -7376,6 +7541,54 @@ func (r InterruptSessionResponse) ContentType() string {
 	return ""
 }
 
+type SetSessionModelResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *Session
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r SetSessionModelResponse) GetJSON200() *Session {
+	return r.JSON200
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r SetSessionModelResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r SetSessionModelResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r SetSessionModelResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r SetSessionModelResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r SetSessionModelResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 type ReopenSessionResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -8176,6 +8389,28 @@ func (c *ClientWithResponses) InterruptSessionWithResponse(ctx context.Context, 
 		return nil, err
 	}
 	return ParseInterruptSessionResponse(rsp)
+}
+
+// SetSessionModelWithBodyWithResponse performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request,
+// with any type of body and a specified content type.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) SetSessionModelWithBodyWithResponse(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetSessionModelResponse, error) {
+	rsp, err := c.SetSessionModelWithBody(ctx, id, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseSetSessionModelResponse(rsp)
+}
+
+// SetSessionModelWithResponse performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request.
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) SetSessionModelWithResponse(ctx context.Context, id SessionID, body SetSessionModelJSONRequestBody, reqEditors ...RequestEditorFn) (*SetSessionModelResponse, error) {
+	rsp, err := c.SetSessionModel(ctx, id, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseSetSessionModelResponse(rsp)
 }
 
 // ReopenSessionWithResponse performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
@@ -9329,6 +9564,39 @@ func ParseInterruptSessionResponse(rsp *http.Response) (*InterruptSessionRespons
 	return response, nil
 }
 
+// ParseSetSessionModelResponse parses an HTTP response from a SetSessionModelWithResponse call
+func ParseSetSessionModelResponse(rsp *http.Response) (*SetSessionModelResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &SetSessionModelResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Session
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseReopenSessionResponse parses an HTTP response from a ReopenSessionWithResponse call
 func ParseReopenSessionResponse(rsp *http.Response) (*ReopenSessionResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -9654,6 +9922,9 @@ type ServerInterface interface {
 
 	// (POST /v1/sessions/{id}/interrupt)
 	InterruptSession(w http.ResponseWriter, r *http.Request, id SessionID)
+
+	// (PUT /v1/sessions/{id}/model)
+	SetSessionModel(w http.ResponseWriter, r *http.Request, id SessionID)
 
 	// (POST /v1/sessions/{id}/reopen)
 	ReopenSession(w http.ResponseWriter, r *http.Request, id SessionID)
@@ -10594,6 +10865,32 @@ func (siw *ServerInterfaceWrapper) InterruptSession(w http.ResponseWriter, r *ht
 	handler.ServeHTTP(w, r)
 }
 
+// SetSessionModel operation middleware
+func (siw *ServerInterfaceWrapper) SetSessionModel(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id SessionID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SetSessionModel(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ReopenSession operation middleware
 func (siw *ServerInterfaceWrapper) ReopenSession(w http.ResponseWriter, r *http.Request) {
 
@@ -10873,6 +11170,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions/{id}/stop", wrapper.StopSession)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions/{id}/fork", wrapper.ForkSession)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/sessions/{id}/agent-type", wrapper.SetSessionAgentType)
+	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/sessions/{id}/model", wrapper.SetSessionModel)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/hydration", wrapper.GetSessionHydration)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/history", wrapper.GetSessionHistory)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/code-snapshots", wrapper.GetSessionCodeSnapshots)

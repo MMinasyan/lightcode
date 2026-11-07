@@ -2049,7 +2049,7 @@ func encodeSessionState(v SessionState) (json.RawMessage, error) {
 	wire, err := json.Marshal(struct {
 		Lifecycle          string          `json:"lifecycle"`
 		ArchivedAt         *string         `json:"archived_at,omitempty"`
-		CurrentAgentType   string          `json:"current_agent_type"`
+		AgentSelection     AgentSelection  `json:"agent_selection"`
 		CurrentOperationID string          `json:"current_operation_id,omitempty"`
 		CheckpointEntryID  string          `json:"checkpoint_entry_id,omitempty"`
 		Usage              json.RawMessage `json:"usage"`
@@ -2057,7 +2057,7 @@ func encodeSessionState(v SessionState) (json.RawMessage, error) {
 	}{
 		Lifecycle:          string(v.Lifecycle),
 		ArchivedAt:         archivedAt,
-		CurrentAgentType:   v.CurrentAgentType,
+		AgentSelection:     v.AgentSelection,
 		CurrentOperationID: v.CurrentOperationID,
 		CheckpointEntryID:  v.CheckpointEntryID,
 		Usage:              usage,
@@ -2195,14 +2195,14 @@ func validateSessionIdentity(v SessionIdentity) error {
 
 // decodeSessionState reads the state section with exact keys.
 func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
-	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "current_agent_type", "current_operation_id", "checkpoint_entry_id", "usage", "last_activity"); err != nil {
+	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "agent_selection", "current_operation_id", "checkpoint_entry_id", "usage", "last_activity"); err != nil {
 		return SessionState{}, err
 	}
 	lifecycle, err := stringMember(obj, "lifecycle", true)
 	if err != nil {
 		return SessionState{}, err
 	}
-	currentAgentType, err := stringMember(obj, "current_agent_type", true)
+	selection, err := decodeAgentSelection(obj["agent_selection"])
 	if err != nil {
 		return SessionState{}, err
 	}
@@ -2232,7 +2232,7 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 	}
 	v := SessionState{
 		Lifecycle:          SessionLifecycle(lifecycle),
-		CurrentAgentType:   currentAgentType,
+		AgentSelection:     selection,
 		CurrentOperationID: currentOperationID,
 		CheckpointEntryID:  checkpointEntryID,
 		Usage:              usage,
@@ -2271,8 +2271,8 @@ func validateSessionState(v SessionState) error {
 	if v.Lifecycle == LifecycleOpen && v.ArchivedAt != nil {
 		return errors.New("open session must not carry archived_at")
 	}
-	if v.CurrentAgentType == "" {
-		return errors.New("current_agent_type must be non-empty")
+	if err := validateAgentSelection(v.AgentSelection); err != nil {
+		return fmt.Errorf("agent_selection: %w", err)
 	}
 	if v.CurrentOperationID != "" {
 		if err := validateOperationIdentity(v.CurrentOperationID, "current operation id"); err != nil {
@@ -2336,21 +2336,21 @@ func encodeOperationAdmission(v OperationAdmission) (json.RawMessage, error) {
 		return nil, err
 	}
 	wire, err := json.Marshal(struct {
-		SessionID     string          `json:"session_id"`
-		OperationID   string          `json:"operation_id"`
-		RequestKind   string          `json:"request_kind"`
-		AdmittedEntry json.RawMessage `json:"admitted_entry,omitempty"`
-		AgentType     string          `json:"agent_type"`
-		Execution     json.RawMessage `json:"execution"`
-		AdmittedAt    string          `json:"admitted_at"`
+		SessionID      string          `json:"session_id"`
+		OperationID    string          `json:"operation_id"`
+		RequestKind    string          `json:"request_kind"`
+		AdmittedEntry  json.RawMessage `json:"admitted_entry,omitempty"`
+		AgentSelection AgentSelection  `json:"agent_selection"`
+		Execution      json.RawMessage `json:"execution"`
+		AdmittedAt     string          `json:"admitted_at"`
 	}{
-		SessionID:     v.SessionID,
-		OperationID:   v.OperationID,
-		RequestKind:   string(v.RequestKind),
-		AdmittedEntry: admittedEntry,
-		AgentType:     v.AgentType,
-		Execution:     execution,
-		AdmittedAt:    admittedAt,
+		SessionID:      v.SessionID,
+		OperationID:    v.OperationID,
+		RequestKind:    string(v.RequestKind),
+		AdmittedEntry:  admittedEntry,
+		AgentSelection: v.AgentSelection,
+		Execution:      execution,
+		AdmittedAt:     admittedAt,
 	})
 	if err != nil {
 		return nil, err
@@ -2486,7 +2486,7 @@ func decodeOperationRegister(reg Register) (OperationRecord, error) {
 
 // decodeOperationAdmission reads the admission section with exact keys.
 func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmission, error) {
-	if err := rejectUnknownMembers(obj, "session_id", "operation_id", "request_kind", "admitted_entry", "agent_type", "execution", "admitted_at"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "operation_id", "request_kind", "admitted_entry", "agent_selection", "execution", "admitted_at"); err != nil {
 		return OperationAdmission{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -2519,7 +2519,7 @@ func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmissio
 			return OperationAdmission{}, fmt.Errorf("member %q must be absent for request kind %q", "admitted_entry", requestKind)
 		}
 	}
-	agentType, err := stringMember(obj, "agent_type", true)
+	selection, err := decodeAgentSelection(obj["agent_selection"])
 	if err != nil {
 		return OperationAdmission{}, err
 	}
@@ -2540,13 +2540,13 @@ func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmissio
 		return OperationAdmission{}, fmt.Errorf("member %q: %w", "admitted_at", err)
 	}
 	v := OperationAdmission{
-		SessionID:     sessionID,
-		OperationID:   operationID,
-		RequestKind:   RequestKind(requestKind),
-		AdmittedEntry: admittedEntry,
-		AgentType:     agentType,
-		Execution:     execution,
-		AdmittedAt:    stamped,
+		SessionID:      sessionID,
+		OperationID:    operationID,
+		RequestKind:    RequestKind(requestKind),
+		AdmittedEntry:  admittedEntry,
+		AgentSelection: selection,
+		Execution:      execution,
+		AdmittedAt:     stamped,
 	}
 	if err := validateOperationAdmission(v); err != nil {
 		return OperationAdmission{}, err
@@ -2579,8 +2579,8 @@ func validateOperationAdmission(v OperationAdmission) error {
 	default:
 		return fmt.Errorf("request kind %q is not one of %q or %q", v.RequestKind, RequestKindMessage, RequestKindCompact)
 	}
-	if v.AgentType == "" {
-		return errors.New("agent_type must be non-empty")
+	if err := validateAgentSelection(v.AgentSelection); err != nil {
+		return fmt.Errorf("agent_selection: %w", err)
 	}
 	if v.AdmittedAt.IsZero() {
 		return errors.New("admitted_at must not be zero")

@@ -112,6 +112,74 @@ func writeServiceFile(t *testing.T, path, content string) {
 	}
 }
 
+func writeAgentDefinitions(t *testing.T, configPath, content string) {
+	t.Helper()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		data = []byte(`{}`)
+	} else {
+		testassert.NoError(t, err)
+	}
+	var root map[string]json.RawMessage
+	testassert.NoError(t, json.Unmarshal(data, &root))
+	var extensions map[string]json.RawMessage
+	if len(root["extensions"]) != 0 {
+		testassert.NoError(t, json.Unmarshal(root["extensions"], &extensions))
+	}
+	if extensions == nil {
+		extensions = map[string]json.RawMessage{}
+	}
+	var section map[string]json.RawMessage
+	if len(extensions["agents"]) != 0 {
+		testassert.NoError(t, json.Unmarshal(extensions["agents"], &section))
+	}
+	if section == nil {
+		section = map[string]json.RawMessage{}
+	}
+	section["enabled"] = json.RawMessage(`true`)
+	section["definitions"] = json.RawMessage(content)
+	extensions["agents"], err = json.Marshal(section)
+	testassert.NoError(t, err)
+	root["extensions"], err = json.Marshal(extensions)
+	testassert.NoError(t, err)
+	data, err = json.Marshal(root)
+	testassert.NoError(t, err)
+	writeServiceFile(t, configPath, string(data))
+}
+
+func fixtureAgentPlugin() Plugin {
+	return servicePlugin("agents", &atomic.Int64{}, acceptValidator)
+}
+
+func enableFixturePlugin(t *testing.T, configPath, id string) {
+	t.Helper()
+	data, err := os.ReadFile(configPath)
+	testassert.NoError(t, err)
+	var root map[string]json.RawMessage
+	testassert.NoError(t, json.Unmarshal(data, &root))
+	var extensions map[string]json.RawMessage
+	if len(root["extensions"]) != 0 {
+		testassert.NoError(t, json.Unmarshal(root["extensions"], &extensions))
+	}
+	if extensions == nil {
+		extensions = map[string]json.RawMessage{}
+	}
+	extensions[id] = json.RawMessage(`{"enabled":true}`)
+	root["extensions"], err = json.Marshal(extensions)
+	testassert.NoError(t, err)
+	data, err = json.Marshal(root)
+	testassert.NoError(t, err)
+	writeServiceFile(t, configPath, string(data))
+}
+
+func resourceServiceConfig(alpha string) string {
+	return strings.TrimSuffix(providerConfigFile("One"), "}") + `,"extensions":{"alpha":{"enabled":true,` + strings.TrimPrefix(alpha, "{") + `,"beta":{"enabled":true}}}`
+}
+
+func ownerResourceConfig(endpoint, alpha, extra string) string {
+	return strings.TrimSuffix(ownerConfigDocument(endpoint), "}") + `,"extensions":{"agents":{"enabled":true,"definitions":` + ownerAgentsDocument + `},"alpha":{"enabled":true,` + strings.TrimPrefix(alpha, "{") + extra + `}}`
+}
+
 func servicePlugin(id string, opens *atomic.Int64, validate func(json.RawMessage) error) Plugin {
 	return Plugin{
 		ID:       id,
@@ -126,6 +194,42 @@ func servicePlugin(id string, opens *atomic.Int64, validate func(json.RawMessage
 }
 
 func TestRuntimeConfigurationResourceReplacement(t *testing.T) {
+	t.Run("inactive dependency declaration is not composed", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		e.fixtureStore(storage.NewMemory())
+		var opens atomic.Int64
+		p := servicePlugin("alpha", &opens, acceptValidator)
+		p.Requires = []CapabilitySpec{Spec[any]("missing")}
+		writeServiceFile(t, e.configPath, `{"extensions":{"alpha":{"enabled":false}}}`)
+		r, err := e.open(context.Background(), p)
+		testassert.NoError(t, err)
+		defer r.Close(context.Background())
+		testassert.Equal(t, opens.Load(), int64(0))
+		writeServiceFile(t, e.configPath, `{"extensions":{"alpha":{"enabled":true}}}`)
+		before := r.config.current()
+		_, err = r.Reload(context.Background())
+		testassert.Require(t, errors.Is(err, ErrConfiguration) && r.config.current() == before && opens.Load() == 0, "invalid active graph = %v", err)
+	})
+	t.Run("inactive extension remains unconstructed across reload", func(t *testing.T) {
+		e := newOwnerEnv(t)
+		e.fixtureStore(storage.NewMemory())
+		var opens, activeOpens atomic.Int64
+		p := servicePlugin("alpha", &opens, func(json.RawMessage) error { return errors.New("inactive validator called") })
+		active := servicePlugin("beta", &activeOpens, acceptValidator)
+		writeServiceFile(t, e.configPath, `{"extensions":{"alpha":{"enabled":false,"value":"invalid"},"beta":{"enabled":true},"uninstalled":{"enabled":true}}}`)
+		r, err := e.open(context.Background(), p, active)
+		testassert.NoError(t, err)
+		defer r.Close(context.Background())
+		testassert.Equal(t, opens.Load(), int64(0))
+		testassert.Equal(t, activeOpens.Load(), int64(1))
+		resources := r.config.current().resources
+		writeServiceFile(t, e.configPath, `{"extensions":{"alpha":{"enabled":false,"value":[1,2]},"beta":{"enabled":true},"uninstalled":{"enabled":true,"data":5}}}`)
+		_, err = r.Reload(context.Background())
+		testassert.NoError(t, err)
+		testassert.Equal(t, opens.Load(), int64(0))
+		testassert.Equal(t, activeOpens.Load(), int64(1))
+		testassert.Require(t, r.config.current().resources == resources, "inactive edits replaced active resources")
+	})
 	e := newOwnerEnv(t)
 	e.fixtureStore(storage.NewMemory())
 	var opens, closes atomic.Int64
@@ -134,7 +238,10 @@ func TestRuntimeConfigurationResourceReplacement(t *testing.T) {
 		id := opens.Add(1)
 		return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error { closes.Add(1); return nil }}, nil
 	}
-	writeServiceFile(t, e.configPath, pluginsConfigFile(`{ "value" : 1 }`))
+	extensionConfig := func(raw string) string {
+		return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", `{"m":{"name":"One","context_window":100}}`) + `},"extensions":{"alpha":` + raw + `}}`
+	}
+	writeServiceFile(t, e.configPath, extensionConfig(`{ "enabled":true,"value" : 1 }`))
 	plugins := []Plugin{p}
 	r, err := e.open(context.Background(), plugins...)
 	testassert.NoError(t, err)
@@ -150,17 +257,17 @@ func TestRuntimeConfigurationResourceReplacement(t *testing.T) {
 	_, err = r.updateSettings(context.Background(), view.Settings)
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(1))
-	testassert.Equal(t, string(r.config.current().plugins["alpha"]), `{ "value" : 1 }`)
+	testassert.Equal(t, string(r.config.current().extensions["alpha"]), `{ "enabled":true,"value" : 1 }`)
 	_, err = r.updateProvider(context.Background(), "prov", protocol.ProviderEdit{})
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(1))
-	testassert.Equal(t, string(r.config.current().plugins["alpha"]), `{ "value" : 1 }`)
-	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"value":2}`))
+	testassert.Equal(t, string(r.config.current().extensions["alpha"]), `{ "enabled":true,"value" : 1 }`)
+	writeServiceFile(t, e.configPath, extensionConfig(`{"enabled":true,"value":2}`))
 	_, err = r.Reload(context.Background())
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(2))
 	testassert.Equal(t, closes.Load(), int64(1))
-	for i, document := range []string{pluginsConfigFile(`{ "value":2}`), providerConfigFile("One"), pluginsConfigFile(`{}`)} {
+	for i, document := range []string{extensionConfig(`{ "enabled":true,"value":2}`), extensionConfig(`{"enabled":true}`), extensionConfig(`{"enabled":true,"value":3}`)} {
 		writeServiceFile(t, e.configPath, document)
 		_, err := r.Reload(context.Background())
 		testassert.NoError(t, err)
@@ -171,7 +278,7 @@ func TestRuntimeConfigurationResourceReplacement(t *testing.T) {
 
 func TestResourceFactoryWithoutWarningSink(t *testing.T) {
 	h := newServiceHarness(t)
-	writeServiceFile(t, h.configPath, `{}`)
+	writeServiceFile(t, h.configPath, `{"extensions":{"alpha":{"enabled":true}}}`)
 	p := servicePlugin("alpha", &h.opens, nil)
 	p.Open = func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
 		if info.ReportWarning != nil {
@@ -211,7 +318,7 @@ func TestRuntimeConfigurationCandidateResources(t *testing.T) {
 		}
 		return Instance{Values: map[string]any{"capability.beta": "ok"}}, nil
 	}
-	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"value":1}`))
+	writeServiceFile(t, e.configPath, resourceServiceConfig(`{"value":1}`))
 	r, err := e.open(context.Background(), first, second)
 	testassert.NoError(t, err)
 	defer r.Close(context.Background())
@@ -221,8 +328,8 @@ func TestRuntimeConfigurationCandidateResources(t *testing.T) {
 	sub, err := r.Subscribe(32)
 	testassert.NoError(t, err)
 	defer sub.Close()
-	settings := projectSettings(previous.sessions, previous.tools, previous.jobs, previous.compaction, previous.plugins)
-	settings.Plugins["alpha"] = `{"value":2}`
+	settings := projectSettings(previous.sessions, previous.tools, previous.jobs, previous.compaction, previous.extensions)
+	settings.Extensions["alpha"] = `{"enabled":true,"value":2}`
 	fail.Store(true)
 	_, err = r.updateSettings(context.Background(), settings)
 	testassert.Require(t, errors.Is(err, errFactory), "failed candidate = %v", err)
@@ -278,7 +385,7 @@ func TestRuntimeCanceledCandidateDisposesOnlyItsPrefix(t *testing.T) {
 		}
 		return Instance{Values: map[string]any{"capability.beta": 1}}, nil
 	}
-	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"v":1}`))
+	writeServiceFile(t, e.configPath, resourceServiceConfig(`{"v":1}`))
 	r, err := e.open(context.Background(), first, second)
 	testassert.NoError(t, err)
 	defer r.Close(context.Background())
@@ -287,7 +394,7 @@ func TestRuntimeCanceledCandidateDisposesOnlyItsPrefix(t *testing.T) {
 	sub, err := r.Subscribe(16)
 	testassert.NoError(t, err)
 	defer sub.Close()
-	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"v":2}`))
+	writeServiceFile(t, e.configPath, resourceServiceConfig(`{"v":2}`))
 	park.Store(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -322,11 +429,11 @@ func TestRuntimeRetirementDoesNotHoldPublicationLocks(t *testing.T) {
 			return nil
 		}}, nil
 	}
-	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"v":1}`))
+	writeServiceFile(t, e.configPath, resourceServiceConfig(`{"v":1}`))
 	r, err := e.open(context.Background(), p)
 	testassert.NoError(t, err)
 	defer func() { releaseOnce.Do(func() { close(release) }); _ = r.Close(context.Background()) }()
-	writeServiceFile(t, e.configPath, pluginsConfigFile(`{"v":2}`))
+	writeServiceFile(t, e.configPath, resourceServiceConfig(`{"v":2}`))
 	first := make(chan error, 1)
 	go func() { _, err := r.Reload(context.Background()); first <- err }()
 	<-entered
@@ -369,7 +476,7 @@ func TestRuntimeRetiredResourcesReleaseBeforeArtifactInterval(t *testing.T) {
 			return nil
 		}}, nil
 	}
-	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":1}}}`)
+	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"v":1}`, ""))
 	r, err := e.open(context.Background(), p)
 	testassert.NoError(t, err)
 	defer func() {
@@ -381,7 +488,7 @@ func TestRuntimeRetiredResourcesReleaseBeforeArtifactInterval(t *testing.T) {
 	testassert.NoError(t, err)
 	submitThroughRuntime(t, r, session.Identity.SessionID, "op-owned", "work")
 	<-modelStarted
-	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":2}}}`)
+	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"v":2}`, ""))
 	_, err = r.Reload(context.Background())
 	testassert.NoError(t, err)
 	modelOnce.Do(func() { close(modelRelease) })
@@ -422,7 +529,7 @@ func TestRuntimePreparedReservationSurvivesUntilOpening(t *testing.T) {
 		<-modelRelease
 		return textTurnEvents("done")
 	})
-	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":1}}}`)
+	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"v":1}`, `,"operation":{"enabled":true}`))
 	r, err := e.open(context.Background(), alpha, operation)
 	testassert.NoError(t, err)
 	defer func() {
@@ -439,7 +546,7 @@ func TestRuntimePreparedReservationSurvivesUntilOpening(t *testing.T) {
 		done <- err
 	}()
 	<-store.parked
-	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"v":2}}}`)
+	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"v":2}`, `,"operation":{"enabled":true}`))
 	_, err = r.Reload(context.Background())
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(2))
@@ -481,7 +588,7 @@ func TestRuntimeDiscardedPreparationReleasesRetiredResources(t *testing.T) {
 		id := opens.Add(1)
 		return Instance{Values: map[string]any{"capability.alpha": id}, Close: func() error { closes.Add(1); return nil }}, nil
 	}
-	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"value":1}}}`)
+	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"value":1}`, ""))
 	r, err := e.open(context.Background(), p)
 	testassert.NoError(t, err)
 	defer r.Close(context.Background())
@@ -494,7 +601,7 @@ func TestRuntimeDiscardedPreparationReleasesRetiredResources(t *testing.T) {
 		done <- err
 	}()
 	<-store.entered
-	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"plugins":{"alpha":{"value":2}}}`)
+	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"value":2}`, ""))
 	_, err = r.Reload(context.Background())
 	testassert.NoError(t, err)
 	testassert.Equal(t, closes.Load(), int64(0))
@@ -573,16 +680,17 @@ func TestConfigurationServicePublishesImmutableGenerations(t *testing.T) {
 // that candidate (no mixed rereads), while the next build captures them.
 func TestConfigurationServiceCapturesInputOnce(t *testing.T) {
 	h := newServiceHarness(t)
-	agentsPath := filepath.Join(h.dataDir, "agents.json")
 	writeServiceFile(t, h.configPath, providerConfigFile("One"))
-	writeServiceFile(t, agentsPath, `{"early":{"model":"prov/m"}}`)
+	writeAgentDefinitions(t, h.configPath, `{"early":{"model":"prov/m"}}`)
+	enableFixturePlugin(t, h.configPath, "alpha")
 
 	rewrite := func(json.RawMessage) error {
 		writeServiceFile(t, h.configPath, providerConfigFile("Two"))
-		writeServiceFile(t, agentsPath, `{"late":{"model":"prov/m"}}`)
+		writeAgentDefinitions(t, h.configPath, `{"late":{"model":"prov/m"}}`)
+		enableFixturePlugin(t, h.configPath, "alpha")
 		return nil
 	}
-	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, rewrite))
+	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, rewrite), fixtureAgentPlugin())
 
 	first, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
@@ -624,11 +732,8 @@ func TestConfigurationServicePluginValidationRejectsPublication(t *testing.T) {
 		wantSource string
 		wantIs     error
 	}{
-		{name: "unknown plugin ID", config: `{"plugins":{"alpha":{},"ghost":{}}}`, wantSource: "ghost"},
-		{name: "value is not an object", config: `{"plugins":{"alpha":[1]}}`, wantSource: "not a JSON object"},
-		{name: "value is null", config: `{"plugins":{"alpha":null}}`, wantSource: "not a JSON object"},
-		{name: "validator failure", config: `{"plugins":{"alpha":{"x":1}}}`, validate: func(json.RawMessage) error { return sentinel }, wantIs: sentinel},
-		{name: "no-settings violation", config: `{"plugins":{"alpha":{"x":true}}}`, wantSource: "declares no settings validator"},
+		{name: "validator failure", config: `{"extensions":{"alpha":{"enabled":true,"x":1}}}`, validate: func(json.RawMessage) error { return sentinel }, wantIs: sentinel},
+		{name: "no-settings violation", config: `{"extensions":{"alpha":{"enabled":true,"x":true}}}`, wantSource: "declares no settings validator"},
 	} {
 		h := newServiceHarness(t)
 		writeServiceFile(t, h.configPath, row.config)
@@ -647,14 +752,20 @@ func TestConfigurationServicePluginValidationRejectsPublication(t *testing.T) {
 		config   string
 		validate func(json.RawMessage) error
 	}{
-		{name: "absent section passes nil", config: `{}`},
-		{name: "no-settings accepts the empty object", config: `{"plugins":{"alpha":{}}}`},
+		{name: "absent section", config: `{}`},
+		{name: "disabled section", config: `{"extensions":{"alpha":{"enabled":false,"x":[1]},"ghost":{"enabled":true}}}`},
+		{name: "non-object section", config: `{"extensions":{"alpha":[1,2]}}`},
+		{name: "null section", config: `{"extensions":{"alpha":null}}`},
+		{name: "string enabled", config: `{"extensions":{"alpha":{"enabled":"true","invalid":true}}}`},
+		{name: "numeric enabled", config: `{"extensions":{"alpha":{"enabled":1,"invalid":true}}}`},
+		{name: "null enabled", config: `{"extensions":{"alpha":{"enabled":null,"invalid":true}}}`},
+		{name: "no-settings accepts participation flag", config: `{"extensions":{"alpha":{"enabled":true}}}`},
 	} {
 		h := newServiceHarness(t)
 		writeServiceFile(t, h.configPath, row.config)
 		var seen atomic.Pointer[json.RawMessage]
 		validate := row.validate
-		if validate == nil {
+		if validate == nil && row.name != "no-settings accepts participation flag" {
 			validate = func(raw json.RawMessage) error {
 				clone := append(json.RawMessage(nil), raw...)
 				seen.Store(&clone)
@@ -666,10 +777,8 @@ func TestConfigurationServicePluginValidationRejectsPublication(t *testing.T) {
 			_, err := svc.publish(context.Background())
 			testassert.Require(t, err == nil, "%s: publish: %v", row.name, err)
 		}
-		if row.name == "absent section passes nil" {
-			if got := seen.Load(); got == nil || len(*got) != 0 {
-				t.Fatalf("%s: the plugin received %q, want nil", row.name, string(*got))
-			}
+		if row.name != "no-settings accepts participation flag" && seen.Load() != nil {
+			t.Fatalf("%s: inactive validator ran", row.name)
 		}
 		testassert.Require(t, h.opens.Load() == 0, "%s: configuration publication ran a factory", row.name)
 	}
@@ -677,7 +786,7 @@ func TestConfigurationServicePluginValidationRejectsPublication(t *testing.T) {
 
 // pluginsConfigFile is providerConfigFile with one plugin section verbatim.
 func pluginsConfigFile(alpha string) string {
-	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", `{"m":{"name":"One","context_window":100}}`) + `},"plugins":{"alpha":` + alpha + `}}`
+	return `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "", `{"m":{"name":"One","context_window":100}}`) + `},"extensions":{"alpha":` + alpha + `}}`
 }
 
 // TestConfigurationServiceValidatorScratchCannotChangePublication proves the
@@ -688,7 +797,7 @@ func pluginsConfigFile(alpha string) string {
 // candidate notifies nothing while leaving the prior pointer, generation,
 // and retained bytes intact.
 func TestConfigurationServiceValidatorScratchCannotChangePublication(t *testing.T) {
-	const admitted = `{"value":"original"}`
+	const admitted = `{"enabled":true,"value":"original"}`
 	t.Run("in-place scratch never reaches the publication", func(t *testing.T) {
 		h := newServiceHarness(t)
 		writeServiceFile(t, h.configPath, pluginsConfigFile(admitted))
@@ -698,25 +807,25 @@ func TestConfigurationServiceValidatorScratchCannotChangePublication(t *testing.
 		}))
 		pub, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
-		testassert.Require(t, string(pub.snapshot.plugins["alpha"]) == admitted, "published snapshot bytes = %s, want the retained candidate", pub.snapshot.plugins["alpha"])
+		testassert.Require(t, string(pub.snapshot.extensions["alpha"]) == admitted, "published snapshot bytes = %s, want the retained candidate", pub.snapshot.extensions["alpha"])
 		{
 			got := (Invocation{snapshot: pub.snapshot}).Config("alpha")
 			testassert.Require(t, string(got) == admitted, "Invocation.Config = %s, want the retained candidate", got)
 		}
 	})
-	t.Run("absent settings still pass nil through", func(t *testing.T) {
+	t.Run("absent settings skip validator", func(t *testing.T) {
 		h := newServiceHarness(t)
 		writeServiceFile(t, h.configPath, providerConfigFile("One"))
-		sawNil := false
+		called := false
 		svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, func(raw json.RawMessage) error {
-			sawNil = raw == nil
+			called = true
 			return nil
 		}))
 		{
 			_, err := svc.publish(context.Background())
 			testassert.NoError(t, err)
 		}
-		testassert.Require(t, sawNil, "absent settings reached the validator as something other than nil")
+		testassert.Require(t, !called, "absent settings reached the validator")
 	})
 	t.Run("rejected tampering leaves the prior publication intact", func(t *testing.T) {
 		h := newServiceHarness(t)
@@ -746,7 +855,7 @@ func TestConfigurationServiceValidatorScratchCannotChangePublication(t *testing.
 		default:
 		}
 		testassert.Require(t, svc.current() == first.snapshot, "a rejected candidate replaced the prior publication")
-		testassert.Require(t, first.snapshot.generation == 1 && string(first.snapshot.plugins["alpha"]) == admitted, "prior snapshot = generation %d bytes %s, want generation 1 with the retained bytes", first.snapshot.generation, first.snapshot.plugins["alpha"])
+		testassert.Require(t, first.snapshot.generation == 1 && string(first.snapshot.extensions["alpha"]) == admitted, "prior snapshot = generation %d bytes %s, want generation 1 with the retained bytes", first.snapshot.generation, first.snapshot.extensions["alpha"])
 	})
 }
 
@@ -755,7 +864,7 @@ func TestConfigurationServiceValidatorScratchCannotChangePublication(t *testing.
 // and publication, and the context error stays unwrapped.
 func TestConfigurationServiceCancellationBetweenValidatorsStopsTheRest(t *testing.T) {
 	h := newServiceHarness(t)
-	writeServiceFile(t, h.configPath, `{}`)
+	writeServiceFile(t, h.configPath, `{"extensions":{"first":{"enabled":true},"second":{"enabled":true},"third":{"enabled":true}}}`)
 	ctx, cancel := context.WithCancel(context.Background())
 	var lastRan atomic.Bool
 	svc := h.service(context.Background(),
@@ -808,7 +917,7 @@ func TestConfigurationServiceChecksCancellationBeforePublication(t *testing.T) {
 	})
 	t.Run("caller canceled after the last validator", func(t *testing.T) {
 		h := newServiceHarness(t)
-		writeServiceFile(t, h.configPath, `{}`)
+		writeServiceFile(t, h.configPath, `{"extensions":{"alpha":{"enabled":true}}}`)
 		ctx, cancel := context.WithCancel(context.Background())
 		svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, func(json.RawMessage) error {
 			cancel()
@@ -855,7 +964,7 @@ func TestConfigurationServiceChecksCancellationBeforePublication(t *testing.T) {
 	t.Run("owner canceled after the last validator", func(t *testing.T) {
 		owner, cancelOwner := context.WithCancel(context.Background())
 		h := newServiceHarness(t)
-		writeServiceFile(t, h.configPath, `{}`)
+		writeServiceFile(t, h.configPath, `{"extensions":{"alpha":{"enabled":true}}}`)
 		svc := h.service(owner, servicePlugin("alpha", &h.opens, func(json.RawMessage) error {
 			cancelOwner()
 			return nil
@@ -899,6 +1008,7 @@ func (c *firstCheckContext) Err() error {
 func TestConfigurationServiceSerializesBuildsAndRejectsCanceledWaiters(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, providerConfigFile("One"))
+	enableFixturePlugin(t, h.configPath, "alpha")
 	var builds atomic.Int64
 	gate := make(chan struct{})
 	entered := make(chan struct{})
@@ -1014,18 +1124,18 @@ func TestConfigurationServiceGenerationOverflow(t *testing.T) {
 // wholly missing.
 func TestConfigurationServiceKeepsFirstRunSkeletons(t *testing.T) {
 	h := newServiceHarness(t)
-	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, nil))
+	svc := h.service(context.Background(), servicePlugin("agents", &h.opens, acceptValidator))
 	first, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	if configData, err := os.ReadFile(h.configPath); err != nil || string(configData) != mainConfigSkeleton {
 		t.Fatalf("first-run config = %q (%v), want the retained skeleton", string(configData), err)
 	}
-	if agentsData, err := os.ReadFile(filepath.Join(h.dataDir, "agents.json")); err != nil || string(agentsData) != agentsSkeleton {
-		t.Fatalf("first-run agents = %q (%v), want the retained skeleton", string(agentsData), err)
+	if _, err := os.Stat(filepath.Join(h.dataDir, "agents.json")); !os.IsNotExist(err) {
+		t.Fatalf("first-run agents.json: %v, want absent", err)
 	}
 	testassert.Equal(t, len(first.snapshot.definitions), 5)
 
-	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{"plain":{}}`)
+	writeServiceFile(t, h.configPath, `{"extensions":{"agents":{"enabled":true,"definitions":{"plain":{}}}}}`)
 	second, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	{
@@ -1077,7 +1187,7 @@ func TestConfigurationServiceKeepsHomeBasedCachePaths(t *testing.T) {
 	for _, entry := range entries {
 		names = append(names, entry.Name())
 	}
-	testassert.Require(t, strings.Join(names, ",") == "agents.json,config.json", "data directory entries = %q, want only the captured input files", names)
+	testassert.Require(t, strings.Join(names, ",") == "config.json", "data directory entries = %q, want only the main configuration", names)
 }
 
 // TestConfigurationServiceRestartsGenerationWithFreshCaptures proves the
@@ -1239,7 +1349,7 @@ func TestConfigurationServiceUnreadableMainDocumentFailsPublication(t *testing.T
 func TestConfigurationServiceToolDeclarationsStayDeclarative(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, providerConfigFile("One"))
-	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{"worker":{"tools":["tool.x"]}}`)
+	writeAgentDefinitions(t, h.configPath, `{"worker":{"tools":["tool.x"]}}`)
 	describeCalled := false
 	toolPlugin := Plugin{
 		ID:    "tooldecl",
@@ -1253,22 +1363,18 @@ func TestConfigurationServiceToolDeclarationsStayDeclarative(t *testing.T) {
 			return Instance{Values: map[string]any{"tool.x": noopTool{}}}, nil
 		},
 	}
-	svc := h.service(context.Background(), toolPlugin)
+	svc := h.service(context.Background(), toolPlugin, fixtureAgentPlugin())
 	snapshot, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	// The declared tool ID validated the configured reference and produced no
 	// warning.
 	found, _ := hasDefinition(snapshot.snapshot, "worker")
 	testassert.Require(t, found && len(snapshot.snapshot.agentWarnings) == 0, "worker retained = %v with warnings %+v, want the declared tool to validate cleanly", found, snapshot.snapshot.agentWarnings)
-	// An undeclared reference drops the definition with the retained warning.
-	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{"worker":{"tools":["ghost_tool"]}}`)
-	snapshot, err = svc.publish(context.Background())
-	testassert.NoError(t, err)
-	{
-		found, _ := hasDefinition(snapshot.snapshot, "worker")
-		testassert.Require(t, !found, "the unknown tool name did not drop its definition")
-	}
-	testassert.Require(t, len(snapshot.snapshot.agentWarnings) == 1 && snapshot.snapshot.agentWarnings[0].Kind == "invalid_agent_type" && strings.Contains(snapshot.snapshot.agentWarnings[0].Message, "ghost_tool"), "warnings = %+v, want the retained invalid-agent drop naming ghost_tool", snapshot.snapshot.agentWarnings)
+	// An invalid active definition rejects the complete candidate.
+	previous := snapshot.snapshot
+	writeAgentDefinitions(t, h.configPath, `{"worker":{"tools":["ghost_tool"]}}`)
+	_, err = svc.publish(context.Background())
+	testassert.Require(t, errors.Is(err, ErrConfiguration) && strings.Contains(err.Error(), "ghost_tool") && svc.current() == previous, "invalid definition = %v, want rejection without publication", err)
 	testassert.Require(t, !describeCalled, "configuration publication ran the description function")
 	if h.opens.Load() != 0 {
 		t.Fatalf("%d factories ran during configuration publication", h.opens.Load())
@@ -1284,12 +1390,12 @@ func TestConfigurationServiceToolDeclarationsStayDeclarative(t *testing.T) {
 func TestConfigurationServiceProjectsHostSelectedDefaultCapabilities(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, providerConfigFile("One"))
-	writeServiceFile(t, filepath.Join(h.dataDir, "agents.json"), `{
+	writeAgentDefinitions(t, h.configPath, `{
 	  "custom": {},
 	  "clear": {"capabilities": []},
 	  "explicit": {"capabilities": ["capability.alpha"]}
 	}`)
-	svc := h.serviceWithDefaults(context.Background(), []string{"capability.alpha"}, servicePlugin("alpha", &atomic.Int64{}, nil))
+	svc := h.serviceWithDefaults(context.Background(), []string{"capability.alpha"}, servicePlugin("alpha", &atomic.Int64{}, nil), fixtureAgentPlugin())
 	snapshot, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	want := []string{"capability.alpha"}
@@ -1303,9 +1409,9 @@ func TestConfigurationServiceProjectsHostSelectedDefaultCapabilities(t *testing.
 	}
 
 	plain := newServiceHarness(t)
-	writeServiceFile(t, plain.configPath, strings.TrimSuffix(providerConfigFile("One"), "}")+`,"plugins":{"hooks":{"tag":"T"}}}`)
-	writeServiceFile(t, filepath.Join(plain.dataDir, "agents.json"), `{}`)
-	noDefaults := plain.service(context.Background(), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
+	writeServiceFile(t, plain.configPath, strings.TrimSuffix(providerConfigFile("One"), "}")+`,"extensions":{"hooks":{"enabled":true,"tag":"T"}}}`)
+	writeAgentDefinitions(t, plain.configPath, `{}`)
+	noDefaults := plain.service(context.Background(), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}), fixtureAgentPlugin())
 	snapshot, err = noDefaults.publish(context.Background())
 	testassert.NoError(t, err)
 	for _, def := range snapshot.snapshot.definitions {

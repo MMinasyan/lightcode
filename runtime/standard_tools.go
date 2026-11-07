@@ -248,7 +248,7 @@ func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) 
 // nil-tracker read path that always returns the bounded requested content.
 type readTool struct{ inst *standardTools }
 
-func (readTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (readTool) describe(_ Invocation, _ harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "read_file",
@@ -339,7 +339,7 @@ func (in *standardTools) prepareMutation(tc ToolContext, call model.ToolCall, ru
 // writeTool is the write_file tool.
 type writeTool struct{ inst *standardTools }
 
-func (t writeTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (t writeTool) describe(_ Invocation, constraints harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return mutationDescription("write_file", writeFileDescription, writeFileParameters, constraints)
 }
 
@@ -366,7 +366,7 @@ func (t writeTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCal
 // built from the committed normalized arguments and the result.
 type editTool struct{ inst *standardTools }
 
-func (t editTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (t editTool) describe(_ Invocation, constraints harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return mutationDescription("edit_file", editFileDescription, editFileParameters, constraints)
 }
 
@@ -393,7 +393,7 @@ func (t editTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall
 // other selected eligible tool.
 type patchTool struct{ inst *standardTools }
 
-func (t patchTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (t patchTool) describe(_ Invocation, constraints harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return mutationDescription("apply_patch", applyPatchDescription, applyPatchParameters, constraints)
 }
 
@@ -435,7 +435,7 @@ type runCommandTool struct {
 	jobs jobs.Jobs
 }
 
-func (runCommandTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (runCommandTool) describe(_ Invocation, constraints harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	description := runCommandDescription
 	if constraints.Readonly {
 		description = tool.ReadOnlyRunCommandDescription
@@ -698,7 +698,7 @@ func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec
 // execution observes cancellation as an interrupted result.
 type sleepTool struct{}
 
-func (sleepTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (sleepTool) describe(_ Invocation, _ harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "sleep",
@@ -746,7 +746,7 @@ func (sleepTool) Prepare(_ context.Context, _ ToolContext, call model.ToolCall) 
 // (list). The jobs service is its own field.
 type processTool struct{ jobs jobs.Jobs }
 
-func (processTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (processTool) describe(_ Invocation, _ harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "process",
@@ -845,7 +845,7 @@ func isJobID(id string) bool {
 // dir — with a nonempty write dir the Harness confines every write to it, so
 // the tool stays available. The description consumes the hard constraints
 // only; no execution instance is constructed.
-func mutationDescription(name, description, parameters string, constraints ToolConstraints) (ToolDescription, error) {
+func mutationDescription(name, description, parameters string, constraints harness.ToolConstraints) (ToolDescription, error) {
 	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        name,

@@ -14,6 +14,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/prompt"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 const testConfigDocument = `{
@@ -24,10 +25,35 @@ const testConfigDocument = `{
     }
   },
   "sessions": {"auto_archive": false, "archive_after_days": 3},
-  "plugins": {"alpha": {"threshold": 9007199254740993}},
+  "extensions": {"alpha": {"threshold": 9007199254740993}},
   "permissions": {"allow": ["read_file"]},
   "compaction": {"summarizer_provider": "legacy"}
 }`
+
+func TestAgentSelectionProtocolModelConversion(t *testing.T) {
+	for _, row := range []struct {
+		wire protocol.ModelRef
+		ref  model.ModelRef
+	}{
+		{"", model.ModelRef{}},
+		{"provider/part/model", model.ModelRef{Provider: "provider", Model: "part/model"}},
+	} {
+		selection, err := selectionFromProtocol(protocol.AgentSelection{Inputs: &protocol.AgentInputs{Model: row.wire, AssemblyMode: protocol.AgentAssemblyFull}})
+		testassert.NoError(t, err)
+		testassert.Equal(t, selection.Inputs.Model, row.ref)
+		projected := projectAgentSelection(selection)
+		testassert.Equal(t, projected.Inputs.Model, row.wire)
+		data, err := json.Marshal(projected.Inputs)
+		testassert.NoError(t, err)
+		var members map[string]json.RawMessage
+		testassert.NoError(t, json.Unmarshal(data, &members))
+		var rendered string
+		testassert.NoError(t, json.Unmarshal(members["model"], &rendered))
+		testassert.Equal(t, rendered, string(row.wire))
+	}
+	_, err := selectionFromProtocol(protocol.AgentSelection{Inputs: &protocol.AgentInputs{Model: "invalid"}})
+	testassert.Require(t, errors.Is(err, harness.ErrInvalid), "invalid wire model = %v", err)
+}
 
 const testAgentsDocument = `{
   "primary": {"model": "prov/m"},
@@ -86,8 +112,8 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 	// The legacy compaction member is unowned now: unknown members are
 	// ignored and the absent model/prompt keep their defaults.
 	testassert.Require(t, snapshot.compactionValues.model.IsZero() && snapshot.compactionValues.prompt == prompt.DefaultSummarizerPrompt, "compaction values = %+v, want the absent-section defaults", snapshot.compactionValues)
-	plugin, ok := snapshot.plugins["alpha"]
-	testassert.Require(t, ok, "plugins = %+v, want the alpha entry", snapshot.plugins)
+	plugin, ok := snapshot.extensions["alpha"]
+	testassert.Require(t, ok, "extensions = %+v, want the alpha entry", snapshot.extensions)
 	var pluginFields map[string]any
 	decoder := json.NewDecoder(strings.NewReader(string(plugin)))
 	decoder.UseNumber()
@@ -118,10 +144,10 @@ func TestNewConfigurationSnapshot(t *testing.T) {
 // roster, and the legacy whole-document rules (old-shape rejection,
 // permission decoding) never reject the captured bytes.
 func TestNewConfigurationNullAndDefaults(t *testing.T) {
-	for _, doc := range []string{`{}`, `{"sessions":null,"plugins":null,"providers":null}`} {
+	for _, doc := range []string{`{}`, `{"sessions":null,"extensions":null,"providers":null}`} {
 		snapshot, err := assembleConfiguration(1, doc, `null`, nil)
 		testassert.Require(t, err == nil, "newConfiguration(%s): %v", doc, err)
-		testassert.Require(t, snapshot.sessions.AutoArchive && snapshot.sessions.ArchiveAfterDays == 7 && snapshot.sessions.DeleteAfterArchiveDays == 7 && snapshot.plugins == nil, "sessions under %s = %+v, want true/7/7; plugins under %s = %+v, want none", doc, snapshot.sessions, doc, snapshot.plugins)
+		testassert.Require(t, snapshot.sessions.AutoArchive && snapshot.sessions.ArchiveAfterDays == 7 && snapshot.sessions.DeleteAfterArchiveDays == 7 && snapshot.extensions == nil, "sessions under %s = %+v, want true/7/7; extensions under %s = %+v, want none", doc, snapshot.sessions, doc, snapshot.extensions)
 		wantBuiltins := []string{"primary", "secondary", "explore", "review", "compact"}
 		gotNames := make([]string, len(snapshot.definitions))
 		for i, def := range snapshot.definitions {
@@ -148,7 +174,7 @@ func TestNewConfigurationRejectsCandidates(t *testing.T) {
 		{name: "sessions not an object", configData: `{"sessions":5}`, agentsData: `{}`},
 		{name: "sessions day overflow", configData: `{"sessions":{"archive_after_days":106752}}`, agentsData: `{}`},
 		{name: "delete day overflow", configData: `{"sessions":{"delete_after_archive_days":106752}}`, agentsData: `{}`},
-		{name: "plugins not an object", configData: `{"plugins":[]}`, agentsData: `{}`},
+		{name: "extensions not an object", configData: `{"extensions":[]}`, agentsData: `{}`},
 		{name: "agents not an object", configData: `{}`, agentsData: `[]`},
 	} {
 		{
@@ -185,7 +211,7 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 	}
 	testassert.Require(t, reflect.DeepEqual(got, want), "projected roster = %q, want %q", got, want)
 
-	plan, err := harness.ResolveAgentType("plan", types)
+	plan, err := resolveAgentType("plan", types)
 	testassert.NoError(t, err)
 	testassert.Require(t, plan.Model == (model.ModelRef{Provider: "prov", Model: "m"}) && plan.SystemPrompt == "simple" && plan.Prompt == "plan prompt", "plan view = %+v, want the public identity and prompt fields", plan)
 	{
@@ -196,22 +222,22 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 		wantCaps := []string{"cap-b", "cap-a"}
 		testassert.Require(t, reflect.DeepEqual(plan.Capabilities, wantCaps), "plan capabilities = %q, want the selected order", plan.Capabilities)
 	}
-	testassert.Require(t, plan.Readonly && plan.WriteDir == "/tmp/plan" && plan.Subagent && plan.Description == "planner", "plan permission constraints = %v %q, want the definition's readonly true and its write_dir; plan roster fields = subagent %v description %q, want the definition's subagent flag and description", plan.Readonly, plan.WriteDir, plan.Subagent, plan.Description)
-	primaryView, err := harness.ResolveAgentType("primary", types)
+	testassert.Require(t, plan.Readonly && plan.WriteDir == "/tmp/plan", "plan permission constraints = %v %q", plan.Readonly, plan.WriteDir)
+	primaryView, err := resolveAgentType("primary", types)
 	testassert.NoError(t, err)
-	testassert.Require(t, !primaryView.Readonly && primaryView.WriteDir == "" && !primaryView.Subagent && primaryView.Description == "", "primary permission constraints = %v %q, want the unset defaults; primary roster fields = subagent %v description %q, want the unset defaults", primaryView.Readonly, primaryView.WriteDir, primaryView.Subagent, primaryView.Description)
+	testassert.Require(t, !primaryView.Readonly && primaryView.WriteDir == "", "primary permission constraints = %v %q", primaryView.Readonly, primaryView.WriteDir)
 
 	// WriteDir is trimmed exactly once at projection, preserving the legacy
 	// whitespace-as-unset behavior: padded paths arrive clean and a
 	// whitespace-only path arrives as unset.
 	padded, err := assembleConfiguration(4, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "  /tmp/plan  "`, 1), testCapabilities())
 	testassert.NoError(t, err)
-	paddedPlan, err := harness.ResolveAgentType("plan", padded.agentTypes())
+	paddedPlan, err := resolveAgentType("plan", padded.agentTypes())
 	testassert.NoError(t, err)
 	testassert.Equal(t, paddedPlan.WriteDir, "/tmp/plan")
 	blank, err := assembleConfiguration(5, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "   "`, 1), testCapabilities())
 	testassert.NoError(t, err)
-	blankPlan, err := harness.ResolveAgentType("plan", blank.agentTypes())
+	blankPlan, err := resolveAgentType("plan", blank.agentTypes())
 	testassert.NoError(t, err)
 	testassert.Equal(t, blankPlan.WriteDir, "")
 
@@ -219,11 +245,11 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 	// explore inherits primary's tools with no capability selection of its
 	// own, so declared-but-unselected IDs never appear in it. The inherited
 	// default tools are intersected with the compiled tool universe.
-	explore, err := harness.ResolveAgentType("explore", types)
+	explore, err := resolveAgentType("explore", types)
 	testassert.NoError(t, err)
 	testassert.Require(t, explore.Model == plan.Model && explore.Capabilities == nil && reflect.DeepEqual(explore.Tools, []string{"read_file"}), "explore view = %+v, want the inherited model, an empty selection and the intersected default tools", explore)
 	{
-		_, err := harness.ResolveAgentType("not-loaded", types)
+		_, err := resolveAgentType("not-loaded", types)
 		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "unknown selection = %v, want ErrInvalid", err)
 	}
 
@@ -231,7 +257,7 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 	// snapshot or a later projection of the same snapshot.
 	plan.Tools[0] = "tampered"
 	plan.Capabilities[0] = "tampered"
-	again, err := harness.ResolveAgentType("plan", snapshot.agentTypes())
+	again, err := resolveAgentType("plan", snapshot.agentTypes())
 	testassert.NoError(t, err)
 	testassert.Require(t, again.Tools[0] == "plan_tool" && again.Capabilities[0] == "cap-b", "projection aliases the snapshot storage: %+v", again)
 }
@@ -243,7 +269,7 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 func TestInvocationAgentTypesReturnsOwnedRoster(t *testing.T) {
 	inv := Invocation{snapshot: testSnapshot(t)}
 
-	roster := inv.AgentTypes()
+	var roster []protocol.Agent = inv.AgentTypes()
 	want := []string{"primary", "secondary", "explore", "review", "compact", "plan"}
 	got := make([]string, len(roster))
 	for i, at := range roster {

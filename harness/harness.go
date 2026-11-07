@@ -36,8 +36,8 @@ type Dependencies struct {
 // PreparationSession is the revision-free owned Session view one preparation
 // receives.
 type PreparationSession struct {
-	Identity  SessionIdentity
-	AgentType string
+	Identity       SessionIdentity
+	AgentSelection AgentSelection
 }
 
 // PreparationRequest is the input of one preparation call.
@@ -322,8 +322,8 @@ type PreparedTool struct {
 
 // CreateSessionRequest is the input of one root Session creation.
 type CreateSessionRequest struct {
-	Workspace string
-	AgentType string
+	Workspace      string
+	AgentSelection AgentSelection
 }
 
 // SubmitRequest is the input of one public Session message submission.
@@ -467,8 +467,8 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 	if err := validateWorkspace(req.Workspace); err != nil {
 		return SessionRecord{}, invalidInput("workspace: %v", err)
 	}
-	if req.AgentType == "" {
-		return SessionRecord{}, invalidInput("agent type must be non-empty")
+	if err := validateAgentSelection(req.AgentSelection); err != nil {
+		return SessionRecord{}, invalidInput("agent selection: %v", err)
 	}
 	sessionID, err := newHexID()
 	if err != nil {
@@ -478,10 +478,10 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 	record := SessionRecord{
 		Identity: SessionIdentity{SessionID: sessionID, Workspace: req.Workspace, CreatedAt: now},
 		State: SessionState{
-			Lifecycle:        LifecycleOpen,
-			CurrentAgentType: req.AgentType,
-			Usage:            UsageTotals{},
-			LastActivity:     now,
+			Lifecycle:      LifecycleOpen,
+			AgentSelection: ownAgentSelection(req.AgentSelection),
+			Usage:          UsageTotals{},
+			LastActivity:   now,
 		},
 	}
 	payload, err := encodeSessionRegister(record)
@@ -538,10 +538,32 @@ func (h *Harness) ReadOperation(ctx context.Context, sessionID, operationID stri
 // ChangeAgentType changes the current Agent type of an open Session. It
 // preserves identity, usage, history, and last activity, and never alters an
 // active Operation's admission capture.
-func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType string) (SessionRecord, error) {
-	if agentType == "" {
-		return SessionRecord{}, invalidInput("agent type must be non-empty")
+func (h *Harness) ChangeAgentType(ctx context.Context, sessionID string, selection AgentSelection) (SessionRecord, error) {
+	if err := validateAgentSelection(selection); err != nil {
+		return SessionRecord{}, invalidInput("agent selection: %v", err)
 	}
+	selection = ownAgentSelection(selection)
+	return h.changeSelection(ctx, sessionID, func(AgentSelection) (AgentSelection, error) {
+		return selection, nil
+	})
+}
+
+// SetSessionModel changes only a resolved selection's model for later admissions.
+func (h *Harness) SetSessionModel(ctx context.Context, sessionID string, ref model.ModelRef) (SessionRecord, error) {
+	if (ref.Provider == "") != (ref.Model == "") {
+		return SessionRecord{}, invalidInput("model must be wholly empty or complete")
+	}
+	return h.changeSelection(ctx, sessionID, func(current AgentSelection) (AgentSelection, error) {
+		if current.Inputs == nil {
+			return AgentSelection{}, fmt.Errorf("selection is not resolved: %w", ErrConflict)
+		}
+		current = ownAgentSelection(current)
+		current.Inputs.Model = ref
+		return current, nil
+	})
+}
+
+func (h *Harness) changeSelection(ctx context.Context, sessionID string, update func(AgentSelection) (AgentSelection, error)) (SessionRecord, error) {
 	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return SessionRecord{}, err
@@ -580,7 +602,10 @@ func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType stri
 				return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, sessionID, expected, reg.Revision)
 			}
 			state := current.State
-			state.CurrentAgentType = agentType
+			state.AgentSelection, err = update(state.AgentSelection)
+			if err != nil {
+				return err
+			}
 			changed := SessionRecord{Identity: current.Identity, State: state}
 			payload, err := encodeSessionRegister(changed)
 			if err != nil {
@@ -1489,8 +1514,8 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 	c.mu.Unlock()
 
 	prepared, capture, prepCtx, cleanup, err := h.prepareExecution(ctx, PreparationSession{
-		Identity:  view.Identity,
-		AgentType: view.State.CurrentAgentType,
+		Identity:       view.Identity,
+		AgentSelection: view.State.AgentSelection,
 	}, req.Kind)
 	if err != nil {
 		return OperationRecord{}, nil, "", err
@@ -1513,9 +1538,9 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 }
 
 // prepareExecution is the shared outside-lock preparation and validation of
-// one admission producer, used by normal admission and Fork alike: it merges
+// one admission producer, used by normal admission, Fork, and child launch: it merges
 // the caller context with the Harness context, invokes the single preparation
-// callback, requires a non-nil opener and a valid capture, and returns the
+// callback with an owned selection, requires a non-nil opener and a valid capture, and returns the
 // prepared execution with its owned durable capture plus the combined context
 // and its cleanup. A preparation failure returns with the combined context
 // already cleaned up; on success the caller keeps it live through publication
@@ -1539,6 +1564,7 @@ func (h *Harness) prepareExecution(ctx context.Context, session PreparationSessi
 		cleanup()
 		return PreparedExecution{}, ExecutionCapture{}, nil, nil, h.ctx.Err()
 	}
+	session.AgentSelection = ownAgentSelection(session.AgentSelection)
 	prepared, prepErr := h.deps.Prepare(prepCtx, PreparationRequest{
 		Session:     session,
 		RequestKind: kind,
@@ -1714,12 +1740,12 @@ func produceAdmission(tx Transaction, session SessionRecord, capture ExecutionCa
 		now := time.Now().UTC()
 		record := OperationRecord{
 			Admission: OperationAdmission{
-				SessionID:   req.SessionID,
-				OperationID: req.OperationID,
-				RequestKind: req.Kind,
-				AgentType:   session.State.CurrentAgentType,
-				Execution:   capture,
-				AdmittedAt:  now,
+				SessionID:      req.SessionID,
+				OperationID:    req.OperationID,
+				RequestKind:    req.Kind,
+				AgentSelection: ownAgentSelection(session.State.AgentSelection),
+				Execution:      capture,
+				AdmittedAt:     now,
 			},
 			State: OperationCurrentState{
 				Status:           OperationRunning,
@@ -1782,13 +1808,13 @@ func produceAdmission(tx Transaction, session SessionRecord, capture ExecutionCa
 	}
 	record := OperationRecord{
 		Admission: OperationAdmission{
-			SessionID:     req.SessionID,
-			OperationID:   req.OperationID,
-			RequestKind:   req.Kind,
-			AdmittedEntry: EntryRef{SessionID: req.SessionID, EntryID: entryID},
-			AgentType:     session.State.CurrentAgentType,
-			Execution:     capture,
-			AdmittedAt:    inserted.CommittedAt,
+			SessionID:      req.SessionID,
+			OperationID:    req.OperationID,
+			RequestKind:    req.Kind,
+			AdmittedEntry:  EntryRef{SessionID: req.SessionID, EntryID: entryID},
+			AgentSelection: ownAgentSelection(session.State.AgentSelection),
+			Execution:      capture,
+			AdmittedAt:     inserted.CommittedAt,
 		},
 		State: OperationCurrentState{
 			Status:           OperationRunning,
@@ -2114,6 +2140,7 @@ func ownUsageTotals(t UsageTotals) UsageTotals {
 // ownSessionRecord returns an independent owned copy of one Session record.
 func ownSessionRecord(rec SessionRecord) SessionRecord {
 	out := rec
+	out.State.AgentSelection = ownAgentSelection(rec.State.AgentSelection)
 	if rec.State.ArchivedAt != nil {
 		stamped := *rec.State.ArchivedAt
 		out.State.ArchivedAt = &stamped
@@ -2125,6 +2152,7 @@ func ownSessionRecord(rec SessionRecord) SessionRecord {
 // ownOperationRecord returns an independent owned copy of one Operation record.
 func ownOperationRecord(rec OperationRecord) OperationRecord {
 	out := rec
+	out.Admission.AgentSelection = ownAgentSelection(rec.Admission.AgentSelection)
 	out.Admission.Execution = ownCapture(rec.Admission.Execution)
 	out.State.Usage = ownUsageTotals(rec.State.Usage)
 	out.State.PendingToolCalls = make([]PendingToolCall, len(rec.State.PendingToolCalls))

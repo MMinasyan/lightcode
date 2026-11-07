@@ -510,7 +510,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 	t.Run("create", func(t *testing.T) {
 		h := newTestHarness(t, emptyStore(t), nil)
 		col := observeHarness(h)
-		created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+		created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 		testassert.NoError(t, err)
 		facts := col.invalidations()
 		testassert.Equal(t, len(facts), 1)
@@ -521,7 +521,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), nil)
 		col := observeHarness(h)
 		{
-			_, err := h.ChangeAgentType(context.Background(), testSessionID, "planner")
+			_, err := h.ChangeAgentType(context.Background(), testSessionID, testSelection("planner"))
 			testassert.NoError(t, err)
 		}
 		{
@@ -1524,7 +1524,7 @@ func TestObserveRematerializationNoHint(t *testing.T) {
 	col := observeHarness(h)
 	advanceSessionRevision(t, store, testSessionID) // the foreign writer
 	{
-		_, err := h.ChangeAgentType(context.Background(), testSessionID, "planner")
+		_, err := h.ChangeAgentType(context.Background(), testSessionID, testSelection("planner"))
 		testassert.Require(t, errors.Is(err, ErrConflict), "foreign-revision change = %v, want the conflict class", err)
 	}
 	{
@@ -1583,7 +1583,7 @@ func TestObserveRestartNoReplay(t *testing.T) {
 		testassert.Require(t, len(got) == 0, "the new owner's reads replayed %+v", got)
 	}
 	{
-		_, err := restarted.ChangeAgentType(context.Background(), testSessionID, "planner")
+		_, err := restarted.ChangeAgentType(context.Background(), testSessionID, testSelection("planner"))
 		testassert.NoError(t, err)
 	}
 	{

@@ -283,7 +283,7 @@ type SessionIdentity struct {
 type SessionState struct {
 	Lifecycle          SessionLifecycle `json:"lifecycle"`
 	ArchivedAt         *time.Time       `json:"archived_at,omitempty"`
-	CurrentAgentType   string           `json:"current_agent_type"`
+	AgentSelection     AgentSelection   `json:"agent_selection"`
 	CurrentOperationID string           `json:"current_operation_id,omitempty"`
 	CheckpointEntryID  string           `json:"checkpoint_entry_id,omitempty"`
 	Usage              UsageTotals      `json:"usage"`
@@ -302,13 +302,13 @@ type SessionRecord struct {
 // OperationAdmission is the immutable admission section of one Operation
 // register. It is the sole durable Agent-type field for its Operation.
 type OperationAdmission struct {
-	SessionID     string           `json:"session_id"`
-	OperationID   string           `json:"operation_id"`
-	RequestKind   RequestKind      `json:"request_kind"`
-	AdmittedEntry EntryRef         `json:"admitted_entry"`
-	AgentType     string           `json:"agent_type"`
-	Execution     ExecutionCapture `json:"execution"`
-	AdmittedAt    time.Time        `json:"admitted_at"`
+	SessionID      string           `json:"session_id"`
+	OperationID    string           `json:"operation_id"`
+	RequestKind    RequestKind      `json:"request_kind"`
+	AdmittedEntry  EntryRef         `json:"admitted_entry"`
+	AgentSelection AgentSelection   `json:"agent_selection"`
+	Execution      ExecutionCapture `json:"execution"`
+	AdmittedAt     time.Time        `json:"admitted_at"`
 }
 
 // ActiveEffect names the one in-flight effect of a running Operation and the

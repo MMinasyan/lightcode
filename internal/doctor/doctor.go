@@ -7,9 +7,11 @@
 package doctor
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 
 	agentcfg "github.com/MMinasyan/lightcode/internal/agents"
@@ -43,15 +45,17 @@ type Report struct {
 // Params carries the environmental inputs so Run stays free of
 // process-global reads that tests cannot control.
 type Params struct {
-	Home          string // user home dir; ignored when HomeErr is set
-	HomeErr       error
-	ConfigPath    string // resolved config path; ignored when ConfigPathErr is set
-	ConfigPathErr error
-	WorkDir       string // project lookup key (the process cwd)
-	BinaryPath    string
-	Version       string
-	Platform      string
-	LookupEnv     func(string) (string, bool) // process env; os.LookupEnv in production
+	Home                  string // user home dir; ignored when HomeErr is set
+	HomeErr               error
+	ConfigPath            string // resolved config path; ignored when ConfigPathErr is set
+	ConfigPathErr         error
+	WorkDir               string // project lookup key (the process cwd)
+	BinaryPath            string
+	Version               string
+	Platform              string
+	LookupEnv             func(string) (string, bool) // process env; os.LookupEnv in production
+	InstalledExtensions   []string
+	InstalledCapabilities []string
 }
 
 // Run executes every check group. The second result reports that no
@@ -161,21 +165,28 @@ func dataChecks(p Params, dataDir string, checks *[]Check, add func(group, name,
 			add("data", "config", StatusOK, p.ConfigPath)
 		}
 
-		agentsPath := agentcfg.PathForConfig(p.ConfigPath)
-		if _, err := os.Stat(agentsPath); os.IsNotExist(err) {
-			if parsed, parseErr := agentcfg.ParseWithCapabilities([]byte("{}"), nil, agentcfg.StandardTools, nil); parseErr == nil {
-				agentsCfg = parsed
+		if cfg != nil && slices.Contains(p.InstalledExtensions, "agents") && config.SectionEnabled(cfg.Extensions["agents"]) {
+			var section struct {
+				Definitions json.RawMessage `json:"definitions"`
 			}
-			add("data", "agents", StatusOK, "agents.json: not created yet (created on first run)")
-		} else if err != nil {
-			add("data", "agents", StatusFail, err.Error())
-		} else if data, err := os.ReadFile(agentsPath); err != nil {
-			add("data", "agents", StatusFail, err.Error())
-		} else if parsed, err := agentcfg.ParseWithCapabilities(data, nil, agentcfg.StandardTools, nil); err != nil {
-			add("data", "agents", StatusFail, err.Error())
-		} else {
-			agentsCfg = parsed
-			add("data", "agents", StatusOK, agentsPath)
+			if err := json.Unmarshal(cfg.Extensions["agents"], &section); err != nil {
+				add("data", "agents", StatusFail, err.Error())
+			} else {
+				data := section.Definitions
+				if len(data) == 0 {
+					data = json.RawMessage("{}")
+				}
+				capabilities := append(append([]string(nil), agentcfg.StandardTools...), p.InstalledCapabilities...)
+				parsed, err := agentcfg.ParseWithCapabilities(data, capabilities, agentcfg.StandardTools, p.InstalledCapabilities)
+				if err != nil {
+					add("data", "agents", StatusFail, err.Error())
+				} else if warnings := parsed.Warnings(); len(warnings) != 0 {
+					add("data", "agents", StatusFail, warnings[0].Error())
+				} else {
+					agentsCfg = parsed
+					add("data", "agents", StatusOK, "extensions.agents")
+				}
+			}
 		}
 	}
 
