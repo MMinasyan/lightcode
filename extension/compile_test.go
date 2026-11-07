@@ -569,14 +569,13 @@ func TestFixedEffectfulHookSchemaCoversTerminalFailure(t *testing.T) {
 // malformed tail both fail for every actual consumer, while a trailing
 // whitespace-only tail remains valid.
 func TestJSONAcceptanceRequiresSingleValueEOF(t *testing.T) {
-	methods := map[string]*methodContract{}
 	compiled, err := Compile([]Native{testNative("ext", LifetimeHarness, []Capability{ServiceCapability("service", "test.eof",
 		ServiceMethod("call", ModeServiceIO, `{"type":"object"}`, `{"type":"object"}`, `{"type":"object"}`, `{"type":"object"}`))}, nil, nil)})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
 	service, _ := compiled.Capability("service")
-	methods = service.Methods
+	methods := service.Methods
 	for _, tail := range []string{" {}", " null", ` 1`, " ]", `{"x":`} {
 		section := `{"enabled":true}` + tail
 		if err := compiled.ValidateSection("ext", json.RawMessage(section)); err == nil {
