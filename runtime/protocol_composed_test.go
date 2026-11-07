@@ -28,9 +28,9 @@ import (
 
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/extension"
+	"github.com/MMinasyan/lightcode/extensions/adaptation"
 	"github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"

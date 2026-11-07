@@ -10,8 +10,8 @@ package builtin
 
 import (
 	"github.com/MMinasyan/lightcode/extension"
+	"github.com/MMinasyan/lightcode/extensions/adaptation"
 	"github.com/MMinasyan/lightcode/extensions/agents"
-	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
 )
 
 // Plugins returns the shipped registration set in registration order.

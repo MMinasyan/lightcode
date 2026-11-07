@@ -9,7 +9,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
+	"github.com/MMinasyan/lightcode/extensions/adaptation"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/runtime"

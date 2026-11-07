@@ -133,6 +133,7 @@ func SubmitForTest(ctx context.Context, r *Runtime, sessionID, operationID, text
 	return err
 }
 
-// ShippedAdaptationPlugin supplies the shipped adaptation plugin to in-package
-// tests, which cannot import it without an import cycle.
+// ShippedAdaptationPlugin supplies the shipped adaptation plugin to
+// in-package tests, which receive it from the external composition test's
+// init assignment.
 var ShippedAdaptationPlugin func() extension.Native
