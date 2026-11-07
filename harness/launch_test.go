@@ -702,6 +702,7 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 	testassert.Require(t, op.State.Status == OperationRunning && op.Admission.RequestKind == RequestKindMessage && op.Admission.AgentSelection.Definition.DefinitionID == "child-agent", "durable child operation = %+v, want the running plugin admission", op)
 	capture := op.Admission.Execution
 	want := testCapture()
+	want.InitialToolNames = []string{"echo"} // the accepted nil default materializes to every captured eligible tool
 	testassert.Require(t, reflect.DeepEqual(capture, want), "durable child capture = %+v, want the sentinel capture %+v", capture, want)
 	graph, err := validateFixture(t, store, res.ChildSessionID)
 	testassert.NoError(t, err)

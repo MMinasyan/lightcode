@@ -14,9 +14,10 @@ func suppliedDefinition(name string) harness.AgentSelection {
 }
 
 func defaultAgentSelection() harness.AgentSelection {
-	tools := make([]string, 0, len(standardToolSpecs()))
-	for _, spec := range standardToolSpecs() {
-		tools = append(tools, spec.id)
+	declarations := standardToolDeclarations()
+	tools := make([]string, 0, len(declarations))
+	for _, declaration := range declarations {
+		tools = append(tools, declaration.id)
 	}
 	return harness.AgentSelection{Inputs: &harness.AgentInputs{AssemblyMode: "full", Tools: tools}}
 }

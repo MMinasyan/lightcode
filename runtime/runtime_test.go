@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -147,7 +148,7 @@ func (e *ownerEnv) fixtureJobs(service jobsService) {
 	e.t.Cleanup(func() { newJobs = previous })
 }
 
-func (e *ownerEnv) options(plugins ...Plugin) options {
+func (e *ownerEnv) options(natives ...extension.Native) options {
 	data, _ := os.ReadFile(e.configPath)
 	var doc struct {
 		Extensions map[string]json.RawMessage `json:"extensions"`
@@ -155,17 +156,17 @@ func (e *ownerEnv) options(plugins ...Plugin) options {
 	_ = json.Unmarshal(data, &doc)
 	if sectionEnabled(doc.Extensions["agents"]) {
 		found := false
-		for _, plugin := range plugins {
-			found = found || plugin.ID == "agents"
+		for _, native := range natives {
+			found = found || native.Declaration.ID == "agents"
 		}
 		if !found {
-			plugins = append(plugins, servicePlugin("agents", &atomic.Int64{}, acceptValidator))
+			natives = append(natives, fixtureAgentPlugin())
 		}
 	}
-	return options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins}
+	return options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: natives}
 }
 
-func (e *ownerEnv) open(ctx context.Context, plugins ...Plugin) (*Runtime, error) {
+func (e *ownerEnv) open(ctx context.Context, plugins ...extension.Native) (*Runtime, error) {
 	e.t.Helper()
 	return open(ctx, e.options(plugins...))
 }
@@ -173,7 +174,7 @@ func (e *ownerEnv) open(ctx context.Context, plugins ...Plugin) (*Runtime, error
 // openSwept opens one Runtime with a test-driven sweep clock: the returned
 // channel is the only tick source, so the automatic lifecycle sweep never runs
 // until a test sends.
-func (e *ownerEnv) openSwept(ctx context.Context, plugins ...Plugin) (*Runtime, chan time.Time, error) {
+func (e *ownerEnv) openSwept(ctx context.Context, plugins ...extension.Native) (*Runtime, chan time.Time, error) {
 	e.t.Helper()
 	ticks := make(chan time.Time)
 	opts := e.options(plugins...)
@@ -186,74 +187,67 @@ func (e *ownerEnv) openSwept(ctx context.Context, plugins ...Plugin) (*Runtime, 
 // exactly as harness.Storage: an ordinary capability export the owner never
 // consumes. Its Close records the disposal event only; the test retains the
 // store itself.
-func (e *ownerEnv) corePlugin(id, exportID string, value any, closeFn func() error) Plugin {
-	return Plugin{
-		ID:       id,
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[harness.Storage](exportID)},
-		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
-			e.scopeDataDir.Store(info.DataDir)
-			e.events.add("open:" + id)
-			return Instance{Values: map[string]any{exportID: value}, Close: closeFn}, nil
-		},
-	}
+func (e *ownerEnv) corePlugin(id, exportID string, _ any, closeFn func() error) extension.Native {
+	capability := testServiceCapability(exportID)
+	return testNative(id, extension.LifetimeHarness, []extension.Capability{capability}, nil, func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
+		e.scopeDataDir.Store(info.DataDir)
+		e.events.add("open:" + id)
+		instance := extension.Instance{Capabilities: map[string]extension.Implementation{exportID: testServiceImplementation()}}
+		if closeFn != nil {
+			instance.Close = func(context.Context, extension.CallContext) error {
+				e.events.add("close:" + id)
+				return closeFn()
+			}
+		}
+		return instance, nil
+	})
 }
 
 // ordinaryPlugin provides one value capability and records its construction
 // and disposal order.
-func (e *ownerEnv) ordinaryPlugin(id string, scope ScopeKind, providesID string, requires ...CapabilitySpec) Plugin {
-	return Plugin{
-		ID:       id,
-		Scope:    scope,
-		Provides: []CapabilitySpec{Spec[any](providesID)},
-		Requires: requires,
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			e.events.add("open:" + id)
-			return Instance{
-				Values: map[string]any{providesID: id},
-				Close:  func() error { e.events.add("close:" + id); return nil },
-			}, nil
-		},
-	}
+func (e *ownerEnv) ordinaryPlugin(id string, scope ScopeKind, providesID string, requires ...extension.Binding) extension.Native {
+	capability := testServiceCapability(providesID)
+	return testNative(id, scope.lifetime(), []extension.Capability{capability}, requires, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		e.events.add("open:" + id)
+		return extension.Instance{
+			Capabilities: map[string]extension.Implementation{providesID: testServiceImplementation()},
+			Close: func(context.Context, extension.CallContext) error {
+				e.events.add("close:" + id)
+				return nil
+			},
+		}, nil
+	})
 }
 
 // countedPlugin is one ordinary plugin whose Open returns each construction
 // number on a buffered signal.
-func (e *ownerEnv) countedPlugin(id string, scope ScopeKind, providesID string, opens chan<- int64) Plugin {
+func (e *ownerEnv) countedPlugin(id string, scope ScopeKind, providesID string, opens chan<- int64) extension.Native {
 	var count atomic.Int64
-	return Plugin{
-		ID:       id,
-		Scope:    scope,
-		Provides: []CapabilitySpec{Spec[any](providesID)},
-		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
-			e.scopeWorkspace.Store(info.Workspace)
-			e.events.add("open:" + id)
-			opens <- count.Add(1)
-			return Instance{Values: map[string]any{providesID: id}}, nil
-		},
-	}
+	capability := testServiceCapability(providesID)
+	return testNative(id, scope.lifetime(), []extension.Capability{capability}, nil, func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
+		e.scopeWorkspace.Store(info.Scope.Workspace)
+		e.events.add("open:" + id)
+		opens <- count.Add(1)
+		return extension.Instance{Capabilities: map[string]extension.Implementation{providesID: testServiceImplementation()}}, nil
+	})
 }
 
 // sqliteDerivationPlugin opens lightcode.db under the ScopeInfo DataDir it
 // receives, proving the same normalized owner root reaches the factory.
-func (e *ownerEnv) sqliteDerivationPlugin() Plugin {
-	return Plugin{
-		ID:       "db",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[harness.Storage]("session_store")},
-		Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
-			e.scopeDataDir.Store(info.DataDir)
-			e.events.add("open:db")
-			store, err := storage.OpenSQLite(filepath.Join(info.DataDir, "lightcode.db"))
-			if err != nil {
-				return Instance{}, err
-			}
-			return Instance{
-				Values: map[string]any{"session_store": store},
-				Close:  func() error { e.events.add("close:db"); return store.Close() },
-			}, nil
-		},
-	}
+func (e *ownerEnv) sqliteDerivationPlugin() extension.Native {
+	capability := testServiceCapability("session_store")
+	return testNative("db", extension.LifetimeHarness, []extension.Capability{capability}, nil, func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
+		e.scopeDataDir.Store(info.DataDir)
+		e.events.add("open:db")
+		store, err := storage.OpenSQLite(filepath.Join(info.DataDir, "lightcode.db"))
+		if err != nil {
+			return extension.Instance{}, err
+		}
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"session_store": testServiceImplementation()}, Close: func(context.Context, extension.CallContext) error {
+			e.events.add("close:db")
+			return store.Close()
+		}}, nil
+	})
 }
 
 // gatedValidator is one plugin settings validator a test can arm to park a
@@ -333,7 +327,7 @@ func (s *failingListStore) ListSessionIDs(context.Context) ([]string, error) { r
 // non-nil while its dynamic pointer is nil.
 type nilStorage struct{ harness.Storage }
 
-func wantFailedOpen(t *testing.T, e *ownerEnv, plugins []Plugin, wantIs error) {
+func wantFailedOpen(t *testing.T, e *ownerEnv, plugins []extension.Native, wantIs error) {
 	t.Helper()
 	r, err := e.open(context.Background(), plugins...)
 	testassert.Require(t, r == nil, "failed construction returned a non-nil Runtime with error %v", err)
@@ -479,7 +473,7 @@ func seedRunningOperation(t *testing.T, store harness.Storage, workspace string)
 					}
 					return harness.Execution{OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
 						return harness.InvocationExecution{
-							NormalizeTool: runtimeNormalize,
+							NormalizeTool: runtimeNormalizeContext,
 							Model:         modelFn,
 							Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 								return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "seeded"}}}
@@ -547,7 +541,7 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		r, err := open(context.Background(), options{
 			DataDir:    relData,
 			ConfigPath: filepath.Join(relData, "config.json"),
-			Plugins:    []Plugin{e.sqliteDerivationPlugin()},
+			Plugins:    []extension.Native{e.sqliteDerivationPlugin()},
 		})
 		testassert.NoError(t, err)
 		{
@@ -713,7 +707,7 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		duplicateA := e.ordinaryPlugin("same", ScopeRuntime, "a.cap")
 		duplicateB := e.ordinaryPlugin("same", ScopeRuntime, "b.cap")
 		e.fixtureStore(storage.NewMemory())
-		wantFailedOpen(t, e, []Plugin{duplicateA, duplicateB}, ErrComposition)
+		wantFailedOpen(t, e, []extension.Native{duplicateA, duplicateB}, ErrComposition)
 		testassert.Require(t, len(e.events.all()) == 0, "invalid active graph ran a factory: %v", e.events.all())
 		e.assertLockReleased(t)
 	})
@@ -736,13 +730,13 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		enableFixturePlugin(t, e.configPath, "first")
 		enableFixturePlugin(t, e.configPath, "failing")
 		failing := e.ordinaryPlugin("failing", ScopeRuntime, "failing.cap")
-		failing.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		failing.Open = func(context.Context, extension.InstanceContext) (extension.Instance, error) {
 			e.events.add("open:failing")
-			return Instance{}, errFactory
+			return extension.Instance{}, errFactory
 		}
 		e.fixtureStore(storage.NewMemory())
 		e.fixtureJobs(&stubStopper{events: e.events})
-		wantFailedOpen(t, e, []Plugin{e.ordinaryPlugin("first", ScopeRuntime, "first.cap"), failing}, errFactory)
+		wantFailedOpen(t, e, []extension.Native{e.ordinaryPlugin("first", ScopeRuntime, "first.cap"), failing}, errFactory)
 		// Reverse acquisition order: the constructed scope's instances, then the
 		// jobs work group joining, then the store closing; the failing factory
 		// disposed nothing, and the ownership lock — which carries no event —
@@ -785,19 +779,19 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		defer cancel()
 		arrive := make(chan struct{}, 1)
 		first := e.ordinaryPlugin("signalled", ScopeRuntime, "signalled.cap")
-		first.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		first.Open = func(context.Context, extension.InstanceContext) (extension.Instance, error) {
 			e.events.add("open:signalled")
 			select {
 			case arrive <- struct{}{}:
 			default:
 			}
-			return Instance{Values: map[string]any{"signalled.cap": "signalled"}, Close: func() error { e.events.add("close:signalled"); return nil }}, nil
+			return serviceInstance("signalled.cap", func() error { e.events.add("close:signalled"); return nil }), nil
 		}
 		second := e.ordinaryPlugin("waiting", ScopeRuntime, "waiting.cap")
-		second.Open = func(ctx context.Context, _ ScopeInfo, _ Bindings) (Instance, error) {
+		second.Open = func(ctx context.Context, _ extension.InstanceContext) (extension.Instance, error) {
 			<-ctx.Done()
 			e.events.add("open:waiting")
-			return Instance{}, ctx.Err()
+			return extension.Instance{}, ctx.Err()
 		}
 		go func() {
 			<-arrive
@@ -823,12 +817,17 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 	t.Run("cancellation during the initial publication reports the constructor context error", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
-		validator := &gatedValidator{}
+		arrive := make(chan struct{})
+		release := make(chan struct{})
+		var barrierOnce sync.Once
+		candidateBarrier = func() {
+			barrierOnce.Do(func() { close(arrive) })
+			<-release
+		}
+		t.Cleanup(func() { candidateBarrier = nil })
 		gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
-		gate.ValidateConfig = validator.ValidateConfig
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		arrive := validator.arm()
 		type outcome struct {
 			r   *Runtime
 			err error
@@ -841,7 +840,7 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 		}()
 		<-arrive
 		cancel()
-		validator.release()
+		close(release)
 		var got outcome
 		select {
 		case got = <-done:
@@ -853,55 +852,6 @@ func TestRuntimeStartupFailuresUnwindAcquiredResources(t *testing.T) {
 			events := e.events.all()
 			testassert.Require(t, len(events) == 0, "factory events = %v, want the publication rejection to precede any factory", events)
 		}
-		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
-		e.assertLockReleased(t)
-	})
-
-	t.Run("an ErrClosed source identity survives without cancellation", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
-		gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
-		gate.ValidateConfig = func(json.RawMessage) error { return ErrClosed }
-		e.fixtureStore(storage.NewMemory())
-		wantFailedOpen(t, e, []Plugin{gate}, ErrClosed)
-		{
-			events := e.events.all()
-			testassert.Require(t, len(events) == 0, "factory events = %v, want the validator rejection preserved before any factory", events)
-		}
-		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
-		e.assertLockReleased(t)
-	})
-
-	t.Run("a wrapped ErrClosed source survives cancellation at the publication boundary", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
-		errValidator := fmt.Errorf("test validator unavailable: %w", ErrClosed)
-		validator := &gatedValidator{fail: errValidator}
-		gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
-		gate.ValidateConfig = validator.ValidateConfig
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		arrive := validator.arm()
-		type outcome struct {
-			r   *Runtime
-			err error
-		}
-		done := make(chan outcome, 1)
-		go func() {
-			e.fixtureStore(storage.NewMemory())
-			r, err := e.open(ctx, gate)
-			done <- outcome{r, err}
-		}()
-		<-arrive
-		cancel()
-		validator.release()
-		var got outcome
-		select {
-		case got = <-done:
-		case <-time.After(10 * time.Second):
-			t.Fatal("canceled construction never returned")
-		}
-		testassert.Require(t, got.r == nil && errors.Is(got.err, errValidator) && errors.Is(got.err, ErrConfiguration) && !errors.Is(got.err, context.Canceled), "construction completed after the validator rejection (Runtime %v, error %v); open error = %v, want the wrapped validator and ErrConfiguration identities preserved, not replaced by the context error; open error = %v, want the source identity rather than the constructor context error", got.r, got.err, got.err, got.err)
 		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
 		e.assertLockReleased(t)
 	})
@@ -930,15 +880,15 @@ func TestRuntimeCloseSharesOneCleanupAndReleasesTheLockLast(t *testing.T) {
 		})
 		// The consumer is registered before its provider: construction must still
 		// follow the composition's stable topological order.
-		y := e.ordinaryPlugin("y", ScopeRuntime, "y.cap", Spec[any]("x.cap"))
-		y.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		y := e.ordinaryPlugin("y", ScopeRuntime, "y.cap", extension.Binding{Name: "x", Provider: "x/x#component", CapabilityID: "x.cap", Definition: testServiceCapability("x.cap").Definition()})
+		y.Open = func(context.Context, extension.InstanceContext) (extension.Instance, error) {
 			e.events.add("open:y")
-			return Instance{Values: map[string]any{"y.cap": "y"}, Close: func() error { e.events.add("close:y"); return nil }}, nil
+			return serviceInstance("y.cap", func() error { e.events.add("close:y"); return nil }), nil
 		}
 		x := e.ordinaryPlugin("x", ScopeRuntime, "x.cap")
-		x.Open = func(context.Context, ScopeInfo, Bindings) (Instance, error) {
+		x.Open = func(context.Context, extension.InstanceContext) (extension.Instance, error) {
 			e.events.add("open:x")
-			return Instance{Values: map[string]any{"x.cap": "x"}, Close: func() error { e.events.add("close:x"); return errXClose }}, nil
+			return serviceInstance("x.cap", func() error { e.events.add("close:x"); return errXClose }), nil
 		}
 		w := e.ordinaryPlugin("w", ScopeWorkspace, "w.cap")
 
@@ -1044,12 +994,15 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 		t.Run("caller cancellation before publication consumes no revision", func(t *testing.T) {
 			e := newOwnerEnv(t)
 			writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
-			validator := &gatedValidator{}
 			gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
-			gate.ValidateConfig = validator.ValidateConfig
 			e.fixtureStore(store)
 			r, err := e.open(context.Background(), gate)
 			testassert.NoError(t, err)
+			arrive := make(chan struct{})
+			release := make(chan struct{})
+			var barrierOnce sync.Once
+			candidateBarrier = func() { barrierOnce.Do(func() { close(arrive) }); <-release }
+			t.Cleanup(func() { candidateBarrier = nil })
 			defer func() {
 				{
 					err := r.Close(context.Background())
@@ -1058,7 +1011,6 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			}()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			arrive := validator.arm()
 			reloadDone := make(chan error, 1)
 			go func() {
 				_, err := r.Reload(ctx)
@@ -1066,7 +1018,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			}()
 			<-arrive
 			cancel()
-			validator.release()
+			close(release)
 			{
 				err := <-reloadDone
 				testassert.Require(t, errors.Is(err, context.Canceled), "canceled Reload = %v, want the caller's own context error", err)
@@ -1080,13 +1032,15 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 		t.Run("shutdown joins the admitted build before releasing the lock", func(t *testing.T) {
 			e := newOwnerEnv(t)
 			writeServiceFile(t, e.configPath, ownerGatedConfigDocument(e.server.URL))
-			validator := &gatedValidator{}
 			gate := e.ordinaryPlugin("gate", ScopeRuntime, "gate.cap")
-			gate.ValidateConfig = validator.ValidateConfig
 			e.fixtureStore(store)
 			r, err := e.open(context.Background(), gate)
 			testassert.NoError(t, err)
-			arrive := validator.arm()
+			arrive := make(chan struct{})
+			release := make(chan struct{})
+			var barrierOnce sync.Once
+			candidateBarrier = func() { barrierOnce.Do(func() { close(arrive) }); <-release }
+			t.Cleanup(func() { candidateBarrier = nil })
 			reloadDone := make(chan error, 1)
 			go func() {
 				_, err := r.Reload(context.Background())
@@ -1100,7 +1054,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 				t.Fatalf("Close returned while an admitted build was still in flight (%v); the call gate joined nothing", err)
 			case <-time.After(200 * time.Millisecond):
 			}
-			validator.release()
+			close(release)
 			select {
 			case err := <-closeDone:
 				testassert.NoError(t, err)
@@ -1436,17 +1390,11 @@ func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
 	t.Run("a standard tool name is the rejected export identity", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		enableFixturePlugin(t, e.configPath, "shadow")
-		shadow := Plugin{
-			ID:    "shadow",
-			Scope: ScopeRuntime,
-			Provides: []CapabilitySpec{ToolSpec("write_file", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
-				return ToolDescription{}, nil
-			})},
-			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				return Instance{Values: map[string]any{"write_file": nil}}, nil
-			},
-		}
-		wantFailedOpen(t, e, []Plugin{shadow}, ErrComposition)
+		shadow := testNative("shadow", extension.LifetimeHarness, []extension.Capability{extension.ToolCapability("write_file")}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+			return extension.Instance{Capabilities: map[string]extension.Implementation{"write_file": {Tool: noopNativeTool{}}}}, nil
+		})
+		shadow.Describe["write_file"] = testDescribeTool("write_file")
+		wantFailedOpen(t, e, []extension.Native{shadow}, ErrComposition)
 		testassert.Require(t, len(e.events.all()) == 0, "invalid active graph ran a factory: %v", e.events.all())
 		e.assertLockReleased(t)
 	})
@@ -1458,108 +1406,6 @@ func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
 // factory runs, a plugin at every shorter lifetime binds the actual value
 // through Bind and can run it, and the nearest forbidden siblings — a duplicate
 // export, a wrongly typed dependency — reject before any factory dispatches.
-func TestRuntimeStandardToolsAreOwnerProvidedCapabilities(t *testing.T) {
-	t.Run("the owner's Runtime factory binds the actual read_file value", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		enableFixturePlugin(t, e.configPath, "consumer")
-		workspace := filepath.Join(e.home, "owner-tool-ws")
-		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "held.txt"), []byte("owner provided\n"), 0o600))
-		var bound Tool
-		consumer := e.ordinaryPlugin("consumer", ScopeRuntime, "consumer.cap", Spec[Tool]("read_file"))
-		consumer.Open = func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
-			tool, err := Bind[Tool](deps, "read_file")
-			if err != nil {
-				return Instance{}, err
-			}
-			bound = tool
-			e.events.add("open:consumer")
-			return Instance{Values: map[string]any{"consumer.cap": "consumer"}}, nil
-		}
-		e.fixtureStore(storage.NewMemory())
-		r, err := e.open(context.Background(), consumer)
-		testassert.NoError(t, err)
-		testassert.NoError(t, r.Close(context.Background()))
-		testassert.Require(t, bound != nil, "the Runtime factory never bound the owner-provided read_file value")
-		// The bound value is the owner's real tool: it reads one Workspace
-		// file through its own preparation and execution.
-		tc := ToolContext{
-			Workspace:     workspace,
-			AdmittedEntry: harness.EntryRef{SessionID: testSessionID, EntryID: testEntryID},
-		}
-		arguments, err := bound.Normalize(tc, model.ToolCall{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"held.txt"}`)})
-		testassert.NoError(t, err)
-		prepared := bound.Prepare(context.Background(), tc, model.ToolCall{ID: "call-1", Name: "read_file", Arguments: arguments})
-		testassert.Require(t, prepared.Execute != nil, "prepared tool = %+v, want an executable plan", prepared)
-		outcome := prepared.Execute(context.Background())
-		testassert.Require(t, outcome.Result.Status == model.ResultSuccess && strings.Contains(outcome.Result.Content, "owner provided"), "bound tool read = %+v, want the file content", outcome.Result)
-	})
-
-	t.Run("Workspace, Operation and Agent consumers bind the owner-provided value", func(t *testing.T) {
-		var bound []string
-		consumer := func(id string, kind ScopeKind) Plugin {
-			return Plugin{
-				ID:       id,
-				Scope:    kind,
-				Provides: []CapabilitySpec{Spec[any](id + ".cap")},
-				Requires: []CapabilitySpec{Spec[Tool]("read_file")},
-				Open: func(_ context.Context, _ ScopeInfo, deps Bindings) (Instance, error) {
-					tool, err := Bind[Tool](deps, "read_file")
-					if err != nil {
-						return Instance{}, err
-					}
-					if tool == nil {
-						return Instance{}, errors.New("the standard tool binding supplied no value")
-					}
-					bound = append(bound, string(kind))
-					return Instance{Values: map[string]any{id + ".cap": id}}, nil
-				},
-			}
-		}
-		c := mustComposition(t,
-			consumer("rt", ScopeRuntime),
-			consumer("ws", ScopeWorkspace),
-			consumer("op", ScopeOperation),
-			consumer("ag", ScopeAgent))
-		c.standardValues = newStandardTools(t.TempDir(), &fakeJobs{})
-		rt := mustOpenScope(t, c, context.Background(), runtimeScopeInfo(), nil)
-		ws := mustOpenScope(t, c, context.Background(), workspaceScopeInfo("/ws/one"), []*scope{rt})
-		op := mustOpenScope(t, c, context.Background(), ScopeInfo{Kind: ScopeOperation, DataDir: "/owner/data", Workspace: "/ws/one", SessionID: "s", OperationID: "o"}, []*scope{rt, ws})
-		ag := mustOpenScope(t, c, context.Background(), ScopeInfo{Kind: ScopeAgent, DataDir: "/owner/data", Workspace: "/ws/one", SessionID: "s", OperationID: "o"}, []*scope{rt, ws, op})
-		for _, sc := range []*scope{rt, ws, op, ag} {
-			defer func() { _ = sc.close() }()
-		}
-		testassert.Require(t, slices.Equal(bound, []string{"runtime", "workspace", "operation", "agent"}), "standard tool bindings = %q, want every lifetime's factory to receive the owner-provided value", bound)
-	})
-
-	t.Run("a wrongly typed dependency on a standard tool rejects before any factory", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		enableFixturePlugin(t, e.configPath, "consumer")
-		consumer := e.ordinaryPlugin("consumer", ScopeRuntime, "consumer.cap", Spec[greeter]("read_file"))
-		wantFailedOpen(t, e, []Plugin{consumer}, ErrComposition)
-		testassert.Require(t, len(e.events.all()) == 0, "invalid graph ran a factory: %v", e.events.all())
-		e.assertLockReleased(t)
-	})
-
-	t.Run("a duplicate export of a standard tool rejects before any factory", func(t *testing.T) {
-		e := newOwnerEnv(t)
-		enableFixturePlugin(t, e.configPath, "shadow")
-		shadow := Plugin{
-			ID:    "shadow",
-			Scope: ScopeRuntime,
-			Provides: []CapabilitySpec{ToolSpec("read_file", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
-				return ToolDescription{Definition: model.ToolDefinition{Name: "read_file", Parameters: json.RawMessage(`{}`)}}, nil
-			})},
-			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				return Instance{Values: map[string]any{"read_file": readTool{}}}, nil
-			},
-		}
-		wantFailedOpen(t, e, []Plugin{shadow}, ErrComposition)
-		testassert.Require(t, len(e.events.all()) == 0, "invalid graph ran a factory: %v", e.events.all())
-		e.assertLockReleased(t)
-	})
-}
-
 // TestRuntimeSettingsSectionsHaveOneOwner proves the settings-owner split:
 // a registered Plugin whose ID names a baseline section owns only its own
 // plugins entry, while the top-level tools and jobs sections stay the
@@ -1569,30 +1415,20 @@ func TestRuntimeSettingsSectionsHaveOneOwner(t *testing.T) {
 	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+
 		`,"tools":{"read_max_lines":7},"jobs":{"max_background_processes":3},`+
 		`"extensions":{"capowner":{"enabled":true,"kept":1},"tools":{"enabled":true,"kept":"plugin tools"},"jobs":{"enabled":true,"kept":"plugin jobs"}}}`)
-	received := map[string]json.RawMessage{}
-	validator := func(id string) func(json.RawMessage) error {
-		return func(raw json.RawMessage) error {
-			received[id] = append(json.RawMessage(nil), raw...)
-			return nil
-		}
-	}
-	plugins := []Plugin{
+	plugins := []extension.Native{
 		e.ordinaryPlugin("capowner", ScopeRuntime, "capowner.cap"),
 		e.ordinaryPlugin("tools", ScopeRuntime, "tools.cap"),
 		e.ordinaryPlugin("jobs", ScopeRuntime, "jobs.cap"),
 	}
-	plugins[0].ValidateConfig = validator("capowner")
-	plugins[1].ValidateConfig = validator("tools")
-	plugins[2].ValidateConfig = validator("jobs")
 	e.fixtureStore(storage.NewMemory())
 	r, err := e.open(context.Background(), plugins...)
 	testassert.NoError(t, err)
 	defer func() { testassert.NoError(t, r.Close(context.Background())) }()
 
-	testassert.Equal(t, string(received["capowner"]), `{"enabled":true,"kept":1}`)
-	testassert.Equal(t, string(received["tools"]), `{"enabled":true,"kept":"plugin tools"}`)
-	testassert.Equal(t, string(received["jobs"]), `{"enabled":true,"kept":"plugin jobs"}`)
 	snapshot := r.config.current()
+	testassert.Equal(t, string(snapshot.extensions["capowner"]), `{"enabled":true,"kept":1}`)
+	testassert.Equal(t, string(snapshot.extensions["tools"]), `{"enabled":true,"kept":"plugin tools"}`)
+	testassert.Equal(t, string(snapshot.extensions["jobs"]), `{"enabled":true,"kept":"plugin jobs"}`)
 	testassert.Require(t, snapshot != nil, "no published configuration")
 	testassert.Equal(t, compactJSON(t, snapshot.tools), `{"read_max_lines":7}`)
 	testassert.Equal(t, compactJSON(t, snapshot.jobs), `{"max_background_processes":3}`)
@@ -1609,16 +1445,13 @@ func TestRuntimeSettingsSectionsHaveOneOwner(t *testing.T) {
 // shortScopeProbe is one Operation- or Agent-scoped plugin recording every
 // construction, so a recovery row can prove no execution scope opens before
 // an explicit admission.
-func shortScopeProbe(id string, scope ScopeKind, opens *atomic.Int64) Plugin {
-	return Plugin{
-		ID:       id,
-		Scope:    scope,
-		Provides: []CapabilitySpec{Spec[any](id + ".cap")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			opens.Add(1)
-			return Instance{Values: map[string]any{id + ".cap": id}}, nil
-		},
-	}
+func shortScopeProbe(id string, scope ScopeKind, opens *atomic.Int64) extension.Native {
+	capabilityID := id + ".cap"
+	capability := testServiceCapability(capabilityID)
+	return testNative(id, scope.lifetime(), []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		opens.Add(1)
+		return extension.Instance{Capabilities: map[string]extension.Implementation{capabilityID: testServiceImplementation()}}, nil
+	})
 }
 
 // readSessionFacts reads one Session's header and whole committed fact set

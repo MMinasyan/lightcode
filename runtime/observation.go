@@ -208,11 +208,13 @@ func scopeEvent(kind protocol.ScopeEventKind, info ScopeInfo) Event {
 			OperationId: info.OperationID,
 		})
 	case ScopeAgent:
-		_ = scope.FromAgentScope(protocol.AgentScope{ // plain members; the marshal cannot fail
-			Kind:        protocol.AgentScopeKindAgent,
-			Workspace:   eventString(info.Workspace),
-			SessionId:   info.SessionID,
-			OperationId: info.OperationID,
+		_ = scope.FromInvocationScope(protocol.InvocationScope{ // plain members; the marshal cannot fail
+			Kind:         protocol.Invocation,
+			Workspace:    eventString(info.Workspace),
+			SessionId:    info.SessionID,
+			OperationId:  info.OperationID,
+			InvocationId: info.InvocationID,
+			Purpose:      protocol.InvocationScopePurpose(info.Purpose),
 		})
 	}
 	var event Event

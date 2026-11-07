@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -41,8 +42,8 @@ func TestProtocolComposedRuntimeLoss(t *testing.T) {
 		t.Setenv("ASSEMBLED_TEST_KEY", "assembled-key-1")
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T1", "L1"))
 		writeAgentDefinitions(t, e.configPath, assembledAgentsDocument)
-		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(PreparationInput) PreparationConsequence {
-			return PreparationConsequence{}
+		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(extension.PreparationInput) extension.PreparationConsequence {
+			return extension.PreparationConsequence{}
 		}}
 		ws := &workspaceOpens{}
 		r, err := e.open(ctx, assembledPlugins(e, store, hook, ws)...)

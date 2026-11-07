@@ -49,7 +49,7 @@ func snapshotTurnPrepared(script *scriptModel) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return publicExecutionOver(script.effect, script.effect, func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0],"s":"<>&"}`),
@@ -1336,13 +1336,13 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 			compactInput := 0.5
 			capture.Pricing = &harness.ModelPricing{Input: &conversationInput, Output: &conversationOutput}
 			capture.Compact.Pricing = &harness.ModelPricing{Input: &compactInput}
-			immediateTool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			immediateTool := func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0]}`),
 				}}
 			}
-			parkingTool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			parkingTool := func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Execute: func(execCtx context.Context) harness.ToolOutcome {
 					close(parkEntered)
 					select {

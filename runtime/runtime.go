@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
@@ -30,7 +31,7 @@ var ErrOwned = errors.New("runtime: data directory owned by another Runtime")
 type Options struct {
 	DataDir    string
 	ConfigPath string
-	Plugins    []Plugin
+	Plugins    []extension.Native
 
 	// DefaultCapabilityIDs is the application's selected baseline capability
 	// selection installed on the built-in definitions before user overlays and
@@ -71,7 +72,7 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 // time.Ticker.
 type options struct {
 	DataDir, ConfigPath  string
-	Plugins              []Plugin
+	Plugins              []extension.Native
 	DefaultCapabilityIDs []string
 	Identity             string
 	GlobalRulesDir       string
@@ -180,9 +181,9 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	// The warning store and the passive publication adapter initialize
 	// before any plugin scope opens: the Runtime installs the adapter's
 	// neutral plugin-warning sink on the composition, which binds each
-	// Runtime-scoped factory's copied ScopeInfo to its own registered ID, and
-	// scopes and preparations report into the store from the moment they
-	// exist.
+	// Runtime-scoped factory's InstanceContext warning callback to its own
+	// registered ID, and scopes and preparations report into the store from
+	// the moment they exist.
 	warnings := newWarningStore()
 	adapter := newObservationAdapter(obs, warnings)
 	c.reportWarning = adapter.reportPluginWarning
@@ -227,6 +228,8 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	jobsService := newJobs(dataDir)
 	acquired = append(acquired, jobsService.Close)
 	c.standardValues = newStandardTools(dataDir, jobsService)
+	background := &backgroundBridge{}
+	c.hosts.background = background
 	configService.composition = c
 	configService.dataDir = dataDir
 	if err := configService.prepareResources(work, initial); err != nil {
@@ -244,7 +247,6 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unwind(err)
 	}
 
-	background := &backgroundBridge{}
 	// The private per-Session artifact interval registry initializes before
 	// the Harness: every committed opener, restore, committed deletion and
 	// sweep candidate coordinates on it, and no caller can observe an

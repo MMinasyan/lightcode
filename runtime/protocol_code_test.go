@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -1443,18 +1444,14 @@ func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
 // the registry is reclaimed and the next execution runs normally.
 // failingAgentFactoryPlugin is one Agent-scoped plugin whose factory fails
 // while armed: the concrete opening-failure row.
-func failingAgentFactoryPlugin(fail *atomic.Bool) Plugin {
-	return Plugin{
-		ID:       "failing-agent",
-		Scope:    ScopeAgent,
-		Provides: []CapabilitySpec{Spec[any]("failing.agent.cap")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			if fail.Load() {
-				return Instance{}, errors.New("boom")
-			}
-			return Instance{Values: map[string]any{"failing.agent.cap": "ok"}}, nil
-		},
-	}
+func failingAgentFactoryPlugin(fail *atomic.Bool) extension.Native {
+	capability := testServiceCapability("failing.agent.cap")
+	return testNative("failing-agent", extension.LifetimeInvocation, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		if fail.Load() {
+			return extension.Instance{}, errors.New("boom")
+		}
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"failing.agent.cap": testServiceImplementation()}}, nil
+	})
 }
 
 func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
@@ -1494,22 +1491,18 @@ func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 // parkingAgentClosePlugin is one Agent-scoped plugin whose Instance.Close
 // signals its start and then parks on the release gate: the held
 // execution-cleanup row.
-func parkingAgentClosePlugin(started chan struct{}, gate chan struct{}) Plugin {
-	return Plugin{
-		ID:       "parking-agent",
-		Scope:    ScopeAgent,
-		Provides: []CapabilitySpec{Spec[any]("parking.agent.cap")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"parking.agent.cap": "ok"}, Close: func() error {
-				select {
-				case started <- struct{}{}:
-				default:
-				}
-				<-gate
-				return nil
-			}}, nil
-		},
-	}
+func parkingAgentClosePlugin(started chan struct{}, gate chan struct{}) extension.Native {
+	capability := testServiceCapability("parking.agent.cap")
+	return testNative("parking-agent", extension.LifetimeInvocation, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"parking.agent.cap": testServiceImplementation()}, Close: func(context.Context, extension.CallContext) error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-gate
+			return nil
+		}}, nil
+	})
 }
 
 func TestExecutionCleanupReleasesIntervalLast(t *testing.T) {

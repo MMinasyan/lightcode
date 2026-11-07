@@ -44,7 +44,7 @@ func executorTurnFixture(t *testing.T, hook bool) (*Harness, *graphStorage, *coo
 		}
 		return completedTurnStream(), nil
 	}
-	planFn := func(_ context.Context, call model.ToolCall) PreparedTool {
+	planFn := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		preparedCalls++
 		return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
 			executed++
@@ -55,7 +55,7 @@ func executorTurnFixture(t *testing.T, hook bool) (*Harness, *graphStorage, *coo
 		h, store, c, sessionID, prepared, cancel := newExecutionHarness(t, modelFn, planFn)
 		return h, store, c, sessionID, prepared, cancel, &rounds, &preparedCalls, &executed
 	}
-	argHook := ToolArgumentsHook{ID: "cap.hook.one", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+	argHook := ToolArgumentsHook{ID: "cap.hook.one", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 		return model.CloneRaw(call.Arguments), nil
 	}}
 	h, store, c, sessionID, prepared, cancel := newOpenerHarness(t, func(context.Context, OperationAdmission) (Execution, error) {
@@ -193,7 +193,7 @@ func TestImmediateToolResultPublicationFailureRetainsNoActiveEffect(t *testing.T
 				}
 				return completedTurnStream(), nil
 			}
-			planFn := func(_ context.Context, call model.ToolCall) PreparedTool {
+			planFn := func(ctx context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 			}
 			h, store, c, sessionID, prepared, cancel := newExecutionHarness(t, modelFn, planFn)
@@ -456,7 +456,7 @@ func TestWaitRetainsPublicationFailureAtPendingCallBoundaries(t *testing.T) {
 			}
 			return completedTurnStream(), nil
 		}
-		planFn := func(_ context.Context, call model.ToolCall) PreparedTool {
+		planFn := func(ctx context.Context, call model.ToolCall) PreparedTool {
 			preparedCalls++
 			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}

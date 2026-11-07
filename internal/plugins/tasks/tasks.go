@@ -1,9 +1,9 @@
 // Package tasks declares the child-session task tool: it composes the
 // subagent roster description, validates the requested subagent type, and
-// launches one child Session through the Runtime's background bridge,
+// launches one child Session through the declared child-launch host service,
 // returning the child session ID immediately. It is an ordinary
-// Runtime-scoped composition unit with no cross-plugin capability contract
-// and no additional Runtime authority.
+// Harness-scoped native extension with one named-service binding and no
+// additional Runtime authority.
 package tasks
 
 import (
@@ -16,11 +16,11 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/toolargs"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
 const (
@@ -40,10 +40,13 @@ const taskParameters = `{"type":"object","properties":{"prompt":{"type":"string"
 // argument is the child session ID. No live-members line is forced.
 const taskStartedTemplate = "Task started in the background with session ID: `%s`. You will be notified when it completes. Continue with your next steps; the result will arrive as a message when it is ready."
 
-// settings is the plugin's private configuration, decoded with json.Unmarshal
-// from the extensions.agents.task section. Nil input and missing or null-valued
-// members keep the defaults; unknown members are ignored; every consumed
-// field is range-checked against the retained bounds.
+const configSchema = `{"type":"object","required":["enabled"],"properties":{"enabled":{"type":"boolean"},"definitions":true,"task":{"anyOf":[{"type":"null"},{"type":"object","properties":{"max_concurrent":{"anyOf":[{"type":"integer","minimum":1,"maximum":20},{"type":"null"}]},"max_output_bytes":{"anyOf":[{"type":"integer","minimum":1024,"maximum":1048576},{"type":"null"}]}},"additionalProperties":true}]}},"additionalProperties":true}`
+
+// settings is the tool's private configuration, decoded once from the task
+// member of the active extensions.agents section at Open. Nil input and
+// missing or null-valued members keep the defaults; unknown members are
+// ignored; every consumed field is range-checked against the retained
+// bounds.
 type settings struct {
 	MaxConcurrent  int `json:"max_concurrent"`
 	MaxOutputBytes int `json:"max_output_bytes"`
@@ -53,9 +56,8 @@ func defaultSettings() settings {
 	return settings{MaxConcurrent: 4, MaxOutputBytes: 15360}
 }
 
-// decodeSettings decodes the task member of extensions.agents on top of the
-// defaults and enforces the retained ranges. ValidateConfig and per-call
-// preparation share it.
+// decodeSettings decodes the task member on top of the defaults and enforces
+// the retained ranges.
 func decodeSettings(raw json.RawMessage) (settings, error) {
 	s := defaultSettings()
 	if len(bytes.TrimSpace(raw)) != 0 {
@@ -80,39 +82,50 @@ func decodeSettings(raw json.RawMessage) (settings, error) {
 	return s, nil
 }
 
-// taskTool is the task export: unavailable to child Sessions, its
-// description composes the Subagent roster from the captured Invocation, and
-// preparation validates the call before declaring the one child.launch pair.
-type taskTool struct{}
+// launchData is the tool's opaque ToolPlan payload: the validated call facts
+// needed by Execute after authorization.
+type launchData struct {
+	CallID         string `json:"call_id"`
+	Prompt         string `json:"prompt"`
+	SubagentType   string `json:"subagent_type"`
+	MaxConcurrent  int    `json:"max_concurrent"`
+	MaxOutputBytes int    `json:"max_output_bytes"`
+}
 
-func (taskTool) describe(inv runtime.Invocation, _ harness.ToolConstraints, identity harness.SessionIdentity) (runtime.ToolDescription, error) {
+// taskTool is the task contribution: unavailable to child Sessions, its
+// description composes the Subagent roster from the captured Agent roster,
+// preparation uses the settings retained at Open and validates the call
+// before declaring the one child.launch pair, and execution launches through
+// the declared host service.
+type taskTool struct {
+	settings settings
+}
+
+func (taskTool) describe(_ context.Context, input extension.DescribeInput) (extension.ToolDescription, error) {
 	var b strings.Builder
 	b.WriteString(taskDescriptionPrefix)
 	b.WriteString("\n\nAvailable subagent types:\n")
-	for _, at := range inv.AgentTypes() {
+	for _, at := range input.AgentTypes {
 		if at.Subagent {
 			fmt.Fprintf(&b, "- %s: %s\n", at.Name, at.Description)
 		}
 	}
-	return runtime.ToolDescription{
+	return extension.ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        toolID,
 			Description: b.String(),
 			Parameters:  json.RawMessage(taskParameters),
 		},
-		Available: identity.ParentSessionID == "",
+		Available: input.Session.ParentSessionID == "",
 	}, nil
 }
 
-func (taskTool) Normalize(_ runtime.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (taskTool) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, normalizeTaskArgs)
 }
 
-func (taskTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.ToolCall) harness.PreparedTool {
-	s, err := decodeSettings(tc.Invocation.Config(pluginID))
-	if err != nil {
-		return immediateError(call.ID, err)
-	}
+func (t taskTool) Prepare(_ context.Context, tc extension.ToolContext, call model.ToolCall) extension.ToolPlan {
+	s := t.settings
 	// Preparation accepts only the committed normalized arguments: one
 	// strict decode-and-pass, never a second normalization.
 	args, err := toolargs.Decode(call.Arguments)
@@ -127,33 +140,63 @@ func (taskTool) Prepare(_ context.Context, tc runtime.ToolContext, call model.To
 	if !ok {
 		return immediateError(call.ID, errors.New("missing 'subagent_type' parameter"))
 	}
-	if err := resolveSubagent(subagentType, tc.Invocation.AgentTypes()); err != nil {
+	if err := resolveSubagent(subagentType, tc.AgentTypes); err != nil {
 		return immediateError(call.ID, fmt.Errorf("unknown subagent type %q: %w", subagentType, err))
 	}
-	return harness.PreparedTool{
-		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: subagentType}},
-		Execute: func(_ context.Context) harness.ToolOutcome {
-			operationID, err := newOperationID()
-			if err != nil {
-				return launchOutcome(call.ID, err)
-			}
-			result, err := tc.Background.LaunchChild(runtime.ChildRequest{
-				AgentType:     subagentType,
-				Content:       []model.ContentPart{{Kind: model.PartText, Text: prompt}},
-				OperationID:   operationID,
-				MaxConcurrent: s.MaxConcurrent,
-				OutputLimit:   s.MaxOutputBytes,
-			})
-			if err != nil {
-				return launchOutcome(call.ID, err)
-			}
-			return harness.ToolOutcome{Result: model.ToolResult{
-				CallID:  call.ID,
-				Status:  model.ResultSuccess,
-				Content: fmt.Sprintf(taskStartedTemplate, result),
-			}}
-		},
+	data, err := json.Marshal(launchData{CallID: call.ID, Prompt: prompt, SubagentType: subagentType, MaxConcurrent: s.MaxConcurrent, MaxOutputBytes: s.MaxOutputBytes})
+	if err != nil {
+		return immediateError(call.ID, err)
 	}
+	return extension.ToolPlan{
+		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: subagentType}},
+		Data:        data,
+	}
+}
+
+func (taskTool) Execute(ctx context.Context, tc extension.ToolContext, plan extension.ToolPlan) harness.ToolOutcome {
+	var data launchData
+	if err := json.Unmarshal(plan.Data, &data); err != nil {
+		return harness.ToolOutcome{Result: model.ToolResult{Status: model.ResultError, Content: err.Error()}}
+	}
+	callID := data.CallID
+	operationID, err := newOperationID()
+	if err != nil {
+		return launchOutcome(callID, err)
+	}
+	arguments, err := json.Marshal(struct {
+		AgentType     string `json:"agent_type"`
+		Prompt        string `json:"prompt"`
+		OperationID   string `json:"operation_id"`
+		MaxConcurrent int    `json:"max_concurrent"`
+		OutputLimit   int    `json:"output_limit"`
+	}{
+		AgentType:     data.SubagentType,
+		Prompt:        data.Prompt,
+		OperationID:   operationID,
+		MaxConcurrent: data.MaxConcurrent,
+		OutputLimit:   data.MaxOutputBytes,
+	})
+	if err != nil {
+		return launchOutcome(callID, err)
+	}
+	result, err := tc.Calls.Call(ctx, "child_launch", "launch", arguments)
+	if err != nil {
+		return launchOutcome(callID, err)
+	}
+	if result.Failure != nil {
+		return launchOutcome(callID, errors.New(result.Failure.Message))
+	}
+	var launched struct {
+		ChildSessionID string `json:"child_session_id"`
+	}
+	if err := json.Unmarshal(result.Value, &launched); err != nil {
+		return launchOutcome(callID, err)
+	}
+	return harness.ToolOutcome{Result: model.ToolResult{
+		CallID:  callID,
+		Status:  model.ResultSuccess,
+		Content: fmt.Sprintf(taskStartedTemplate, launched.ChildSessionID),
+	}}
 }
 
 // resolveSubagent checks the captured roster for the exactly-named Subagent
@@ -172,9 +215,8 @@ func resolveSubagent(name string, roster []protocol.Agent) error {
 	return fmt.Errorf("unknown agent type %q", name)
 }
 
-// launchOutcome renders one launch failure — or the operation-ID mint
-// failure — through the uniform tool-error path: the harness's rejection
-// details are model-facing and arrive unwrapped.
+// launchOutcome renders one launch failure through the uniform tool-error
+// path: the harness's rejection details are model-facing and arrive unwrapped.
 func launchOutcome(callID string, err error) harness.ToolOutcome {
 	return harness.ToolOutcome{Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: err.Error()}}
 }
@@ -182,14 +224,13 @@ func launchOutcome(callID string, err error) harness.ToolOutcome {
 // immediateError is the normalization-class immediate outcome: status error
 // carrying the validation diagnostic, per the tool-boundary validation
 // contract.
-func immediateError(callID string, cause error) harness.PreparedTool {
-	return harness.PreparedTool{Immediate: &harness.ToolOutcome{
+func immediateError(callID string, cause error) extension.ToolPlan {
+	return extension.ToolPlan{Immediate: &harness.ToolOutcome{
 		Result: model.ToolResult{CallID: callID, Status: model.ResultError, Content: cause.Error()},
 	}}
 }
 
-// newOperationID mints a fresh 32-lowercase-hex operation identity
-// (crypto/rand, the newHexID shape).
+// newOperationID mints a fresh 32-lowercase-hex operation identity.
 func newOperationID() (string, error) {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
@@ -218,9 +259,7 @@ func normalizeTaskArgs(args map[string]any) (map[string]any, error) {
 	return clean, nil
 }
 
-// normalizeCallArguments is the one shared Normalize body: the strict decode
-// of the call arguments, the tool's single argument normalization, and the
-// marshaled normalized object.
+// normalizeCallArguments is the one shared Normalize body.
 func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) (map[string]any, error)) (json.RawMessage, error) {
 	args, err := toolargs.Decode(call.Arguments)
 	if err != nil {
@@ -233,31 +272,42 @@ func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) 
 	return json.Marshal(normalized)
 }
 
-// Plugin returns the Runtime-scoped plugin whose single export is the task
-// tool. ValidateConfig validates the owned extensions.agents.task section; Open
-// constructs the stateless tool value — settings and the roster arrive per
-// call through the Invocation, launches through the ToolContext's background
-// bridge.
-func Plugin() runtime.Plugin {
-	return runtime.Plugin{
-		ID:    pluginID,
-		Scope: runtime.ScopeRuntime,
-		Provides: []runtime.CapabilitySpec{
-			runtime.ToolSpec(toolID, taskTool{}.describe),
+// Native returns the Harness-scoped native whose single export is the task
+// tool and whose one declared binding is the child-launch host service.
+func Native() extension.Native {
+	childLaunch, _ := extension.HostCapability(extension.ContractChildLaunch)
+	return extension.Native{
+		Declaration: extension.Declaration{
+			ID:           pluginID,
+			Version:      "1",
+			ConfigSchema: []byte(configSchema),
+			Components: []extension.Component{{
+				ID:       pluginID,
+				Lifetime: extension.LifetimeHarness,
+				Provides: []string{toolID},
+				Requires: []extension.Binding{{
+					Name:         "child_launch",
+					Provider:     extension.HostProvider,
+					CapabilityID: extension.ContractChildLaunch,
+					Definition:   childLaunch,
+				}},
+			}},
+			Capabilities: []extension.Capability{extension.ToolCapability(toolID)},
 		},
-		ValidateConfig: func(raw json.RawMessage) error {
-			_, err := decodeSettings(raw)
-			return err
-		},
-		Open: open,
+		Describe: map[string]extension.ToolDescribe{toolID: taskTool{}.describe},
+		Open:     open,
 	}
 }
 
-// open checks the scope context and publishes the stateless tool value; no
-// per-Session state is created here.
-func open(ctx context.Context, _ runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+func open(ctx context.Context, instance extension.InstanceContext) (extension.Instance, error) {
 	if err := ctx.Err(); err != nil {
-		return runtime.Instance{}, err
+		return extension.Instance{}, err
 	}
-	return runtime.Instance{Values: map[string]any{toolID: taskTool{}}}, nil
+	s, err := decodeSettings(instance.Section)
+	if err != nil {
+		return extension.Instance{}, err
+	}
+	return extension.Instance{Capabilities: map[string]extension.Implementation{
+		toolID: {Tool: taskTool{settings: s}},
+	}}, nil
 }

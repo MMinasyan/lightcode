@@ -13,6 +13,30 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
+// CallbackIdentity is the minimal immutable carrier the Harness binds to one
+// effect callback context: the already-reserved result entry identity of the
+// associated effect, or empty where no effect exists.
+type CallbackIdentity struct {
+	RequestID  string
+	ToolCallID string
+	EffectID   string
+}
+
+type callbackIdentityKey struct{}
+
+// WithCallbackIdentity binds one effect identity to a callback context. The
+// value is immutable and grants nothing by itself; the host reads it when it
+// constructs a native call view.
+func WithCallbackIdentity(ctx context.Context, identity CallbackIdentity) context.Context {
+	return context.WithValue(ctx, callbackIdentityKey{}, identity)
+}
+
+// CallbackIdentityFromContext returns the bound effect identity, if any.
+func CallbackIdentityFromContext(ctx context.Context) CallbackIdentity {
+	identity, _ := ctx.Value(callbackIdentityKey{}).(CallbackIdentity)
+	return identity
+}
+
 // JobStopper is the job-stop seam: the Harness cannot import plugin packages,
 // so the interface is declared at its consumer. Nil is legal; StartJob rejects
 // job admission without one (managed shutdown stops every Job).
@@ -238,7 +262,7 @@ type InvocationExecution struct {
 	// with no filesystem, service, permission or effect I/O. It receives an
 	// owned call and returns one owned JSON object preserving unrelated
 	// accepted fields; its error is a per-call validation failure.
-	NormalizeTool func(model.ToolCall) (json.RawMessage, error)
+	NormalizeTool func(context.Context, model.ToolCall) (json.RawMessage, error)
 	// ToolHooks are the selected argument hooks in configured order. Each
 	// runs after the advertisement gate and before concrete preparation; the
 	// first receives the original raw call arguments, every later one the
@@ -2114,6 +2138,20 @@ func ownCapture(c ExecutionCapture) ExecutionCapture {
 		for i, tool := range c.Tools {
 			out.Tools[i] = tool
 			out.Tools[i].Parameters = model.CloneRaw(tool.Parameters)
+		}
+	}
+	if c.InitialToolNames == nil {
+		out.InitialToolNames = nil
+	} else {
+		out.InitialToolNames = append([]string{}, c.InitialToolNames...)
+	}
+	if len(c.Implementations) == 0 {
+		out.Implementations = nil
+	} else {
+		out.Implementations = make([]ImplementationCapture, len(c.Implementations))
+		for i, implementation := range c.Implementations {
+			out.Implementations[i] = implementation
+			out.Implementations[i].Settings = model.CloneRaw(implementation.Settings)
 		}
 	}
 	if len(c.Capabilities) == 0 {

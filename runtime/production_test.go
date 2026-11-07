@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -89,165 +89,149 @@ func useFixtureStore(t *testing.T, store harness.Storage) {
 	t.Cleanup(func() { openStore = previous })
 }
 
-func hookPlugin(hook *recordHook) Plugin {
-	return Plugin{
-		ID:       "hooks",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[PreparationHook]("hook.first")},
-		ValidateConfig: func(raw json.RawMessage) error {
-			var settings struct {
-				Tag string `json:"tag"`
-			}
-			if err := json.Unmarshal(raw, &settings); err != nil || settings.Tag == "" {
-				return errors.New("hooks require a non-empty tag")
-			}
-			return nil
-		},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"hook.first": hook}}, nil
-		},
-	}
+func hookPlugin(hook *recordHook) extension.Native {
+	capability := extension.HookCapability("hook.first", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure))
+	return testNative("hooks", extension.LifetimeHarness, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"hook.first": {Preparation: hook.Prepare}}}, nil
+	})
 }
 
-func parkPlugin(park *parkingHook) Plugin {
-	return Plugin{
-		ID:       "park",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[PreparationHook]("park.second")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"park.second": park}}, nil
-		},
-	}
+// parkPlugin declares the suite's parking preparation contribution.
+func parkPlugin(park *parkingHook) extension.Native {
+	capability := extension.HookCapability("park.second", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure))
+	return testNative("park", extension.LifetimeHarness, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"park.second": {Preparation: park.Prepare}}}, nil
+	})
 }
 
-// fileWriteTool is the concrete mutation tool of the production suite: pure
-// terminating normalization, one declared file.write pair on the canonical
-// target, and an executor performing the real file effect in the Workspace.
+// fileWriteTool is the concrete mutation tool of the production suite.
 type fileWriteTool struct{}
 
-func (t fileWriteTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (t fileWriteTool) describe(_ context.Context, input extension.DescribeInput) (extension.ToolDescription, error) {
 	definition, err := model.NewToolDefinition(model.ToolDefinition{
 		Name:        "prod_write",
 		Description: "writes one file in the workspace",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`),
 	})
 	if err != nil {
-		return ToolDescription{}, err
+		return extension.ToolDescription{}, err
 	}
-	return ToolDescription{Definition: definition, Available: !constraints.Readonly || constraints.WriteDir != ""}, nil
+	return extension.ToolDescription{Definition: definition, Available: !input.Constraints.Readonly || input.Constraints.WriteDir != ""}, nil
 }
 
-func (t fileWriteTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t fileWriteTool) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return runtimeNormalize(call)
 }
 
-func (t fileWriteTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t fileWriteTool) Prepare(_ context.Context, tc extension.ToolContext, call model.ToolCall) extension.ToolPlan {
 	var args struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
 	}
 	if err := json.Unmarshal(call.Arguments, &args); err != nil || args.Path == "" || args.Content == "" {
-		return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "prod_write requires path and content"}}}
+		return extension.ToolPlan{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "prod_write requires path and content"}}}
 	}
 	target := filepath.Clean(filepath.Join(tc.Workspace, args.Path))
-	return harness.PreparedTool{
-		Permissions:        []harness.PermissionRequest{{Permission: "file.write", Target: target}},
-		CanonicalWorkspace: filepath.Clean(tc.Workspace),
-		Execute: func(ctx context.Context) harness.ToolOutcome {
-			if err := ctx.Err(); err != nil {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "interrupted"}}
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
-			}
-			if err := os.WriteFile(target, []byte(args.Content), 0o600); err != nil {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
-			}
-			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "written"}}
-		},
-	}
+	data, _ := json.Marshal(args)
+	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: "file.write", Target: target}}, CanonicalWorkspace: filepath.Clean(tc.Workspace), Data: data}
 }
 
-// fileReadTool is the concrete read-only sibling: always available, its
-// executor returns the file content.
+func (t fileWriteTool) Execute(ctx context.Context, tc extension.ToolContext, plan extension.ToolPlan) harness.ToolOutcome {
+	var args struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(plan.Data, &args); err != nil {
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultError, Content: err.Error()}}
+	}
+	target := filepath.Clean(filepath.Join(tc.Workspace, args.Path))
+	if err := ctx.Err(); err != nil {
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultError, Content: "interrupted"}}
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultError, Content: err.Error()}}
+	}
+	if err := os.WriteFile(target, []byte(args.Content), 0o600); err != nil {
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultError, Content: err.Error()}}
+	}
+	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultSuccess, Content: "written"}}
+}
+
+// fileReadTool is the concrete read-only sibling.
 type fileReadTool struct{}
 
-func (t fileReadTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
-	definition, err := model.NewToolDefinition(model.ToolDefinition{
-		Name:        "prod_read",
-		Description: "reads one file in the workspace",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}`),
-	})
+func (t fileReadTool) describe(context.Context, extension.DescribeInput) (extension.ToolDescription, error) {
+	definition, err := model.NewToolDefinition(model.ToolDefinition{Name: "prod_read", Description: "reads one file in the workspace", Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}`)})
 	if err != nil {
-		return ToolDescription{}, err
+		return extension.ToolDescription{}, err
 	}
-	return ToolDescription{Definition: definition, Available: true}, nil
+	return extension.ToolDescription{Definition: definition, Available: true}, nil
 }
 
-func (t fileReadTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t fileReadTool) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return runtimeNormalize(call)
 }
 
-func (t fileReadTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t fileReadTool) Prepare(_ context.Context, tc extension.ToolContext, call model.ToolCall) extension.ToolPlan {
 	var args struct {
 		Path string `json:"path"`
 	}
 	if err := json.Unmarshal(call.Arguments, &args); err != nil || args.Path == "" {
-		return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "prod_read requires path"}}}
+		return extension.ToolPlan{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "prod_read requires path"}}}
 	}
 	target := filepath.Clean(filepath.Join(tc.Workspace, args.Path))
-	return harness.PreparedTool{
-		Permissions:        []harness.PermissionRequest{{Permission: "file.read", Target: target}},
-		CanonicalWorkspace: filepath.Clean(tc.Workspace),
-		Execute: func(ctx context.Context) harness.ToolOutcome {
-			if err := ctx.Err(); err != nil {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "interrupted"}}
-			}
-			data, err := os.ReadFile(target)
-			if err != nil {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
-			}
-			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: string(data)}}
-		},
-	}
+	data, _ := json.Marshal(args)
+	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: "file.read", Target: target}}, CanonicalWorkspace: filepath.Clean(tc.Workspace), Data: data}
 }
 
-// productionToolsPlugin declares the suite's concrete tools. The standard
-// tools are not exportable: run_command in this list is the reserved-name
-// rejection's discriminating sibling, tested separately.
-func productionToolsPlugin() Plugin {
-	return Plugin{
-		ID:       "prodtools",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("prod_write", fileWriteTool{}.describe), ToolSpec("prod_read", fileReadTool{}.describe)},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"prod_write": fileWriteTool{}, "prod_read": fileReadTool{}}}, nil
-		},
+func (t fileReadTool) Execute(ctx context.Context, tc extension.ToolContext, plan extension.ToolPlan) harness.ToolOutcome {
+	var args struct {
+		Path string `json:"path"`
 	}
+	if err := json.Unmarshal(plan.Data, &args); err != nil {
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultError, Content: err.Error()}}
+	}
+	target := filepath.Clean(filepath.Join(tc.Workspace, args.Path))
+	if err := ctx.Err(); err != nil {
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultError, Content: "interrupted"}}
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultError, Content: err.Error()}}
+	}
+	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultSuccess, Content: string(data)}}
 }
 
-// testAdaptation is the custom test preparation contribution: one appended
-// paragraph and one excluded tool applied through the closed consequence.
+// productionToolsPlugin declares the suite's concrete tools.
+func productionToolsPlugin() extension.Native {
+	native := testNative("prodtools", extension.LifetimeHarness,
+		[]extension.Capability{extension.ToolCapability("prod_write"), extension.ToolCapability("prod_read")}, nil,
+		func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"prod_write": {Tool: fileWriteTool{}},
+				"prod_read":  {Tool: fileReadTool{}},
+			}}, nil
+		})
+	native.Describe = map[string]extension.ToolDescribe{
+		"prod_write": fileWriteTool{}.describe,
+		"prod_read":  fileReadTool{}.describe,
+	}
+	return native
+}
+
+// testAdaptation is the custom test preparation contribution.
 type testAdaptation struct{}
 
-func (testAdaptation) Prepare(_ context.Context, input PreparationInput) (PreparationConsequence, error) {
+func (testAdaptation) Prepare(_ context.Context, _ extension.CallContext, input extension.PreparationInput) (extension.PreparationConsequence, error) {
 	prompt := input.Prompt + "\n\n  PROD-ADAPTATION-BLOCK\n"
-	return PreparationConsequence{
-		Prompt:    &prompt,
-		ToolNames: []string{"prod_write"},
-	}, nil
+	return extension.PreparationConsequence{Prompt: &prompt, ToolNames: []string{"prod_write"}}, nil
 }
 
-// prodAdaptationPlugin declares the suite's custom preparation contribution.
-func prodAdaptationPlugin() Plugin {
-	return Plugin{
-		ID:       "adapt",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[PreparationHook]("model_adaptation")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"model_adaptation": testAdaptation{}}}, nil
-		},
-	}
+func prodAdaptationPlugin() extension.Native {
+	capability := extension.HookCapability("model_adaptation", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure))
+	return testNative("adapt", extension.LifetimeHarness, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"model_adaptation": {Preparation: testAdaptation{}.Prepare}}}, nil
+	})
 }
 
 // eachProductionStore runs one production composition fixture against the
@@ -295,7 +279,7 @@ func (e *productionEnv) open(ctx context.Context, hook *recordHook, park *parkin
 
 // openPlugins opens the fixture's exact plugin list over its data and config
 // roots, with the owner's store construction pointed at the fixture's store.
-func (e *productionEnv) openPlugins(ctx context.Context, plugins ...Plugin) (*Runtime, error) {
+func (e *productionEnv) openPlugins(ctx context.Context, natives ...extension.Native) (*Runtime, error) {
 	e.t.Helper()
 	useFixtureStore(e.t, e.store)
 	data, err := os.ReadFile(e.configPath)
@@ -304,33 +288,34 @@ func (e *productionEnv) openPlugins(ctx context.Context, plugins ...Plugin) (*Ru
 		Extensions map[string]json.RawMessage `json:"extensions"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
+		return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: natives, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
 	}
 	hasAgents := false
-	for _, plugin := range plugins {
-		hasAgents = hasAgents || plugin.ID == "agents"
-		if _, exists := doc.Extensions[plugin.ID]; !exists {
-			enableFixturePlugin(e.t, e.configPath, plugin.ID)
+	for _, native := range natives {
+		id := native.Declaration.ID
+		hasAgents = hasAgents || id == "agents"
+		if _, exists := doc.Extensions[id]; !exists {
+			enableFixturePlugin(e.t, e.configPath, id)
 		}
 	}
 	if !hasAgents && sectionEnabled(doc.Extensions["agents"]) {
-		plugins = append(plugins, fixtureAgentPlugin())
+		natives = append(natives, fixtureAgentPlugin())
 	}
-	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: plugins, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
+	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: natives, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
 }
 
 // openWithPlugins composes the suite's base plugin set plus extras — the
 // adaptation row adds its custom preparation contribution this way.
-func (e *productionEnv) openWithPlugins(ctx context.Context, hook *recordHook, park *parkingHook, extra ...Plugin) (*Runtime, error) {
+func (e *productionEnv) openWithPlugins(ctx context.Context, hook *recordHook, park *parkingHook, extra ...extension.Native) (*Runtime, error) {
 	e.t.Helper()
-	plugins := []Plugin{productionToolsPlugin(), hookPlugin(hook), parkPlugin(park)}
+	plugins := []extension.Native{productionToolsPlugin(), hookPlugin(hook), parkPlugin(park)}
 	return e.openPlugins(ctx, append(plugins, extra...)...)
 }
 
 func (e *productionEnv) hookedHook() *recordHook {
-	return &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in PreparationInput) PreparationConsequence {
+	return &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in extension.PreparationInput) extension.PreparationConsequence {
 		prompt := in.Prompt + "|hooked"
-		return PreparationConsequence{Prompt: &prompt}
+		return extension.PreparationConsequence{Prompt: &prompt}
 	}}
 }
 
@@ -744,17 +729,18 @@ func TestProductionAdmissionUsesReadyRevisionDuringParkedBuild(t *testing.T) {
 		ungate := make(chan struct{})
 		releaseGate := sync.OnceFunc(func() { close(ungate) })
 		var opens atomic.Int64
-		gate := servicePlugin("gate", &opens, func(json.RawMessage) error {
+		candidateBarrier = func() {
 			if !armed.Load() {
-				return nil
+				return
 			}
 			select {
 			case arrived <- struct{}{}:
 			default:
 			}
 			<-ungate
-			return nil
-		})
+		}
+		t.Cleanup(func() { candidateBarrier = nil })
+		gate := servicePlugin("gate", &opens, acceptValidator)
 		ctx := context.Background()
 		r, err := e.openWithPlugins(ctx, e.hookedHook(), &parkingHook{}, gate)
 		testassert.NoError(t, err)
@@ -941,8 +927,8 @@ func TestProductionHookCapture(t *testing.T) {
 		testassert.NoError(t, err)
 		// The hook's narrowed description survives into the committed
 		// capture.
-		hook.set(nil, func(PreparationInput) PreparationConsequence {
-			return PreparationConsequence{Descriptions: map[string]string{"prod_write": "narrowed by the hook"}}
+		hook.set(nil, func(extension.PreparationInput) extension.PreparationConsequence {
+			return extension.PreparationConsequence{Descriptions: map[string]string{"prod_write": "narrowed by the hook"}}
 		})
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-narrow", "hello")
 		rec := awaitOperation(t, r, session.Identity.SessionID, "op-narrow", harness.OperationSuccess)
@@ -954,15 +940,15 @@ func TestProductionHookCapture(t *testing.T) {
 		// post-terminal drain can race the submit into a steering buffer.
 		for _, row := range []struct {
 			name   string
-			mutate func(in PreparationInput) PreparationConsequence
+			mutate func(in extension.PreparationInput) extension.PreparationConsequence
 		}{
-			{"model", func(in PreparationInput) PreparationConsequence {
+			{"model", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Model = model.ModelRef{Provider: "prov", Model: "other"}
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
-			{"constraints", func(in PreparationInput) PreparationConsequence {
+			{"constraints", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Constraints = ToolConstraints{Readonly: true, WriteDir: "/somewhere-else"}
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
 		} {
 			hook.set(nil, row.mutate)
@@ -989,7 +975,7 @@ func TestProductionHostDefaultCapabilitiesSelectContribution(t *testing.T) {
 		r, err := Open(ctx, Options{
 			DataDir:              e.dataDir,
 			ConfigPath:           e.configPath,
-			Plugins:              []Plugin{productionToolsPlugin(), hookPlugin(e.hookedHook()), fixtureAgentPlugin()},
+			Plugins:              []extension.Native{productionToolsPlugin(), hookPlugin(e.hookedHook()), fixtureAgentPlugin()},
 			DefaultCapabilityIDs: []string{"hook.first"},
 		})
 		testassert.NoError(t, err)
@@ -1006,760 +992,10 @@ func TestProductionHostDefaultCapabilitiesSelectContribution(t *testing.T) {
 // countingWorkspacePlugin is one real Workspace-scoped declaration whose
 // factory counts construction, so a preparation test can observe whether
 // admission reached Workspace construction.
-func countingWorkspacePlugin(opens *atomic.Int64) Plugin {
-	return Plugin{
-		ID:       "wsprobe",
-		Scope:    ScopeWorkspace,
-		Provides: []CapabilitySpec{Spec[any]("ws.probe")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			opens.Add(1)
-			return Instance{Values: map[string]any{"ws.probe": struct{}{}}}, nil
-		},
-	}
-}
-
-// TestProductionUndeclaredDefaultCapabilityRejectedBeforeAdmission proves the
-// compiled-membership rule over the shared preparation: a built-in default
-// selection naming no compiled export rejects Submit with ErrInvalid before
-// Workspace construction or any preparation contribution, persists no
-// Operation and no input, while a declared contribution in the same default
-// selection would otherwise run. The declared long-lived and declared
-// short-scope positive siblings remain covered by
-// TestProductionHostDefaultCapabilitiesSelectContribution and
-// TestPreparationSelectsShortScopeCapabilitiesAtOpen.
-func TestProductionUndeclaredDefaultCapabilityRejectedBeforeAdmission(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		writeAgentDefinitions(t, e.configPath, `{"primary": {"model": "prov/m"}}`)
-		hook := e.hookedHook()
-		var workspaceOpens atomic.Int64
-		useFixtureStore(t, e.store)
-		r, err := Open(ctx, Options{
-			DataDir:              e.dataDir,
-			ConfigPath:           e.configPath,
-			Plugins:              []Plugin{productionToolsPlugin(), hookPlugin(hook), countingWorkspacePlugin(&workspaceOpens)},
-			DefaultCapabilityIDs: []string{"hook.first", "undeclared.capability"},
-		})
-		testassert.NoError(t, err)
-		defer r.Close(ctx)
-		session, err := r.createSession(ctx, e.workspace("undeclared-default-ws"), "primary")
-		testassert.NoError(t, err)
-		sessionID := session.Identity.SessionID
-
-		submitErr := submitExpectFailure(r, sessionID, "op-1", "hello")
-		operationErr := readOperationError(ctx, r, sessionID, "op-1")
-		entries, entriesErr := e.store.ReadEntries(ctx, sessionID, 0)
-		testassert.NoError(t, entriesErr)
-		testassert.Require(t, errors.Is(submitErr, harness.ErrInvalid), "submit error = %v (operation read %v, persisted entries %d, workspace opens %d, hook calls %d), want ErrInvalid", submitErr, operationErr, len(entries), workspaceOpens.Load(), len(hook.calls()))
-		testassert.Require(t, errors.Is(operationErr, harness.ErrNotFound), "failed admission left an Operation: %v", operationErr)
-		testassert.Require(t, len(entries) == 0, "failed admission persisted %d conversation entries, want none", len(entries))
-		testassert.Require(t, workspaceOpens.Load() == 0, "Workspace factory ran %d times before the rejected admission", workspaceOpens.Load())
-		testassert.Require(t, len(hook.calls()) == 0, "preparation contribution ran %d times before the rejected admission", len(hook.calls()))
-	})
-}
-
-func TestProductionFailedOpening(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		writeServiceFile(t, e.configPath, "{not json")
-
-		if r, err := e.open(ctx, e.hookedHook(), &parkingHook{}); err == nil {
-			r.Close(ctx)
-			t.Fatal("Open over a malformed configuration succeeded, want failure with no partial authority")
-		}
-
-		// The failed construction released the data-directory ownership: the
-		// same root opens again once the document is valid.
-		writeServiceFile(t, e.configPath, productionConfigDocument(e.server.URL, "T1"))
-		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		testassert.NoError(t, err)
-		testassert.NoError(t, r.Close(ctx))
-	})
-}
-
-func TestProductionBlockedShutdown(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		park := &parkingHook{}
-		r, err := e.open(ctx, e.hookedHook(), park)
-		testassert.NoError(t, err)
-		session, err := r.createSession(ctx, e.workspace("shutdown-ws"), "worker")
-		testassert.NoError(t, err)
-
-		// The armed hook parks the admission: an in-flight admitted call
-		// blocks Close until released, and the joined shutdown completes.
-		release := make(chan struct{})
-		used := make(chan struct{}, 1)
-		park.arm(release, used)
-		done := make(chan error, 1)
-		go func() {
-			done <- submitExpectFailure(r, session.Identity.SessionID, "op-parked", "hello")
-		}()
-		select {
-		case <-used:
-		case <-time.After(10 * time.Second):
-			t.Fatal("the parked admission never reached the hook")
-		}
-		closeDone := make(chan error, 1)
-		go func() { closeDone <- r.Close(ctx) }()
-		select {
-		case err := <-closeDone:
-			t.Fatalf("Close returned while the admission was parked (%v); shutdown joined nothing", err)
-		case <-time.After(200 * time.Millisecond):
-		}
-		close(release)
-		testassert.NoError(t, <-closeDone)
-		{
-			err := <-done
-			testassert.Require(t, err != nil, "the parked admission succeeded after the owner canceled; want the cancellation failure")
-		}
-	})
-
-	// With a pending steering head, the joined shutdown never starts a
-	// successor: the buffered head is discarded and becomes no Operation.
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		testassert.NoError(t, err)
-		session, err := r.createSession(ctx, e.workspace("shutdown-successor-ws"), "worker")
-		testassert.NoError(t, err)
-		e.server.armGate() // the run parks at its first model request
-		submitThroughRuntime(t, r, session.Identity.SessionID, "op-run", "hello")
-		e.server.awaitRequests(1)
-		steering, err := submitRawThroughRuntime(ctx, r, session.Identity.SessionID, "op-steer", "steer", harness.MessageModeRegular)
-		testassert.NoError(t, err)
-		testassert.Check(t, steering.Disposition == harness.DispositionSteering, "steering submit disposition = %q, want steering", steering.Disposition)
-		testassert.NoError(t, r.Close(ctx))
-		e.server.releaseGate()
-		{
-			_, err := e.store.ReadRegister(ctx, harness.RegisterKey{
-				SessionID: session.Identity.SessionID, Kind: harness.RegisterOperation, OperationID: "op-steer",
-			})
-			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "shutdown started a successor: %v", err)
-		}
-	})
-}
-
-func TestProductionDuplicateTools(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		testassert.NoError(t, err)
-		defer r.Close(ctx)
-		session, err := r.createSession(ctx, e.workspace("dup-ws"), "duper")
-		testassert.NoError(t, err)
-		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "hello")
-		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
-		{
-			got := toolNames(rec.Admission.Execution.Tools)
-			testassert.Require(t, slices.Equal(got, []string{"prod_read", "prod_write"}), "advertisement = %v, want duplicates deduped by first occurrence", got)
-		}
-	})
-}
-
-func TestProductionReadonlyAdvertisement(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		testassert.NoError(t, err)
-		defer r.Close(ctx)
-		session, err := r.createSession(ctx, e.workspace("ro-ws"), "ro")
-		testassert.NoError(t, err)
-		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "hello")
-		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
-		testassert.Require(t, rec.Admission.Execution.Readonly, "capture readonly = %v, want the agent's constraint", rec.Admission.Execution.Readonly)
-		{
-			got := toolNames(rec.Admission.Execution.Tools)
-			testassert.Require(t, slices.Equal(got, []string{"prod_read"}), "advertisement = %v, want the mutation tool dropped by the hard constraint", got)
-		}
-	})
-}
-
-// TestProductionTransportConversion pins the catalog-to-transport conversion
-// on one published snapshot: effective role and streamed usage, sidecar
-// layers with raw numbers, the effective protocol metadata, the
-// same-provider source-family map, and the retained wire-debug opt-in.
-func TestProductionTransportConversion(t *testing.T) {
-	sh := newServiceHarness(t)
-	writeServiceFile(t, sh.configPath, conversionConfigDocument())
-	writeAgentDefinitions(t, sh.configPath, "{}")
-	owner, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	c := mustComposition(t)
-	obs := newObservation()
-	svc := newConfigurationService(owner, c, sh.loader, sh.configPath, obs, nil)
-	snapshot, err := svc.publish(owner)
-	testassert.NoError(t, err)
-	p := newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
-	ref := model.ModelRef{Provider: "prov", Model: "m"}
-	provider, entry, err := snapshot.snapshot.catalog.Lookup(catalog.ModelRef{Provider: ref.Provider, Model: ref.Model})
-	testassert.NoError(t, err)
-
-	resolved, err := p.resolveTransport(provider, entry, ref, "resolved-key")
-	testassert.NoError(t, err)
-	testassert.Require(t, resolved.Model == ref && resolved.BaseURL == "https://prov.test/v1" && resolved.APIKey == "resolved-key" && resolved.WireSystemRole == "user", "resolved identity = %+v, want the captured endpoint, key, and model; got %v, want %v", resolved, resolved.WireSystemRole, "user")
-	testassert.Require(t, resolved.StreamedUsage, "streamed usage = false, want the model-level true override of the provider-level false")
-	testassert.Require(t, resolved.Headers["X-Trace"] == "t1", "resolved headers = %v, want the captured transport headers", resolved.Headers)
-	testassert.Equal(t, string(resolved.ProviderExtraBody["provider_side"]), `"p"`)
-	testassert.Equal(t, string(resolved.ProviderExtraBody["big"]), "9007199254740993")
-	testassert.Require(t, string(resolved.ModelExtraBody["precise"]) == "1.25" && resolved.ProtocolFamily == "fam" && slices.Equal(resolved.MustPreserve, []string{"proto_keep"}) && resolved.Drop["drop_me"] && len(resolved.Drop) == 1, "got %v, want %v; resolved protocol metadata = family %q must-preserve %v drop %v, want the model-level effective values", string(resolved.ModelExtraBody["precise"]), "1.25", resolved.ProtocolFamily, resolved.MustPreserve, resolved.Drop)
-	wantFamilies := map[model.ModelRef]string{
-		{Provider: "prov", Model: "m"}:     "fam",
-		{Provider: "prov", Model: "sib"}:   "fam",
-		{Provider: "prov", Model: "other"}: "else",
-	}
-	testassert.Require(t, len(resolved.SourceFamilies) == len(wantFamilies), "source families = %v, want exactly the same-provider map %v", resolved.SourceFamilies, wantFamilies)
-	for k, v := range wantFamilies {
-		if resolved.SourceFamilies[k] != v {
-			t.Fatalf("source family of %s = %q, want %q", k.String(), resolved.SourceFamilies[k], v)
-		}
-	}
-
-	// The system message encodes with the effective wire role.
-	body, _, err := model.Encode(resolved, model.Request{Messages: []model.Message{{Role: model.RoleSystem, Content: []model.ContentPart{{Kind: model.PartText, Text: "sys"}}}}}, nil)
-	testassert.NoError(t, err)
-	testassert.Require(t, strings.Contains(string(body), `"role":"user"`), "system message wire role = %s, want the effective user role", body)
-
-	// The wire-debug opt-in: off by default; enabled it creates the
-	// home-based private directory and supplies it; a creation failure
-	// disables diagnostics, never execution.
-	testassert.Equal(t, resolved.WireDebugDir, "")
-	t.Setenv(debugWireEnv, "1")
-	enabled, err := p.resolveTransport(provider, entry, ref, "resolved-key")
-	testassert.NoError(t, err)
-	want := filepath.Join(sh.home, ".lightcode", "debug", "wire")
-	testassert.Equal(t, enabled.WireDebugDir, want)
-	{
-		info, err := os.Stat(want)
-		testassert.Require(t, err == nil && info.IsDir(), "wire debug directory = (%v, %v), want the created private directory", info, err)
-	}
-	blocked := filepath.Join(sh.home, "file.txt")
-	testassert.NoError(t, os.WriteFile(blocked, []byte("a file, not a directory"), 0o600))
-	broken := &preparation{home: filepath.Join(blocked, "sub")}
-	disabled, err := broken.resolveTransport(provider, entry, ref, "resolved-key")
-	testassert.NoError(t, err)
-	testassert.Equal(t, disabled.WireDebugDir, "")
-}
-
-func conversionConfigDocument() string {
-	return `{
-  "providers": {
-    "prov": {
-      "transport": {"base_url": "https://prov.test/v1", "api_key_env": "", "headers": {"X-Trace": "t1"}},
-      "system_role": "developer",
-      "usage_in_stream": false,
-      "discovery": false,
-      "extra_body": {"provider_side": "p", "big": 9007199254740993},
-      "protocol_metadata": {"family": "fam", "must_preserve": ["keep_provider"], "drop": ["drop_provider"]},
-      "models": {
-        "m": {"name": "M", "context_window": 4096, "usage_in_stream": true, "system_role": "user",
-              "extra_body": {"precise": 1.25},
-              "protocol_metadata": {"family": "fam", "must_preserve": ["proto_keep"], "drop": ["drop_me"]}},
-        "sib": {"name": "S", "context_window": 4096},
-        "other": {"name": "O", "context_window": 4096, "protocol_metadata": {"family": "else"}}
-      }
-    }
-  }
-}`
-}
-
-// TestProductionCommandRow dispatches one run_command through the production
-// composition: the concrete opener's tool dispatch runs the real command and
-// the settled result content reaches the durable tool-result entry.
-func TestProductionCommandRow(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		testassert.NoError(t, err)
-		defer r.Close(ctx)
-		workspace := e.workspace("run-ws")
-		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
-		session, err := r.createSession(ctx, workspace, "runner")
-		testassert.NoError(t, err)
-		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please run")
-		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
-		if !slices.Equal(toolNames(rec.Admission.Execution.Tools), []string{"run_command"}) {
-			t.Fatalf("advertisement = %v, want the command tool", toolNames(rec.Admission.Execution.Tools))
-		}
-		// The settled result content proves the command ran through the
-		// concrete opener's dispatch.
-		entries, err := e.store.ReadEntries(ctx, session.Identity.SessionID, 0)
-		testassert.NoError(t, err)
-		var content string
-		for _, entry := range entries {
-			if entry.Kind != harness.EntryToolResult {
-				continue
-			}
-			var wire struct {
-				Content string `json:"content"`
-			}
-			testassert.NoError(t, json.Unmarshal(entry.Payload, &wire))
-			content = wire.Content
-		}
-		testassert.Equal(t, content, "production-command-row")
-	})
-}
-
-// TestProductionPatchRow admits an Agent that selects only the baseline
-// apply_patch tool on an owner with no optional plugin: the exact
-// advertisement on the capture and on the wire request, the real patch
-// mutation through the concrete dispatch, the engine's settled summary in the
-// durable tool-result entry, and the preimage snapshot inside the admitted
-// Operation's own code group. The hard-constraint siblings stay honest: a
-// readonly Agent without a write dir never sees the mutation tool and its call
-// settles unavailable with the file untouched, while a confined write dir
-// admits the tool, applies the in-bound patch, and denies the out-of-bound one
-// without touching the file. The bundled GPT exclusion sibling is
-// TestProductionCapabilityIDsModelIndependent.
-func TestProductionPatchRow(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		const original = "alpha\nbeta\ngamma\n"
-		const patchIn = "out/notes.txt"
-		update := func(path, old, added string) string {
-			input := "*** Begin Patch\n*** Update File: " + path + "\n@@\n-" + old + "\n+" + added + "\n*** End Patch"
-			raw, err := json.Marshal(map[string]any{"input": input})
-			testassert.NoError(t, err)
-			return string(raw)
-		}
-		writeServiceFile(t, e.configPath, chainCommandConfigDocument(e.server.URL))
-		writeAgentDefinitions(t, e.configPath, `{
-   "patcher": {"model": "prov/m", "system_prompt": "simple", "tools": ["apply_patch"]},
-   "patchro": {"model": "prov/m", "system_prompt": "simple", "tools": ["apply_patch"], "readonly": true},
-   "patchdir": {"model": "prov/m", "system_prompt": "simple", "tools": ["apply_patch"], "readonly": true, "write_dir": "out"}
- }`)
-		e.server.setScript(func(_ context.Context, body string) []string {
-			if lastMessageRole(body) == "tool" {
-				return textTurnEvents("done") // the ordinary follow-up after one settled call
-			}
-			switch lastUserText(body) {
-			case "patch it":
-				return toolCallTurnEvents("call-1", "apply_patch", update("notes.txt", "alpha", "ALPHA"))
-			case "patch out":
-				return toolCallTurnEvents("call-2", "apply_patch", update("notes.txt", "alpha", "ALPHA"))
-			case "patch in":
-				return toolCallTurnEvents("call-3", "apply_patch", update(patchIn, "alpha", "ALPHA"))
-			case "patch escape":
-				return toolCallTurnEvents("call-4", "apply_patch", update("notes.txt", "alpha", "ALPHA"))
-			}
-			return nil
-		})
-
-		// The positive case: the baseline patch tool selected alone.
-		workspace := e.workspace("patch-ws")
-		testassert.NoError(t, os.MkdirAll(filepath.Join(workspace, "out"), 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "notes.txt"), []byte(original), 0o600))
-		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, patchIn), []byte(original), 0o600))
-		r, err := e.openPlugins(ctx)
-		testassert.NoError(t, err)
-		defer r.Close(ctx)
-
-		session, err := r.createSession(ctx, workspace, "patcher")
-		testassert.NoError(t, err)
-		sessionID := session.Identity.SessionID
-		submitThroughRuntime(t, r, sessionID, "op-1", "patch it")
-		rec := awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
-		{
-			got := toolNames(rec.Admission.Execution.Tools)
-			testassert.Require(t, slices.Equal(got, []string{"apply_patch"}), "advertisement = %v, want exactly the selected baseline patch tool", got)
-		}
-		{
-			wire := decodeWireChatBody(t, e.server.bodyAt(0))
-			names := make([]string, 0, len(wire.Tools))
-			for _, tool := range wire.Tools {
-				names = append(names, tool.Function.Name)
-			}
-			testassert.Require(t, slices.Equal(names, []string{"apply_patch"}), "wire request tools = %v, want exactly the selected baseline patch tool", names)
-		}
-		results := chainToolResults(t, e.store, sessionID)
-		settled, ok := results["call-1"]
-		testassert.Require(t, ok && settled.Status == model.ResultSuccess && settled.Content == "Success. Updated the following files:\nM notes.txt", "patch result = %+v (ok %v), want the engine's settled summary", settled, ok)
-		var preview struct {
-			EditPreviewFiles []struct {
-				Path string `json:"path"`
-				Op   string `json:"op"`
-			} `json:"edit_preview_files"`
-		}
-		testassert.NoError(t, json.Unmarshal(settled.Metadata, &preview))
-		testassert.Require(t, len(preview.EditPreviewFiles) == 1 && preview.EditPreviewFiles[0].Path == "notes.txt" && preview.EditPreviewFiles[0].Op == "M", "edit_preview_files = %+v, want the update's one preview entry", preview.EditPreviewFiles)
-		{
-			data, err := os.ReadFile(filepath.Join(workspace, "notes.txt"))
-			testassert.Require(t, err == nil && string(data) == "ALPHA\nbeta\ngamma\n", "notes.txt = (%q, %v), want the patched bytes", data, err)
-		}
-		{
-			group := filepath.Join(e.dataDir, "code", sessionID, rec.Admission.AdmittedEntry.EntryID, "snapshots", "1")
-			entries, err := os.ReadDir(group)
-			testassert.NoError(t, err)
-			found := false
-			for _, entry := range entries {
-				metaData, err := os.ReadFile(filepath.Join(group, entry.Name(), "meta.json"))
-				if err != nil {
-					continue
-				}
-				var meta struct {
-					OriginalPath string `json:"original_path"`
-					Existed      bool   `json:"existed"`
-				}
-				if err := json.Unmarshal(metaData, &meta); err != nil || !meta.Existed || !strings.HasSuffix(meta.OriginalPath, "notes.txt") {
-					continue
-				}
-				preimage, err := os.ReadFile(filepath.Join(group, entry.Name(), "original"))
-				testassert.Require(t, err == nil && string(preimage) == original, "notes.txt preimage = (%q, %v), want the pre-mutation bytes", preimage, err)
-				found = true
-			}
-			testassert.Require(t, found, "no notes.txt preimage snapshot in %s, want the mutation's snapshot evidence", group)
-		}
-
-		// The readonly sibling without a write dir: the mutation tool is not
-		// advertised, its call settles unavailable, and the file stays intact.
-		roWorkspace := e.workspace("patch-ro-ws")
-		testassert.NoError(t, os.MkdirAll(roWorkspace, 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(roWorkspace, "notes.txt"), []byte(original), 0o600))
-		ro, err := r.createSession(ctx, roWorkspace, "patchro")
-		testassert.NoError(t, err)
-		submitThroughRuntime(t, r, ro.Identity.SessionID, "op-ro", "patch out")
-		recRO := awaitOperation(t, r, ro.Identity.SessionID, "op-ro", harness.OperationSuccess)
-		{
-			got := toolNames(recRO.Admission.Execution.Tools)
-			testassert.Require(t, len(got) == 0, "readonly advertisement = %v, want the mutation tool kept out", got)
-		}
-		{
-			result := chainToolResults(t, e.store, ro.Identity.SessionID)["call-2"]
-			testassert.Require(t, result.Status == model.ResultError && result.Content == `Tool "apply_patch" is not available.`, "readonly patch call = %+v, want the unavailable settlement", result)
-		}
-		{
-			data, err := os.ReadFile(filepath.Join(roWorkspace, "notes.txt"))
-			testassert.Require(t, err == nil && string(data) == original, "readonly sibling notes.txt = (%q, %v), want the untouched bytes", data, err)
-		}
-
-		// The confined write-dir sibling: the tool is advertised, the in-bound
-		// patch runs, and the out-of-bound patch is denied with its file intact.
-		wd, err := r.createSession(ctx, workspace, "patchdir")
-		testassert.NoError(t, err)
-		submitThroughRuntime(t, r, wd.Identity.SessionID, "op-in", "patch in")
-		recIn := awaitOperation(t, r, wd.Identity.SessionID, "op-in", harness.OperationSuccess)
-		{
-			got := toolNames(recIn.Admission.Execution.Tools)
-			testassert.Require(t, slices.Equal(got, []string{"apply_patch"}), "write-dir advertisement = %v, want the confined mutation tool admitted", got)
-		}
-		{
-			data, err := os.ReadFile(filepath.Join(workspace, patchIn))
-			testassert.Require(t, err == nil && string(data) == "ALPHA\nbeta\ngamma\n", "out/notes.txt = (%q, %v), want the in-bound patch applied", data, err)
-		}
-		submitThroughRuntime(t, r, wd.Identity.SessionID, "op-escape", "patch escape")
-		recOut := awaitOperation(t, r, wd.Identity.SessionID, "op-escape", harness.OperationSuccess)
-		{
-			_ = recOut
-			result := chainToolResults(t, e.store, wd.Identity.SessionID)["call-4"]
-			testassert.Require(t, result.Status == model.ResultDenied && result.Content == "Permission denied.", "out-of-bound patch call = %+v, want the fixed policy denial", result)
-		}
-		{
-			data, err := os.ReadFile(filepath.Join(workspace, "notes.txt"))
-			testassert.Require(t, err == nil && string(data) == "ALPHA\nbeta\ngamma\n", "write-dir sibling notes.txt = (%q, %v), want only the positive case's patched bytes", data, err)
-		}
-	})
-}
-
-// TestProductionBaselineCapabilitySelection admits an Agent that selects a
-// standard tool as a capability: the selection survives configuration, the
-// capture carries it, and every invocation resolves the owner-provided value
-// through the ordinary selection path. The tools-list sibling keeps the
-// existing advertisement behavior, and an Agent selecting an unknown capability
-// stays rejected.
-func TestProductionBaselineCapabilitySelection(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		writeServiceFile(t, e.configPath, chainCommandConfigDocument(e.server.URL))
-		writeAgentDefinitions(t, e.configPath, `{
-   "capselect": {"model": "prov/m", "system_prompt": "simple", "tools": [], "capabilities": ["read_file"]},
-   "toolselect": {"model": "prov/m", "system_prompt": "simple", "tools": ["read_file"]}
- }`)
-		e.server.setScript(func(_ context.Context, body string) []string {
-			return textTurnEvents("done") // every turn answers plain text: only the selection path is under test
-		})
-		r, err := e.openPlugins(ctx)
-		testassert.NoError(t, err)
-		defer r.Close(ctx)
-
-		capWorkspace := e.workspace("cap-ws")
-		testassert.NoError(t, os.MkdirAll(capWorkspace, 0o700))
-		session, err := r.createSession(ctx, capWorkspace, "capselect")
-		testassert.NoError(t, err)
-		submitThroughRuntime(t, r, session.Identity.SessionID, "op-cap", "hello")
-		rec := awaitOperation(t, r, session.Identity.SessionID, "op-cap", harness.OperationSuccess)
-		testassert.Require(t, slices.Equal(rec.Admission.Execution.Capabilities, []string{"read_file"}), "captured capabilities = %q, want the standard tool selection", rec.Admission.Execution.Capabilities)
-		testassert.Require(t, len(toolNames(rec.Admission.Execution.Tools)) == 0, "advertisement = %v, want no tool selected", toolNames(rec.Admission.Execution.Tools))
-
-		toolWorkspace := e.workspace("tool-ws")
-		testassert.NoError(t, os.MkdirAll(toolWorkspace, 0o700))
-		toolSession, err := r.createSession(ctx, toolWorkspace, "toolselect")
-		testassert.NoError(t, err)
-		submitThroughRuntime(t, r, toolSession.Identity.SessionID, "op-tool", "hello")
-		toolRec := awaitOperation(t, r, toolSession.Identity.SessionID, "op-tool", harness.OperationSuccess)
-		{
-			got := toolNames(toolRec.Admission.Execution.Tools)
-			testassert.Require(t, slices.Equal(got, []string{"read_file"}), "advertisement = %v, want the selected baseline tool", got)
-		}
-
-		// The forbidden sibling: an unknown capability never joins the
-		// capability universe, so its Agent definition is refused and its
-		// admission reports the missing Agent type.
-		badWorkspace := e.workspace("bad-ws")
-		testassert.NoError(t, os.MkdirAll(badWorkspace, 0o700))
-		bad, err := r.createSessionHeader(ctx, badWorkspace, &protocol.AgentSelection{Inputs: &protocol.AgentInputs{Model: "prov/m", AssemblyMode: protocol.AgentAssemblySimple, Tools: []string{}, Capabilities: []string{"nope.not.a.capability"}}})
-		testassert.NoError(t, err)
-		_, err = submitRawThroughRuntime(ctx, r, bad.SessionId, "op-bad", "hello", harness.MessageModeRegular)
-		testassert.Require(t, err != nil && strings.Contains(err.Error(), "nope.not.a.capability"), "unknown-capability admission = err %v, want the refused capability reported", err)
-	})
-}
-
-// TestProductionSuppliesExplicitPromptInputs proves public Open forwards the
-// caller's identity and global rules directory to preparation: an ambient
-// home .lightcode rule never enters the prompt, and neither does an embedded
-// persona. The zero-value sibling supplies no identity or global directory
-// while the same ambient home rule exists.
-func TestProductionSuppliesExplicitPromptInputs(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		workspace := e.workspace("explicit-ws")
-		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("WORKSPACE_RULES_MARKER"), 0o600))
-		testassert.NoError(t, os.MkdirAll(filepath.Join(e.home, ".lightcode"), 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, ".lightcode", "AGENTS.md"), []byte("AMBIENT_HOME_RULES"), 0o600))
-		globalDir := filepath.Join(e.home, "explicit-rules")
-		testassert.NoError(t, os.MkdirAll(globalDir, 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(globalDir, "AGENTS.md"), []byte("EXPLICIT_GLOBAL_RULES"), 0o600))
-
-		capture := func(t *testing.T, operationID, identity, rulesDir string) string {
-			t.Helper()
-			e.identity = identity
-			e.globalRulesDir = rulesDir
-			r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-			testassert.NoError(t, err)
-			defer func() { testassert.NoError(t, r.Close(ctx)) }()
-			session, err := r.createSession(ctx, workspace, "worker")
-			testassert.NoError(t, err)
-			submitThroughRuntime(t, r, session.Identity.SessionID, operationID, "hello")
-			rec := awaitOperation(t, r, session.Identity.SessionID, operationID, harness.OperationSuccess)
-			return rec.Admission.Execution.SystemPrompt
-		}
-
-		explicit := capture(t, "op-explicit", "PRODUCTION_HOST_IDENTITY", globalDir)
-		testassert.Require(t, strings.Contains(explicit, "PRODUCTION_HOST_IDENTITY") && strings.Contains(explicit, "EXPLICIT_GLOBAL_RULES") && strings.Contains(explicit, "WORKSPACE_RULES_MARKER"), "captured prompt misses the explicit host inputs or Workspace rules: %.300s", explicit)
-		testassert.Require(t, !strings.Contains(explicit, "AMBIENT_HOME_RULES") && !strings.Contains(explicit, "Lightcode, an agentic coding assistant"), "captured prompt carries an implicit home rule or embedded persona: %.300s", explicit)
-
-		zero := capture(t, "op-zero", "", "")
-		testassert.Require(t, strings.Contains(zero, "WORKSPACE_RULES_MARKER"), "zero-value prompt misses the Workspace rules: %.300s", zero)
-		testassert.Require(t, !strings.Contains(zero, "PRODUCTION_HOST_IDENTITY") && !strings.Contains(zero, "EXPLICIT_GLOBAL_RULES"), "zero-value prompt carries an explicit host input: %.300s", zero)
-		testassert.Require(t, !strings.Contains(zero, "AMBIENT_HOME_RULES") && !strings.Contains(zero, "Lightcode, an agentic coding assistant"), "zero-value prompt carries an implicit home rule or embedded persona: %.300s", zero)
-	})
-}
-
-// TestProductionAdaptationComposes composes the suite's custom preparation
-// contribution through public Open and proves through one real admitted
-// operation that the selected adaptation reached the composed surface: the
-// append paragraph lands after the assembled baseline and the hidden tool is
-// absent from the advertisement.
-func TestProductionAdaptationComposes(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		writeAgentDefinitions(t, e.configPath, strings.TrimSuffix(productionAgentsDocument, "}")+`,"adapted":{"model":"prov/m","system_prompt":"simple","tools":["prod_write","prod_read"],"capabilities":["model_adaptation"]}}`)
-		r, err := e.openWithPlugins(ctx, e.hookedHook(), &parkingHook{}, prodAdaptationPlugin())
-		testassert.NoError(t, err)
-		defer r.Close(ctx)
-		session, err := r.createSession(ctx, e.workspace("adapt-ws"), "adapted")
-		testassert.NoError(t, err)
-		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "hello")
-		rec := awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
-
-		prompt := rec.Admission.Execution.SystemPrompt
-		testassert.Require(t, strings.HasSuffix(prompt, "  PROD-ADAPTATION-BLOCK\n"), "captured prompt misses the adaptation's append paragraph and whitespace: %.200s", prompt)
-		testassert.Require(t, strings.Contains(prompt, "## Core Rules"), "captured prompt lost the assembled baseline: %.200s", prompt)
-		{
-			got := toolNames(rec.Admission.Execution.Tools)
-			testassert.Require(t, slices.Equal(got, []string{"prod_write"}), "advertisement = %v, want the adaptation's excluded tool absent", got)
-		}
-
-		// The exclusion is the adaptation's work, not the hard constraints:
-		// the capture's readonly/write-dir fields stay the definition's.
-		testassert.Require(t, !rec.Admission.Execution.Readonly && rec.Admission.Execution.WriteDir == "", "capture constraints = (%v, %q), want the definition's untouched values", rec.Admission.Execution.Readonly, rec.Admission.Execution.WriteDir)
-	})
-}
-
-// TestProductionPreparationHookReplacesAndRemovesPromptAfterAssembly proves
-// the existing PreparationHook callback owns complete replacement and empty
-// removal AFTER prompt assembly: full, simple and none each assemble their
-// baseline (identity, rules, instructions), the hook replaces it with one
-// exact text (or removes it), the admitted capture is exactly that text with
-// no baseline, rule or identity reinsertion, and the model request carries
-// the exact system message (or none at all).
-func TestProductionPreparationHookReplacesAndRemovesPromptAfterAssembly(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		writeAgentDefinitions(t, e.configPath, `{
-  "fullagent": {"model": "prov/m", "system_prompt": "full", "prompt": "FULL_INSTRUCTIONS", "capabilities": ["hook.first"]},
-  "simpleagent": {"model": "prov/m", "system_prompt": "simple", "prompt": "SIMPLE_INSTRUCTIONS", "capabilities": ["hook.first"]},
-  "noneagent": {"model": "prov/m", "system_prompt": "none", "prompt": "NONE_INSTRUCTIONS", "capabilities": ["hook.first"]}
-}`)
-		globalDir := e.workspace("global-rules")
-		testassert.NoError(t, os.MkdirAll(globalDir, 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(globalDir, "AGENTS.md"), []byte("EXPLICIT_GLOBAL_RULES"), 0o600))
-		e.identity = "PRODUCTION_HOST_IDENTITY"
-		e.globalRulesDir = globalDir
-		workspace := e.workspace("hook-prompt-ws")
-		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("WORKSPACE_RULES_MARKER"), 0o600))
-
-		const replaced = "HOOK-REPLACED-PROMPT"
-		cases := []struct {
-			name, agent, want string
-			assembled         []string
-		}{
-			{"full", "fullagent", replaced, []string{"PRODUCTION_HOST_IDENTITY", "EXPLICIT_GLOBAL_RULES", "WORKSPACE_RULES_MARKER", "FULL_INSTRUCTIONS"}},
-			{"simple", "simpleagent", replaced, []string{"PRODUCTION_HOST_IDENTITY", "EXPLICIT_GLOBAL_RULES", "WORKSPACE_RULES_MARKER", "SIMPLE_INSTRUCTIONS"}},
-			{"none", "noneagent", "", []string{"NONE_INSTRUCTIONS"}},
-		}
-		for _, tc := range cases {
-			t.Run(tc.name, func(t *testing.T) {
-				var mu sync.Mutex
-				var preHook string
-				hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in PreparationInput) PreparationConsequence {
-					mu.Lock()
-					preHook = in.Prompt
-					mu.Unlock()
-					prompt := tc.want
-					return PreparationConsequence{Prompt: &prompt}
-				}}
-				r, err := e.openPlugins(ctx, hookPlugin(hook))
-				testassert.NoError(t, err)
-				defer r.Close(ctx)
-				session, err := r.createSession(ctx, workspace, tc.agent)
-				testassert.NoError(t, err)
-				before := e.server.requests()
-				submitThroughRuntime(t, r, session.Identity.SessionID, "op-"+tc.name, "hello")
-				rec := awaitOperation(t, r, session.Identity.SessionID, "op-"+tc.name, harness.OperationSuccess)
-
-				mu.Lock()
-				assembled := preHook
-				mu.Unlock()
-				for _, marker := range tc.assembled {
-					testassert.Require(t, strings.Contains(assembled, marker), "pre-hook prompt misses the assembled %q: %.300s", marker, assembled)
-				}
-				testassert.Equal(t, rec.Admission.Execution.SystemPrompt, tc.want)
-				for _, marker := range tc.assembled {
-					testassert.Require(t, !strings.Contains(rec.Admission.Execution.SystemPrompt, marker), "admitted prompt reinserted %q", marker)
-				}
-
-				testassert.Require(t, e.server.requests() > before, "no model request was recorded")
-				wire := decodeWireChatBody(t, e.server.bodyAt(before))
-				if tc.want == "" {
-					testassert.Require(t, len(wire.Messages) != 0 && wire.Messages[0].Role != "system", "wire messages = %+v, want no system message for the removed prompt", wire.Messages)
-					return
-				}
-				want, err := json.Marshal(tc.want)
-				testassert.Require(t, err == nil && len(wire.Messages) != 0 && wire.Messages[0].Role == "system" && string(wire.Messages[0].Content) == string(want), "wire messages = %+v, want the exact replacement system message %s", wire.Messages, want)
-			})
-		}
-	})
-}
-
-// TestProductionKeylessProvider admits an agent on the credential-free
-// provider (empty api_key_env) through public Open: the admission resolves
-// no credential, the real model request carries no Authorization header, and
-// the turn settles through the concrete opener.
-func TestProductionKeylessProvider(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		testassert.NoError(t, err)
-		defer r.Close(ctx)
-		session, err := r.createSession(ctx, e.workspace("keyless-ws"), "keyless")
-		testassert.NoError(t, err)
-		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please write")
-		awaitOperation(t, r, session.Identity.SessionID, "op-1", harness.OperationSuccess)
-		if e.server.requests() != 2 {
-			t.Fatalf("model requests = %d, want the tool-call turn and the follow-up", e.server.requests())
-		}
-		testassert.Equal(t, e.server.authAt(0), "")
-		data, err := os.ReadFile(filepath.Join(e.workspace("keyless-ws"), "out.txt"))
-		testassert.Require(t, err == nil && string(data) == "written by production", "prod_write effect = (%q, %v), want the written content", data, err)
-	})
-}
-
-// TestExecutionOpenerToolWriteWaitsForRestoreInterval proves the interval
-// with a real Harness-mediated mutating tool: the parked restore owns the
-// Session's artifact interval, the racing admission still commits
-// (Harness-owned), and the committed opener — registered as a waiter in the
-// owned registry state — cannot begin the prod_write effect until the restore
-// released the interval. The durable Operation outcome and the actual file
-// content prove the ordering: the restore's FIFO content lands first, the
-// tool's real write last.
-func TestExecutionOpenerToolWriteWaitsForRestoreInterval(t *testing.T) {
-	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
-		ctx := context.Background()
-		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
-		testassert.NoError(t, err)
-		defer r.Close(ctx)
-		workspace := e.workspace("interval-ws")
-		session, err := r.createSession(ctx, workspace, "worker")
-		testassert.NoError(t, err)
-		sessionID := session.Identity.SessionID
-		op := submitCodeOperation(t, r, sessionID, "op-1", "first")
-		awaitRestorableSession(t, r, sessionID)
-
-		file := filepath.Join(workspace, "out.txt") // the prod_write target
-		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, sessionID, op.Admission.AdmittedEntry.EntryID), file, "written by production")
-
-		park, outcomes := parkRestore(t, r, sessionID, "op-1", fifo)
-		defer park.flush()
-
-		admitted := make(chan error, 1)
-		go func() {
-			res, err := submitRawThroughRuntime(ctx, r, sessionID, "op-write", "write it", harness.MessageModeRegular)
-			if err != nil {
-				admitted <- err
-				return
-			}
-			if res.Disposition != harness.DispositionAdmitted {
-				admitted <- fmt.Errorf("disposition %q, want admitted", res.Disposition)
-				return
-			}
-			admitted <- nil
-		}()
-		select {
-		case err := <-admitted:
-			testassert.NoError(t, err)
-		case <-time.After(10 * time.Second):
-			t.Fatal("admission blocked during a parked restore: admission stays Harness-owned")
-		}
-
-		// The owned registry state is the deterministic parked-opener proof:
-		// the restore holds the token and the opener's acquisition is
-		// registered as its waiter. The tool effect runs strictly after the
-		// opener wins, so this state cannot coexist with a begun write.
-		awaitOpenerRegistered(t, r, sessionID)
-
-		// The real write has not begun: the opener cannot have won the token.
-		{
-			data, err := os.ReadFile(file)
-			testassert.Require(t, err == nil && len(data) == 0, "the tool write began inside the restore interval: (%q, %v)", data, err)
-		}
-
-		park.release("restored")
-		var parkedRestore restoreOutcome
-		select {
-		case parkedRestore = <-outcomes:
-		case <-time.After(10 * time.Second):
-			t.Fatal("the parked restore never returned after its FIFO completed")
-		}
-		testassert.Require(t, parkedRestore.err == nil && len(parkedRestore.result.Restored) == 1 && parkedRestore.result.Restored[0] == file, "parked restore = %v; restored = %v, want the parked group's restore", parkedRestore.err, parkedRestore.result.Restored)
-
-		// The opener won the released interval: the real tool effect ran and
-		// the durable Operation settled.
-		awaitOperation(t, r, sessionID, "op-write", harness.OperationSuccess)
-		{
-			data, err := os.ReadFile(file)
-			testassert.Require(t, err == nil && string(data) == "written by production", "file after the tool write = (%q, %v), want the tool's content", data, err)
-		}
+func countingWorkspacePlugin(opens *atomic.Int64) extension.Native {
+	capability := testServiceCapability("ws.probe")
+	return testNative("wsprobe", extension.LifetimeWorkspace, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		opens.Add(1)
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"ws.probe": testServiceImplementation()}}, nil
 	})
 }

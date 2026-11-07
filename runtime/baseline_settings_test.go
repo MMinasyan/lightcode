@@ -85,7 +85,7 @@ func TestBaselineSettingsDriveToolsJobsAndCompaction(t *testing.T) {
 	readTool := byID["read_file"]
 	call, err := model.NewToolCall(model.ToolCall{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"a.txt"}`)})
 	testassert.NoError(t, err)
-	normalized, err := readTool.Normalize(ToolContext{Invocation: invocation}, call)
+	normalized, err := readTool.Normalize(context.Background(), ToolContext{Invocation: invocation}, call)
 	testassert.NoError(t, err)
 	testassert.Require(t, string(normalized) == `{"limit":77,"offset":1,"path":"a.txt"}`, "read normalization = %s, want the top-level tools limit 77", normalized)
 
@@ -283,7 +283,7 @@ func TestBaselineCapturesStayFrozenAcrossSettingsPublication(t *testing.T) {
 	readTool := newStandardTools(sh.dataDir, &fakeJobs{})["read_file"]
 	read := func(t *testing.T, invocation Invocation) string {
 		t.Helper()
-		normalized, err := readTool.Normalize(ToolContext{Invocation: invocation}, readCall)
+		normalized, err := readTool.Normalize(context.Background(), ToolContext{Invocation: invocation}, readCall)
 		testassert.NoError(t, err)
 		call, err := model.NewToolCall(model.ToolCall{ID: "call-read", Name: "read_file", Arguments: normalized})
 		testassert.NoError(t, err)
@@ -345,7 +345,7 @@ func TestBaselinePartialObjectSettingsUseAbsentDefaults(t *testing.T) {
 	readTool := newStandardTools(sh.dataDir, &fakeJobs{})["read_file"]
 	call, err := model.NewToolCall(model.ToolCall{ID: "call-read", Name: "read_file", Arguments: json.RawMessage(`{"path":"a.txt"}`)})
 	testassert.NoError(t, err)
-	normalized, err := readTool.Normalize(ToolContext{Invocation: invocation}, call)
+	normalized, err := readTool.Normalize(context.Background(), ToolContext{Invocation: invocation}, call)
 	testassert.NoError(t, err)
 	testassert.Require(t, string(normalized) == `{"limit":500,"offset":1,"path":"a.txt"}`, "omitted read_max_lines normalization = %s, want the absent-member default 500", normalized)
 

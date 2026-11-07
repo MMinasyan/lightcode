@@ -271,3 +271,50 @@ func mustAssistantMessage(t *testing.T, text string) model.Message {
 	testassert.NoError(t, err)
 	return msg
 }
+
+// TestRequestViewSeedsFromInitialToolNames proves the first advertisement is
+// the preparation-selected starting visibility, not the full captured
+// catalog: nil keeps the Harness all-tools default, present-empty advertises
+// nothing, and a reordered selection preserves its order.
+func TestRequestViewSeedsFromInitialToolNames(t *testing.T) {
+	other := testToolDefinition()
+	other.Name = "other"
+	base := testCapture()
+	base.Tools = append(base.Tools, other)
+	for _, row := range []struct {
+		name  string
+		input []string
+		want  []string
+	}{
+		{"nil default", nil, []string{"echo", "other"}},
+		{"empty", []string{}, nil},
+		{"reordered", []string{"other", "echo"}, []string{"other", "echo"}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			capture := base
+			capture.InitialToolNames = row.input
+			view := newRequestView(capture, "", "", nil)
+			var got []string
+			for _, definition := range view.effectiveTools() {
+				got = append(got, definition.Name)
+			}
+			if len(got) != len(row.want) {
+				t.Fatalf("effective tools = %v, want %v", got, row.want)
+			}
+			for i := range got {
+				if got[i] != row.want[i] {
+					t.Fatalf("effective tools = %v, want %v", got, row.want)
+				}
+			}
+			names := view.evidenceFor().ToolNames
+			if len(names) != len(row.want) {
+				t.Fatalf("evidence names = %v, want %v", names, row.want)
+			}
+			for i := range names {
+				if names[i] != row.want[i] {
+					t.Fatalf("evidence names = %v, want %v", names, row.want)
+				}
+			}
+		})
+	}
+}

@@ -51,11 +51,11 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '9';
+    protocol_version: '10';
 };
 
 /**
- * One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+ * One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
  *
  */
 export type Scope = ({
@@ -67,8 +67,8 @@ export type Scope = ({
 } & SessionScope) | ({
     kind: 'operation';
 } & OperationScope) | ({
-    kind: 'agent';
-} & AgentScope) | ({
+    kind: 'invocation';
+} & InvocationScope) | ({
     kind: 'job';
 } & JobScope);
 
@@ -104,11 +104,13 @@ export type OperationScope = {
     job_id?: string;
 };
 
-export type AgentScope = {
-    kind: 'agent';
+export type InvocationScope = {
+    kind: 'invocation';
     workspace?: string;
     session_id: string;
     operation_id: string;
+    invocation_id: string;
+    purpose: 'conversation' | 'maintenance';
     job_id?: string;
 };
 

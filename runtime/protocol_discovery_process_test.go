@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -99,7 +100,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 
 		record := readDiscoveryRecord(t, recordPath)
 		health := healthSnapshot(t, record)
-		testassert.Require(t, health.InstanceId == record.InstanceId && health.ProtocolVersion == protocol.N9, "authenticated health = %s/%s, want the record's %s/%s", health.InstanceId, health.ProtocolVersion, record.InstanceId, record.ProtocolVersion)
+		testassert.Require(t, health.InstanceId == record.InstanceId && health.ProtocolVersion == protocol.N10, "authenticated health = %s/%s, want the record's %s/%s", health.InstanceId, health.ProtocolVersion, record.InstanceId, record.ProtocolVersion)
 
 		winner.shutdown()
 		{
@@ -166,7 +167,7 @@ func TestRuntimeDiscoveryOwnershipAcrossProcesses(t *testing.T) {
 		record := readDiscoveryRecord(t, recordPath)
 		before := readDiscoveryBytes(t, recordPath)
 		first := healthSnapshot(t, record)
-		testassert.Require(t, first.InstanceId == record.InstanceId && first.ProtocolVersion != "" && first.ProtocolVersion != protocol.N9, "incompatible health = %s/%q, want the record's instance and a different nonempty version", first.InstanceId, first.ProtocolVersion)
+		testassert.Require(t, first.InstanceId == record.InstanceId && first.ProtocolVersion != "" && first.ProtocolVersion != protocol.N10, "incompatible health = %s/%q, want the record's instance and a different nonempty version", first.InstanceId, first.ProtocolVersion)
 
 		contenderMarker := filepath.Join(t.TempDir(), "marker")
 		contender := startDiscoveryChild(t, e.home, dataDir, recordPath, contenderMarker, discoveryModeOwner)
@@ -250,18 +251,14 @@ func newDiscoveryChildEnv(t *testing.T, home, dataDir string) *ownerEnv {
 // the given marker path: the winner's marker exists while a losing
 // contender's never does, the executable proof that no factory ran without
 // the lock.
-func discoveryMarkerPlugin(markerPath string) Plugin {
-	return Plugin{
-		ID:       "discovery-marker",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[any]("discovery.marker")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			if err := os.WriteFile(markerPath, []byte("open"), 0o600); err != nil {
-				return Instance{}, err
-			}
-			return Instance{Values: map[string]any{"discovery.marker": "marker"}}, nil
-		},
-	}
+func discoveryMarkerPlugin(markerPath string) extension.Native {
+	capability := testServiceCapability("discovery.marker")
+	return testNative("discovery-marker", extension.LifetimeHarness, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		if err := os.WriteFile(markerPath, []byte("open"), 0o600); err != nil {
+			return extension.Instance{}, err
+		}
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"discovery.marker": testServiceImplementation()}}, nil
+	})
 }
 
 // runDiscoveryChild executes one child role and prints only handshake tokens:
@@ -403,7 +400,7 @@ func readDiscoveryRecord(t *testing.T, path string) discoveryRecord {
 		err := decodeOneDocument(data, &record)
 		testassert.Require(t, err == nil, "decode discovery record at %s: %v", path, err)
 	}
-	testassert.Require(t, record.ProtocolVersion == string(protocol.N9) && len(record.InstanceId) == 32 && strings.Trim(record.InstanceId, "0123456789abcdef") == "", "discovery record protocol version = %q, want %q; discovery instance %q is not 32 lowercase hex", record.ProtocolVersion, protocol.N9, record.InstanceId)
+	testassert.Require(t, record.ProtocolVersion == string(protocol.N10) && len(record.InstanceId) == 32 && strings.Trim(record.InstanceId, "0123456789abcdef") == "", "discovery record protocol version = %q, want %q; discovery instance %q is not 32 lowercase hex", record.ProtocolVersion, protocol.N10, record.InstanceId)
 	testassert.Require(t, len(record.Credential) == 64 && strings.Trim(record.Credential, "0123456789abcdef") == "", "discovery credential is not 64 lowercase hex")
 	endpoint, err := url.Parse(record.Endpoint)
 	testassert.Require(t, err == nil && endpoint.Scheme == "http" && endpoint.Hostname() == "127.0.0.1" && endpoint.Port() != "", "discovery endpoint %q is not an http loopback host:port", record.Endpoint)

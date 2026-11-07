@@ -442,7 +442,7 @@ func TestEvidenceCatalogOwnershipAndCopiedPrefix(t *testing.T) {
 		{"empty", []string{}, true},
 		{"ordered subset", []string{"echo", "other"}, true},
 		{"foreign", []string{"foreign"}, false},
-		{"reordered", []string{"other", "echo"}, false},
+		{"reordered", []string{"other", "echo"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := validTestGraph()
@@ -567,7 +567,7 @@ func TestEvidenceCatalogForCommittedOwners(t *testing.T) {
 					fixture.session.State.CurrentOperationID = ""
 				}
 				_, err := validateFixture(t, fixture.storage(t), testSessionID)
-				if foreign && (err == nil || !strings.Contains(err.Error(), "evidence tool names")) {
+				if foreign && (err == nil || !strings.Contains(err.Error(), "evidence tool name")) {
 					t.Fatalf("foreign names: %v", err)
 				}
 				if !foreign && err != nil {

@@ -259,7 +259,7 @@ func (readTool) describe(_ Invocation, _ harness.ToolConstraints, _ harness.Sess
 	}, nil
 }
 
-func (t readTool) Normalize(tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t readTool) Normalize(_ context.Context, tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	s, err := t.inst.settings(tc.Invocation)
 	if err != nil {
 		return nil, err
@@ -343,7 +343,7 @@ func (t writeTool) describe(_ Invocation, constraints harness.ToolConstraints, _
 	return mutationDescription("write_file", writeFileDescription, writeFileParameters, constraints)
 }
 
-func (writeTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (writeTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeWriteArgs)
 }
 
@@ -370,7 +370,7 @@ func (t editTool) describe(_ Invocation, constraints harness.ToolConstraints, _ 
 	return mutationDescription("edit_file", editFileDescription, editFileParameters, constraints)
 }
 
-func (editTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (editTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeEditArgs)
 }
 
@@ -397,7 +397,7 @@ func (t patchTool) describe(_ Invocation, constraints harness.ToolConstraints, _
 	return mutationDescription("apply_patch", applyPatchDescription, applyPatchParameters, constraints)
 }
 
-func (patchTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (patchTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizePatchArgs)
 }
 
@@ -450,7 +450,7 @@ func (runCommandTool) describe(_ Invocation, constraints harness.ToolConstraints
 	}, nil
 }
 
-func (t runCommandTool) Normalize(tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t runCommandTool) Normalize(_ context.Context, tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	s, err := t.inst.settings(tc.Invocation)
 	if err != nil {
 		return nil, err
@@ -709,7 +709,7 @@ func (sleepTool) describe(_ Invocation, _ harness.ToolConstraints, _ harness.Ses
 	}, nil
 }
 
-func (sleepTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (sleepTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeSleepArgs)
 }
 
@@ -757,7 +757,7 @@ func (processTool) describe(_ Invocation, _ harness.ToolConstraints, _ harness.S
 	}, nil
 }
 
-func (processTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (processTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, normalizeProcessArgs)
 }
 
@@ -856,19 +856,26 @@ func mutationDescription(name, description, parameters string, constraints harne
 	}, nil
 }
 
-// standardToolSpecs returns the seven standard tool declarations in
+// standardToolDeclaration is one owner-constructed standard tool declaration:
+// its model-visible ID and pure description function.
+type standardToolDeclaration struct {
+	id       string
+	describe func(Invocation, harness.ToolConstraints, harness.SessionIdentity) (ToolDescription, error)
+}
+
+// standardToolDeclarations returns the seven standard tool declarations in
 // declaration order. Every description is pure over the captured Invocation,
 // the hard constraints, and the literal description constants, so the
 // declarations compile once for every composition with no constructed state.
-func standardToolSpecs() []CapabilitySpec {
-	return []CapabilitySpec{
-		ToolSpec("read_file", readTool{}.describe),
-		ToolSpec("write_file", writeTool{}.describe),
-		ToolSpec("edit_file", editTool{}.describe),
-		ToolSpec("apply_patch", patchTool{}.describe),
-		ToolSpec("run_command", runCommandTool{}.describe),
-		ToolSpec("process", processTool{}.describe),
-		ToolSpec("sleep", sleepTool{}.describe),
+func standardToolDeclarations() []standardToolDeclaration {
+	return []standardToolDeclaration{
+		{id: "read_file", describe: readTool{}.describe},
+		{id: "write_file", describe: writeTool{}.describe},
+		{id: "edit_file", describe: editTool{}.describe},
+		{id: "apply_patch", describe: patchTool{}.describe},
+		{id: "run_command", describe: runCommandTool{}.describe},
+		{id: "process", describe: processTool{}.describe},
+		{id: "sleep", describe: sleepTool{}.describe},
 	}
 }
 

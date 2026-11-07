@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -64,33 +65,30 @@ const configurationAgentsDocument = `{
 // settingsPlugins composes placeholder plugins with the shipped IDs the
 // settings projection reads; their validators accept any object because the
 // projection, not their validation, is the axis under test.
-func settingsPlugins() []Plugin {
+func settingsPlugins() []extension.Native {
 	var opens atomic.Int64 // the fixture counters are unread here
-	return []Plugin{
-		servicePlugin("capowner", &opens, func(json.RawMessage) error { return nil }),
-		servicePlugin("jobcap", &opens, func(json.RawMessage) error { return nil }),
-		servicePlugin("tasks", &opens, func(json.RawMessage) error { return nil }),
+	return []extension.Native{
+		servicePlugin("capowner", &opens, acceptValidator),
+		servicePlugin("jobcap", &opens, acceptValidator),
+		servicePlugin("tasks", &opens, acceptValidator),
 		rosterToolPlugin(),
 	}
 }
 
 // rosterToolPlugin provides one real tool declaration so the composed tool
 // universe admits the fixture's agent tool lists.
-func rosterToolPlugin() Plugin {
-	return Plugin{
-		ID:       "prodtools",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("prod_read", fileReadTool{}.describe)},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"prod_read": fileReadTool{}}}, nil
-		},
-	}
+func rosterToolPlugin() extension.Native {
+	native := testNative("prodtools", extension.LifetimeHarness, []extension.Capability{extension.ToolCapability("prod_read")}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"prod_read": {Tool: fileReadTool{}}}}, nil
+	})
+	native.Describe["prod_read"] = fileReadTool{}.describe
+	return native
 }
 
 // openConfigurationRuntime opens one composed Runtime over the given store
 // with the given documents and extra plugins, using the controlled
 // preparation (these tests admit nothing).
-func openConfigurationRuntime(t *testing.T, store harness.Storage, configDoc, agentsDoc string, extra ...Plugin) (*Runtime, *ownerEnv) {
+func openConfigurationRuntime(t *testing.T, store harness.Storage, configDoc, agentsDoc string, extra ...extension.Native) (*Runtime, *ownerEnv) {
 	t.Helper()
 	e := newOwnerEnv(t)
 	return openConfigurationRuntimeWithEnv(t, store, e, configDoc, agentsDoc, extra...)
@@ -289,7 +287,7 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 
 // openConfigurationRuntimeWithEnv is openConfigurationRuntime with a
 // pre-configured env (the .env must exist before Open loads it).
-func openConfigurationRuntimeWithEnv(t *testing.T, store harness.Storage, e *ownerEnv, configDoc, agentsDoc string, extra ...Plugin) (*Runtime, *ownerEnv) {
+func openConfigurationRuntimeWithEnv(t *testing.T, store harness.Storage, e *ownerEnv, configDoc, agentsDoc string, extra ...extension.Native) (*Runtime, *ownerEnv) {
 	t.Helper()
 	writeServiceFile(t, e.configPath, configDoc)
 	if agentsDoc != "" {
@@ -367,17 +365,18 @@ func TestConfigurationReadsRemainAvailableDuringParkedBuild(t *testing.T) {
 	ungate := make(chan struct{})
 	releaseGate := sync.OnceFunc(func() { close(ungate) })
 	var opens atomic.Int64
-	gate := servicePlugin("gate", &opens, func(json.RawMessage) error {
+	candidateBarrier = func() {
 		if !armed.Load() {
-			return nil
+			return
 		}
 		select {
 		case gated <- struct{}{}:
 		default:
 		}
 		<-ungate
-		return nil
-	})
+	}
+	t.Cleanup(func() { candidateBarrier = nil })
+	gate := servicePlugin("gate", &opens, acceptValidator)
 	configDoc := strings.TrimSuffix(configurationProvidersDocument, "}") + `,"extensions":{"gate":{"enabled":true}}}`
 	r, _ := openConfigurationRuntime(t, store, configDoc, configurationAgentsDocument, append(settingsPlugins(), gate)...)
 	defer func() {

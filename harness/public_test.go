@@ -61,7 +61,7 @@ func publicCapture() harness.ExecutionCapture {
 
 // publicNormalize is the suite's required pure normalizer: it accepts exactly
 // one non-null JSON object and returns its compact encoding.
-func publicNormalize(call model.ToolCall) (json.RawMessage, error) {
+func publicNormalize(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
 		return nil, errors.New("arguments must be one non-null JSON object")
@@ -81,7 +81,7 @@ func publicExecution(conversation, compact func(context.Context, model.Request) 
 		return harness.InvocationExecution{
 			Model:         modelFn,
 			NormalizeTool: publicNormalize,
-			Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			Tool: func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 			},
 		}, nil
@@ -1391,7 +1391,7 @@ func TestPublicOpenerInputMutationKeepsAdmittedExecution(t *testing.T) {
 									return harness.InvocationExecution{
 										Model:         script.effect,
 										NormalizeTool: publicNormalize,
-										Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+										Tool: func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 											return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 										},
 									}, nil
@@ -1737,7 +1737,7 @@ func TestPublicOrderedToolCallsSettle(t *testing.T) {
 		prepared := harness.PreparedExecution{
 			Capture: publicCapture(),
 			Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-				return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+				return publicExecutionOver(script.effect, script.effect, func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 					toolMu.Lock()
 					toolOrder = append(toolOrder, call.ID)
 					toolMu.Unlock()
@@ -1820,7 +1820,7 @@ func TestPublicToolMetadataPersistsOpaqueAcrossStores(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					return publicExecutionOver(script.effect, script.effect, func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 						switch call.ID {
 						case "call-2": // malformed metadata: dropped, the result still commits
 							return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
@@ -1937,7 +1937,7 @@ func TestPublicPreparedPermissionBoundarySurvivesRestart(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: capture,
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					return publicExecutionOver(script.effect, script.effect, func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 						if call.ID == "call-2" { // the exit-condition omission through the public path
 							return harness.PreparedTool{Immediate: &harness.ToolOutcome{
 								Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "undeclared success"},
@@ -3295,7 +3295,7 @@ func rawAdmission(sessionID, operationID, entryID string) string {
 			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}},`+
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
 			`"context_window":4096,"output_reserve":2048,`+
-			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
+			`"system_prompt":"system","tools":[%s],"initial_tool_names":["echo"],"readonly":false,"write_dir":"",`+
 			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"},`+
 			`"strategy":{"id":"melta.summary/v1","requires_context_window":true}},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, rawToolDefinition, now)
@@ -3652,7 +3652,7 @@ func assertNextRequestAfterColdRecovery(t *testing.T, store harness.Storage, ses
 	f.defaultPrep = harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return publicExecutionOver(script.effect, script.effect, func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				executed++
 				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}}
 			}), nil
@@ -4917,7 +4917,7 @@ func TestPublicRecoverCorruptSibling(t *testing.T) {
 	}
 	rows = append(rows, corruptSiblingRow{
 		name: "assistant evidence: foreign catalog name", seed: seedCorruptSiblingPendingCall,
-		detail: "evidence tool names are outside captured catalog",
+		detail: "evidence tool name \"foreign\" is outside the captured catalog",
 		mutate: func(t *testing.T, snap *sessionSnapshot) {
 			entry := snapEntryOf(snap, harness.EntryAssistant)
 			entry.Payload = editPayloadObject(t, entry.Payload, func(obj map[string]json.RawMessage) {
@@ -5376,7 +5376,7 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 			return harness.PreparedExecution{
 				Capture: publicCapture(),
 				Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-					return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+					return publicExecutionOver(script.effect, script.effect, func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 						// the copied tool result carries tool-owned
 						// formatted metadata that the fork must preserve
 						// in its encoded durable form
@@ -6173,7 +6173,7 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 							return harness.InvocationExecution{
 								Model:         script.effect,
 								NormalizeTool: publicNormalize,
-								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+								Tool: func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 									return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 								},
 								Close: func() error {
@@ -6638,7 +6638,7 @@ func rawCompactAdmission(sessionID, operationID string) string {
 			`"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}},`+
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},`+
 			`"context_window":4096,"output_reserve":2048,`+
-			`"system_prompt":"system","tools":[%s],"readonly":false,"write_dir":"",`+
+			`"system_prompt":"system","tools":[%s],"initial_tool_names":["echo"],"readonly":false,"write_dir":"",`+
 			`"compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"},`+
 			`"strategy":{"id":"melta.summary/v1","requires_context_window":true}},"admitted_at":%q}`,
 		sessionID, operationID, rawToolDefinition, now)

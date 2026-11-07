@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -485,40 +486,28 @@ func TestConversationProjectionToolCallLifecycle(t *testing.T) {
 		// The declared tools' prepared outcomes: the first result carries its
 		// big-number metadata, the second parks until released, the rest
 		// settle immediately.
-		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) extension.ToolPlan {
 			permissions := []harness.PermissionRequest{{Permission: "command.run", Target: "test"}}
 			switch call.ID {
 			case "call-1":
-				return harness.PreparedTool{
-					Permissions: permissions,
-					Immediate: &harness.ToolOutcome{
-						Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
-						Metadata: json.RawMessage(`{"n":9007199254740993}`),
-					},
-				}
-			case "call-2": // parks: its result lands after the pending read
-				return harness.PreparedTool{
-					Permissions: permissions,
-					Execute: func(context.Context) harness.ToolOutcome {
-						select {
-						case toolStarted <- struct{}{}:
-						default:
-						}
-						<-releaseTool
-						return harness.ToolOutcome{Evidence: harness.ExecutionObserved,
-							Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "second"},
-							Metadata: json.RawMessage(`{"late":true}`),
-						}
-					},
-				}
+				return extension.ToolPlan{Permissions: permissions, Immediate: &harness.ToolOutcome{
+					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
+					Metadata: json.RawMessage(`{"n":9007199254740993}`),
+				}}
+			case "call-2":
+				return extension.ToolPlan{Permissions: permissions, Data: []byte(call.ID)}
 			default:
-				return harness.PreparedTool{
-					Permissions: permissions,
-					Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
-				}
+				return extension.ToolPlan{Permissions: permissions, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}}}
 			}
 		})
-
+		bg.tools.setExecute(func(_ context.Context, plan extension.ToolPlan) harness.ToolOutcome {
+			select {
+			case toolStarted <- struct{}{}:
+			default:
+			}
+			<-releaseTool
+			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: string(plan.Data), Status: model.ResultSuccess, Content: "second"}, Metadata: json.RawMessage(`{"late":true}`)}
+		})
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
 		bg.e.server.awaitRequests(2) // the parked second call's turn arrived
 		<-toolStarted
@@ -619,10 +608,8 @@ func TestConversationProjectionSyntheticToolResult(t *testing.T) {
 		})
 		// The declared read tool fails its prepared call immediately: the
 		// synthetic error outcome settles the published call.
-		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{
-				Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}},
-			}
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) extension.ToolPlan {
+			return extension.ToolPlan{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no concrete tools yet"}}}
 		})
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
@@ -646,35 +633,28 @@ func twoReadCallTurnEvents() []string {
 	}
 }
 
-// parkedReadCallPrepare builds the prepared-tool callback shared by the
-// interrupted projection and the paging attachment rows: the started call-1
-// parks its execution until the release channel or the run's cancellation
-// releases it — the returned real outcome wins the cancellation race — while
-// every other call settles immediately.
-func parkedReadCallPrepare(releaseTool <-chan struct{}, toolStarted chan<- struct{}) func(context.Context, model.ToolCall) harness.PreparedTool {
-	return func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+// setParkedReadCall installs the shared interrupted-projection read fixture:
+// call-1 parks its execution until release or run cancellation, while every
+// other call settles immediately.
+func setParkedReadCall(tools *lifecycleTools, releaseTool <-chan struct{}, toolStarted chan<- struct{}) {
+	tools.setPrepare(func(_ context.Context, call model.ToolCall) extension.ToolPlan {
+		permissions := []harness.PermissionRequest{{Permission: "command.run", Target: "test"}}
 		if call.ID != "call-1" {
-			return harness.PreparedTool{
-				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-				Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}},
-			}
+			return extension.ToolPlan{Permissions: permissions, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: call.ID + " ran"}}}
 		}
-		return harness.PreparedTool{
-			Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-			Execute: func(execCtx context.Context) harness.ToolOutcome {
-				select {
-				case toolStarted <- struct{}{}:
-				default:
-				}
-				select {
-				case <-releaseTool: // never released on the main path
-				case <-execCtx.Done(): // the interrupt releases the started call
-				}
-				// A returned real outcome wins the cancellation race.
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first ran"}}
-			},
+		return extension.ToolPlan{Permissions: permissions, Data: []byte(call.ID)}
+	})
+	tools.setExecute(func(execCtx context.Context, plan extension.ToolPlan) harness.ToolOutcome {
+		select {
+		case toolStarted <- struct{}{}:
+		default:
 		}
-	}
+		select {
+		case <-releaseTool:
+		case <-execCtx.Done():
+		}
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: string(plan.Data), Status: model.ResultSuccess, Content: "first ran"}}
+	})
 }
 
 // TestConversationProjectionSyntheticInterruptedResult proves, over real
@@ -702,7 +682,7 @@ func TestConversationProjectionSyntheticInterruptedResult(t *testing.T) {
 		// The started call parks its execution until the run's cancellation
 		// releases it and returns its real outcome; the unstarted call never
 		// begins.
-		bg.tools.setPrepare(parkedReadCallPrepare(releaseTool, toolStarted))
+		setParkedReadCall(bg.tools, releaseTool, toolStarted)
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
 		select {
 		case <-toolStarted:
@@ -884,14 +864,11 @@ func TestConversationProjectionForkPrefixIsIndependent(t *testing.T) {
 		})
 		// The declared read tool settles its call with the big-number
 		// metadata the projection keeps.
-		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) harness.PreparedTool {
-			return harness.PreparedTool{
-				Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-				Immediate: &harness.ToolOutcome{
-					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
-					Metadata: json.RawMessage(`{"n":9007199254740993}`),
-				},
-			}
+		bg.tools.setPrepare(func(_ context.Context, call model.ToolCall) extension.ToolPlan {
+			return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}}, Immediate: &harness.ToolOutcome{
+				Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "first"},
+				Metadata: json.RawMessage(`{"n":9007199254740993}`),
+			}}
 		})
 		submitThroughRuntime(t, bg.r, root, "op-1", "hello fork")
 		awaitOperation(t, bg.r, root, "op-1", harness.OperationSuccess)

@@ -170,7 +170,7 @@ func TestReviewNoneAfterModelWork(t *testing.T) {
 				return streamOf(turnDelta("stop", "quiet")), nil
 			}
 		}()
-		tool := func(_ context.Context, call model.ToolCall) PreparedTool {
+		tool := func(ctx context.Context, call model.ToolCall) PreparedTool {
 			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}
 		exec := purposeExecution(conversation, onePass)

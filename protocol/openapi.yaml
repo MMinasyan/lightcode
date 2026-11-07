@@ -7,7 +7,7 @@
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "9"
+  version: "10"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -858,13 +858,14 @@ components:
         protocol_version:
           type: string
           enum:
-            - "9"
+            - "10"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
         non-global kind must address its subject: workspace carries workspace,
-        session carries session_id, operation and agent carry session_id and
-        operation_id, and job carries session_id and job_id. Each branch keeps
+        session carries session_id, operation and invocation carry session_id
+        and operation_id, invocation additionally carries invocation_id and
+        purpose, and job carries session_id and job_id. Each branch keeps
         the same closed member vocabulary, so attribution members beyond the
         required identities are allowed; every supplied member is nonempty and
         session_id always matches its pattern.
@@ -873,7 +874,7 @@ components:
         - $ref: "#/components/schemas/WorkspaceScope"
         - $ref: "#/components/schemas/SessionScope"
         - $ref: "#/components/schemas/OperationScope"
-        - $ref: "#/components/schemas/AgentScope"
+        - $ref: "#/components/schemas/InvocationScope"
         - $ref: "#/components/schemas/JobScope"
       discriminator:
         propertyName: kind
@@ -882,7 +883,7 @@ components:
           workspace: "#/components/schemas/WorkspaceScope"
           session: "#/components/schemas/SessionScope"
           operation: "#/components/schemas/OperationScope"
-          agent: "#/components/schemas/AgentScope"
+          invocation: "#/components/schemas/InvocationScope"
           job: "#/components/schemas/JobScope"
     RuntimeScope:
       type: object
@@ -976,18 +977,20 @@ components:
         job_id:
           type: string
           minLength: 1
-    AgentScope:
+    InvocationScope:
       type: object
       additionalProperties: false
       required:
         - kind
         - session_id
         - operation_id
+        - invocation_id
+        - purpose
       properties:
         kind:
           type: string
           enum:
-            - agent
+            - invocation
         workspace:
           type: string
           minLength: 1
@@ -997,6 +1000,14 @@ components:
         operation_id:
           type: string
           minLength: 1
+        invocation_id:
+          type: string
+          minLength: 1
+        purpose:
+          type: string
+          enum:
+            - conversation
+            - maintenance
         job_id:
           type: string
           minLength: 1

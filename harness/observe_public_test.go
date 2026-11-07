@@ -706,7 +706,7 @@ func observedBlockedToolFixture(t *testing.T, store harness.Storage) (*publicFac
 		releaseOnce sync.Once
 	)
 	release := func() { releaseOnce.Do(func() { close(released) }) }
-	tool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+	tool := func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 		return harness.PreparedTool{
 			Permissions: publicPermission,
 			Execute: func(context.Context) harness.ToolOutcome {

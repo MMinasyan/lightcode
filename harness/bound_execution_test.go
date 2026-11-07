@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -99,7 +100,7 @@ func TestInvocationCloseOrderAndStreamLifetime(t *testing.T) {
 					}
 					return completedTurnStream(), nil
 				},
-				Tool: func(_ context.Context, call model.ToolCall) PreparedTool {
+				Tool: func(ctx context.Context, call model.ToolCall) PreparedTool {
 					return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
 						return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}, Evidence: ExecutionObserved}
 					}}
@@ -746,7 +747,7 @@ func TestToolOutputShapingCannotChangeKnowledge(t *testing.T) {
 		return completedTurnStream(), nil
 	}
 	prepared := preparedExecuting(Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
-		inv := invocationExecution(modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
+		inv := invocationExecution(modelFn, func(ctx context.Context, call model.ToolCall) PreparedTool {
 			return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
 				return ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "raw failure"}, Evidence: ExecutionUnknown}
 			}}
@@ -800,6 +801,12 @@ func admitPrepared(t *testing.T, h *Harness, c *coordinator, sessionID, operatio
 // capture containers while the opener runs cannot change the dispatch.
 func TestExecutionAdoptsCommittedCapture(t *testing.T) {
 	capture := testCapture()
+	capture.InitialToolNames = []string{"echo"}
+	capture.Implementations = []ImplementationCapture{
+		{ExtensionID: "settings", Version: "1", Settings: json.RawMessage(`{ "raw" : 1 }`)},
+		{ExtensionID: "null", Version: "1", Settings: json.RawMessage(`null`)},
+		{ExtensionID: "absent", Version: "1"},
+	}
 	var sent model.Request
 	mutated := false
 	exec := Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
@@ -812,7 +819,9 @@ func TestExecutionAdoptsCommittedCapture(t *testing.T) {
 			NormalizeTool: objectNormalize,
 		}, nil
 	}}
-	prepared := preparedExecutionFor(capture, func(context.Context, OperationAdmission) (Execution, error) {
+	prepared := preparedExecutionFor(capture, func(_ context.Context, admission OperationAdmission) (Execution, error) {
+		admission.Execution.InitialToolNames[0] = "opener"
+		admission.Execution.Implementations[0].Settings[len(admission.Execution.Implementations[0].Settings)-2] = '8'
 		return exec, nil
 	})
 	store := emptyStore(t)
@@ -822,6 +831,9 @@ func TestExecutionAdoptsCommittedCapture(t *testing.T) {
 		if draft.Kind == EntryInput && draft.OperationID == testOpID {
 			capture.Tools[0].Name = "mutated"
 			capture.SystemPrompt = "mutated"
+			capture.InitialToolNames[0] = "mutated"
+			capture.Implementations[0].Settings[len(capture.Implementations[0].Settings)-2] = '9'
+			capture.Implementations[1] = ImplementationCapture{ExtensionID: "replaced", Version: "1", Settings: json.RawMessage(`false`)}
 			mutated = true
 		}
 		return nil
@@ -837,6 +849,21 @@ func TestExecutionAdoptsCommittedCapture(t *testing.T) {
 	testassert.Require(t, mutated, "the producer mutation never ran")
 	testassert.Require(t, len(sent.Tools) == 1 && sent.Tools[0].Name == "echo", "model advertisement = %+v, want the committed capture's tool, never the mutated producer value", sent.Tools)
 	testassert.Require(t, sent.Messages[0].TextContent() == "system", "model prompt = %q, want the committed capture's prompt, never the mutated producer value", sent.Messages[0].TextContent())
+	resident, err := h.ReadOperation(context.Background(), session.Identity.SessionID, testOpID)
+	testassert.NoError(t, err)
+	assertOwnedCaptureProvenance(t, resident.Admission.Execution)
+	cold, err := newTestHarness(t, store, nil).ReadOperation(context.Background(), session.Identity.SessionID, testOpID)
+	testassert.NoError(t, err)
+	assertOwnedCaptureProvenance(t, cold.Admission.Execution)
+}
+
+func assertOwnedCaptureProvenance(t *testing.T, capture ExecutionCapture) {
+	t.Helper()
+	testassert.Require(t, slices.Equal(capture.InitialToolNames, []string{"echo"}), "initial names = %v, want the owned selection", capture.InitialToolNames)
+	testassert.Require(t, len(capture.Implementations) == 3, "implementations = %+v, want three", capture.Implementations)
+	testassert.Require(t, string(capture.Implementations[0].Settings) == `{ "raw" : 1 }`, "settings = %q, want the exact owned bytes", capture.Implementations[0].Settings)
+	testassert.Require(t, string(capture.Implementations[1].Settings) == "null", "null settings = %q, want the present literal null", capture.Implementations[1].Settings)
+	testassert.Require(t, len(capture.Implementations[2].Settings) == 0, "absent settings = %q, want absence", capture.Implementations[2].Settings)
 }
 
 // TestPreparedPlanSnapshotFreezesMutableData proves plan ownership: the
@@ -856,7 +883,7 @@ func TestPreparedPlanSnapshotFreezesMutableData(t *testing.T) {
 		}
 		permissions := []PermissionRequest{{Permission: PermissionCommandRun, Target: "original"}}
 		var evaluated []PermissionRequest
-		exec := effectExecution(modelFn, func(_ context.Context, call model.ToolCall) PreparedTool {
+		exec := effectExecution(modelFn, func(ctx context.Context, call model.ToolCall) PreparedTool {
 			return PreparedTool{Permissions: permissions, Execute: func(context.Context) ToolOutcome {
 				return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 			}}

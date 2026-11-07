@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -48,8 +49,8 @@ const (
 type configurationService struct {
 	loader        *catalog.Loader
 	configPath    string
-	plugins       []Plugin
-	pluginIDs     map[string]bool
+	natives       []extension.Native
+	nativeIDs     map[string]bool
 	capabilityIDs []string
 	toolIDs       []string
 
@@ -107,15 +108,15 @@ type configurationCapture struct {
 // the service reads no dotenv: that belongs to Runtime startup, not to any
 // build or reload.
 func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configPath string, obs *observation, defaultCapabilityIDs []string) *configurationService {
-	pluginIDs := make(map[string]bool, len(c.plugins))
-	for _, p := range c.plugins {
-		pluginIDs[p.ID] = true
+	nativeIDs := make(map[string]bool, len(c.natives))
+	for _, native := range c.natives {
+		nativeIDs[native.Declaration.ID] = true
 	}
 	return &configurationService{
 		loader:               loader,
 		configPath:           configPath,
-		plugins:              c.plugins,
-		pluginIDs:            pluginIDs,
+		natives:              c.natives,
+		nativeIDs:            nativeIDs,
 		capabilityIDs:        c.capabilityIDs,
 		toolIDs:              c.toolIDs,
 		defaultCapabilityIDs: append([]string(nil), defaultCapabilityIDs...),
@@ -209,6 +210,9 @@ func (s *configurationService) publish(ctx context.Context) (configurationCaptur
 	if err != nil {
 		s.buildMu.Unlock()
 		return configurationCapture{}, err
+	}
+	if prePublishBarrier != nil {
+		prePublishBarrier()
 	}
 	// Immediately before the atomic Store, caller and owner cancellation are
 	// checked once more under the caller-first rule. A publication that wins
@@ -331,21 +335,24 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 // for that one provider — a connection candidate is fully validated before
 // its caller's first persistence and is never rebuilt after it.
 func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData []byte, conn *connectionEffects) (*configuration, error) {
+	if candidateBarrier != nil {
+		candidateBarrier()
+	}
 	doc, err := decodeCapturedConfig(configData)
 	if err != nil {
 		return nil, configurationFailure(err)
 	}
-	var active []Plugin
-	for _, p := range s.plugins {
-		if sectionEnabled(doc.Extensions[p.ID]) {
-			active = append(active, p)
+	var active []extension.Native
+	for _, native := range s.natives {
+		if sectionEnabled(doc.Extensions[native.Declaration.ID]) {
+			active = append(active, native)
 		}
 	}
-	graph, err := newComposition(active)
+	graph, err := newNativeComposition(active)
 	if err != nil {
 		return nil, configurationFailure(err)
 	}
-	agentsActive := s.pluginIDs["agents"] && sectionEnabled(doc.Extensions["agents"])
+	agentsActive := s.nativeIDs["agents"] && sectionEnabled(doc.Extensions["agents"])
 	agentsData := []byte("{}")
 	if agentsActive {
 		var section struct {
@@ -381,7 +388,7 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 		return nil, configurationFailure(snapshot.agentWarnings[0])
 	}
 	snapshot.composition = graph
-	if err := s.validatePlugins(ctx, doc.Extensions); err != nil {
+	if err := s.validateExtensions(ctx, graph, doc.Extensions); err != nil {
 		return nil, err
 	}
 	if err := s.prepareResources(ctx, snapshot); err != nil {
@@ -389,6 +396,13 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 	}
 	return snapshot, nil
 }
+
+// candidateBarrier and prePublishBarrier are test-only construction seams;
+// nil in production. They add no behavior to the owner.
+var (
+	candidateBarrier  func()
+	prePublishBarrier func()
+)
 
 // captureWorkspacePermissions enumerates the home-based per-Workspace
 // permission inventory during one configuration build and captures each
@@ -429,26 +443,14 @@ func sectionEnabled(raw json.RawMessage) bool {
 	return config.SectionEnabled(raw)
 }
 
-// validatePlugins invokes only active installed validators before publication.
-func (s *configurationService) validatePlugins(ctx context.Context, plugins map[string]json.RawMessage) error {
-	for _, p := range s.plugins {
-		if !sectionEnabled(plugins[p.ID]) {
-			continue
-		}
-		if err := s.canceled(ctx); err != nil {
-			return err
-		}
-		if p.ValidateConfig == nil {
-			var members map[string]json.RawMessage
-			_ = json.Unmarshal(plugins[p.ID], &members)
-			delete(members, "enabled")
-			if len(members) == 0 {
-				continue
-			}
-		}
-		if err := acceptSettings(p, plugins[p.ID]); err != nil {
-			return configurationFailure(err)
-		}
+// validateExtensions validates only active installed extension sections
+// against their compiled local schemas before publication.
+func (s *configurationService) validateExtensions(ctx context.Context, graph *composition, sections map[string]json.RawMessage) error {
+	if err := s.canceled(ctx); err != nil {
+		return err
+	}
+	if err := graph.validateSettings(sections); err != nil {
+		return configurationFailure(err)
 	}
 	return nil
 }

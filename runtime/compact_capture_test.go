@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -100,15 +101,15 @@ func compactPrepWith(t *testing.T, agentsDoc, configDoc, endpoint string) (confi
 	return captured, newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
 }
 
-func compactToolsPlugin() Plugin {
-	return Plugin{
-		ID:       "compacttools",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("echo", staticToolDescription("echo")), ToolSpec("read", staticToolDescription("read"))},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"echo": noopTool{}, "read": noopTool{}}}, nil
-		},
-	}
+func compactToolsPlugin() extension.Native {
+	native := testNative("compacttools", extension.LifetimeHarness, []extension.Capability{extension.ToolCapability("echo"), extension.ToolCapability("read")}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{
+			"echo": {Tool: noopNativeTool{}},
+			"read": {Tool: noopNativeTool{}},
+		}}, nil
+	})
+	native.Describe = map[string]extension.ToolDescribe{"echo": testDescribeTool("echo"), "read": testDescribeTool("read")}
+	return native
 }
 
 func compactPrepRequest() harness.PreparationRequest {
@@ -125,7 +126,11 @@ func compactPrepSelection(t *testing.T, captured configurationCapture, agentName
 	t.Helper()
 	agent, err := resolveAgentType(agentName, captured.snapshot.agentTypes())
 	testassert.Require(t, err == nil, "ResolveAgentType(%q): %v", agentName, err)
-	return selection{agent: agent, bindings: Bindings{}, invocation: Invocation{snapshot: captured.snapshot}, credentials: captured.credentials}
+	sc := mustOpenScope(t, captured.snapshot.composition, context.Background(), ScopeInfo{Kind: ScopeRuntime, DataDir: t.TempDir()}, nil)
+	t.Cleanup(func() { _ = sc.close() })
+	selected := append([]string(nil), agent.Capabilities...)
+	selected = append(selected, agent.Tools...)
+	return selection{agent: agent, scopes: []*scope{sc}, selected: selected, invocation: Invocation{snapshot: captured.snapshot}, credentials: captured.credentials}
 }
 
 // TestConcretePrepareCompactCapture pins every capture field the compaction

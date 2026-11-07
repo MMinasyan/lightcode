@@ -17,7 +17,7 @@ var runtimeIdentity string
 func installedExtensions() ([]string, []string) {
 	var ids []string
 	for _, plugin := range builtin.Plugins() {
-		ids = append(ids, plugin.ID)
+		ids = append(ids, plugin.Declaration.ID)
 	}
 	return ids, builtin.DefaultCapabilityIDs()
 }

@@ -2407,6 +2407,33 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		}
 		tools = append(tools, raw)
 	}
+	implementations := make([]json.RawMessage, 0, len(v.Implementations))
+	for _, implementation := range v.Implementations {
+		var settings json.RawMessage
+		if len(implementation.Settings) != 0 {
+			settings = frame(implementation.Settings)
+		}
+		wire, err := json.Marshal(struct {
+			ExtensionID string          `json:"extension_id"`
+			Version     string          `json:"version"`
+			Settings    json.RawMessage `json:"settings_base64,omitempty"`
+		}{ExtensionID: implementation.ExtensionID, Version: implementation.Version, Settings: settings})
+		if err != nil {
+			return nil, err
+		}
+		implementations = append(implementations, wire)
+	}
+	initialToolNames := v.InitialToolNames
+	if initialToolNames == nil {
+		initialToolNames = make([]string, 0, len(v.Tools))
+		for _, tool := range v.Tools {
+			initialToolNames = append(initialToolNames, tool.Name)
+		}
+	} else if len(initialToolNames) == 0 {
+		initialToolNames = []string{}
+	} else {
+		initialToolNames = append([]string(nil), initialToolNames...)
+	}
 	wire, err := json.Marshal(struct {
 		ConfigurationRevision string            `json:"configuration_revision"`
 		Model                 json.RawMessage   `json:"model"`
@@ -2414,12 +2441,14 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		OutputReserve         int               `json:"output_reserve"`
 		SystemPrompt          string            `json:"system_prompt"`
 		Tools                 []json.RawMessage `json:"tools"`
+		InitialToolNames      []string          `json:"initial_tool_names"`
 		Capabilities          []string          `json:"capabilities,omitempty"`
 		Readonly              bool              `json:"readonly"`
 		WriteDir              string            `json:"write_dir"`
 		Pricing               json.RawMessage   `json:"pricing,omitempty"`
 		Compact               json.RawMessage   `json:"compact"`
 		Strategy              json.RawMessage   `json:"strategy"`
+		Implementations       []json.RawMessage `json:"implementations,omitempty"`
 	}{
 		ConfigurationRevision: v.ConfigurationRevision,
 		Model:                 modelRaw,
@@ -2427,12 +2456,14 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		OutputReserve:         v.OutputReserve,
 		SystemPrompt:          v.SystemPrompt,
 		Tools:                 tools,
+		InitialToolNames:      initialToolNames,
 		Capabilities:          v.Capabilities,
 		Readonly:              v.Readonly,
 		WriteDir:              v.WriteDir,
 		Pricing:               pricingRaw,
 		Compact:               compactRaw,
 		Strategy:              strategyRaw,
+		Implementations:       implementations,
 	})
 	if err != nil {
 		return nil, err
@@ -2592,7 +2623,7 @@ func validateOperationAdmission(v OperationAdmission) error {
 // tool names, and preserved tool and capability order. The permission
 // capability members are required, including their false and empty values.
 func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, error) {
-	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "context_window", "output_reserve", "system_prompt", "tools", "capabilities", "readonly", "write_dir", "pricing", "compact", "strategy"); err != nil {
+	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "context_window", "output_reserve", "system_prompt", "tools", "initial_tool_names", "capabilities", "readonly", "write_dir", "pricing", "compact", "strategy", "implementations"); err != nil {
 		return ExecutionCapture{}, err
 	}
 	revision, err := stringMember(obj, "configuration_revision", true)
@@ -2670,6 +2701,18 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 		}
 		v.Tools = append(v.Tools, tool)
 	}
+	initialRaw, err := arrayMember(obj, "initial_tool_names", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	v.InitialToolNames = make([]string, 0, len(initialRaw))
+	for i, raw := range initialRaw {
+		var name string
+		if err := json.Unmarshal(raw, &name); err != nil {
+			return ExecutionCapture{}, fmt.Errorf("initial_tool_names[%d]: %w", i, err)
+		}
+		v.InitialToolNames = append(v.InitialToolNames, name)
+	}
 	capabilitiesRaw, err := arrayMember(obj, "capabilities", false)
 	if err != nil {
 		return ExecutionCapture{}, err
@@ -2683,6 +2726,44 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	}
 	if len(v.Capabilities) == 0 { // omission and the empty array both mean none
 		v.Capabilities = nil
+	}
+	implementationsRaw, err := arrayMember(obj, "implementations", false)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	for i, raw := range implementationsRaw {
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &members); err != nil {
+			return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+		}
+		if err := rejectUnknownMembers(members, "extension_id", "version", "settings_base64"); err != nil {
+			return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+		}
+		extensionID, err := stringMember(members, "extension_id", true)
+		if err != nil {
+			return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+		}
+		version, err := stringMember(members, "version", true)
+		if err != nil {
+			return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+		}
+		var captured ImplementationCapture
+		captured.ExtensionID = extensionID
+		captured.Version = version
+		if _, present := members["settings_base64"]; present {
+			settings, err := framedMember(members, "settings_base64", true)
+			if err != nil {
+				return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+			}
+			if !json.Valid(settings) {
+				return ExecutionCapture{}, fmt.Errorf("implementations[%d]: settings must be valid JSON", i)
+			}
+			captured.Settings = model.CloneRaw(settings)
+		}
+		v.Implementations = append(v.Implementations, captured)
+	}
+	if len(v.Implementations) == 0 {
+		v.Implementations = nil
 	}
 	if err := validateExecutionCapture(v); err != nil {
 		return ExecutionCapture{}, err
@@ -2816,6 +2897,38 @@ func validateExecutionCapture(v ExecutionCapture) error {
 	}
 	if err := model.ValidateRequest(model.Request{Tools: v.Tools}); err != nil {
 		return err
+	}
+	seenImplementation := make(map[string]bool, len(v.Implementations))
+	for i, implementation := range v.Implementations {
+		if implementation.ExtensionID == "" || implementation.Version == "" {
+			return fmt.Errorf("implementations[%d]: extension_id and version must be non-empty", i)
+		}
+		if seenImplementation[implementation.ExtensionID] {
+			return fmt.Errorf("implementations[%d]: duplicate extension %q", i, implementation.ExtensionID)
+		}
+		seenImplementation[implementation.ExtensionID] = true
+		if len(implementation.Settings) != 0 && !json.Valid(implementation.Settings) {
+			return fmt.Errorf("implementations[%d]: settings must be valid JSON", i)
+		}
+	}
+	if v.InitialToolNames != nil {
+		tools := make(map[string]bool, len(v.Tools))
+		for _, tool := range v.Tools {
+			tools[tool.Name] = true
+		}
+		names := make(map[string]bool, len(v.InitialToolNames))
+		for i, name := range v.InitialToolNames {
+			if name == "" {
+				return fmt.Errorf("initial_tool_names[%d]: name must be non-empty", i)
+			}
+			if !tools[name] {
+				return fmt.Errorf("initial_tool_names[%d]: %q is outside the captured tool catalog", i, name)
+			}
+			if names[name] {
+				return fmt.Errorf("initial_tool_names[%d]: duplicate name %q", i, name)
+			}
+			names[name] = true
+		}
 	}
 	seen := make(map[string]bool, len(v.Capabilities))
 	for i, capability := range v.Capabilities {

@@ -6,11 +6,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/prompt"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
 // bundledGPTGuidanceLine and bundledGPTGuidanceReplacement are the complete
@@ -33,15 +33,22 @@ func fixtureCatalog() []model.ToolDefinition {
 	}
 }
 
-// prepareHook opens the shipped plugin's single contribution and invokes it.
-func prepareHook(t *testing.T, ref model.ModelRef, mode prompt.Mode) runtime.PreparationConsequence {
+func openHook(t *testing.T) extension.PreparationHook {
 	t.Helper()
-	instance, err := adaptation.Plugin().Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
+	instance, err := adaptation.Native().Open(context.Background(), extension.InstanceContext{})
 	testassert.NoError(t, err)
-	testassert.Require(t, instance.Close == nil, "the adaptation plugin declares a Close")
-	hook, ok := instance.Values[adaptation.CapabilityID].(runtime.PreparationHook)
-	testassert.Require(t, ok, "open supplied %T, want a runtime.PreparationHook", instance.Values[adaptation.CapabilityID])
-	consequence, err := hook.Prepare(context.Background(), runtime.PreparationInput{
+	testassert.Require(t, instance.Close == nil, "the adaptation native declares a Close")
+	implementation, ok := instance.Capabilities[adaptation.CapabilityID]
+	testassert.Require(t, ok, "open supplied %d capabilities, want the declared hook", len(instance.Capabilities))
+	testassert.Require(t, implementation.Preparation != nil, "the declared capability carries no preparation hook")
+	return implementation.Preparation
+}
+
+// prepareHook opens the shipped native's single contribution and invokes it.
+func prepareHook(t *testing.T, ref model.ModelRef, mode prompt.Mode) extension.PreparationConsequence {
+	t.Helper()
+	hook := openHook(t)
+	consequence, err := hook(context.Background(), extension.CallContext{}, extension.PreparationInput{
 		Model:    ref,
 		Assembly: prompt.AssemblyInput{Mode: mode},
 		Prompt:   "BASE_PROMPT",
@@ -51,15 +58,16 @@ func prepareHook(t *testing.T, ref model.ModelRef, mode prompt.Mode) runtime.Pre
 	return consequence
 }
 
-func TestPluginDeclaresOneRuntimeScopedPreparationHook(t *testing.T) {
-	plugin := adaptation.Plugin()
-	testassert.Require(t, plugin.ID == "adaptation" && plugin.Scope == runtime.ScopeRuntime, "plugin identity = %q/%s, want adaptation/runtime", plugin.ID, plugin.Scope)
-	testassert.Require(t, plugin.ValidateConfig == nil, "the adaptation plugin declares a settings validator")
-	testassert.Equal(t, len(plugin.Provides), 1)
-	instance, err := plugin.Open(context.Background(), runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
-	testassert.NoError(t, err)
-	_, ok := instance.Values[adaptation.CapabilityID].(runtime.PreparationHook)
-	testassert.Require(t, ok, "the declared capability = %T, want a runtime.PreparationHook", instance.Values[adaptation.CapabilityID])
+func TestNativeDeclaresOneHarnessScopedPreparationHook(t *testing.T) {
+	native := adaptation.Native()
+	testassert.Require(t, native.Declaration.ID == "adaptation", "native identity = %q, want adaptation", native.Declaration.ID)
+	testassert.Equal(t, len(native.Declaration.Components), 1)
+	testassert.Require(t, native.Declaration.Components[0].Lifetime == extension.LifetimeHarness, "component lifetime = %q, want harness", native.Declaration.Components[0].Lifetime)
+	testassert.Equal(t, len(native.Declaration.Capabilities), 1)
+	capability := native.Declaration.Capabilities[0]
+	testassert.Require(t, capability.ID == adaptation.CapabilityID && capability.Kind == extension.KindHook, "capability = %q/%s, want the preparation hook", capability.ID, capability.Kind)
+	testassert.Require(t, len(capability.Hooks) == 1 && capability.Hooks[0].Boundary == extension.BoundaryPrepare && capability.Hooks[0].Mode == extension.HookModePure, "hooks = %+v, want a pure prepare boundary", capability.Hooks)
+	openHook(t)
 }
 
 func TestPrepareAppliesShippedBundledRows(t *testing.T) {
@@ -97,11 +105,8 @@ func TestPrepareUnmatchedModelIsBaseline(t *testing.T) {
 }
 
 func TestPrepareMatchesTheModelComponentOnly(t *testing.T) {
-	// A pattern inside the provider component never matches: the matcher
-	// receives ref.Model alone.
 	got := prepareHook(t, model.ModelRef{Provider: "gpt-5", Model: "unrelated"}, prompt.ModeFull)
 	testassert.Require(t, got.Prompt == nil && got.ToolNames == nil, "provider-shaped ref treatment = %+v, want the zero baseline", got)
-	// Matching is case-insensitive over the bare model component.
 	got = prepareHook(t, model.ModelRef{Provider: "openai", Model: "GPT-5.4"}, prompt.ModeFull)
 	testassert.Require(t, len(got.ToolNames) == 4, "case-insensitive row did not match: %+v", got)
 }
@@ -120,8 +125,6 @@ func TestPrepareReturnsIndependentContainers(t *testing.T) {
 func TestOpenRejectsCanceledScopeContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	{
-		_, err := adaptation.Plugin().Open(ctx, runtime.ScopeInfo{Kind: runtime.ScopeRuntime, DataDir: t.TempDir()}, runtime.Bindings{})
-		testassert.Require(t, err != nil, "Open with a canceled scope context succeeded")
-	}
+	_, err := adaptation.Native().Open(ctx, extension.InstanceContext{})
+	testassert.Require(t, err != nil, "Open with a canceled scope context succeeded")
 }

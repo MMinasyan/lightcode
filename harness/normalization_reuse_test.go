@@ -26,7 +26,7 @@ type seqNormalizer struct {
 	attempts int
 }
 
-func (n *seqNormalizer) normalize(call model.ToolCall) (json.RawMessage, error) {
+func (n *seqNormalizer) normalize(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
 	n.attempts++
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
@@ -41,7 +41,7 @@ func (n *seqNormalizer) normalize(call model.ToolCall) (json.RawMessage, error) 
 }
 
 func passthroughHook(id string, received *json.RawMessage) ToolArgumentsHook {
-	return ToolArgumentsHook{ID: id, ExtensionID: "reuse-ext", Mode: HookModePure, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+	return ToolArgumentsHook{ID: id, ExtensionID: "reuse-ext", Mode: HookModePure, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 		*received = model.CloneRaw(call.Arguments)
 		return model.CloneRaw(call.Arguments), nil
 	}}

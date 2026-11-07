@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/client"
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
 	"github.com/MMinasyan/lightcode/internal/plugins/tasks"
@@ -77,28 +78,32 @@ const composedCustomSettingsDocument = `{"enabled":true,"threshold":900719925474
 // settings section uses the plugin's defaults, its own validator owns the
 // document's interpretation, and its Runtime-scoped factory reports one
 // neutral plugin warning the store attributes to this registration ID.
-func composedCustomPlugin() runtime.Plugin {
-	return runtime.Plugin{
-		ID:       composedCustomPluginID,
-		Scope:    runtime.ScopeRuntime,
-		Provides: []runtime.CapabilitySpec{runtime.Spec[any]("custom.marker")},
-		ValidateConfig: func(raw json.RawMessage) error {
-			if len(raw) == 0 {
-				return nil // the absent section uses the plugin's defaults
-			}
-			var document struct {
-				Threshold *int64 `json:"threshold"`
-			}
-			if err := json.Unmarshal(raw, &document); err != nil || document.Threshold == nil || *document.Threshold < 1 {
-				return errors.New("custom plugin settings require a positive threshold")
-			}
-			return nil
+func composedCustomPlugin() extension.Native {
+	return extension.Native{
+		Declaration: extension.Declaration{
+			ID:           composedCustomPluginID,
+			Version:      "1",
+			ConfigSchema: []byte(`{"type":"object","required":["enabled"],"properties":{"enabled":{"type":"boolean"},"threshold":{"type":"integer","minimum":1}},"additionalProperties":false}`),
+			Components: []extension.Component{{
+				ID:       composedCustomPluginID,
+				Lifetime: extension.LifetimeHarness,
+				Provides: []string{"custom.marker"},
+			}},
+			Capabilities: []extension.Capability{
+				extension.ServiceCapability("custom.marker", "custom.marker.contract", extension.PureMethod("call", `{}`, `{}`)),
+			},
 		},
-		Open: func(_ context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+		Open: func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
 			if info.ReportWarning != nil {
 				info.ReportWarning("notice", "custom plugin scope opened")
 			}
-			return runtime.Instance{Values: map[string]any{"custom.marker": composedCustomPluginID}}, nil
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"custom.marker": {Service: map[string]extension.Handler{
+					"call": func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
+						return extension.Result{Value: json.RawMessage(`{}`)}, nil
+					},
+				}},
+			}}, nil
 		},
 	}
 }
@@ -111,6 +116,9 @@ type composedFlowServer struct {
 	*httptest.Server
 	childGate    chan struct{}
 	releaseChild func()
+
+	mu     sync.Mutex
+	bodies []string
 }
 
 func newComposedFlowServer(t *testing.T) *composedFlowServer {
@@ -126,6 +134,9 @@ func newComposedFlowServer(t *testing.T) *composedFlowServer {
 func (s *composedFlowServer) serve(w http.ResponseWriter, r *http.Request) {
 	raw, _ := io.ReadAll(r.Body)
 	body := string(raw)
+	s.mu.Lock()
+	s.bodies = append(s.bodies, body)
+	s.mu.Unlock()
 	if composedWireRole(body) == "tool" {
 		composedWireTextTurn(w, "done")
 		return
@@ -214,6 +225,40 @@ func composedWireConversationText(body string) string {
 		}
 	}
 	return b.String()
+}
+
+// composedFlowBodies returns the recorded request bodies in arrival order.
+func (s *composedFlowServer) composedFlowBodies() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.bodies...)
+}
+
+// composedFlowToolResultSeen reports whether one recorded request carries a
+// tool-role message for the call whose content includes the given text.
+func composedFlowToolResultSeen(bodies []string, callID, text string) bool {
+	for _, body := range bodies {
+		var doc struct {
+			Messages []struct {
+				Role       string          `json:"role"`
+				Content    json.RawMessage `json:"content"`
+				ToolCallID string          `json:"tool_call_id"`
+			} `json:"messages"`
+		}
+		if json.Unmarshal([]byte(body), &doc) != nil {
+			continue
+		}
+		for _, message := range doc.Messages {
+			if message.Role != "tool" || message.ToolCallID != callID {
+				continue
+			}
+			var content string
+			if json.Unmarshal(message.Content, &content) == nil && strings.Contains(content, text) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func composedWireSSE(w http.ResponseWriter, events ...string) {
@@ -501,7 +546,7 @@ func composedReserveEnv(t *testing.T, name string) {
 // production composition, the mounted authenticated protocol, the generated
 // client, and one authenticated SSE stream, on memory and SQLite stores.
 func TestProtocolComposedFlow(t *testing.T) {
-	run := func(t *testing.T, plugins []runtime.Plugin) {
+	run := func(t *testing.T, plugins []extension.Native) {
 		ctx := context.Background()
 		home := t.TempDir()
 		t.Setenv("HOME", home)
@@ -531,7 +576,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// endpoint is no usable owner.
 		foreign := filepath.Join(t.TempDir(), "foreign.json")
 		wrongCredential := strings.Repeat("0", 64)
-		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N9, wrongCredential))
+		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N10, wrongCredential))
 		{
 			_, err := client.Connect(ctx, foreign)
 			testassert.Require(t, errors.Is(err, client.ErrNoRuntime), "wrong-credential connect = %v, want ErrNoRuntime", err)
@@ -728,7 +773,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// 5. The child Session runs its own turn and hydrates as an
 		// ordinary Session; the parent receives its completion.
 		composedSubmit(t, c, main, "op-child", "spawn the child")
-		composedAwaitOp(t, c, main, "op-child", protocol.OperationStatusSuccess)
+		h = composedAwaitOp(t, c, main, "op-child", protocol.OperationStatusSuccess)
 		// The child's model turn parks at the server gate, so its background
 		// membership stays observably present on the parent; the identity
 		// comes from the hydrated member, never from a UI string.
@@ -744,6 +789,17 @@ func TestProtocolComposedFlow(t *testing.T) {
 			testassert.Require(t, childID != "" || !time.Now().After(deadline), "the child member never appeared: %+v", h.Background)
 			time.Sleep(10 * time.Millisecond)
 		}
+		// The committed task result carries the actual child identity, and the
+		// parent's next model request receives that result verbatim.
+		childAssistant := composedAssistantOf(t, h.Conversation.Items, "op-child")
+		var childCall *protocol.ToolCallView
+		for i := range childAssistant.ToolCalls {
+			if childAssistant.ToolCalls[i].Id == "call-child" {
+				childCall = &childAssistant.ToolCalls[i]
+			}
+		}
+		testassert.Require(t, childCall != nil && childCall.Name == "task" && childCall.Status != nil && *childCall.Status == protocol.ToolCallStatusSuccess && childCall.Content != nil && strings.Contains(*childCall.Content, childID), "op-child task call = %+v, want a committed success naming the actual child %q", childCall, childID)
+		testassert.Require(t, composedFlowToolResultSeen(model.composedFlowBodies(), "call-child", childID), "no parent model request after the task result carried the actual child identity %q", childID)
 		stream.wait(func(event protocol.Event) bool {
 			if composedDiscriminator(t, event) != "session_changed" {
 				return false
@@ -971,7 +1027,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 
 	// The shipped composition over the included store: the composition's
 	// optional plugins ride the directly constructed baseline services.
-	run(t, []runtime.Plugin{adaptation.Plugin(), tasks.Plugin(), composedCustomPlugin()})
+	run(t, []extension.Native{adaptation.Native(), tasks.Native(), composedCustomPlugin()})
 }
 
 func composedHistory(t *testing.T, c *client.Client, sessionID string, cursor *string) *protocol.HistoryPage {
@@ -1240,7 +1296,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		composedWriteFile(t, configPath, heldConfigDocument(model.URL, heldOldKeyEnv, false))
 		runtime.WriteAgentDefinitionsForTest(t, configPath, heldAgentsMain)
 
-		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []runtime.Plugin{tasks.Plugin()}})
+		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []extension.Native{tasks.Native()}})
 		testassert.NoError(t, err)
 		store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
 		testassert.NoError(t, err)

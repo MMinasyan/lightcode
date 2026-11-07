@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"os"
 	goruntime "runtime"
 	"strings"
@@ -25,9 +26,11 @@ type surfaceRequest struct {
 	promptSize     prompt.Mode
 	promptBody     string
 	invocation     Invocation
+	model          model.ModelRef
 	constraints    harness.ToolConstraints
 	identity       harness.SessionIdentity
-	toolSpecs      []CapabilitySpec
+	agentInputs    harness.AgentInputs
+	toolSpecs      []toolDeclaration
 }
 
 // surfaceResult is one composed prompt with its captured rule diagnostics and
@@ -46,7 +49,7 @@ type surfaceResult struct {
 // eligible tool is included — an exclusion can never revive a tool the hard
 // constraints made ineligible. A zero session start samples the compose time
 // once, so the resulting prompt is captured once.
-func composeSurface(req surfaceRequest) (surfaceResult, []model.ToolDefinition, error) {
+func composeSurface(ctx context.Context, req surfaceRequest) (surfaceResult, []model.ToolDefinition, error) {
 	sessionStart := req.sessionStart
 	if sessionStart.IsZero() {
 		sessionStart = time.Now()
@@ -76,7 +79,7 @@ func composeSurface(req surfaceRequest) (surfaceResult, []model.ToolDefinition, 
 
 	catalog := make([]model.ToolDefinition, 0, len(req.toolSpecs))
 	for _, spec := range req.toolSpecs {
-		description, err := spec.describe(req.invocation, req.constraints, req.identity)
+		description, err := spec.describe(ctx, req.invocation, req.model, req.constraints, req.identity, req.agentInputs)
 		if err != nil {
 			return surfaceResult{}, nil, err
 		}

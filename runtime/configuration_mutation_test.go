@@ -16,9 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/config"
+	taskplugin "github.com/MMinasyan/lightcode/internal/plugins/tasks"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -397,18 +399,11 @@ func mustMarshal(t *testing.T, value any) []byte {
 // file stay untouched.
 func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	h := newServiceHarness(t)
-	var received []json.RawMessage
-	var mu sync.Mutex
 	// The fixture document carries the old alpha section the stale save must
 	// remove wholesale.
 	writeServiceFile(t, h.configPath, strings.TrimSuffix(mutationConfigDocument(), "}")+`,"tools":{"max_output_bytes":42},"plugins":{"legacy":{"value":9007199254740993}},"extensions":{"alpha":{"enabled":true,"kept":1}}}`)
 	svc := h.service(context.Background(),
-		servicePlugin("alpha", &h.opens, func(raw json.RawMessage) error {
-			mu.Lock()
-			received = append(received, append(json.RawMessage(nil), raw...))
-			mu.Unlock()
-			return nil
-		}),
+		servicePlugin("alpha", &h.opens, acceptValidator),
 		servicePlugin("capowner", &h.opens, acceptValidator),
 	)
 	svc.attachWarnings(newWarningStore())
@@ -462,11 +457,6 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 		_, ok := root["alpha"]
 		testassert.Require(t, !ok, "a removed plugin section leaked to the root")
 	}
-	// The removed section is inactive and its validator does not run.
-	mu.Lock()
-	alphaCalls := len(received)
-	mu.Unlock()
-	testassert.Require(t, alphaCalls == 1, "alpha validator calls = %d, want no call for omitted section", alphaCalls)
 	nextConfigurationEvent(t, sub, "2")
 
 	// The refusal domain: an unknown ID, invalid inner JSON, and a valid but
@@ -501,10 +491,6 @@ func TestConfigurationMutateSettingsOwnsOpaquePluginDocuments(t *testing.T) {
 	testassert.NoError(t, err)
 	got := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.extensions).Extensions
 	testassert.Require(t, reflect.DeepEqual(got, retained), "inactive documents = %v, want %v", got, retained)
-	mu.Lock()
-	alphaCalls = len(received)
-	mu.Unlock()
-	testassert.Equal(t, alphaCalls, 1)
 	nextConfigurationEvent(t, sub, "4")
 }
 
@@ -668,13 +654,14 @@ func TestConfigurationMutateAgentModelPreservesConcurrentSettings(t *testing.T) 
 	writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
 	var armed atomic.Bool
 	entered, release := make(chan struct{}), make(chan struct{})
-	plugin := servicePlugin("agents", &h.opens, func(json.RawMessage) error {
+	candidateBarrier = func() {
 		if armed.CompareAndSwap(true, false) {
 			close(entered)
 			<-release
 		}
-		return nil
-	})
+	}
+	t.Cleanup(func() { candidateBarrier = nil })
+	plugin := servicePlugin("agents", &h.opens, acceptValidator)
 	svc := h.service(context.Background(), plugin)
 	initial, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
@@ -819,7 +806,7 @@ func TestConfigurationMutateAgentModelRejectsInactiveOwner(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			h := newServiceHarness(t)
 			writeServiceFile(t, h.configPath, row.config)
-			var plugins []Plugin
+			var plugins []extension.Native
 			if row.installed {
 				plugins = append(plugins, fixtureAgentPlugin())
 			}
@@ -843,15 +830,6 @@ func TestConfigurationMutateAgentModelRejectsInactiveOwner(t *testing.T) {
 // plugins member are removed by the whole-shape write instead — the
 // whole-plugins regression owns that axis.)
 func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing.T) {
-	sentinel := errors.New("written settings invalid")
-	// rejectWritten accepts the absent section but rejects the mutation's
-	// written section (2048) for the fixture's own unrelated plugin id.
-	rejectWritten := func(raw json.RawMessage) error {
-		if strings.Contains(string(raw), "2048") {
-			return sentinel
-		}
-		return nil
-	}
 	// withSection returns the shared written settings plus one extra owned
 	// plugin section, so a row can target one specific plugin settings owner.
 	withSection := func(id, document string) protocol.Settings {
@@ -868,6 +846,7 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 	rows := []struct {
 		name       string
 		validate   func(json.RawMessage) error
+		schema     json.RawMessage
 		external   string // the document an external editor writes before the edit
 		settings   protocol.Settings
 		wantSource string
@@ -881,10 +860,11 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 		},
 		{
 			name:       "an unrelated plugin validator rejects its own written section",
-			validate:   rejectWritten,
+			validate:   acceptValidator,
+			schema:     json.RawMessage("false"),
 			external:   mutationConfigDocument(),
 			settings:   withSection("capowner", `{"enabled":true,"kept":2048}`),
-			wantSource: "written settings invalid",
+			wantSource: "jsonschema validation failed",
 		},
 		{
 			name:       "externally malformed document",
@@ -905,9 +885,11 @@ func TestConfigurationMutateInvalidCandidateLeavesEverythingUnchanged(t *testing
 		t.Run(row.name, func(t *testing.T) {
 			h := newServiceHarness(t)
 			writeServiceFile(t, h.configPath, mutationConfigDocument())
-			svc := h.service(context.Background(),
-				servicePlugin("capowner", &h.opens, row.validate),
-				servicePlugin("alpha", &h.opens, acceptValidator))
+			capowner := servicePlugin("capowner", &h.opens, row.validate)
+			if row.schema != nil {
+				capowner.Declaration.ConfigSchema = row.schema
+			}
+			svc := h.service(context.Background(), capowner, servicePlugin("alpha", &h.opens, acceptValidator))
 			{
 				_, err := svc.publish(context.Background())
 				testassert.NoError(t, err)
@@ -957,7 +939,7 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 		{
 			name:       "invalid active extension",
 			config:     `{"providers":{},"extensions":{"alpha":{"enabled":true,"invalid":true}}}`,
-			wantSource: "invalid alpha",
+			wantSource: "jsonschema validation failed",
 		},
 	}
 	for _, row := range rows {
@@ -967,12 +949,11 @@ func TestConfigurationMutateAgentEditInvalidCandidateLeavesEverythingUnchanged(t
 			writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
 			svc := h.service(context.Background(),
 				servicePlugin("capowner", &h.opens, acceptValidator),
-				servicePlugin("alpha", &h.opens, func(raw json.RawMessage) error {
-					if strings.Contains(string(raw), `"invalid":true`) {
-						return errors.New("invalid alpha")
-					}
-					return nil
-				}), fixtureAgentPlugin())
+				func() extension.Native {
+					plugin := servicePlugin("alpha", &h.opens, acceptValidator)
+					plugin.Declaration.ConfigSchema = json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"},"invalid":{"not":{"const":true}}},"required":["enabled"]}`)
+					return plugin
+				}(), fixtureAgentPlugin())
 			{
 				_, err := svc.publish(context.Background())
 				testassert.NoError(t, err)
@@ -1041,10 +1022,9 @@ func TestConfigurationMutateCancelsBeforeWrite(t *testing.T) {
 		h := newServiceHarness(t)
 		writeServiceFile(t, h.configPath, strings.TrimSuffix(mutationConfigDocument(), "}")+`,"extensions":{"capowner":{"enabled":true}}}`)
 		ctx, cancel := context.WithCancel(context.Background())
-		svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, func(json.RawMessage) error {
-			cancel()
-			return nil
-		}))
+		candidateBarrier = cancel
+		t.Cleanup(func() { candidateBarrier = nil })
+		svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 		{
 			_, err := svc.publish(context.Background())
 			testassert.NoError(t, err)
@@ -1173,13 +1153,14 @@ func TestConfigurationMutateSerializesWithReload(t *testing.T) {
 	var builds atomic.Int64
 	gate := make(chan struct{})
 	entered := make(chan struct{}, 1)
-	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, func(json.RawMessage) error {
+	candidateBarrier = func() {
 		if builds.Add(1) == 2 { // the second build — the mutation — parks
 			entered <- struct{}{}
 			<-gate
 		}
-		return nil
-	}))
+	}
+	t.Cleanup(func() { candidateBarrier = nil })
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -1428,13 +1409,14 @@ func TestConfigurationMutateExternalEditorRaceLastWriterWins(t *testing.T) {
 	var parked int32 // the validator parks only the edit build
 	arrive := make(chan struct{}, 1)
 	gate := make(chan struct{})
-	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, func(json.RawMessage) error {
+	candidateBarrier = func() {
 		if atomic.LoadInt32(&parked) == 1 {
-			arrive <- struct{}{} // signal from the validation stage; no I/O here
+			arrive <- struct{}{}
 			<-gate
 		}
-		return nil
-	}))
+	}
+	t.Cleanup(func() { candidateBarrier = nil })
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
 	{
 		_, err := svc.publish(context.Background())
 		testassert.NoError(t, err)
@@ -1571,4 +1553,54 @@ func requireRealWarningRevision(t *testing.T, event Event, store *warningStore) 
 	testassert.Require(t, err == nil && revision != 0, "warning event revision = %q, want a real advanced value", body.WarningsRevision.Revision)
 	current, _ := store.snapshot()
 	testassert.Require(t, revision <= current, "warning event revision = %d, beyond the store's current value %d", revision, current)
+}
+
+// TestConfigurationSettingsRejectNonIntegerTaskLexemes proves the settings and
+// publication path: null/default/integer task forms publish, while JSON Schema
+// integer lexemes that Go's decoder cannot represent as int are rejected at
+// candidate Open before any owning byte or revision changes.
+func TestConfigurationSettingsRejectNonIntegerTaskLexemes(t *testing.T) {
+	for _, row := range []struct {
+		name     string
+		task     string
+		accepted bool
+	}{
+		{"null task", `null`, true},
+		{"absent members", `{}`, true},
+		{"null members", `{"max_concurrent":null,"max_output_bytes":null}`, true},
+		{"integer members", `{"max_concurrent":7,"max_output_bytes":2048}`, true},
+		{"decimal lexeme", `{"max_concurrent":1.0}`, false},
+		{"exponent lexeme", `{"max_concurrent":1e0}`, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h := newServiceHarness(t)
+			writeServiceFile(t, h.configPath, mutationConfigDocument())
+			svc := h.service(context.Background(), taskplugin.Native())
+			// The isolated service harness normally skips resource opening; this
+			// row owns the real publication boundary, so attach the owner graph
+			// and data root the Runtime wires in production.
+			graph, err := newNativeComposition([]extension.Native{taskplugin.Native()})
+			testassert.NoError(t, err)
+			svc.composition = graph
+			svc.dataDir = t.TempDir()
+			initial, err := svc.publish(context.Background())
+			testassert.NoError(t, err)
+			before, err := os.ReadFile(h.configPath)
+			testassert.NoError(t, err)
+			generation := svc.current().generation
+			settings := projectSettings(initial.snapshot.sessions, initial.snapshot.tools, initial.snapshot.jobs, initial.snapshot.compaction, initial.snapshot.extensions)
+			settings.Extensions["agents"] = `{"enabled":true,"task":` + row.task + `}`
+			_, err = svc.mutate(context.Background(), editSettings(settings))
+			if row.accepted {
+				testassert.NoError(t, err)
+				testassert.Require(t, svc.current().generation != generation, "accepted settings did not advance the generation")
+				return
+			}
+			testassert.Require(t, errors.Is(err, ErrConfiguration), "settings write = %v, want the configuration refusal", err)
+			after, err := os.ReadFile(h.configPath)
+			testassert.NoError(t, err)
+			testassert.Require(t, string(after) == string(before), "rejected settings changed the owning bytes")
+			testassert.Equal(t, svc.current().generation, generation)
+		})
+	}
 }

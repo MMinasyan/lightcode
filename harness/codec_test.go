@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -953,7 +954,7 @@ func TestRegisterPayloadRejectsInvalidWire(t *testing.T) {
 		{"miscased key", renameKey(opRaw, "admission", "Admission")},
 		{"null admission", setKey(opRaw, "admission", json.RawMessage(`null`))},
 		{"wrong state container", setKey(opRaw, "state", json.RawMessage(`[]`))},
-		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}},"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"context_window":4096,"output_reserve":2048,"system_prompt":"system","tools":[],"readonly":false,"write_dir":"","compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
+		{"operation mismatch", setKey(opRaw, "admission", json.RawMessage(`{"session_id":"`+testSessionID+`","operation_id":"ghost","request_kind":"message","admitted_entry":{"session_id":"`+testSessionID+`","entry_id":"`+hexID(1)+`"},"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"coder"}},"execution":{"configuration_revision":"rev-1","model":{"provider":"prov","model":"gpt-x"},"context_window":4096,"output_reserve":2048,"system_prompt":"system","tools":[],"initial_tool_names":[],"readonly":false,"write_dir":"","compact":{"model":{"provider":"cprov","model":"compact-x"},"system_prompt":"summarize"}},"admitted_at":"2026-01-02T03:04:05.123456789Z"}`))},
 	}
 	for _, m := range opMutations {
 		t.Run("operation/"+m.name, func(t *testing.T) {
@@ -3486,5 +3487,142 @@ func TestOperationStateUnreportedMaintenanceCodec(t *testing.T) {
 			_, err = decodeOperationRegister(Register{Key: RegisterKey{SessionID: testSessionID, Kind: RegisterOperation, OperationID: testOpID}, Payload: tampered})
 			testassert.Require(t, err != nil, "operation register with %s decoded, want rejection", row.name)
 		})
+	}
+}
+
+// TestExecutionCaptureInitialToolNamesCodec proves the canonical capture
+// carries the preparation-selected starting advertisement: a nil Go input
+// materializes to every captured tool, a present empty stays empty, order is
+// preserved, and the strict decoder requires the member with a unique
+// in-catalog subset. Ownership preserves nil versus present-empty.
+func TestExecutionCaptureInitialToolNamesCodec(t *testing.T) {
+	other := testToolDefinition()
+	other.Name = "other"
+	base := testCapture()
+	base.Tools = append(base.Tools, other)
+	for _, row := range []struct {
+		name  string
+		input []string
+		want  []string
+	}{
+		{"nil defaults to all", nil, []string{"echo", "other"}},
+		{"present empty", []string{}, []string{}},
+		{"reordered", []string{"other", "echo"}, []string{"other", "echo"}},
+		{"subset", []string{"other"}, []string{"other"}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			capture := base
+			capture.InitialToolNames = row.input
+			raw, err := encodeExecutionCapture(capture)
+			testassert.NoError(t, err)
+			obj, err := decodePayloadObject(raw)
+			testassert.NoError(t, err)
+			decoded, err := decodeExecutionCapture(obj)
+			testassert.NoError(t, err)
+			testassert.Require(t, slices.Equal(decoded.InitialToolNames, row.want), "decoded initial names = %v, want %v", decoded.InitialToolNames, row.want)
+			owned := ownCapture(capture)
+			if row.input == nil {
+				testassert.Require(t, owned.InitialToolNames == nil, "owned nil initial names = %v, want nil", owned.InitialToolNames)
+			} else {
+				testassert.Require(t, owned.InitialToolNames != nil && slices.Equal(owned.InitialToolNames, row.input), "owned initial names = %v, want the present copy %v", owned.InitialToolNames, row.input)
+			}
+		})
+	}
+	raw, err := encodeExecutionCapture(base)
+	testassert.NoError(t, err)
+	obj, err := decodePayloadObject(raw)
+	testassert.NoError(t, err)
+	for _, mutation := range []struct {
+		name  string
+		value json.RawMessage
+		drop  bool
+	}{
+		{"missing", nil, true},
+		{"null", json.RawMessage(`null`), false},
+		{"duplicate", json.RawMessage(`["echo","echo"]`), false},
+		{"foreign", json.RawMessage(`["foreign"]`), false},
+		{"empty name", json.RawMessage(`[""]`), false},
+	} {
+		members := make(map[string]json.RawMessage, len(obj))
+		for key, value := range obj {
+			members[key] = value
+		}
+		if mutation.drop {
+			delete(members, "initial_tool_names")
+		} else {
+			members["initial_tool_names"] = mutation.value
+		}
+		if _, err := decodeExecutionCapture(members); err == nil {
+			t.Fatalf("%s initial_tool_names accepted", mutation.name)
+		}
+	}
+}
+
+// TestImplementationCaptureSettingsUseCanonicalFraming proves provenance
+// settings use the same canonical raw-byte framing as strategy settings:
+// present bytes, including literal null and noncompact/HTML/exact numeric
+// documents, survive exactly; absent stays absent; and malformed/noncanonical
+// framing is rejected rather than embedded through an outer JSON encoder.
+func TestImplementationCaptureSettingsUseCanonicalFraming(t *testing.T) {
+	settings := []byte("{ \n \"api_key_env\" : \"OPENAI_API_KEY\", \"html\":\"<&>\", \"escaped\":\"\\u003c\", \"large\":9007199254740993, \"exp\":1e400 }")
+	capture := provenanceCapture()
+	capture.Implementations = []ImplementationCapture{
+		{ExtensionID: "agents", Version: "1", Settings: settings},
+		{ExtensionID: "nulls", Version: "1", Settings: json.RawMessage(`null`)},
+		{ExtensionID: "absent", Version: "1"},
+	}
+	raw, err := encodeExecutionCapture(capture)
+	testassert.NoError(t, err)
+	obj, err := decodePayloadObject(raw)
+	testassert.NoError(t, err)
+	implementations, err := arrayMember(obj, "implementations", true)
+	testassert.NoError(t, err)
+	testassert.Require(t, len(implementations) == 3, "implementations = %d, want three", len(implementations))
+	first, err := decodePayloadObject(implementations[0])
+	testassert.NoError(t, err)
+	if _, present := first["settings"]; present {
+		t.Fatal("implementation settings were embedded through an outer JSON encoder")
+	}
+	framed, err := framedMember(first, "settings_base64", true)
+	testassert.NoError(t, err)
+	testassert.Require(t, string(framed) == string(settings), "framed settings = %q, want the exact source bytes %q", framed, settings)
+	decoded, err := decodeExecutionCapture(obj)
+	testassert.NoError(t, err)
+	testassert.Require(t, len(decoded.Implementations) == 3, "decoded implementations = %d, want three", len(decoded.Implementations))
+	testassert.Require(t, string(decoded.Implementations[0].Settings) == string(settings), "decoded settings = %q, want the exact source bytes", decoded.Implementations[0].Settings)
+	testassert.Require(t, string(decoded.Implementations[1].Settings) == "null", "decoded null settings = %q, want the present literal null", decoded.Implementations[1].Settings)
+	testassert.Require(t, len(decoded.Implementations[2].Settings) == 0, "decoded absent settings = %q, want absence", decoded.Implementations[2].Settings)
+
+	for _, mutation := range []struct {
+		name  string
+		value json.RawMessage
+		drop  bool
+		extra bool
+	}{
+		{"noncanonical base64", json.RawMessage(`"e30"`), false, false},
+		{"unframed text", json.RawMessage(`"not base64!"`), false, false},
+		{"empty framing", json.RawMessage(`""`), false, false},
+		{"wrong type", json.RawMessage(`123`), false, false},
+		{"invalid framed JSON", frame([]byte(`{not json`)), false, false},
+		{"legacy embedded document", json.RawMessage(`{"enabled":true}`), false, false},
+		{"absent", nil, true, false},
+	} {
+		wire := make(map[string]json.RawMessage, len(first))
+		for key, value := range first {
+			wire[key] = value
+		}
+		if mutation.drop {
+			delete(wire, "settings_base64")
+		} else {
+			wire["settings_base64"] = mutation.value
+		}
+		mutated := []json.RawMessage{mustMarshal(wire), implementations[1], implementations[2]}
+		obj["implementations"] = mustMarshal(mutated)
+		_, err := decodeExecutionCapture(obj)
+		if mutation.drop {
+			testassert.Require(t, err == nil, "absent settings rejected")
+		} else {
+			testassert.Require(t, err != nil, "%s framing accepted", mutation.name)
+		}
 	}
 }

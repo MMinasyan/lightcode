@@ -246,7 +246,7 @@ func TestMaintenanceGapAcrossTransitionsAndRecovery(t *testing.T) {
 			}
 			return streamOf(turnDelta("stop", "quiet"), usageDelta(model.Usage{})), nil
 		}
-		tool := func(_ context.Context, call model.ToolCall) PreparedTool {
+		tool := func(ctx context.Context, call model.ToolCall) PreparedTool {
 			// The ordinary model transition has already committed the call.
 			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 			testassert.NoError(t, err)

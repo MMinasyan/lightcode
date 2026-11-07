@@ -22,6 +22,10 @@ const publicModule = "github.com/MMinasyan/lightcode"
 // the SQLite driver is confined to internal/storage.
 const sqliteDriverPkg = "github.com/mattn/go-sqlite3"
 
+// jsonschemaPkg is the one third-party schema compiler the extension
+// declaration compiler permits.
+const jsonschemaPkg = "github.com/santhosh-tekuri/jsonschema/v6"
+
 // oapiRuntimePkg is the one third-party dependency the protocol permits:
 // generated HTTP parameter binding for its standard-library net/http server
 // and client.
@@ -119,6 +123,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		modelPkg       = publicModule + "/model"
 		agentPkg       = publicModule + "/agent"
 		harnessPkg     = publicModule + "/harness"
+		extensionPkg   = publicModule + "/extension"
 		storagePkg     = publicModule + "/internal/storage"
 		runtimePkg     = publicModule + "/runtime"
 		configPkg      = publicModule + "/internal/config"
@@ -228,9 +233,13 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			if imp != modelPkg && imp != agentPkg && !std[imp] {
 				problems = append(problems, rel+": harness package imports "+imp+"; harness may import only the standard library, "+modelPkg+", and "+agentPkg)
 			}
+		case "extension":
+			if imp != modelPkg && imp != harnessPkg && imp != promptPkg && imp != protocolPkg && imp != jsonschemaPkg && !std[imp] {
+				problems = append(problems, rel+": extension package imports "+imp+"; extension may import only the standard library, the shared "+modelPkg+", "+harnessPkg+", "+promptPkg+" and "+protocolPkg+" contracts, and "+jsonschemaPkg+", never the Runtime/MELTA owner or a concrete/internal implementation package")
+			}
 		case "runtime":
-			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != configPkg && imp != agentsPkg && imp != catalogPkg && imp != atomicfsPkg && imp != promptPkg && imp != adaptationPkg && imp != snapshotPkg && imp != safefsPkg && imp != pathutilPkg && imp != storagePkg && imp != toolPkg && imp != editprePkg && imp != shellparsePkg && imp != toolargsPkg && imp != jobsPkg && !std[imp] {
-				problems = append(problems, rel+": runtime package imports "+imp+"; runtime may import only the standard library, "+modelPkg+", "+harnessPkg+", "+protocolPkg+", and the retained "+configPkg+", "+agentsPkg+", "+catalogPkg+", "+atomicfsPkg+", "+promptPkg+", "+adaptationPkg+", "+snapshotPkg+", "+safefsPkg+", "+pathutilPkg+", "+storagePkg+", "+toolPkg+", "+editprePkg+", "+shellparsePkg+", "+toolargsPkg+", and "+jobsPkg+" helpers, never any concrete plugin under "+pluginsPkg+" or the SQLite driver")
+			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != configPkg && imp != agentsPkg && imp != catalogPkg && imp != atomicfsPkg && imp != promptPkg && imp != adaptationPkg && imp != snapshotPkg && imp != safefsPkg && imp != pathutilPkg && imp != storagePkg && imp != toolPkg && imp != editprePkg && imp != shellparsePkg && imp != toolargsPkg && imp != jobsPkg && imp != extensionPkg && !std[imp] {
+				problems = append(problems, rel+": runtime package imports "+imp+"; runtime may import only the standard library, "+modelPkg+", "+harnessPkg+", "+protocolPkg+", and the retained "+configPkg+", "+agentsPkg+", "+catalogPkg+", "+atomicfsPkg+", "+promptPkg+", "+adaptationPkg+", "+snapshotPkg+", "+safefsPkg+", "+pathutilPkg+", "+storagePkg+", "+toolPkg+", "+editprePkg+", "+shellparsePkg+", "+toolargsPkg+", "+jobsPkg+", and "+extensionPkg+" helpers, never any concrete plugin under "+pluginsPkg+" or the SQLite driver")
 			}
 		case "internal/catalog":
 			if imp != modelPkg && imp != atomicfsPkg && !std[imp] {
@@ -249,11 +258,11 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": internal/jobs imports "+imp+"; the jobs service may import only the standard library, "+harnessPkg+", and "+cmdoutputPkg+" — the Runtime owner consumes it, never the other way round")
 			}
 		case "internal/plugins/adaptation":
-			if imp != runtimePkg && imp != modelPkg && imp != adaptationPkg && imp != promptPkg && !std[imp] {
-				problems = append(problems, rel+": internal/plugins/adaptation imports "+imp+"; the adaptation plugin may import only the standard library, "+runtimePkg+", "+modelPkg+", "+promptPkg+", and "+adaptationPkg)
+			if imp != runtimePkg && imp != modelPkg && imp != adaptationPkg && imp != promptPkg && imp != extensionPkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/adaptation imports "+imp+"; the adaptation plugin may import only the standard library, "+runtimePkg+", "+modelPkg+", "+promptPkg+", "+adaptationPkg+", and "+extensionPkg)
 			}
 		case "internal/plugins/tasks":
-			if imp != modelPkg && imp != harnessPkg && imp != runtimePkg && imp != protocolPkg && imp != toolargsPkg && !std[imp] {
+			if imp != modelPkg && imp != harnessPkg && imp != runtimePkg && imp != protocolPkg && imp != toolargsPkg && imp != extensionPkg && !std[imp] {
 				problems = append(problems, rel+": internal/plugins/tasks imports "+imp+"; the child-session tool plugin may import only the standard library, "+modelPkg+", "+harnessPkg+", "+runtimePkg+", "+protocolPkg+", and "+toolargsPkg)
 			}
 		case "internal/toolargs":
@@ -265,8 +274,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": internal/testassert imports "+imp+"; the shared test assertion helper may import only the standard library")
 			}
 		case "internal/plugins/builtin":
-			if imp != runtimePkg && imp != pluginsPkg+"/adaptation" && imp != tasksPkg && !std[imp] {
-				problems = append(problems, rel+": internal/plugins/builtin imports "+imp+"; the shipped registration set may import only the standard library, "+runtimePkg+", and the two sibling plugins it registers — the store and the standard tools are directly constructed by the owner")
+			if imp != runtimePkg && imp != pluginsPkg+"/adaptation" && imp != tasksPkg && imp != extensionPkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/builtin imports "+imp+"; the shipped registration set may import only the standard library, "+runtimePkg+", the two sibling plugins it registers, and "+extensionPkg+" — the store and the standard tools are directly constructed by the owner")
 			}
 		case "protocol":
 			if imp != oapiRuntimePkg && !std[imp] {
@@ -513,6 +522,26 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	{
 		problems := checkTrackedGoFile("internal/agents/x.go", []string{publicModule + "/internal/atomicfs"}, std)
 		testassert.Check(t, len(problems) == 1, "internal/agents importing the atomic file helper: %d problems, want 1: %v", len(problems), problems)
+	}
+	// The native extension contract carries only the shared model, harness,
+	// prompt and protocol data contracts plus the installed schema compiler;
+	// the Runtime/MELTA owner, concrete plugins, adaptation table, storage,
+	// agent package and the SQLite driver are the nearest forbidden
+	// implementation siblings.
+	{
+		problems := checkTrackedGoFile("extension/x.go", []string{"context", "encoding/json", "sync", publicModule + "/model", publicModule + "/harness", publicModule + "/prompt", publicModule + "/protocol", jsonschemaPkg}, std)
+		testassert.Check(t, len(problems) == 0, "allowed extension imports flagged: %v", problems)
+	}
+	for _, imp := range []string{
+		publicModule + "/agent", publicModule + "/runtime", publicModule + "/internal/agent",
+		publicModule + "/internal/adaptation", publicModule + "/internal/storage", sqliteDriverPkg,
+		publicModule + "/internal/plugins", publicModule + "/internal/plugins/sqlite",
+		publicModule + "/internal/plugins/tasks", publicModule + "/plugins/jobs",
+	} {
+		{
+			problems := checkTrackedGoFile("extension/x.go", []string{imp}, std)
+			testassert.Check(t, len(problems) == 1, "extension importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
 	}
 	// The runtime owner consumes the public model, harness, and protocol
 	// contracts and the retained helpers it composes directly: configuration,

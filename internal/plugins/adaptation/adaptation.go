@@ -1,31 +1,40 @@
 // Package adaptation declares Lightcode's per-model adaptation plugin as one
-// ordinary Runtime-scoped PreparationHook contribution selected through static
-// registration. It retains the bundled model matching and applies its
-// exclusions, full-mode prompt append and tool-description replacements
-// through the same closed consequence every other preparation contribution
-// uses. It has no settings and no Close.
+// ordinary Harness-scoped preparation hook contribution selected through the
+// ordinary Agent capability list. It retains the bundled model matching and
+// applies its exclusions, full-mode prompt append and tool-description
+// replacements through the same closed consequence every other preparation
+// contribution uses. It has no settings and no Close.
 package adaptation
 
 import (
 	"context"
 
+	"github.com/MMinasyan/lightcode/extension"
 	modeladapt "github.com/MMinasyan/lightcode/internal/adaptation"
 	"github.com/MMinasyan/lightcode/prompt"
-	"github.com/MMinasyan/lightcode/runtime"
 )
 
 // CapabilityID is the plugin's one declared preparation capability.
 const CapabilityID = "model_adaptation"
 
-// Plugin returns the Runtime-scoped plugin whose single export is declared as
-// the public PreparationHook contract. It has no dependencies and no settings
-// validator.
-func Plugin() runtime.Plugin {
-	return runtime.Plugin{
-		ID:    "adaptation",
-		Scope: runtime.ScopeRuntime,
-		Provides: []runtime.CapabilitySpec{
-			runtime.Spec[runtime.PreparationHook](CapabilityID),
+const configSchema = `{"type":"object","properties":{"enabled":{"type":"boolean"}},"required":["enabled"],"additionalProperties":false}`
+
+// Native returns the Harness-scoped native whose single contribution is the
+// prepare-boundary hook. It has no dependencies and no settings.
+func Native() extension.Native {
+	return extension.Native{
+		Declaration: extension.Declaration{
+			ID:           "adaptation",
+			Version:      "1",
+			ConfigSchema: []byte(configSchema),
+			Components: []extension.Component{{
+				ID:       "adaptation",
+				Lifetime: extension.LifetimeHarness,
+				Provides: []string{CapabilityID},
+			}},
+			Capabilities: []extension.Capability{
+				extension.HookCapability(CapabilityID, extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure)),
+			},
 		},
 		Open: open,
 	}
@@ -36,15 +45,15 @@ func Plugin() runtime.Plugin {
 // exclusions and description replacements apply in every mode.
 type hook struct{}
 
-func (hook) Prepare(_ context.Context, input runtime.PreparationInput) (runtime.PreparationConsequence, error) {
+func (hook) Prepare(_ context.Context, _ extension.CallContext, input extension.PreparationInput) (extension.PreparationConsequence, error) {
 	match := modeladapt.Match(input.Model.Model)
 	if match == nil {
-		return runtime.PreparationConsequence{}, nil
+		return extension.PreparationConsequence{}, nil
 	}
-	var consequence runtime.PreparationConsequence
+	var consequence extension.PreparationConsequence
 	if len(match.Append) > 0 && input.Assembly.Mode == prompt.ModeFull {
-		prompt := modeladapt.TransformPrompt(input.Prompt, &modeladapt.Adaptation{Append: match.Append})
-		consequence.Prompt = &prompt
+		replaced := modeladapt.TransformPrompt(input.Prompt, &modeladapt.Adaptation{Append: match.Append})
+		consequence.Prompt = &replaced
 	}
 	if len(match.ExcludeTools) > 0 {
 		excluded := make(map[string]bool, len(match.ExcludeTools))
@@ -75,9 +84,11 @@ func (hook) Prepare(_ context.Context, input runtime.PreparationInput) (runtime.
 	return consequence, nil
 }
 
-func open(ctx context.Context, _ runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+func open(ctx context.Context, _ extension.InstanceContext) (extension.Instance, error) {
 	if err := ctx.Err(); err != nil {
-		return runtime.Instance{}, err
+		return extension.Instance{}, err
 	}
-	return runtime.Instance{Values: map[string]any{CapabilityID: hook{}}}, nil
+	return extension.Instance{Capabilities: map[string]extension.Implementation{
+		CapabilityID: {Preparation: hook{}.Prepare},
+	}}, nil
 }

@@ -806,7 +806,7 @@ func TestHistoryPageAttachesResultsBeyondTheBaseRange(t *testing.T) {
 		})
 		// The started call parks until the run's cancellation releases it; the
 		// unstarted call never begins and settles synthetically.
-		bg.tools.setPrepare(parkedReadCallPrepare(releaseTool, toolStarted))
+		setParkedReadCall(bg.tools, releaseTool, toolStarted)
 		submitThroughRuntime(t, bg.r, session, "op-1", "work")
 		select {
 		case <-toolStarted:

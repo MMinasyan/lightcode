@@ -26,7 +26,7 @@ import (
 // baseline store, jobs, and tools: the complete composition opens over the
 // included SQLite database, reload publishes, and shutdown converges leaving
 // exactly the included store's files.
-func init() { runtime.ShippedAdaptationPlugin = adaptation.Plugin }
+func init() { runtime.ShippedAdaptationPlugin = adaptation.Native }
 
 func TestBuiltinRegistrationComposes(t *testing.T) {
 	ctx := context.Background()

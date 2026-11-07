@@ -300,7 +300,7 @@ func TestSteeringAdmitsHeadsInFIFOOrder(t *testing.T) {
 	openerArrived := make(chan struct{})
 	openerGate := make(chan struct{})
 	var once sync.Once
-	exec := effectExecution(script.model, func(_ context.Context, call model.ToolCall) PreparedTool {
+	exec := effectExecution(script.model, func(ctx context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 	})
 	prepared := PreparedExecution{

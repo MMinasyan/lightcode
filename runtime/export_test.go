@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/extension"
+
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -26,7 +28,7 @@ func WriteAgentDefinitionsForTest(t *testing.T, configPath, content string) {
 // runtime-to-plugin import cycle. It forwards to the public Open with the
 // supplied plugins: the same concrete preparation path, with no alternate
 // producer. It is absent from production builds.
-func OpenForTest(ctx context.Context, dataDir, configPath string, plugins []Plugin) (*Runtime, error) {
+func OpenForTest(ctx context.Context, dataDir, configPath string, plugins []extension.Native) (*Runtime, error) {
 	return Open(ctx, Options{
 		DataDir:    dataDir,
 		ConfigPath: configPath,
@@ -61,34 +63,6 @@ func ConfiguredInvocationForTest(tools, jobs, compaction string, sections map[st
 // runtime_test package. It is absent from production builds.
 func EqualEventForTest(a, b Event) bool {
 	return equalEvent(a, b)
-}
-
-// ComposeScopeForTest opens the given plugins as one Runtime scope through
-// the composition machinery — every dependency binding is constructed
-// in-package — and returns the bound capability values by ID together with
-// the scope disposal. It is absent from production builds.
-func ComposeScopeForTest(ctx context.Context, info ScopeInfo, plugins []Plugin) (map[string]any, func() error, error) {
-	c, err := newComposition(plugins)
-	if err != nil {
-		return nil, nil, err
-	}
-	sc, err := c.openScope(ctx, info, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	values := make(map[string]any, len(sc.bindings.entries))
-	for id, entry := range sc.bindings.entries {
-		values[id] = entry.value
-	}
-	return values, sc.close, nil
-}
-
-// DescribeToolForTest invokes one declared tool spec's recorded description
-// function for the external tests that exercise a real plugin's describe
-// closure — outside this package only the zero Invocation is constructible.
-// It is absent from production builds.
-func DescribeToolForTest(spec CapabilitySpec, inv Invocation, constraints ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
-	return spec.describe(inv, constraints, identity)
 }
 
 // GetConfigurationForTest bridges the private configuration read for the
@@ -148,4 +122,4 @@ func SubmitForTest(ctx context.Context, r *Runtime, sessionID, operationID, text
 
 // ShippedAdaptationPlugin supplies the shipped adaptation plugin to in-package
 // tests, which cannot import it without an import cycle.
-var ShippedAdaptationPlugin func() Plugin
+var ShippedAdaptationPlugin func() extension.Native

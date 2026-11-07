@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -364,47 +365,60 @@ func seedLifecycleChild(t *testing.T, store harness.Storage, parentID, childID, 
 // model's tool calls exercise real prepared outcomes.
 type lifecycleTools struct {
 	mu      sync.Mutex
-	prepare func(ctx context.Context, call model.ToolCall) harness.PreparedTool
+	prepare func(ctx context.Context, call model.ToolCall) extension.ToolPlan
+	execute func(ctx context.Context, plan extension.ToolPlan) harness.ToolOutcome
 }
 
-func (t *lifecycleTools) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t *lifecycleTools) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return runtimeNormalize(call)
 }
 
-func (t *lifecycleTools) Prepare(ctx context.Context, _ ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t *lifecycleTools) Prepare(ctx context.Context, _ extension.ToolContext, call model.ToolCall) extension.ToolPlan {
 	t.mu.Lock()
 	prepare := t.prepare
 	t.mu.Unlock()
 	if prepare != nil {
 		return prepare(ctx, call)
 	}
-	// The fixture's default: one immediate success under the declared
-	// command.run pair, the settled result the plain rows expect.
-	return harness.PreparedTool{
-		Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-		Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}},
-	}
+	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}}, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 }
 
-// setPrepare installs one per-test prepared-outcome dispatcher.
-func (t *lifecycleTools) setPrepare(prepare func(ctx context.Context, call model.ToolCall) harness.PreparedTool) {
+func (t *lifecycleTools) Execute(ctx context.Context, _ extension.ToolContext, plan extension.ToolPlan) harness.ToolOutcome {
+	t.mu.Lock()
+	execute := t.execute
+	t.mu.Unlock()
+	if execute != nil {
+		return execute(ctx, plan)
+	}
+	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultSuccess, Content: "ok"}}
+}
+
+func (t *lifecycleTools) setExecute(execute func(ctx context.Context, plan extension.ToolPlan) harness.ToolOutcome) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.execute = execute
+}
+
+func (t *lifecycleTools) setPrepare(prepare func(ctx context.Context, call model.ToolCall) extension.ToolPlan) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.prepare = prepare
 }
 
-// lifecycleToolsPlugin declares the suite's read and grep tools over the one
-// shared dispatcher; both are always available so the concrete surface
-// advertises them and the model's calls reach the real dispatcher.
-func lifecycleToolsPlugin(tools *lifecycleTools) Plugin {
-	return Plugin{
-		ID:       "bgtools",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("read", availableToolDescription("read")), ToolSpec("grep", availableToolDescription("grep"))},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"read": tools, "grep": tools}}, nil
-		},
+func lifecycleToolsPlugin(tools *lifecycleTools) extension.Native {
+	native := testNative("bgtools", extension.LifetimeHarness,
+		[]extension.Capability{extension.ToolCapability("read"), extension.ToolCapability("grep")}, nil,
+		func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"read": {Tool: tools},
+				"grep": {Tool: tools},
+			}}, nil
+		})
+	native.Describe = map[string]extension.ToolDescribe{
+		"read": extensionToolDescribe("read", availableToolDescription("read")),
+		"grep": extensionToolDescribe("grep", availableToolDescription("grep")),
 	}
+	return native
 }
 
 // bgRuntime is the background suite's native owner: the solo and worker agent

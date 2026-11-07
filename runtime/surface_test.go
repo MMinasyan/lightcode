@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/tool"
@@ -22,33 +23,33 @@ import (
 // Tool-spec fixtures for the composer: ToolSpec records the pure describe
 // function behind the same validation production declarations use.
 
-func staticToolSpec(id, description string, available bool) CapabilitySpec {
-	return ToolSpec(id, func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
+func staticToolSpec(id, description string, available bool) toolDeclaration {
+	return toolDeclaration{id: id, standardDescribe: func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return toolDescriptionFor(id, description, available)
-	})
+	}}
 }
 
 // mutationToolSpec mirrors the native mutation-tool descriptions: available
 // unless the hard constraints make it ineligible.
-func mutationToolSpec(id string) CapabilitySpec {
-	return ToolSpec(id, func(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func mutationToolSpec(id string) toolDeclaration {
+	return toolDeclaration{id: id, standardDescribe: func(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 		return toolDescriptionFor(id, id+" description", !constraints.Readonly || constraints.WriteDir != "")
-	})
+	}}
 }
 
-func failingToolSpec(id string) CapabilitySpec {
-	return ToolSpec(id, func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
+func failingToolSpec(id string) toolDeclaration {
+	return toolDeclaration{id: id, standardDescribe: func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
 		return ToolDescription{}, errors.New(id + " describe failure")
-	})
+	}}
 }
 
 // lineageToolSpec declares a tool available only on a root Session: its
 // description function receives the preparation session identity and gates
 // availability on the parent lineage.
-func lineageToolSpec(id string) CapabilitySpec {
-	return ToolSpec(id, func(_ Invocation, _ ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
+func lineageToolSpec(id string) toolDeclaration {
+	return toolDeclaration{id: id, standardDescribe: func(_ Invocation, _ ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
 		return toolDescriptionFor(id, id+" description", identity.ParentSessionID == "")
-	})
+	}}
 }
 
 func toolDescriptionFor(id, description string, available bool) (ToolDescription, error) {
@@ -70,7 +71,7 @@ func baseSurfaceRequest(t *testing.T) surfaceRequest {
 		globalRulesDir: t.TempDir(),
 		workspace:      t.TempDir(),
 		promptSize:     prompt.ModeFull,
-		toolSpecs: []CapabilitySpec{
+		toolSpecs: []toolDeclaration{
 			staticToolSpec("read_file", "read_file description", true),
 			staticToolSpec("apply_patch", "apply_patch description", true),
 		},
@@ -83,7 +84,7 @@ func TestComposeSurfacePromptSizesSkipRulesUnderNone(t *testing.T) {
 	for _, mode := range []prompt.Mode{prompt.ModeNone, prompt.ModeSimple, prompt.ModeFull} {
 		r := req
 		r.promptSize = mode
-		result, _, err := composeSurface(r)
+		result, _, err := composeSurface(context.Background(), r)
 		testassert.Require(t, err == nil, "composeSurface(%s): %v", mode, err)
 		rules, err := prompt.ReadRules(req.globalRulesDir, req.workspace, mode)
 		testassert.NoError(t, err)
@@ -117,14 +118,14 @@ func TestComposeSurfaceRulesPrecedenceAndOverrides(t *testing.T) {
 	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("PROJECT CONTENT"), 0o600))
 	req := baseSurfaceRequest(t)
 	req.globalRulesDir, req.workspace = globalDir, workspace
-	result, _, err := composeSurface(req)
+	result, _, err := composeSurface(context.Background(), req)
 	testassert.NoError(t, err)
 	testassert.Require(t, strings.Contains(result.Prompt, "GLOBAL CONTENT") && strings.Contains(result.Prompt, "PROJECT CONTENT"), "the composed prompt lost a rules layer")
 	testassert.Require(t, strings.Index(result.Prompt, "GLOBAL CONTENT") < strings.Index(result.Prompt, "PROJECT CONTENT"), "project rules did not render after global rules")
 	// A user heading overrides the built-in section while the rest of the
 	// assembly is unchanged.
 	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("## Tone\n\nProject tone rule."), 0o600))
-	result, _, err = composeSurface(req)
+	result, _, err = composeSurface(context.Background(), req)
 	testassert.NoError(t, err)
 	testassert.Require(t, !strings.Contains(result.Prompt, "Be direct and concise"), "the built-in tone section survived a user tone heading override")
 	testassert.Require(t, strings.Contains(result.Prompt, "Project tone rule."), "the overriding project tone rule is missing")
@@ -136,7 +137,7 @@ func TestComposeSurfaceInvalidModeFailsBeforeRulesRead(t *testing.T) {
 	testassert.NoError(t, os.Mkdir(filepath.Join(globalDir, "AGENTS.md"), 0o700))
 	req.globalRulesDir = globalDir
 	req.promptSize = "bogus"
-	result, catalog, err := composeSurface(req)
+	result, catalog, err := composeSurface(context.Background(), req)
 	testassert.Require(t, errors.Is(err, prompt.ErrInvalidInput), "composeSurface invalid mode error = %v, want ErrInvalidInput", err)
 	testassert.Require(t, result.Prompt == "" && len(result.Warnings) == 0 && catalog == nil, "invalid mode produced a surface: %+v", result)
 }
@@ -145,7 +146,7 @@ func TestComposeSurfaceAdvertisement(t *testing.T) {
 	req := baseSurfaceRequest(t)
 
 	// Every eligible tool is advertised in declaration order.
-	_, catalog, err := composeSurface(req)
+	_, catalog, err := composeSurface(context.Background(), req)
 	testassert.NoError(t, err)
 	{
 		names := toolNames(catalog)
@@ -154,26 +155,26 @@ func TestComposeSurfaceAdvertisement(t *testing.T) {
 
 	// An ineligible tool stays out of the catalog: selection can never revive
 	// a tool the hard constraints made ineligible.
-	req.toolSpecs = []CapabilitySpec{
+	req.toolSpecs = []toolDeclaration{
 		staticToolSpec("read_file", "read_file description", true),
 		mutationToolSpec("write_file"),
 	}
 	req.constraints = ToolConstraints{Readonly: true}
-	_, catalog, err = composeSurface(req)
+	_, catalog, err = composeSurface(context.Background(), req)
 	testassert.NoError(t, err)
 	testassert.Require(t, reflect.DeepEqual(toolNames(catalog), []string{"read_file"}), "readonly catalog = %q, want only the eligible read_file", toolNames(catalog))
 }
 
 func TestComposeSurfaceReadonlyCannotRegainMutationTools(t *testing.T) {
 	req := baseSurfaceRequest(t)
-	req.toolSpecs = []CapabilitySpec{
+	req.toolSpecs = []toolDeclaration{
 		staticToolSpec("read_file", "read_file description", true),
 		mutationToolSpec("write_file"),
 		mutationToolSpec("edit_file"),
 		mutationToolSpec("apply_patch"),
 	}
 	req.constraints = ToolConstraints{Readonly: true}
-	_, catalog, err := composeSurface(req)
+	_, catalog, err := composeSurface(context.Background(), req)
 	testassert.NoError(t, err)
 	{
 		names := toolNames(catalog)
@@ -181,7 +182,7 @@ func TestComposeSurfaceReadonlyCannotRegainMutationTools(t *testing.T) {
 	}
 	// The nearest sibling: with a write dir the tools are eligible.
 	req.constraints = ToolConstraints{Readonly: true, WriteDir: "/tmp/plan"}
-	_, catalog, err = composeSurface(req)
+	_, catalog, err = composeSurface(context.Background(), req)
 	testassert.NoError(t, err)
 	{
 		names := toolNames(catalog)
@@ -191,8 +192,8 @@ func TestComposeSurfaceReadonlyCannotRegainMutationTools(t *testing.T) {
 
 func TestComposeSurfaceDescribeFailureAborts(t *testing.T) {
 	req := baseSurfaceRequest(t)
-	req.toolSpecs = []CapabilitySpec{failingToolSpec("broken")}
-	_, catalog, err := composeSurface(req)
+	req.toolSpecs = []toolDeclaration{failingToolSpec("broken")}
+	_, catalog, err := composeSurface(context.Background(), req)
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "broken describe failure"), "composeSurface = (%#v, %v), want the describe error", catalog, err)
 	testassert.Require(t, catalog == nil, "a failed description still advertised %d tools", len(catalog))
 }
@@ -200,7 +201,7 @@ func TestComposeSurfaceDescribeFailureAborts(t *testing.T) {
 func TestComposeSurfaceZeroSessionStartSamplesComposeTime(t *testing.T) {
 	req := baseSurfaceRequest(t)
 	before := time.Now().Add(-time.Second)
-	result, _, err := composeSurface(req)
+	result, _, err := composeSurface(context.Background(), req)
 	after := time.Now().Add(time.Second)
 	testassert.NoError(t, err)
 	const marker = "Session started: "
@@ -215,7 +216,7 @@ func TestComposeSurfaceZeroSessionStartSamplesComposeTime(t *testing.T) {
 	testassert.Require(t, !sampled.Before(before) && !sampled.After(after), "sampled session start = %s, want a compose-time value within [%s, %s]", sampled, before, after)
 	// An explicit session start is used verbatim.
 	req.sessionStart = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	result, _, err = composeSurface(req)
+	result, _, err = composeSurface(context.Background(), req)
 	testassert.NoError(t, err)
 	testassert.Require(t, strings.Contains(result.Prompt, "Session started: 2026-01-02 03:04:05 UTC"), "the explicit session start did not render verbatim: %q", result.Prompt)
 }
@@ -230,7 +231,7 @@ func TestComposeSurfaceExcludesLineageUnavailableTools(t *testing.T) {
 	req.identity = harness.SessionIdentity{SessionID: "root-session"}
 	req.toolSpecs = append(req.toolSpecs, lineageToolSpec("task"))
 
-	_, root, err := composeSurface(req)
+	_, root, err := composeSurface(context.Background(), req)
 	testassert.NoError(t, err)
 	{
 		names := toolNames(root)
@@ -239,7 +240,7 @@ func TestComposeSurfaceExcludesLineageUnavailableTools(t *testing.T) {
 
 	childReq := req
 	childReq.identity = harness.SessionIdentity{SessionID: "child-session", ParentSessionID: "root-session"}
-	_, child, err := composeSurface(childReq)
+	_, child, err := composeSurface(context.Background(), childReq)
 	testassert.NoError(t, err)
 	{
 		names := toolNames(child)
@@ -270,29 +271,29 @@ func TestPreparationContributionBundledDescriptionReplacementIsLiteral(t *testin
 		}
 		return out
 	}
-	instance, err := ShippedAdaptationPlugin().Open(context.Background(), ScopeInfo{}, Bindings{})
+	instance, err := ShippedAdaptationPlugin().Open(context.Background(), extension.InstanceContext{})
 	testassert.NoError(t, err)
-	adaptationHook := instance.Values["model_adaptation"].(PreparationHook)
+	adaptationHook := instance.Capabilities["model_adaptation"].Preparation
 	req := baseSurfaceRequest(t)
-	req.toolSpecs = []CapabilitySpec{
-		ToolSpec("run_command", runCommandTool{}.describe),
+	req.toolSpecs = []toolDeclaration{
+		{id: "run_command", standardDescribe: runCommandTool{}.describe},
 		staticToolSpec("note_editor", unrelated, true),
 	}
 	apply := func(t *testing.T, constraints ToolConstraints) map[string]string {
 		t.Helper()
 		r := req
 		r.constraints = constraints
-		_, catalog, err := composeSurface(r)
+		_, catalog, err := composeSurface(context.Background(), r)
 		testassert.NoError(t, err)
 		view := newPreparationView(prompt.AssemblyInput{Mode: prompt.ModeFull}, "BASE", catalog)
-		consequence, err := adaptationHook.Prepare(context.Background(), view.input(harness.SessionIdentity{}, model.ModelRef{Provider: "prov", Model: "gpt-5.5"}, constraints, nil))
+		consequence, err := adaptationHook(context.Background(), extension.CallContext{}, view.input(harness.SessionIdentity{}, model.ModelRef{Provider: "prov", Model: "gpt-5.5"}, constraints, nil))
 		testassert.NoError(t, err)
 		testassert.NoError(t, view.apply("adapt", consequence))
 		return descriptions(view.tools())
 	}
 
 	// Unselected: with no applied contribution each tool keeps its own text.
-	_, catalog, err := composeSurface(req)
+	_, catalog, err := composeSurface(context.Background(), req)
 	testassert.NoError(t, err)
 	{
 		got := descriptions(catalog)

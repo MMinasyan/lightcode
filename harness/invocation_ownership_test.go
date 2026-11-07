@@ -43,7 +43,7 @@ func TestConversationOpenedInvocationDeclarationsAreOwned(t *testing.T) {
 			ran("tampered.req")
 			return RequestConsequence{}, nil
 		}}
-		sharedArgs[0] = ToolArgumentsHook{ID: "tampered.arg", ExtensionID: "tamper-ext", Mode: HookModePure, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+		sharedArgs[0] = ToolArgumentsHook{ID: "tampered.arg", ExtensionID: "tamper-ext", Mode: HookModePure, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 			ran("tampered.arg")
 			return model.CloneRaw(call.Arguments), nil
 		}}
@@ -64,11 +64,11 @@ func TestConversationOpenedInvocationDeclarationsAreOwned(t *testing.T) {
 		ran("own.req.effectful")
 		return RequestConsequence{}, nil
 	}}
-	argPure := ToolArgumentsHook{ID: "own.arg.pure", ExtensionID: "own-ext", Mode: HookModePure, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+	argPure := ToolArgumentsHook{ID: "own.arg.pure", ExtensionID: "own-ext", Mode: HookModePure, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 		ran("own.arg.pure")
 		return model.CloneRaw(call.Arguments), nil
 	}}
-	argEffectful := ToolArgumentsHook{ID: "own.arg.effectful", ExtensionID: "own-ext", Mode: HookModeEffectful, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+	argEffectful := ToolArgumentsHook{ID: "own.arg.effectful", ExtensionID: "own-ext", Mode: HookModeEffectful, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 		ran("own.arg.effectful")
 		return model.CloneRaw(call.Arguments), nil
 	}}

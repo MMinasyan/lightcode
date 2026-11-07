@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -144,8 +145,8 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 
 		// A failed hook (invalid consequence rejected before publication)
 		// changes nothing.
-		hook.set(nil, func(PreparationInput) PreparationConsequence {
-			return PreparationConsequence{ToolNames: []string{"outside_catalog"}}
+		hook.set(nil, func(extension.PreparationInput) extension.PreparationConsequence {
+			return extension.PreparationConsequence{ToolNames: []string{"outside_catalog"}}
 		})
 		hookSession, err := r.createSession(ctx, e.workspace("prompt-ws-4"), "worker")
 		testassert.NoError(t, err)

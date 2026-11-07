@@ -539,7 +539,7 @@ func TestContractCorpusSSEIdentity(t *testing.T) {
 var contractGeneratedTypes = map[string]func() any{
 	"Agent":                       func() any { return new(protocol.Agent) },
 	"AgentMutation":               func() any { return new(protocol.AgentMutation) },
-	"AgentScope":                  func() any { return new(protocol.AgentScope) },
+	"InvocationScope":             func() any { return new(protocol.InvocationScope) },
 	"AssistantItem":               func() any { return new(protocol.AssistantItem) },
 	"BackgroundMember":            func() any { return new(protocol.BackgroundMember) },
 	"CodeRevertError":             func() any { return new(protocol.CodeRevertError) },

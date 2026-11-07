@@ -179,7 +179,7 @@ func TestHookFamiliesDisjointForSameIdentity(t *testing.T) {
 			RequestHooks: []RequestHook{{ID: sharedID, ExtensionID: sharedExt, Mode: HookModePure, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
 				return RequestConsequence{Prompt: &prompt}, nil
 			}}},
-			ToolHooks: []ToolArgumentsHook{{ID: sharedID, ExtensionID: sharedExt, Mode: HookModeEffectful, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+			ToolHooks: []ToolArgumentsHook{{ID: sharedID, ExtensionID: sharedExt, Mode: HookModeEffectful, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 				return json.RawMessage(`{"x":2}`), nil
 			}}},
 		}, nil
@@ -220,13 +220,13 @@ func TestArgumentHookChainPureRestoreKeepsAcceptedIdentities(t *testing.T) {
 	original := json.RawMessage(`{"x":1}`)
 	spy := &hookToolSpy{}
 	exec := hookFixtureExecution(spy.tool, objectNormalize,
-		ToolArgumentsHook{ID: "cap.pure.one", ExtensionID: "cap-a", Mode: HookModePure, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+		ToolArgumentsHook{ID: "cap.pure.one", ExtensionID: "cap-a", Mode: HookModePure, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 			return json.RawMessage(`{"x":9}`), nil
 		}},
-		ToolArgumentsHook{ID: "cap.pure.two", ExtensionID: "cap-a", Mode: HookModePure, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+		ToolArgumentsHook{ID: "cap.pure.two", ExtensionID: "cap-a", Mode: HookModePure, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 			return model.CloneRaw(original), nil // restore the original, not the preceding hook's replacement
 		}},
-		ToolArgumentsHook{ID: "cap.effectful", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+		ToolArgumentsHook{ID: "cap.effectful", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 			return json.RawMessage(`{"x":7}`), nil
 		}},
 	)
@@ -351,7 +351,7 @@ func TestMaintenanceFactsSettleOnce(t *testing.T) {
 				return inv, err
 			}
 			if request.Purpose == InvocationPurposeConversation {
-				inv.Tool = func(_ context.Context, call model.ToolCall) PreparedTool {
+				inv.Tool = func(ctx context.Context, call model.ToolCall) PreparedTool {
 					return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 				}
 			}
@@ -431,7 +431,7 @@ func TestRunningRequestSuspendAndClear(t *testing.T) {
 				}
 				return completedTurnStream(), nil
 			},
-			Tool: func(_ context.Context, call model.ToolCall) PreparedTool {
+			Tool: func(ctx context.Context, call model.ToolCall) PreparedTool {
 				saw := observe()
 				toolSaw = append(toolSaw, saw)
 				testassert.Require(t, saw.requestID != "", "tool prepare observed no producing request")
@@ -579,9 +579,9 @@ func TestUnadvertisedCallSettlesUnavailable(t *testing.T) {
 		}
 		return completedTurnStream(), nil
 	}
-	normalize := func(call model.ToolCall) (json.RawMessage, error) {
+	normalize := func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 		normalizeCalls++
-		return objectNormalize(call)
+		return objectNormalize(ctx, call)
 	}
 	prepare := func(context.Context, model.ToolCall) PreparedTool { prepareCalls++; return PreparedTool{} }
 	exec := executionForInvocation(InvocationExecution{Model: modelFn, NormalizeTool: normalize, Tool: prepare})
@@ -678,13 +678,13 @@ func TestAcceptedPureRequestIdentitiesRecordInOrder(t *testing.T) {
 
 func TestArgumentRefusalDoesNotAcceptInvalidOriginal(t *testing.T) {
 	spy := &hookToolSpy{}
-	normalize := func(call model.ToolCall) (json.RawMessage, error) {
+	normalize := func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 		if string(call.Arguments) == "not json" {
 			return nil, errors.New("invalid original")
 		}
-		return objectNormalize(call)
+		return objectNormalize(ctx, call)
 	}
-	hook := ToolArgumentsHook{ID: "pure.refuse", ExtensionID: "ext.test", Mode: HookModePure, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+	hook := ToolArgumentsHook{ID: "pure.refuse", ExtensionID: "ext.test", Mode: HookModePure, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 		if call.ID == "call-1" {
 			return nil, errors.New("refused")
 		}
@@ -735,7 +735,7 @@ func TestEffectfulNoopKeepsSurvivingPureArgumentIdentity(t *testing.T) {
 	pure := ToolArgumentsHook{ID: "pure.repair", ExtensionID: "ext.test", Mode: HookModePure, Run: func(context.Context, model.ToolCall) (json.RawMessage, error) {
 		return json.RawMessage(`{"x":9}`), nil
 	}}
-	effect := ToolArgumentsHook{ID: "effect.noop", ExtensionID: "ext.test", Mode: HookModeEffectful, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+	effect := ToolArgumentsHook{ID: "effect.noop", ExtensionID: "ext.test", Mode: HookModeEffectful, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 		return model.CloneRaw(call.Arguments), nil
 	}}
 	exec := hookFixtureExecution(spy.tool, objectNormalize, pure, effect)
@@ -841,7 +841,7 @@ func TestRequestHookHistoricalToolCallMutationStaysLocal(t *testing.T) {
 	roundA := Execution{OpenInvocation: func(context.Context, InvocationRequest) (InvocationExecution, error) {
 		return InvocationExecution{
 			Model: func(context.Context, model.Request) (model.Stream, error) { return pairStream, nil },
-			Tool: func(_ context.Context, call model.ToolCall) PreparedTool {
+			Tool: func(ctx context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "tool done"}}}
 			},
 			NormalizeTool: objectNormalize,

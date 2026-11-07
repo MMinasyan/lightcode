@@ -32,7 +32,7 @@ const (
 	// into PRAGMA user_version at initialization and checked at open. Version
 	// 15 records selected Agent inputs in Session and Operation payloads;
 	// the SQL tables are unchanged.
-	sqliteSchemaVersion = 15
+	sqliteSchemaVersion = 16
 
 	// sqlitePoolDSN configures every physical connection of the long-lived
 	// pool: write-ahead logging, full synchronous durability, immediate

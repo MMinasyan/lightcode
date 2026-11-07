@@ -299,7 +299,7 @@ func seedRunningOperationCounted(t *testing.T, store harness.Storage, workspace 
 					}
 					return harness.Execution{OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
 						return harness.InvocationExecution{
-							NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
+							NormalizeTool: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 								var obj map[string]json.RawMessage
 								if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
 									return nil, errors.New("arguments must be one non-null JSON object")

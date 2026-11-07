@@ -164,16 +164,24 @@ func validateAgentSelection(v AgentSelection) error {
 	return nil
 }
 
+// Owned returns an independent copy of one resolved AgentInputs value: its
+// tool/capability slices and strategy settings bytes are detached, while the
+// scalar model/instructions/mode/constraints fields copy by value.
+func (v AgentInputs) Owned() AgentInputs {
+	out := v
+	out.Tools = append([]string(nil), v.Tools...)
+	out.Capabilities = append([]string(nil), v.Capabilities...)
+	out.Strategy.Settings = append(json.RawMessage(nil), v.Strategy.Settings...)
+	return out
+}
+
 func ownAgentSelection(v AgentSelection) AgentSelection {
 	if v.Definition != nil {
 		ref := *v.Definition
 		v.Definition = &ref
 	}
 	if v.Inputs != nil {
-		inputs := *v.Inputs
-		inputs.Tools = append([]string(nil), inputs.Tools...)
-		inputs.Capabilities = append([]string(nil), inputs.Capabilities...)
-		inputs.Strategy.Settings = append(json.RawMessage(nil), inputs.Strategy.Settings...)
+		inputs := v.Inputs.Owned()
 		v.Inputs = &inputs
 	}
 	return v

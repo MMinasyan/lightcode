@@ -375,7 +375,7 @@ func (s *configurationService) editAgentModel(agentType, ref string) configurati
 		if err != nil {
 			return 0, configurationFailure(err)
 		}
-		if !s.pluginIDs["agents"] || !sectionEnabled(extensions["agents"]) {
+		if !s.nativeIDs["agents"] || !sectionEnabled(extensions["agents"]) {
 			return 0, fmt.Errorf("agents extension is unavailable: %w", harness.ErrInvalid)
 		}
 		section, err := decodeRoot(extensions["agents"])

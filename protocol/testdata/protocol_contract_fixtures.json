@@ -632,7 +632,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"9\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"10\"}"
     }
    ],
    "reject": [
@@ -642,16 +642,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"9\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"10\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"9\"}"
+     "json": "{\"protocol_version\":\"10\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"9\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"10\",\"extra\":true}"
     }
    ]
   },
@@ -1328,7 +1328,7 @@
     },
     {
      "name": "agent-identity",
-     "json": "{\"kind\":\"agent\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\"}"
+     "json": "{\"kind\":\"invocation\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"invocation_id\":\"inv-1\",\"purpose\":\"conversation\"}"
     }
    ],
    "reject": [
@@ -1358,11 +1358,11 @@
     },
     {
      "name": "agent-without-session-id",
-     "json": "{\"kind\":\"agent\",\"operation_id\":\"op-1\"}"
+     "json": "{\"kind\":\"invocation\",\"operation_id\":\"op-1\"}"
     },
     {
      "name": "agent-without-operation-id",
-     "json": "{\"kind\":\"agent\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}"
+     "json": "{\"kind\":\"invocation\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\"}"
     },
     {
      "name": "job-without-session-id",
@@ -1446,15 +1446,15 @@
    "reject": []
   },
   {
-   "schema": "AgentScope",
+   "schema": "InvocationScope",
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"kind\":\"agent\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\"}"
+     "json": "{\"kind\":\"invocation\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"invocation_id\":\"inv-1\",\"purpose\":\"conversation\"}"
     },
     {
      "name": "full",
-     "json": "{\"kind\":\"agent\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"job_id\":\"job-1\"}"
+     "json": "{\"kind\":\"invocation\",\"workspace\":\"/workspace\",\"session_id\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"operation_id\":\"op-1\",\"invocation_id\":\"inv-1\",\"purpose\":\"maintenance\",\"job_id\":\"job-1\"}"
     }
    ],
    "reject": []
