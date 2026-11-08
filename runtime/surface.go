@@ -31,6 +31,7 @@ type surfaceRequest struct {
 	identity       harness.SessionIdentity
 	agentInputs    harness.AgentInputs
 	toolSpecs      []toolDeclaration
+	shell          string
 }
 
 // surfaceResult is one composed prompt with its captured rule diagnostics and
@@ -68,7 +69,7 @@ func composeSurface(ctx context.Context, req surfaceRequest) (surfaceResult, []m
 	}
 	if req.promptSize != prompt.ModeNone {
 		input.OS = goruntime.GOOS
-		input.Shell = captureShell()
+		input.Shell = req.shell
 		input.OSDescription = captureOSDescription()
 	}
 	assembled, err := prompt.Assemble(input)
@@ -89,15 +90,6 @@ func composeSurface(ctx context.Context, req surfaceRequest) (surfaceResult, []m
 		catalog = append(catalog, description.Definition)
 	}
 	return result, catalog, nil
-}
-
-// captureShell samples the process shell once per composed surface.
-func captureShell() string {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		return "unknown"
-	}
-	return shell
 }
 
 // captureOSDescription samples the platform description once per composed

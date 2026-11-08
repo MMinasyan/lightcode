@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 )
 
@@ -46,6 +47,9 @@ func (s *configurationService) prepareResources(caller context.Context, snapshot
 			}
 		}
 		if equal {
+			equal = maps.Equal(previous.declaredBindings, snapshot.declaredBindings)
+		}
+		if equal {
 			snapshot.resources = previous.resources
 			snapshot.composition = previous.resources.composition
 			return nil
@@ -72,6 +76,7 @@ func (s *configurationService) prepareResources(caller context.Context, snapshot
 	}
 	runtimeInfo := ScopeInfo{Kind: ScopeRuntime, DataDir: s.dataDir, Revision: fmt.Sprint(r.revision)}
 	runtimeInfo.sections = snapshot.extensions
+	runtimeInfo.declaredBindings = snapshot.declaredBindings
 	runtime, err := snapshot.composition.openScopeReporting(ctx, runtimeInfo, nil, report)
 	stopCaller()
 	if err != nil {

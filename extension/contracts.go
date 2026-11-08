@@ -232,6 +232,19 @@ func hostPromptDefinition() CapabilityDefinition {
 	}
 }
 
+// hostCredentialsDefinition is the fixed melta.credentials/v1 host service:
+// one declared credential value addressed by its declared section field.
+func hostCredentialsDefinition() CapabilityDefinition {
+	return CapabilityDefinition{
+		ContractID:      ContractCredentials,
+		ContractVersion: ContractVersion,
+		Kind:            KindService,
+		Methods: []Method{method("get", ModeServiceIO,
+			`{"type":"object","required":["field"],"properties":{"field":{"type":"string","minLength":1}},"additionalProperties":false}`,
+			`{"type":"object","required":["value"],"properties":{"value":{"type":"string"}},"additionalProperties":false}`, "", "")},
+	}
+}
+
 // hostChildLaunchDefinition is the fixed melta.child_launch/v1 host service:
 // data-only child launch whose parent and permission pairs come from the
 // host-issued CallContext, never from arguments.

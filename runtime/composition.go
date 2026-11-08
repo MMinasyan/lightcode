@@ -89,6 +89,13 @@ type ScopeInfo struct {
 
 	sections map[string]json.RawMessage
 
+	// declaredBindings are the candidate's captured declared field values
+	// this scope's components resolve for activation. operationSecrets are the
+	// admitted Operation's captured operation fields, present only on the
+	// Operation and Invocation scopes.
+	declaredBindings map[declaredField]declaredBinding
+	operationSecrets map[string]map[string]string
+
 	// artifactLease is the execution's already-held Session interval shared
 	// by its Operation and invocation scopes. Standalone callbacks leave it
 	// nil and create their own call-owned lease.
@@ -314,6 +321,11 @@ type capabilityValue struct {
 	standard       Tool
 	scope          *scope
 	targets        map[string]*capabilityValue
+
+	// activationSecrets holds the declared activation credential values
+	// captured when this component opened. Every capability view created for
+	// the component shares the map; no durable value carries it.
+	activationSecrets map[string]string
 }
 
 // scopeConstructionError keeps rollback failures distinct.
@@ -400,13 +412,15 @@ func (c *composition) openScopeReporting(ctx context.Context, info ScopeInfo, an
 			InvocationID: info.InvocationID,
 			Purpose:      info.Purpose,
 		}
-		openValue := &capabilityValue{component: component, instanceID: instanceID, scope: sc, targets: targets}
+		activationSecrets := c.captureActivationSecrets(component.Declaration, info.declaredBindings)
+		openValue := &capabilityValue{component: component, instanceID: instanceID, scope: sc, targets: targets, activationSecrets: activationSecrets}
 		openIdentity := callIdentity{
-			session:      harness.SessionIdentity{SessionID: info.SessionID},
-			operationID:  info.OperationID,
-			invocationID: info.InvocationID,
-			purpose:      info.Purpose,
-			revision:     info.Revision,
+			session:          harness.SessionIdentity{SessionID: info.SessionID},
+			operationID:      info.OperationID,
+			invocationID:     info.InvocationID,
+			purpose:          info.Purpose,
+			revision:         info.Revision,
+			operationSecrets: info.operationSecrets,
 		}
 		view, call := c.newView(openValue, scopeCtx, openIdentity)
 		instanceContext := extension.InstanceContext{
@@ -431,14 +445,15 @@ func (c *composition) openScopeReporting(ctx context.Context, info ScopeInfo, an
 		if instance.Close != nil {
 			closeInstance := instance.Close
 			sc.closers = append(sc.closers, func() error {
-				closeValue := &capabilityValue{component: component, instanceID: instanceID, scope: sc, targets: targets}
+				closeValue := &capabilityValue{component: component, instanceID: instanceID, scope: sc, targets: targets, activationSecrets: activationSecrets}
 				closeIdentity := callIdentity{
-					session:      harness.SessionIdentity{SessionID: info.SessionID},
-					operationID:  info.OperationID,
-					invocationID: info.InvocationID,
-					purpose:      info.Purpose,
-					revision:     info.Revision,
-					grant:        nativeGrant{lifecycle: true},
+					session:          harness.SessionIdentity{SessionID: info.SessionID},
+					operationID:      info.OperationID,
+					invocationID:     info.InvocationID,
+					purpose:          info.Purpose,
+					revision:         info.Revision,
+					grant:            nativeGrant{lifecycle: true},
+					operationSecrets: info.operationSecrets,
 				}
 				closeCtx, cancelClose := context.WithTimeout(context.Background(), nativeCloseDeadline)
 				closeView, call := c.newView(closeValue, closeCtx, closeIdentity)
@@ -452,7 +467,7 @@ func (c *composition) openScopeReporting(ctx context.Context, info ScopeInfo, an
 		if err := c.compiled.ValidateInstance(component.Declaration.Declaration.ID, component.ID, instance); err != nil {
 			return fail(fmt.Errorf("component %q: %w: %w", component.ID, ErrComposition, err))
 		}
-		value := &capabilityValue{component: component, instanceID: instanceID, scope: sc, targets: targets}
+		value := &capabilityValue{component: component, instanceID: instanceID, scope: sc, targets: targets, activationSecrets: activationSecrets}
 		for _, capability := range component.Provides {
 			implementation, ok := instance.Capabilities[capability.ID]
 			if !ok {
@@ -510,8 +525,80 @@ func (c *composition) hostHandler(id, method string) (extension.Handler, bool) {
 		return c.childLaunchHandler, true
 	case extension.ContractData:
 		return c.dataHandler(method)
+	case extension.ContractCredentials:
+		return c.credentialsHandler, true
 	}
 	return nil, false
+}
+
+// captureActivationSecrets resolves one component's declared activation
+// SecretRefs against the candidate binding capture and returns the values
+// captured when the candidate was built. Operation references are resolved
+// from the admitted Operation capture, never here, and no environment is
+// sampled at Open.
+func (c *composition) captureActivationSecrets(declaration *extension.CompiledDeclaration, bindings map[declaredField]declaredBinding) map[string]string {
+	if declaration == nil || len(bindings) == 0 {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, secret := range declaration.Declaration.Secrets {
+		if secret.Lifetime != extension.SecretActivation {
+			continue
+		}
+		binding := bindings[declaredField{extensionID: declaration.Declaration.ID, field: secret.Field}]
+		if binding.value == "" {
+			continue
+		}
+		out[secret.Field] = binding.value
+	}
+	return out
+}
+
+// credentialsHandler resolves one declared credential field from the calling
+// component's activation capture or the preparation's Operation capture. A
+// field the extension did not declare is a composition misuse; every other
+// absent, unresolved or undefined value fails uniformly as unavailable
+// through the private lookup, with no Operation-presence distinction.
+func (c *composition) credentialsHandler(ctx context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+	var request struct {
+		Field string `json:"field"`
+	}
+	if err := json.Unmarshal(arguments, &request); err != nil {
+		return extension.Result{}, err
+	}
+	declaration, ok := c.compiled.Declaration(call.ExtensionID)
+	if !ok {
+		return extension.Result{}, fmt.Errorf("extension %q is not installed: %w", call.ExtensionID, ErrClosed)
+	}
+	var declared *extension.SecretRef
+	for i := range declaration.Declaration.Secrets {
+		if declaration.Declaration.Secrets[i].Field == request.Field {
+			declared = &declaration.Declaration.Secrets[i]
+			break
+		}
+	}
+	if declared == nil {
+		return extension.Result{}, fmt.Errorf("credential field %q is not declared: %w", request.Field, ErrComposition)
+	}
+	values := secretValuesFrom(ctx)
+	var value string
+	var found bool
+	if declared.Lifetime == extension.SecretActivation {
+		value, found = values.activation[request.Field]
+	} else {
+		perExtension := values.operation[call.ExtensionID]
+		value, found = perExtension[request.Field]
+	}
+	if !found || value == "" {
+		return extension.Result{}, fmt.Errorf("credential %q is unavailable: %w", request.Field, ErrClosed)
+	}
+	raw, err := json.Marshal(struct {
+		Value string `json:"value"`
+	}{Value: value})
+	if err != nil {
+		return extension.Result{}, err
+	}
+	return extension.Result{Value: raw}, nil
 }
 
 func (c *composition) promptHandler(_ context.Context, _ extension.CallContext, arguments json.RawMessage) (extension.Result, error) {

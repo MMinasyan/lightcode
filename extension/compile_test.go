@@ -684,6 +684,9 @@ func TestFixedContractIdentityIsEnforcedBothWays(t *testing.T) {
 		testNative("definitions-wrong-version", LifetimeHarness, []Capability{Capability{ID: "bad", ContractID: ContractAgentDefinitions, ContractVersion: "2", Kind: KindService, Methods: agentDefinitionMethods()}}, nil, nil),
 		testNative("definitions-wrong-methods", LifetimeHarness, []Capability{Capability{ID: "bad", ContractID: ContractAgentDefinitions, ContractVersion: ContractVersion, Kind: KindService, Methods: agentDefinitionMethods()[:1]}}, nil, nil),
 		testNative("definitions-shorter-lifetime", LifetimeWorkspace, []Capability{AgentDefinitionsCapability("bad")}, nil, nil),
+		testNative("credentials-wrong-version", LifetimeHarness, []Capability{customService("bad", ContractCredentials, "2", hostCredentialsDefinition().Methods...)}, nil, nil),
+		testNative("credentials-wrong-kind", LifetimeHarness, []Capability{Capability{ID: "bad", ContractID: ContractCredentials, ContractVersion: ContractVersion, Kind: KindTool, Methods: hostCredentialsDefinition().Methods}}, nil, nil),
+		testNative("credentials-wrong-methods", LifetimeHarness, []Capability{customService("bad", ContractCredentials, ContractVersion, PureMethod("read", `{}`, `{}`))}, nil, nil),
 	}
 	for i, native := range rejected {
 		if _, err := Compile([]Native{native}); err == nil {
@@ -695,6 +698,7 @@ func TestFixedContractIdentityIsEnforcedBothWays(t *testing.T) {
 		testNative("hooks", LifetimeHarness, []Capability{HookCapability("hook", SingleHook(BoundaryPrepare, HookModePure))}, nil, nil),
 		testNative("strategies", LifetimeOperation, []Capability{StrategyCapability("strategy", true)}, nil, nil),
 		testNative("definitions", LifetimeHarness, []Capability{AgentDefinitionsCapability("definitions")}, nil, nil),
+		testNative("credentials", LifetimeHarness, []Capability{ServiceCapability("caller", "test.caller", PureMethod("call", `{}`, `{}`))}, []Binding{{Name: "credentials", Provider: HostProvider, CapabilityID: ContractCredentials, Definition: hostCredentialsDefinition()}}, nil),
 	}); err != nil {
 		t.Fatalf("Compile rejected valid fixed contracts: %v", err)
 	}

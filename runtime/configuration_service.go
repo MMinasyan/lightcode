@@ -143,20 +143,93 @@ func (s *configurationService) captureFor(ctx context.Context, reserve bool) (co
 	if reserve && snapshot.resources != nil {
 		snapshot.resources.retain()
 	}
-	return configurationCapture{snapshot: snapshot, credentials: s.captureCredentials(snapshot.catalog)}, nil
+	return configurationCapture{snapshot: snapshot, credentials: s.captureCredentials(snapshot)}, nil
 }
 
-// captureCredentials samples every nonempty api_key_env the captured catalog
-// references through the one environment owner; Capture owns the dedupe. A
-// nil manager samples the environment alone (no managed ownership).
-func (s *configurationService) captureCredentials(cat *catalog.Catalog) map[string]config.EnvValue {
-	names := make([]string, 0, len(cat.Providers))
-	for _, prov := range cat.Providers {
+// captureCredentials samples the union of every nonempty api_key_env the
+// captured catalog references and every declared reference name in one
+// environment-owner observation. The returned EnvValue records are the
+// owner's actual observations, unchanged; declared candidate bindings govern
+// extension activation/Operation resources and never rewrite provider
+// Value/Defined/Managed. Capture owns the dedupe; a nil manager samples the
+// environment alone (no managed ownership).
+func (s *configurationService) captureCredentials(snapshot *configuration) map[string]config.EnvValue {
+	names := make([]string, 0, len(snapshot.catalog.Providers)+len(snapshot.secrets))
+	for _, prov := range snapshot.catalog.Providers {
 		if prov != nil && prov.Transport.APIKeyEnv != "" {
 			names = append(names, prov.Transport.APIKeyEnv)
 		}
 	}
+	for _, secret := range snapshot.secrets {
+		names = append(names, secret.name)
+	}
 	return s.env.Capture(names)
+}
+
+// captureDeclaredBindings takes one private candidate observation of the
+// active declared field names and values. A pending connection key action is
+// applied to the matching binding so a build that only later writes the
+// managed key does not publish a stale declared binding. The result is used
+// for resource-set adoption and every component activation value; it is never
+// durable.
+func (s *configurationService) captureDeclaredBindings(secrets []declaredSecret, key *connectionEffects) map[declaredField]declaredBinding {
+	if len(secrets) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(secrets))
+	seen := make(map[string]bool, len(secrets))
+	for _, secret := range secrets {
+		if seen[secret.name] {
+			continue
+		}
+		seen[secret.name] = true
+		names = append(names, secret.name)
+	}
+	captured := s.env.Capture(names)
+	out := make(map[declaredField]declaredBinding, len(secrets))
+	for _, secret := range secrets {
+		value := captured[secret.name].Value
+		if key != nil && key.keyEnv == secret.name {
+			switch key.keyAction {
+			case keyActionSet:
+				value = key.keyValue
+			case keyActionRemove:
+				value = ""
+			}
+		}
+		out[declaredField{extensionID: secret.extensionID, field: secret.field}] = declaredBinding{name: secret.name, value: value}
+	}
+	return out
+}
+
+// operationSecrets derives the private per-extension Operation credential
+// fields from this preparation's one credential observation. Only present
+// values enter the map; absent, unresolved and undefined values are simply
+// missing lookups, never a separate map shape or Operation-presence signal.
+func (c configurationCapture) operationSecrets() map[string]map[string]string {
+	if c.snapshot == nil {
+		return nil
+	}
+	var out map[string]map[string]string
+	for _, secret := range c.snapshot.secrets {
+		if secret.lifetime != extension.SecretOperation {
+			continue
+		}
+		value := c.credentials[secret.name].Value
+		if value == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]map[string]string)
+		}
+		perExtension := out[secret.extensionID]
+		if perExtension == nil {
+			perExtension = make(map[string]string)
+			out[secret.extensionID] = perExtension
+		}
+		perExtension[secret.field] = value
+	}
+	return out
 }
 
 // attachWarnings wires the Runtime-owned warning store. Every successful
@@ -245,7 +318,7 @@ func (s *configurationService) nextGeneration() (uint64, error) {
 // changed — each changed group keeps its own revision increment. No
 // observation callback reacquires capture ownership.
 func (s *configurationService) commit(candidate *configuration) configurationCapture {
-	credentials := s.captureCredentials(candidate.catalog)
+	credentials := s.captureCredentials(candidate)
 	captured := configurationCapture{snapshot: candidate, credentials: credentials}
 	previous := s.published.Load()
 	s.obs.publish(func() []Event {
@@ -305,7 +378,7 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 	if err != nil {
 		return nil, configurationFailure(fmt.Errorf("read main configuration: %w", err))
 	}
-	return s.buildCaptured(ctx, generation, configData, nil)
+	return s.buildCaptured(ctx, generation, configData, nil, nil)
 }
 
 // buildCaptured is the one candidate construction every publisher — Reload's
@@ -316,13 +389,17 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 // and the compiled tool universe, the Workspace permission inventory is
 // enumerated once into the candidate, and the plugin section is validated
 // against the owned declarations and its resource set is prepared or reused.
-// Nothing is returned until the complete candidate survives all of it. A nil conn builds over the ordinary
-// LoadCaptured inputs (which may refresh due providers and write their
-// cache); a connection candidate instead selects the non-refreshing
-// LoadCapturedConnection entry, optionally overlaying the fetched discovery
-// for that one provider — a connection candidate is fully validated before
-// its caller's first persistence and is never rebuilt after it.
-func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData []byte, conn *connectionEffects) (*configuration, error) {
+// Nothing is returned until the complete candidate survives all of it. conn is
+// the catalog-loader input: nil builds over the ordinary LoadCaptured inputs
+// (which may refresh due providers and write their cache); a connection
+// candidate instead selects the non-refreshing LoadCapturedConnection entry,
+// optionally overlaying the fetched discovery for that one provider. Only the
+// connection edit supplies conn; key is the separate pending managed-key
+// action used by declared-binding capture, present for every key-bearing edit
+// including custom creates, and it never changes the catalog-loader choice. A
+// connection candidate is fully validated before its caller's first
+// persistence and is never rebuilt after it.
+func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData []byte, conn, key *connectionEffects) (*configuration, error) {
 	if candidateBarrier != nil {
 		candidateBarrier()
 	}
@@ -357,6 +434,8 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 		return nil, configurationFailure(err)
 	}
 	snapshot.composition = graph
+	snapshot.secrets = resolveDeclaredSecrets(active, doc.Extensions)
+	snapshot.declaredBindings = s.captureDeclaredBindings(snapshot.secrets, key)
 	if err := s.validateExtensions(ctx, graph, doc.Extensions); err != nil {
 		return nil, err
 	}

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -135,7 +134,7 @@ func (c *Compiled) addDeclaration(declaration Declaration, index int) error {
 		Components:   make(map[string]*CompiledComponent, len(declaration.Components)),
 	}
 	for _, secret := range declaration.Secrets {
-		if !strings.HasPrefix(secret.Field, "/") {
+		if !ValidSecretField(secret.Field) {
 			return invalid("extension %q: secret field %q is not a JSON pointer", declaration.ID, secret.Field)
 		}
 		if secret.Lifetime != SecretActivation && secret.Lifetime != SecretOperation {
@@ -291,7 +290,7 @@ func validateFixedContractIdentity(capability Capability) error {
 			return invalid("capability %q: fixed contract %s requires version %s, kind %s and its exact method definitions", capability.ID, ContractAgentDefinitions, ContractVersion, KindService)
 		}
 		return nil
-	case ContractPrompt, ContractChildLaunch, ContractData:
+	case ContractPrompt, ContractChildLaunch, ContractData, ContractCredentials:
 		definition, ok := hostCapability(capability.ContractID)
 		if !ok {
 			return invalid("capability %q: fixed host contract %s has no definition", capability.ID, capability.ContractID)

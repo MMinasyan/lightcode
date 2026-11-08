@@ -184,7 +184,7 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 			conn.discovered = nil
 		}
 	}
-	candidate, err := s.buildCaptured(ctx, generation, configCandidate, conn)
+	candidate, err := s.buildCaptured(ctx, generation, configCandidate, conn, edit.connection)
 	if err != nil {
 		s.buildMu.Unlock()
 		return configurationCapture{}, err

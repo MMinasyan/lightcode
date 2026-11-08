@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
@@ -49,10 +50,19 @@ type selection struct {
 	// an admitted execution.
 	lease *artifactCallLease
 
+	// operationSecrets are the operation-lifetime declared credential values
+	// captured at preparation and retained through the prepared opener. Every
+	// tool and hook view of that execution carries them; no value reaches a
+	// durable capture.
+	operationSecrets map[string]map[string]string
+
 	// credentials is the preparation's one captured credential observation
-	// set, sampled with the same capture as the Invocation's snapshot: the
-	// concrete preparation resolves its transport secrets from it, and no
-	// value leaves the prepared opener or the durable capture.
+	// set, sampled with the same capture as the Invocation's snapshot: it
+	// carries both the provider names the catalog references and every active
+	// declaration's non-secret reference name. The concrete preparation
+	// resolves its transport secrets from it, the operation fields derive
+	// their values from it, and no value leaves the prepared opener or the
+	// durable capture.
 	credentials map[string]config.EnvValue
 
 	// warnings is the per-preparation private presentation collector: the
@@ -245,6 +255,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		runtimeScope, workspaces := snapshot.resources.runtime, snapshot.resources.workspaces
 		workspaceInfo := ScopeInfo{Kind: ScopeWorkspace, DataDir: runtimeScope.info.DataDir, Workspace: workspace, Revision: snapshot.resources.revisionString()}
 		workspaceInfo.sections = snapshot.extensions
+		workspaceInfo.declaredBindings = snapshot.declaredBindings
 		workspaceScope, err := workspaces.get(ctx, workspaceInfo)
 		if err != nil {
 			return harness.PreparedExecution{}, err
@@ -252,7 +263,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		selected := make([]string, 0, len(inputs.Capabilities)+len(inputs.Tools))
 		selected = append(selected, inputs.Capabilities...)
 		selected = append(selected, inputs.Tools...)
-		sel := selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope}, selected: selected, invocation: Invocation{snapshot: snapshot}, credentials: captured.credentials}
+		sel := selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope}, selected: selected, invocation: Invocation{snapshot: snapshot}, credentials: captured.credentials, operationSecrets: captured.operationSecrets()}
 
 		callCtx, release, err := workspaceScope.enter(ctx)
 		if err != nil {
@@ -275,7 +286,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		prepared = harness.PreparedExecution{
 			Capture: capture,
 			Open: func(openCtx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
-				return p.open(openCtx, admission, workspace, runtimeScope, workspaceScope, inputs, definition, snapshot, warnings, opener, &releaseArtifacts)
+				return p.open(openCtx, admission, workspace, runtimeScope, workspaceScope, inputs, definition, snapshot, sel.operationSecrets, warnings, opener, &releaseArtifacts)
 			},
 		}
 		prepared.Release = func() error {
@@ -306,7 +317,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 // after the opening succeeds does the collected prompt presentation publish,
 // so a failed fork or admission never creates warnings for an unpublished
 // Session and a successful opener publishes before any progress.
-func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, runtimeScope, workspaceScope *scope, inputs harness.AgentInputs, definition *harness.DefinitionRef, snapshot *configuration, warnings *preparationWarnings, opener openInvocation, artifactRelease *func()) (harness.Execution, error) {
+func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, runtimeScope, workspaceScope *scope, inputs harness.AgentInputs, definition *harness.DefinitionRef, snapshot *configuration, operationSecrets map[string]map[string]string, warnings *preparationWarnings, opener openInvocation, artifactRelease *func()) (harness.Execution, error) {
 	releaseArtifacts, err := p.artifacts.acquireExecution(ctx, sessionArtifactDir(runtimeScope.info.DataDir, admission.SessionID))
 	if err != nil {
 		return harness.Execution{}, err
@@ -317,7 +328,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		borrowed:  true,
 		release:   releaseArtifacts,
 	}
-	base := ScopeInfo{DataDir: runtimeScope.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID, Revision: snapshot.resources.revisionString(), artifactLease: artifactLease}
+	base := ScopeInfo{DataDir: runtimeScope.info.DataDir, Workspace: workspace, SessionID: admission.SessionID, OperationID: admission.OperationID, Revision: snapshot.resources.revisionString(), artifactLease: artifactLease, declaredBindings: snapshot.declaredBindings, operationSecrets: operationSecrets}
 	base.sections = snapshot.extensions
 	operationInfo := base
 	operationInfo.Kind = ScopeOperation
@@ -357,7 +368,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 		selected := make([]string, 0, len(inputs.Capabilities)+len(inputs.Tools))
 		selected = append(selected, inputs.Capabilities...)
 		selected = append(selected, inputs.Tools...)
-		invocation, err := opener(callCtx, admission, selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope, operation, agentScope}, selected: selected, invocation: Invocation{snapshot: snapshot}, lease: artifactLease}, request)
+		invocation, err := opener(callCtx, admission, selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope, operation, agentScope}, selected: selected, invocation: Invocation{snapshot: snapshot}, lease: artifactLease, operationSecrets: operationSecrets}, request)
 		if err != nil {
 			return unwind(err, releaseAgent)
 		}
@@ -474,6 +485,21 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 		return harness.ExecutionCapture{}, nil, err
 	}
 	agentInputs := sel.inputs
+	// The preparation fixes the credential-name exclusion set once: its one
+	// capture resolved both the provider names and every active declaration's
+	// non-secret reference name. The live producer still adds the current
+	// names at each process start, so a renamed binding is excluded by this
+	// capture and a newly connected one by the live revision.
+	credentialNames := make([]string, 0, len(sel.credentials))
+	for name := range sel.credentials {
+		credentialNames = append(credentialNames, name)
+	}
+	subprocessEnv := filteredSubprocessEnv(p.subprocessEnv, credentialNames)
+	// The baseline environment presentation reads the same child-environment
+	// projection the command path consumes: a name this capture excludes is
+	// absent from the prompt and every preparation/request hook input, and an
+	// absent projection or value renders the existing "unknown".
+	shell := projectedShell(subprocessEnv)
 	result, catalog, err := composeSurface(ctx, surfaceRequest{
 		hostIdentity:   p.identity,
 		globalRulesDir: p.globalRulesDir,
@@ -487,6 +513,7 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 		identity:       req.Session.Identity,
 		agentInputs:    agentInputs,
 		toolSpecs:      specs,
+		shell:          shell,
 	})
 	if err != nil {
 		return harness.ExecutionCapture{}, nil, err
@@ -533,15 +560,50 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 	}
 	capture.Strategy.Settings = append(json.RawMessage(nil), sel.inputs.Strategy.Settings...)
 	workspace := req.Session.Identity.Workspace
-	// The prepared opener carries only the preparation-time credential
-	// names, never their values: the ToolContext's fixed callback filters
-	// those names from the live producer's snapshot, so a binding renamed or
-	// removed after this preparation still cannot reach a command child.
-	credentialNames := make([]string, 0, len(sel.credentials))
-	for name := range sel.credentials {
-		credentialNames = append(credentialNames, name)
+	return capture, p.concreteOpener(transport, compactTransport, req.Session.Identity, workspace, view.catalog, subprocessEnv), nil
+}
+
+// filteredSubprocessEnv applies one preparation's fixed credential-name
+// capture to the Runtime's live producer. A nil producer stays nil, so the
+// command path keeps refusing to spawn; a nil snapshot stays nil rather than
+// falling back to the ambient environment.
+func filteredSubprocessEnv(base func() []string, names []string) func() []string {
+	if base == nil {
+		return nil
 	}
-	return capture, p.concreteOpener(transport, compactTransport, req.Session.Identity, workspace, view.catalog, credentialNames), nil
+	if len(names) == 0 {
+		return base
+	}
+	return func() []string {
+		env := base()
+		if env == nil {
+			return nil
+		}
+		return config.EnvWithoutKeys(env, names)
+	}
+}
+
+// projectedShell reads SHELL from the same child-environment projection the
+// command path consumes. An absent producer, absent snapshot, absent value or
+// empty value renders the existing "unknown".
+func projectedShell(env func() []string) string {
+	if env == nil {
+		return "unknown"
+	}
+	snapshot := env()
+	if snapshot == nil {
+		return "unknown"
+	}
+	for _, entry := range snapshot {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok && name == "SHELL" {
+			if value == "" {
+				return "unknown"
+			}
+			return value
+		}
+	}
+	return "unknown"
 }
 
 // outputReserve applies the retained reserve rule: the catalog entry's
@@ -686,12 +748,12 @@ func wireDebugDir(home string) string {
 // permissions and wraps its executor, so the plugin holds no background
 // authority outside Execute. The ToolContext's environment callback is the
 // preparation's fixed wrapper over the Runtime's live producer: it filters the
-// captured credential names from every snapshot it returns, never rereads the
-// selected execution policy, and keeps the nil producer and nil snapshot
-// fail-closed shapes unchanged. The shared advertisement gate rejects unknown
-// names before dispatch; retry classification and scope disposal belong to the
-// shared machinery.
-func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, session harness.SessionIdentity, workspace string, catalog []model.ToolDefinition, credentialNames []string) openInvocation {
+// captured provider and declared credential names from every snapshot it
+// returns, never rereads the selected execution policy, and keeps the nil
+// producer and nil snapshot fail-closed shapes unchanged. The shared
+// advertisement gate rejects unknown names before dispatch; retry
+// classification and scope disposal belong to the shared machinery.
+func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, session harness.SessionIdentity, workspace string, catalog []model.ToolDefinition, subprocessEnv func() []string) openInvocation {
 	return func(_ context.Context, admission harness.OperationAdmission, sel selection, request harness.InvocationRequest) (harness.InvocationExecution, error) {
 		table := make(map[string]Tool, len(catalog))
 		for _, definition := range catalog {
@@ -701,21 +763,10 @@ func (p *preparation) concreteOpener(transport, compactTransport *model.Transpor
 			}
 			table[definition.Name] = tool
 		}
-		identity := callIdentity{session: session, operationID: admission.OperationID, invocationID: request.ID, purpose: string(request.Purpose), lease: sel.lease}
+		identity := callIdentity{session: session, operationID: admission.OperationID, invocationID: request.ID, purpose: string(request.Purpose), lease: sel.lease, operationSecrets: sel.operationSecrets}
 		hooks := bindToolArgumentHooks(sel, identity)
 		requestHooks := bindRequestHooks(sel, identity)
 		outputHooks := bindToolOutputHooks(sel, identity)
-		subprocessEnv := p.subprocessEnv
-		if subprocessEnv != nil {
-			base := subprocessEnv
-			subprocessEnv = func() []string {
-				env := base()
-				if env == nil {
-					return nil
-				}
-				return config.EnvWithoutKeys(env, credentialNames)
-			}
-		}
 		sessionID := admission.AdmittedEntry.SessionID
 		tc := ToolContext{
 			Session:       session,

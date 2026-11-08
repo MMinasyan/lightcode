@@ -267,12 +267,20 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	if managedEnv != nil {
 		subprocessEnv = func() []string {
 			env := managedEnv.SubprocessEnv()
+			current := configService.current()
+			if current == nil {
+				return env
+			}
 			var names []string
-			for _, prov := range configService.current().catalog.Providers {
+			for _, prov := range current.catalog.Providers {
 				if prov != nil && prov.Transport.APIKeyEnv != "" {
 					names = append(names, prov.Transport.APIKeyEnv)
 				}
 			}
+			// The live revision's declared credential names join the live
+			// provider names; the preparation adds the names its own capture
+			// resolved, so a rename is excluded by both sides.
+			names = append(names, current.declaredSecretNames()...)
 			return config.EnvWithoutKeys(env, names)
 		}
 	}

@@ -131,27 +131,29 @@ func (c *composition) bindTool(sel selection, id string) (Tool, error) {
 	if value.implementation.Tool == nil {
 		return nil, fmt.Errorf("tool %q has no implementation: %w", id, ErrComposition)
 	}
-	return extensionTool{composition: c, value: value, lease: sel.lease}, nil
+	return extensionTool{composition: c, value: value, lease: sel.lease, operationSecrets: sel.operationSecrets}, nil
 }
 
 // extensionTool adapts one native Tool contribution to the host's baseline
 // tool interface and builds the same Harness PreparedTool gate.
 type extensionTool struct {
-	composition *composition
-	value       *capabilityValue
-	lease       *artifactCallLease
+	composition      *composition
+	value            *capabilityValue
+	lease            *artifactCallLease
+	operationSecrets map[string]map[string]string
 }
 
 func (t extensionTool) baseIdentity(tc ToolContext, callID string, grant nativeGrant) callIdentity {
 	return callIdentity{
-		session:      tc.Session,
-		operationID:  tc.OperationID,
-		invocationID: tc.InvocationID,
-		purpose:      string(tc.Purpose),
-		toolCallID:   callID,
-		revision:     tc.Invocation.Revision(),
-		grant:        grant,
-		lease:        t.lease,
+		session:          tc.Session,
+		operationID:      tc.OperationID,
+		invocationID:     tc.InvocationID,
+		purpose:          string(tc.Purpose),
+		toolCallID:       callID,
+		revision:         tc.Invocation.Revision(),
+		grant:            grant,
+		lease:            t.lease,
+		operationSecrets: t.operationSecrets,
 	}
 }
 

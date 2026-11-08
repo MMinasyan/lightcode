@@ -31,6 +31,26 @@ type callIdentity struct {
 	caller       extension.CallerIdentity
 	grant        nativeGrant
 	lease        *artifactCallLease
+
+	// operationSecrets carries the admitted Operation's captured declared
+	// credential values. Harness and Workspace lifecycle views leave it nil;
+	// Operation and Invocation lifecycle views carry it like tools and hooks.
+	operationSecrets map[string]map[string]string
+}
+
+// secretValues are the private credential captures one callback view can
+// resolve: its component's activation values and the enclosing Operation's
+// per-extension values. They never reach a durable capture.
+type secretValues struct {
+	activation map[string]string
+	operation  map[string]map[string]string
+}
+
+type secretValuesKey struct{}
+
+func secretValuesFrom(ctx context.Context) secretValues {
+	values, _ := ctx.Value(secretValuesKey{}).(secretValues)
+	return values
 }
 
 // nativeView is one callback's private admission and cancellation owner. End
@@ -49,6 +69,11 @@ type nativeView struct {
 	release   func()
 	lease     *artifactCallLease
 	ownsLease bool
+
+	// activationSecrets are this component's captured activation credential
+	// values; operationSecrets are the enclosing Operation's captured values.
+	activationSecrets map[string]string
+	operationSecrets  map[string]map[string]string
 
 	mu   sync.Mutex
 	done bool
@@ -88,15 +113,17 @@ func (c *composition) newView(value *capabilityValue, parent context.Context, id
 		ctx = context.WithValue(ctx, artifactLeaseKey{}, lease)
 	}
 	view := &nativeView{
-		composition: c,
-		component:   value.component,
-		targets:     value.targets,
-		grant:       identity.grant,
-		origin:      parent,
-		ctx:         ctx,
-		cancel:      cancel,
-		lease:       lease,
-		ownsLease:   ownsLease,
+		composition:       c,
+		component:         value.component,
+		targets:           value.targets,
+		grant:             identity.grant,
+		origin:            parent,
+		ctx:               ctx,
+		cancel:            cancel,
+		lease:             lease,
+		ownsLease:         ownsLease,
+		activationSecrets: value.activationSecrets,
+		operationSecrets:  identity.operationSecrets,
 	}
 	operationID := identity.operationID
 	if operationID == "" {
@@ -166,7 +193,7 @@ func (v *nativeView) call(supplied context.Context, binding, method string, argu
 	if err := supplied.Err(); err != nil {
 		return extension.Result{}, err
 	}
-	return v.composition.dispatch(merged, v.auth, v.grant, v.component, v.targets, binding, method, arguments, v.lease)
+	return v.composition.dispatch(merged, v.auth, v.grant, v.component, v.targets, binding, method, arguments, v.lease, secretValues{activation: v.activationSecrets, operation: v.operationSecrets})
 }
 
 // end closes admission, cancels the view origin, joins nested calls, then
@@ -196,7 +223,7 @@ func hostGrant(ctx context.Context) nativeGrant {
 }
 
 // dispatch resolves, validates, admits and runs one nested named-service call.
-func (c *composition) dispatch(ctx context.Context, caller extension.CallContext, grant nativeGrant, component *extension.CompiledComponent, targets map[string]*capabilityValue, bindingName, methodName string, arguments json.RawMessage, lease *artifactCallLease) (extension.Result, error) {
+func (c *composition) dispatch(ctx context.Context, caller extension.CallContext, grant nativeGrant, component *extension.CompiledComponent, targets map[string]*capabilityValue, bindingName, methodName string, arguments json.RawMessage, lease *artifactCallLease, secrets secretValues) (extension.Result, error) {
 	var binding *extension.CompiledBinding
 	for i := range component.Requires {
 		if component.Requires[i].Name == bindingName {
@@ -229,6 +256,7 @@ func (c *composition) dispatch(ctx context.Context, caller extension.CallContext
 		hostCaller := caller
 		hostCaller.Call = nil
 		hostCtx := context.WithValue(ctx, grantContextKey{}, nativeGrant{permissions: append([]harness.PermissionRequest(nil), grant.permissions...)})
+		hostCtx = context.WithValue(hostCtx, secretValuesKey{}, secrets)
 		if lease != nil {
 			hostCtx = context.WithValue(hostCtx, artifactLeaseKey{}, lease)
 		}
@@ -248,17 +276,18 @@ func (c *composition) dispatch(ctx context.Context, caller extension.CallContext
 	}
 	pure := grant.pure || method.Mode == extension.ModePure
 	childIdentity := callIdentity{
-		session:      harness.SessionIdentity{SessionID: caller.SessionID},
-		operationID:  caller.OperationID,
-		invocationID: caller.InvocationID,
-		purpose:      caller.Purpose,
-		requestID:    caller.RequestID,
-		toolCallID:   caller.ToolCallID,
-		effectID:     caller.EffectID,
-		revision:     caller.Revision,
-		caller:       extension.CallerIdentity{ExtensionID: caller.ExtensionID, ComponentID: caller.ComponentID, InstanceID: caller.InstanceID},
-		grant:        nativeGrant{permissions: grant.permissions, pure: pure, lifecycle: grant.lifecycle},
-		lease:        lease,
+		session:          harness.SessionIdentity{SessionID: caller.SessionID},
+		operationID:      caller.OperationID,
+		invocationID:     caller.InvocationID,
+		purpose:          caller.Purpose,
+		requestID:        caller.RequestID,
+		toolCallID:       caller.ToolCallID,
+		effectID:         caller.EffectID,
+		revision:         caller.Revision,
+		caller:           extension.CallerIdentity{ExtensionID: caller.ExtensionID, ComponentID: caller.ComponentID, InstanceID: caller.InstanceID},
+		grant:            nativeGrant{permissions: grant.permissions, pure: pure, lifecycle: grant.lifecycle},
+		lease:            lease,
+		operationSecrets: secrets.operation,
 	}
 	return c.invokeProvider(ctx, provider, binding.Methods, methodName, arguments, nil, childIdentity, grant.lifecycle)
 }

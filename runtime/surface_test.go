@@ -71,6 +71,7 @@ func baseSurfaceRequest(t *testing.T) surfaceRequest {
 		globalRulesDir: t.TempDir(),
 		workspace:      t.TempDir(),
 		promptSize:     prompt.ModeFull,
+		shell:          "/bin/fixture-shell",
 		toolSpecs: []toolDeclaration{
 			staticToolSpec("read_file", "read_file description", true),
 			staticToolSpec("apply_patch", "apply_patch description", true),
@@ -95,7 +96,7 @@ func TestComposeSurfacePromptSizesSkipRulesUnderNone(t *testing.T) {
 			Workspace:     req.workspace,
 			SessionStart:  req.sessionStart,
 			OS:            goruntime.GOOS,
-			Shell:         captureShell(),
+			Shell:         req.shell,
 			OSDescription: captureOSDescription(),
 		})
 		testassert.NoError(t, err)

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
@@ -39,6 +40,8 @@ type configuration struct {
 	compaction           json.RawMessage
 	compactionValues     compactionSettings
 	extensions           map[string]json.RawMessage
+	secrets              []declaredSecret
+	declaredBindings     map[declaredField]declaredBinding
 	userProviders        map[string]any
 	permissions          json.RawMessage
 	workspacePermissions map[string]json.RawMessage
@@ -58,6 +61,76 @@ type capturedConfigDocument struct {
 	Compaction  json.RawMessage            `json:"compaction"`
 	Extensions  map[string]json.RawMessage `json:"extensions"`
 	Permissions json.RawMessage            `json:"permissions"`
+}
+
+// declaredSecret is one active extension SecretRef resolved to the non-secret
+// credential name its section field holds. Only the reference metadata is
+// captured here; values live in the private activation/Operation resources
+// that resolve them.
+type declaredSecret struct {
+	extensionID string
+	field       string
+	lifetime    extension.SecretLifetime
+	name        string
+}
+
+// declaredField identifies one active SecretRef field in its extension.
+type declaredField struct {
+	extensionID string
+	field       string
+}
+
+// declaredBinding is one candidate's private capture of an active declared
+// field: the resolved non-secret credential name and the value captured from
+// the one candidate environment observation. It is never durable.
+type declaredBinding struct {
+	name  string
+	value string
+}
+
+// declaredSecretNames returns the unique non-secret credential names every
+// active declaration references. The live producer unions them with the
+// current provider names; the preparation's one credential observation
+// resolves the same names for its captured values and exclusions.
+func (c *configuration) declaredSecretNames() []string {
+	if c == nil || len(c.secrets) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(c.secrets))
+	names := make([]string, 0, len(c.secrets))
+	for _, secret := range c.secrets {
+		if seen[secret.name] {
+			continue
+		}
+		seen[secret.name] = true
+		names = append(names, secret.name)
+	}
+	return names
+}
+
+// resolveDeclaredSecrets inspects the SecretRef metadata of every active
+// installed declaration against its captured section and records the
+// non-secret credential names without executing extension code.
+func resolveDeclaredSecrets(declarations []extension.Native, sections map[string]json.RawMessage) []declaredSecret {
+	var out []declaredSecret
+	for _, native := range declarations {
+		declaration := native.Declaration
+		if len(declaration.Secrets) == 0 {
+			continue
+		}
+		section := sections[declaration.ID]
+		if !sectionEnabled(section) {
+			continue
+		}
+		for _, secret := range declaration.Secrets {
+			name, ok := extension.SecretName(section, secret.Field)
+			if !ok {
+				continue
+			}
+			out = append(out, declaredSecret{extensionID: declaration.ID, field: secret.Field, lifetime: secret.Lifetime, name: name})
+		}
+	}
+	return out
 }
 
 // decodeCapturedConfig decodes one captured main configuration document in a
