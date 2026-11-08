@@ -23,6 +23,11 @@ type resourceSet struct {
 	holds     int
 	warnings  [][3]string
 	committed bool
+
+	// heldNames are the declared names this resource set keeps excluded for
+	// its whole candidate/open/retirement lifetime. They are released only
+	// after shutdown and runtime cleanup finish.
+	heldNames []string
 }
 
 func (s *configurationService) prepareResources(caller context.Context, snapshot *configuration) error {
@@ -77,10 +82,15 @@ func (s *configurationService) prepareResources(caller context.Context, snapshot
 	runtimeInfo := ScopeInfo{Kind: ScopeRuntime, DataDir: s.dataDir, Revision: fmt.Sprint(r.revision)}
 	runtimeInfo.sections = snapshot.extensions
 	runtimeInfo.declaredBindings = snapshot.declaredBindings
+	// The candidate's declared names are held before any author Open. The
+	// hold survives failed-prefix cleanup and transfers to the successful set.
+	r.heldNames = snapshot.declaredSecretNames()
+	s.holdCredentialNames(r.heldNames)
 	runtime, err := snapshot.composition.openScopeReporting(ctx, runtimeInfo, nil, report)
 	stopCaller()
 	if err != nil {
 		cancel()
+		s.releaseCredentialNames(r.heldNames)
 		if canceled := s.canceled(caller); canceled != nil {
 			return errors.Join(canceled, err)
 		}
@@ -88,7 +98,9 @@ func (s *configurationService) prepareResources(caller context.Context, snapshot
 	}
 	if err := s.canceled(caller); err != nil {
 		cancel()
-		return errors.Join(err, runtime.cleanup())
+		cleanupErr := runtime.cleanup()
+		s.releaseCredentialNames(r.heldNames)
+		return errors.Join(err, cleanupErr)
 	}
 	r.runtime = runtime
 	r.workspaces = newWorkspaceScopes(ctx, snapshot.composition, []*scope{runtime}, s.obs, snapshot.extensions)
@@ -115,6 +127,7 @@ func (r *resourceSet) release() error {
 	r.owner.cleanupMu.Lock()
 	r.owner.cleanupErr = errors.Join(r.owner.cleanupErr, err)
 	r.owner.cleanupMu.Unlock()
+	r.owner.releaseCredentialNames(r.heldNames)
 	return err
 }
 

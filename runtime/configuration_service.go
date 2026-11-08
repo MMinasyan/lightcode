@@ -80,6 +80,12 @@ type configurationService struct {
 	buildMu   sync.Mutex
 	captureMu sync.Mutex
 	published atomic.Pointer[configuration]
+
+	// heldMu owns the owner-wide private reference counts for credential
+	// names currently protected by a reserving capture or a live resource
+	// set. Only names live here; no value, token or public manager.
+	heldMu    sync.Mutex
+	heldNames map[string]int
 }
 
 // configurationCapture joins one published immutable configuration revision
@@ -91,6 +97,11 @@ type configurationService struct {
 type configurationCapture struct {
 	snapshot    *configuration
 	credentials map[string]config.EnvValue
+
+	// releaseNames drops this reserving capture's private name reference
+	// counts after its resource cleanup finishes. It is nil for non-reserving
+	// captures.
+	releaseNames func()
 }
 
 // newConfigurationService binds the service to the composition's owned
@@ -133,6 +144,35 @@ func (s *configurationService) capture(ctx context.Context) (configurationCaptur
 func (s *configurationService) captureFor(ctx context.Context, reserve bool) (configurationCapture, error) {
 	s.captureMu.Lock()
 	defer s.captureMu.Unlock()
+	return s.captureBody(ctx, reserve)
+}
+
+// capturePreparation is the explicit preparation admission capture: the same
+// common capture body under captureMu, followed by its owner-wide name hold
+// before the mutex releases. No consumer can observe an accepted preparation
+// whose names are not yet registered.
+func (s *configurationService) capturePreparation(ctx context.Context) (configurationCapture, error) {
+	s.captureMu.Lock()
+	defer s.captureMu.Unlock()
+	captured, err := s.captureBody(ctx, true)
+	if err != nil {
+		return configurationCapture{}, err
+	}
+	if captured.snapshot != nil && captured.snapshot.resources != nil {
+		names := make([]string, 0, len(captured.credentials))
+		for name := range captured.credentials {
+			names = append(names, name)
+		}
+		s.holdCredentialNames(names)
+		captured.releaseNames = func() { s.releaseCredentialNames(names) }
+	}
+	return captured, nil
+}
+
+// captureBody is the common reservation body under captureMu: cancellation,
+// one ready pointer, optional resource retention and the one credential
+// observation. Generic resource captures do not become admission name holds.
+func (s *configurationService) captureBody(ctx context.Context, reserve bool) (configurationCapture, error) {
 	if err := s.canceled(ctx); err != nil {
 		return configurationCapture{}, err
 	}
@@ -144,6 +184,99 @@ func (s *configurationService) captureFor(ctx context.Context, reserve bool) (co
 		snapshot.resources.retain()
 	}
 	return configurationCapture{snapshot: snapshot, credentials: s.captureCredentials(snapshot)}, nil
+}
+
+func (c configurationCapture) releaseHeldNames() {
+	if c.releaseNames != nil {
+		c.releaseNames()
+	}
+}
+
+// holdCredentialNames registers one private reference count per name. The
+// caller owns the matching release; names remain excluded until every holder
+// from both reserving captures and resource sets has released.
+func (s *configurationService) holdCredentialNames(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+	if s.heldNames == nil {
+		s.heldNames = make(map[string]int)
+	}
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		s.heldNames[name]++
+	}
+}
+
+func (s *configurationService) releaseCredentialNames(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if s.heldNames[name] <= 1 {
+			delete(s.heldNames, name)
+			continue
+		}
+		s.heldNames[name]--
+	}
+}
+
+// heldCredentialNames returns a snapshot of the owner-wide held name union.
+func (s *configurationService) heldCredentialNames() []string {
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+	if len(s.heldNames) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(s.heldNames))
+	for name := range s.heldNames {
+		names = append(names, name)
+	}
+	return names
+}
+
+// subprocessEnvironment is the one production child-environment projection:
+// it takes the managed-environment snapshot, the current revision's provider
+// and declared names, and the owner-wide held-name union under one
+// publication/capture ownership. A capture or publication therefore cannot
+// land between the held and current reads. No lock survives this call. A nil
+// manager yields no environment, preserving fail-closed command behavior; a
+// nil ready snapshot contributes no current names.
+func (s *configurationService) subprocessEnvironment() []string {
+	if s.env == nil {
+		return nil
+	}
+	s.captureMu.Lock()
+	defer s.captureMu.Unlock()
+	env := s.env.SubprocessEnv()
+	if env == nil {
+		return nil
+	}
+	var names []string
+	s.heldMu.Lock()
+	for name := range s.heldNames {
+		names = append(names, name)
+	}
+	s.heldMu.Unlock()
+	current := s.published.Load()
+	if current != nil {
+		for _, prov := range current.catalog.Providers {
+			if prov != nil && prov.Transport.APIKeyEnv != "" {
+				names = append(names, prov.Transport.APIKeyEnv)
+			}
+		}
+		names = append(names, current.declaredSecretNames()...)
+	}
+	return config.EnvWithoutKeys(env, names)
 }
 
 // captureCredentials samples the union of every nonempty api_key_env the

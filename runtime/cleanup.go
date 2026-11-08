@@ -59,7 +59,9 @@ func (r *Runtime) cleanupDeletedSessions(ctx context.Context, deletions []delete
 	if err != nil || snapshot == nil || snapshot.resources == nil {
 		return appendOwnerFailures(failures, deletions)
 	}
-	defer func() { _ = snapshot.resources.release() }()
+	defer func() {
+		_ = snapshot.resources.release()
+	}()
 	for _, deletion := range deletions {
 		for _, owner := range deletion.owners {
 			if failure := r.cleanupExternalOwner(ctx, snapshot, deletion.sessionID, owner); failure != nil {

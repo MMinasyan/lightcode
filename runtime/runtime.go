@@ -258,31 +258,12 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	// unarmed registry because the owner is unpublished.
 	// The call-time subprocess environment producer exists only when the
 	// retained manager exists; without it no manager is constructed on
-	// demand and every cooperative command fails. Each request takes one
-	// current configuration pointer solely to obtain the Runtime's provider
-	// credential names and excludes them from the managed-filtered
-	// environment: a live credential exclusion service, ready because the
-	// initial publication above always precedes any prepared command.
+	// demand and every cooperative command fails. The configuration owner
+	// supplies the one coherent projection of the managed environment, the
+	// current revision's names and the owner-wide held-name union.
 	var subprocessEnv func() []string
 	if managedEnv != nil {
-		subprocessEnv = func() []string {
-			env := managedEnv.SubprocessEnv()
-			current := configService.current()
-			if current == nil {
-				return env
-			}
-			var names []string
-			for _, prov := range current.catalog.Providers {
-				if prov != nil && prov.Transport.APIKeyEnv != "" {
-					names = append(names, prov.Transport.APIKeyEnv)
-				}
-			}
-			// The live revision's declared credential names join the live
-			// provider names; the preparation adds the names its own capture
-			// resolved, so a rename is excluded by both sides.
-			names = append(names, current.declaredSecretNames()...)
-			return config.EnvWithoutKeys(env, names)
-		}
+		subprocessEnv = configService.subprocessEnvironment
 	}
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: store,

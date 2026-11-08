@@ -1064,31 +1064,42 @@ func credentialConfigDocument(endpoint, activation, operation string) string {
 	return `{"providers":{"prov":{"transport":{"base_url":"` + endpoint + `","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":262144}}}},"extensions":{"credprobe":{"enabled":true,"activation":` + fmt.Sprintf("%q", activation) + `,"operation":` + fmt.Sprintf("%q", operation) + `}}}`
 }
 
-func TestProjectedShellUsesTheChildEnvironmentProjection(t *testing.T) {
-	if got := projectedShell(nil); got != "unknown" {
-		t.Fatalf("projectedShell(nil producer) = %q, want unknown", got)
+func TestProjectedShellUsesTheOwnerEnvironmentProjection(t *testing.T) {
+	t.Setenv("SHELL", "/bin/projected")
+	t.Setenv("EXTENSION_SECRET", "secret")
+	t.Setenv("KEEP", "value")
+	svc := newConfigurationService(context.Background(), &composition{}, nil, "", newObservation())
+	testassert.Require(t, svc.subprocessEnvironment() == nil, "nil manager produced an environment")
+	if got := projectedShell(svc.subprocessEnvironment); got != "unknown" {
+		t.Fatalf("projectedShell(nil manager) = %q, want unknown", got)
 	}
-	if got := projectedShell(func() []string { return nil }); got != "unknown" {
-		t.Fatalf("projectedShell(nil snapshot) = %q, want unknown", got)
-	}
-	if got := projectedShell(func() []string { return []string{"OTHER=value"} }); got != "unknown" {
-		t.Fatalf("projectedShell(absent SHELL) = %q, want unknown", got)
-	}
-	if got := projectedShell(func() []string { return []string{"SHELL="} }); got != "unknown" {
-		t.Fatalf("projectedShell(empty SHELL) = %q, want unknown", got)
-	}
+	svc.env = config.NewManagedEnvForTest(filepath.Join(t.TempDir(), ".env"))
 
-	base := func() []string { return []string{"SHELL=/bin/projected", "EXTENSION_SECRET=secret", "KEEP=value"} }
-	if got := projectedShell(filteredSubprocessEnv(base, []string{"EXTENSION_SECRET"})); got != "/bin/projected" {
-		t.Fatalf("projectedShell(filtered) = %q, want the projected shell", got)
+	svc.published.Store(&configuration{catalog: &catalog.Catalog{}})
+	if got := projectedShell(svc.subprocessEnvironment); got != "/bin/projected" {
+		t.Fatalf("projectedShell(owner projection) = %q, want the projected shell", got)
 	}
-	filtered := filteredSubprocessEnv(base, []string{"SHELL", "EXTENSION_SECRET"})()
-	testassert.Require(t, !slices.Contains(filtered, "SHELL=/bin/projected") && !slices.Contains(filtered, "EXTENSION_SECRET=secret") && slices.Contains(filtered, "KEEP=value"), "filtered environment = %v, want the declared names removed and the sibling kept", filtered)
-	if projectedShell(filteredSubprocessEnv(base, []string{"SHELL"})) != "unknown" {
-		t.Fatal("a declared SHELL credential still reached the projected prompt")
+	svc.published.Store(&configuration{catalog: &catalog.Catalog{Providers: map[string]*catalog.Provider{
+		"p": {Transport: catalog.Transport{APIKeyEnv: "SHELL"}},
+	}}})
+	if got := projectedShell(svc.subprocessEnvironment); got != "unknown" {
+		t.Fatalf("projectedShell(provider name) = %q, want unknown", got)
 	}
-	if filteredSubprocessEnv(nil, []string{"ANY"}) != nil {
-		t.Fatal("filteredSubprocessEnv(nil) returned a producer")
+	svc.published.Store(&configuration{catalog: &catalog.Catalog{}, secrets: []declaredSecret{{name: "EXTENSION_SECRET"}}})
+	projected := svc.subprocessEnvironment()
+	testassert.Require(t, !slices.Contains(projected, "EXTENSION_SECRET=secret") && slices.Contains(projected, "SHELL=/bin/projected") && slices.Contains(projected, "KEEP=value"), "owner projection = %v, want the declared name removed and siblings kept", projected)
+	svc.published.Store(&configuration{catalog: &catalog.Catalog{}})
+	svc.holdCredentialNames([]string{"SHELL"})
+	if got := projectedShell(svc.subprocessEnvironment); got != "unknown" {
+		t.Fatalf("projectedShell(held name) = %q, want unknown", got)
+	}
+	svc.releaseCredentialNames([]string{"SHELL"})
+	if got := projectedShell(svc.subprocessEnvironment); got != "/bin/projected" {
+		t.Fatalf("projectedShell(released held name) = %q, want the projected shell", got)
+	}
+	t.Setenv("SHELL", "")
+	if got := projectedShell(svc.subprocessEnvironment); got != "unknown" {
+		t.Fatalf("projectedShell(empty shell) = %q, want unknown", got)
 	}
 }
 

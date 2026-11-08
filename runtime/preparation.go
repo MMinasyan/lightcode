@@ -186,7 +186,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		// Configuration and the credentials its catalog references are one
 		// owner-coherent capture: the selected model, its transport secret,
 		// and the revision all belong to the same ready pair.
-		captured, err := p.config.captureFor(ctx, true)
+		captured, err := p.config.capturePreparation(ctx)
 		if err != nil {
 			return harness.PreparedExecution{}, err
 		}
@@ -196,6 +196,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 			defer func() {
 				if resultErr != nil {
 					resultErr = errors.Join(resultErr, snapshot.resources.release())
+					captured.releaseHeldNames()
 				}
 			}()
 		}
@@ -294,6 +295,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 			if releaseArtifacts != nil {
 				releaseArtifacts()
 			}
+			captured.releaseHeldNames()
 			return err
 		}
 		return prepared, nil
@@ -485,20 +487,12 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 		return harness.ExecutionCapture{}, nil, err
 	}
 	agentInputs := sel.inputs
-	// The preparation fixes the credential-name exclusion set once: its one
-	// capture resolved both the provider names and every active declaration's
-	// non-secret reference name. The live producer still adds the current
-	// names at each process start, so a renamed binding is excluded by this
-	// capture and a newly connected one by the live revision.
-	credentialNames := make([]string, 0, len(sel.credentials))
-	for name := range sel.credentials {
-		credentialNames = append(credentialNames, name)
-	}
-	subprocessEnv := filteredSubprocessEnv(p.subprocessEnv, credentialNames)
+	subprocessEnv := p.subprocessEnv
 	// The baseline environment presentation reads the same child-environment
-	// projection the command path consumes: a name this capture excludes is
-	// absent from the prompt and every preparation/request hook input, and an
-	// absent projection or value renders the existing "unknown".
+	// projection the command path consumes: a name the owner-wide held or
+	// current capture excludes is absent from the prompt and every
+	// preparation/request hook input, and an absent projection or value
+	// renders the existing "unknown".
 	shell := projectedShell(subprocessEnv)
 	result, catalog, err := composeSurface(ctx, surfaceRequest{
 		hostIdentity:   p.identity,
@@ -561,26 +555,6 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 	capture.Strategy.Settings = append(json.RawMessage(nil), sel.inputs.Strategy.Settings...)
 	workspace := req.Session.Identity.Workspace
 	return capture, p.concreteOpener(transport, compactTransport, req.Session.Identity, workspace, view.catalog, subprocessEnv), nil
-}
-
-// filteredSubprocessEnv applies one preparation's fixed credential-name
-// capture to the Runtime's live producer. A nil producer stays nil, so the
-// command path keeps refusing to spawn; a nil snapshot stays nil rather than
-// falling back to the ambient environment.
-func filteredSubprocessEnv(base func() []string, names []string) func() []string {
-	if base == nil {
-		return nil
-	}
-	if len(names) == 0 {
-		return base
-	}
-	return func() []string {
-		env := base()
-		if env == nil {
-			return nil
-		}
-		return config.EnvWithoutKeys(env, names)
-	}
 }
 
 // projectedShell reads SHELL from the same child-environment projection the
