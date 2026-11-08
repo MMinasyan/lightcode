@@ -134,8 +134,8 @@ func TestNativeSetModelTransformsLatestSection(t *testing.T) {
 // TestNativeTaskAdvertisesAndLaunchesOwnDefinitionsOnly proves the task tool
 // filters the roster by its own extension and resolver: a foreign provider's
 // same-named entry is never advertised or selectable, and the selected full
-// reference crosses the child-launch call while the permission target stays
-// the definition ID.
+// reference crosses both the child-launch call and its canonical permission
+// target.
 func TestNativeTaskAdvertisesAndLaunchesOwnDefinitionsOnly(t *testing.T) {
 	native := Native(Options{})
 	tool := openInstance(t, Options{}, `{"enabled":true}`).Capabilities[TaskCapabilityID].Tool
@@ -159,7 +159,7 @@ func TestNativeTaskAdvertisesAndLaunchesOwnDefinitionsOnly(t *testing.T) {
 	}}}
 	plan := tool.Prepare(context.Background(), tc, call)
 	testassert.Require(t, plan.Immediate == nil && len(plan.Permissions) == 1, "prepare = %+v", plan)
-	testassert.Require(t, plan.Permissions[0] == (harness.PermissionRequest{Permission: harness.PermissionChildLaunch, Target: "twin"}), "permission pair = %+v, want the definition ID target", plan.Permissions[0])
+	testassert.Require(t, plan.Permissions[0] == (harness.PermissionRequest{Permission: harness.PermissionChildLaunch, Target: (harness.DefinitionRef{ExtensionID: ExtensionID, CapabilityID: DefinitionsCapabilityID, DefinitionID: "twin"}).PermissionTarget()}), "permission pair = %+v, want the complete canonical reference target", plan.Permissions[0])
 	outcome := tool.Execute(context.Background(), tc, plan)
 	testassert.Equal(t, outcome.Result.Status, model.ResultSuccess)
 	var launched struct {

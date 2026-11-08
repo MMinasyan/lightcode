@@ -13,6 +13,46 @@ func testSelection(name string) AgentSelection {
 	return AgentSelection{Definition: &DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: name}}
 }
 
+// TestDefinitionRefPermissionTarget proves the canonical target carries the
+// complete reference: each opaque component is path-escaped before the fixed
+// separator join, so delimiter and percent bytes cannot make distinct
+// references share one target and arbitrary bytes survive.
+func TestDefinitionRefPermissionTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ref  DefinitionRef
+		want string
+	}{
+		{"plain", DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "secondary"}, "agents/agents.definitions/secondary"},
+		{"slash in extension", DefinitionRef{ExtensionID: "a/b", CapabilityID: "c", DefinitionID: "d"}, "a%2Fb/c/d"},
+		{"literal percent in capability", DefinitionRef{ExtensionID: "a", CapabilityID: "b%2Fc", DefinitionID: "d"}, "a/b%252Fc/d"},
+		{"delimiters, space and question in definition", DefinitionRef{ExtensionID: "a", CapabilityID: "b", DefinitionID: "c/d% e?"}, "a/b/c%2Fd%25%20e%3F"},
+		{"unicode and arbitrary byte", DefinitionRef{ExtensionID: "a", CapabilityID: "b", DefinitionID: "\u00fc\xff"}, "a/b/%C3%BC%FF"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.ref.PermissionTarget(); got != tc.want {
+				t.Fatalf("PermissionTarget(%+v) = %q, want %q", tc.ref, got, tc.want)
+			}
+		})
+	}
+	refs := []DefinitionRef{
+		{ExtensionID: "a/b", CapabilityID: "c", DefinitionID: "d"},
+		{ExtensionID: "a", CapabilityID: "b/c", DefinitionID: "d"},
+		{ExtensionID: "a", CapabilityID: "b", DefinitionID: "c/d"},
+		{ExtensionID: "a%2Fb", CapabilityID: "c", DefinitionID: "d"},
+		{ExtensionID: "a", CapabilityID: "b%2Fc", DefinitionID: "d"},
+		{ExtensionID: "a", CapabilityID: "b", DefinitionID: "c%2Fd"},
+	}
+	seen := make(map[string]DefinitionRef, len(refs))
+	for _, ref := range refs {
+		target := ref.PermissionTarget()
+		if prior, ok := seen[target]; ok {
+			t.Fatalf("distinct references %+v and %+v share target %q", prior, ref, target)
+		}
+		seen[target] = ref
+	}
+}
+
 func TestAgentSelectionValidationAndOwnership(t *testing.T) {
 	inputs := AgentInputs{Model: model.ModelRef{Provider: "prov", Model: "gpt-x"}, AssemblyMode: "full", Instructions: "prompt", Tools: []string{"read_file", "write_file", "read_file"}, Capabilities: []string{"cap-b", "cap-a"}, Constraints: ToolConstraints{Readonly: true, WriteDir: "/w/sub"}, Strategy: StrategySelection{Settings: json.RawMessage(" \n{\"exact\":9007199254740993} \n")}}
 	valid := AgentSelection{Inputs: &inputs}

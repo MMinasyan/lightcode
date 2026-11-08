@@ -21,6 +21,13 @@ import (
 // displayed name, declares no configuration edit, and never imports Runtime.
 func guestResolverNative(t *testing.T) extension.Native {
 	t.Helper()
+	return guestResolverNativeDefinition(t, "primary")
+}
+
+// guestResolverNativeDefinition is the same read-only resolver over one named
+// definition, for rows that need an explicit same-named foreign provider.
+func guestResolverNativeDefinition(t *testing.T, definitionID string) extension.Native {
+	t.Helper()
 	inputs := harness.AgentInputs{
 		Model:        model.ModelRef{Provider: "prov", Model: "m"},
 		Instructions: "guest instructions",
@@ -46,7 +53,7 @@ func guestResolverNative(t *testing.T) extension.Native {
 			return extension.Instance{Capabilities: map[string]extension.Implementation{
 				"guestdefs.definitions": {Service: map[string]extension.Handler{
 					"list": func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
-						value, err := json.Marshal([]extension.AgentDefinitionSummary{{ID: "primary", Description: "guest primary"}})
+						value, err := json.Marshal([]extension.AgentDefinitionSummary{{ID: definitionID, Description: "guest " + definitionID}})
 						return extension.Result{Value: value}, err
 					},
 					"resolve": func(_ context.Context, _ extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
@@ -56,10 +63,10 @@ func guestResolverNative(t *testing.T) extension.Native {
 						if err := json.Unmarshal(arguments, &request); err != nil {
 							return extension.Result{}, err
 						}
-						if request.ID != "primary" {
+						if request.ID != definitionID {
 							return extension.Result{}, errors.New("unknown guest definition")
 						}
-						value, err := json.Marshal(extension.AgentDefinitionResolution{Inputs: inputs, Description: "guest primary"})
+						value, err := json.Marshal(extension.AgentDefinitionResolution{Inputs: inputs, Description: "guest " + definitionID})
 						return extension.Result{Value: value}, err
 					},
 				}},

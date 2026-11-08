@@ -538,14 +538,18 @@ type authorityProbe struct {
 }
 
 func childLaunchArguments(target string) json.RawMessage {
+	return childLaunchRefArguments(harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: target}, "op")
+}
+
+func childLaunchRefArguments(ref harness.DefinitionRef, operationID string) json.RawMessage {
 	value, _ := json.Marshal(map[string]any{
 		"definition": map[string]string{
-			"extension_id":  "agents",
-			"capability_id": "agents.definitions",
-			"definition_id": target,
+			"extension_id":  ref.ExtensionID,
+			"capability_id": ref.CapabilityID,
+			"definition_id": ref.DefinitionID,
 		},
 		"prompt":         "x",
-		"operation_id":   "op",
+		"operation_id":   operationID,
 		"max_concurrent": 1,
 		"output_limit":   1024,
 	})
@@ -558,7 +562,7 @@ func (p *authorityProbe) Normalize(tc extension.ToolContext, call model.ToolCall
 }
 func (p *authorityProbe) Prepare(_ context.Context, tc extension.ToolContext, call model.ToolCall) extension.ToolPlan {
 	_, p.prepareErr = tc.Calls.Call(context.Background(), "child_launch", "launch", childLaunchArguments("allowed"))
-	p.plan = extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: "allowed"}}, Data: []byte("allowed")}
+	p.plan = extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: (harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "allowed"}).PermissionTarget()}}, Data: []byte("allowed")}
 	return p.plan
 }
 func (p *authorityProbe) Execute(ctx context.Context, tc extension.ToolContext, plan extension.ToolPlan) harness.ToolOutcome {
@@ -1141,6 +1145,107 @@ func TestNativeClosingScopeRefusesOwnScopeDependency(t *testing.T) {
 	testassert.Equal(t, bCalls.Load(), int64(0))
 }
 
+// childTargetProbe prepares one declared permission target and launches one
+// complete reference through the declared host service.
+type childTargetProbe struct {
+	target    string
+	launch    harness.DefinitionRef
+	executes  atomic.Int64
+	childID   string
+	launchErr error
+}
+
+func (p *childTargetProbe) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+	return call.Arguments, nil
+}
+
+func (p *childTargetProbe) Prepare(context.Context, extension.ToolContext, model.ToolCall) extension.ToolPlan {
+	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: p.target}}}
+}
+
+func (p *childTargetProbe) Execute(ctx context.Context, tc extension.ToolContext, _ extension.ToolPlan) harness.ToolOutcome {
+	p.executes.Add(1)
+	result, err := tc.Calls.Call(ctx, "child_launch", "launch", childLaunchRefArguments(p.launch, "op-child"))
+	if err != nil {
+		p.launchErr = err
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: tc.Calls.ToolCallID, Status: model.ResultError, Content: err.Error()}}
+	}
+	var launched struct {
+		ChildSessionID string `json:"child_session_id"`
+	}
+	if err := json.Unmarshal(result.Value, &launched); err != nil {
+		p.launchErr = err
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: tc.Calls.ToolCallID, Status: model.ResultError, Content: err.Error()}}
+	}
+	p.childID = launched.ChildSessionID
+	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: tc.Calls.ToolCallID, Status: model.ResultSuccess, Content: "launched " + launched.ChildSessionID}}
+}
+
+// TestNativeChildLaunchRequiresCompleteCanonicalTarget proves the real native
+// plan -> Harness authorization -> host child launch path authorizes the
+// complete canonical target: an own reference and an explicitly prepared
+// foreign reference admit exactly that reference, while a same-ID foreign
+// substitution and a bare definition-ID target admit no child.
+func TestNativeChildLaunchRequiresCompleteCanonicalTarget(t *testing.T) {
+	own := harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "shared"}
+	foreign := harness.DefinitionRef{ExtensionID: "guestdefs", CapabilityID: "guestdefs.definitions", DefinitionID: "shared"}
+	for _, row := range []struct {
+		name       string
+		target     string
+		launch     harness.DefinitionRef
+		wantLaunch bool
+		wantRef    harness.DefinitionRef
+	}{
+		{name: "exact own canonical target", target: own.PermissionTarget(), launch: own, wantLaunch: true, wantRef: own},
+		{name: "canonical own target rejects same-ID foreign reference", target: own.PermissionTarget(), launch: foreign},
+		{name: "bare definition ID target authorizes nothing", target: own.DefinitionID, launch: own},
+		{name: "bare target admits no same-ID foreign reference", target: own.DefinitionID, launch: foreign},
+		{name: "explicit foreign canonical target", target: foreign.PermissionTarget(), launch: foreign, wantLaunch: true, wantRef: foreign},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			e := newOwnerEnv(t)
+			store := storage.NewMemory()
+			e.fixtureStore(store)
+			enableFixturePlugin(t, e.configPath, "grant")
+			enableFixturePlugin(t, e.configPath, "guestdefs")
+			writeAgentDefinitions(t, e.configPath, `{"grant_agent":{"model":"prov/m","system_prompt":"simple","tools":["grant_tool"]},"shared":{"model":"prov/m","system_prompt":"simple","subagent":true}}`)
+			e.server.setScript(func(_ context.Context, body string) []string {
+				if lastMessageRole(body) == "tool" {
+					return textTurnEvents("done")
+				}
+				if lastUserText(body) == "run" {
+					return toolCallTurnEvents("call-target", "grant_tool", `{}`)
+				}
+				return textTurnEvents("child done")
+			})
+			probe := &childTargetProbe{target: row.target, launch: row.launch}
+			ctx := context.Background()
+			r, err := e.open(ctx, childGrantNative(probe), guestResolverNativeDefinition(t, "shared"))
+			testassert.NoError(t, err)
+			t.Cleanup(func() { _ = r.Close(context.Background()) })
+			session, err := r.createSession(ctx, e.dataDir, "grant_agent")
+			testassert.NoError(t, err)
+			submitThroughRuntime(t, r, session.Identity.SessionID, "op-target", "run")
+			awaitOperation(t, r, session.Identity.SessionID, "op-target", harness.OperationSuccess)
+			testassert.Require(t, probe.executes.Load() == 1, "probe Execute calls = %d, want one", probe.executes.Load())
+			if !row.wantLaunch {
+				testassert.Require(t, probe.launchErr != nil && strings.Contains(probe.launchErr.Error(), "not authorized by the prepared plan"), "launch error = %v, want the frozen-target refusal", probe.launchErr)
+				testassert.Require(t, probe.childID == "", "child id = %q, want no admitted child", probe.childID)
+				testassert.Equal(t, bridgeChildCount(t, r, store), 0)
+				return
+			}
+			testassert.NoError(t, probe.launchErr)
+			testassert.Require(t, len(probe.childID) == 32, "child id = %q (launch error %v), want a committed child", probe.childID, probe.launchErr)
+			header, err := r.harness.ReadSessionHeader(ctx, probe.childID)
+			testassert.NoError(t, err)
+			testassert.Require(t, header.AgentSelection.Definition != nil && *header.AgentSelection.Definition == row.wantRef, "child session selection = %+v, want %+v", header.AgentSelection.Definition, row.wantRef)
+			operation, err := r.harness.ReadOperation(ctx, probe.childID, "op-child")
+			testassert.NoError(t, err)
+			testassert.Require(t, operation.Admission.AgentSelection.Definition != nil && *operation.Admission.AgentSelection.Definition == row.wantRef, "child operation selection = %+v, want %+v", operation.Admission.AgentSelection.Definition, row.wantRef)
+		})
+	}
+}
+
 // childGrantProbe launches through the declared host service: it first
 // mutates the plan the native executor received, then its own retained plan
 // buffer, and finally asks for the originally declared target. The Harness
@@ -1160,7 +1265,7 @@ func (p *childGrantProbe) Normalize(_ extension.ToolContext, call model.ToolCall
 
 func (p *childGrantProbe) Prepare(context.Context, extension.ToolContext, model.ToolCall) extension.ToolPlan {
 	p.retained = extension.ToolPlan{
-		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: "secondary"}},
+		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: (harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "secondary"}).PermissionTarget()}},
 		Data:        []byte("secondary"),
 	}
 	return p.retained
@@ -1239,7 +1344,7 @@ func TestNativeChildLaunchGrantIgnoresPlanMutation(t *testing.T) {
 // denied result instead.
 func TestNativeChildLaunchDeniedPlanDoesNotExecute(t *testing.T) {
 	e := newOwnerEnv(t)
-	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"permissions":{"rules":[{"permission":"child.launch","target":"secondary","access":"deny"}]}}`)
+	writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"permissions":{"rules":[{"permission":"child.launch","target":"agents/agents.definitions/secondary","access":"deny"}]}}`)
 	enableFixturePlugin(t, e.configPath, "grant")
 	writeAgentDefinitions(t, e.configPath, `{"grant_agent":{"model":"prov/m","system_prompt":"simple","tools":["grant_tool"]},"secondary":{"model":"prov/m","system_prompt":"simple","subagent":true}}`)
 	probe := &childGrantProbe{}

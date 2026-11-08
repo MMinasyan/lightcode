@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -140,6 +141,15 @@ type DefinitionRef struct {
 	ExtensionID  string `json:"extension_id"`
 	CapabilityID string `json:"capability_id"`
 	DefinitionID string `json:"definition_id"`
+}
+
+// PermissionTarget returns the canonical semantic-permission target for the
+// complete reference: each opaque component is URL-path escaped and the three
+// escaped components are joined with '/'. Escaping preserves arbitrary
+// component bytes and keeps '%' and '/' unambiguous; the result is data and
+// is never parsed.
+func (r DefinitionRef) PermissionTarget() string {
+	return url.PathEscape(r.ExtensionID) + "/" + url.PathEscape(r.CapabilityID) + "/" + url.PathEscape(r.DefinitionID)
 }
 
 type AgentSelection struct {

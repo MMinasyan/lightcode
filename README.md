@@ -148,7 +148,7 @@ Shell-exported environment variables take precedence over values in `~/.lightcod
 
 #### Permissions
 
-Every tool call is checked before execution against one automatic policy and never prompts. The built-in policy allows file reads and writes inside the workspace and denies sensitive file basenames (`.env`, private keys, credential files) even there. Its target permissions are scoped: `command.run`, `child.launch`, and `process.own` allow any target, and `sleep` only its fixed target; anything undeclared is denied. Child sessions are gated by the same policy. Pair targets are canonical: a resolved file path for the file pairs, one parsed shell segment (or the complete normalized command) for `command.run`, `*` for `sleep`, the resolved Agent-type identity for `child.launch`, and `<session-id>/<job-id>` for `process.own` read/kill (or `*` for its list action).
+Every tool call is checked before execution against one automatic policy and never prompts. The built-in policy allows file reads and writes inside the workspace and denies sensitive file basenames (`.env`, private keys, credential files) even there. Its target permissions are scoped: `command.run`, `child.launch`, and `process.own` allow any target, and `sleep` only its fixed target; anything undeclared is denied. Child sessions are gated by the same policy. Pair targets are canonical: a resolved file path for the file pairs, one parsed shell segment (or the complete normalized command) for `command.run`, `*` for `sleep`, the complete source-qualified Agent definition reference for `child.launch` (extension, capability and definition components path-escaped and joined with `/`), and `<session-id>/<job-id>` for `process.own` read/kill (or `*` for its list action).
 
 Optional rule lists refine that policy: global rules live in the `permissions` member of `~/.lightcode/config.json`, per-workspace rules in `~/.lightcode/projects/p-<full SHA-256 of the cleaned absolute workspace path>/permissions.json` (that directory name is a storage key for the permission file, not a durable project record):
 
@@ -164,7 +164,7 @@ Optional rule lists refine that policy: global rules live in the `permissions` m
 }
 ```
 
-Rule targets are globs matched against the pair's canonical target — for example a resolved file path, a parsed `command.run` segment or complete command text, an Agent-type identity, a `<session-id>/<job-id>` job reference, or the fixed `*` (the rules above are illustrative). The last matching rule at a level wins, the workspace level decides before the global level, and a level's `default` applies when no rule matches. Permission names are `file.read`, `file.write`, `command.run`, `sleep`, `child.launch`, and `process.own`. A malformed block discards both user levels for that resolution, leaving the built-in policy.
+Rule targets are globs matched against the pair's canonical target — for example a resolved file path, a parsed `command.run` segment or complete command text, a complete Agent definition reference, a `<session-id>/<job-id>` job reference, or the fixed `*` (the rules above are illustrative). The last matching rule at a level wins, the workspace level decides before the global level, and a level's `default` applies when no rule matches. Permission names are `file.read`, `file.write`, `command.run`, `sleep`, `child.launch`, and `process.own`. A malformed block discards both user levels for that resolution, leaving the built-in policy.
 
 #### Run
 

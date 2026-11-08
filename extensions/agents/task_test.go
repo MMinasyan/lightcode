@@ -157,6 +157,7 @@ func TestExecuteUsesDeclaredChildLaunchBinding(t *testing.T) {
 	tc := extension.ToolContext{AgentTypes: []protocol.Agent{{Name: "secondary", Subagent: true, Definition: protocol.DefinitionRef{ExtensionId: ExtensionID, CapabilityId: DefinitionsCapabilityID, DefinitionId: "secondary"}}}}
 	plan := tool.Prepare(context.Background(), tc, call)
 	testassert.Require(t, plan.Immediate == nil && plan.Data != nil, "Prepare = %+v, want an executable plan", plan)
+	testassert.Require(t, len(plan.Permissions) == 1 && plan.Permissions[0] == (harness.PermissionRequest{Permission: harness.PermissionChildLaunch, Target: (harness.DefinitionRef{ExtensionID: ExtensionID, CapabilityID: DefinitionsCapabilityID, DefinitionID: "secondary"}).PermissionTarget()}), "permissions = %+v, want the complete canonical reference target", plan.Permissions)
 
 	var requestedBinding, requestedMethod string
 	var requestedArguments json.RawMessage

@@ -157,7 +157,7 @@ func (t taskTool) Prepare(_ context.Context, tc extension.ToolContext, call mode
 		return immediateError(call.ID, err)
 	}
 	return extension.ToolPlan{
-		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: definition.DefinitionID}},
+		Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: definition.PermissionTarget()}},
 		Data:        data,
 	}
 }

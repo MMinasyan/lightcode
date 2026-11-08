@@ -628,11 +628,12 @@ func (c *composition) childLaunchHandler(ctx context.Context, call extension.Cal
 		return extension.Result{}, err
 	}
 	grant := hostGrant(ctx)
-	// The permission target stays the selected definition ID; the complete
-	// source-qualified reference rides the launch so admission resolves the
-	// exact provider.
-	if !slices.Contains(grant.permissions, harness.PermissionRequest{Permission: harness.PermissionChildLaunch, Target: request.Definition.DefinitionID}) {
-		return extension.Result{}, fmt.Errorf("child launch target %q is not authorized by the prepared plan: %w", request.Definition.DefinitionID, ErrClosed)
+	// The permission target is the complete canonical reference, so a frozen
+	// grant for one provider's definition cannot authorize another provider's
+	// same-ID definition.
+	target := request.Definition.PermissionTarget()
+	if !slices.Contains(grant.permissions, harness.PermissionRequest{Permission: harness.PermissionChildLaunch, Target: target}) {
+		return extension.Result{}, fmt.Errorf("child launch target %q is not authorized by the prepared plan: %w", target, ErrClosed)
 	}
 	if call.SessionID == "" {
 		return extension.Result{}, fmt.Errorf("child launch has no calling Session: %w", ErrClosed)

@@ -57,7 +57,7 @@ func (p *bridgeChildProbe) Normalize(_ extension.ToolContext, call model.ToolCal
 	return call.Arguments, nil
 }
 func (p *bridgeChildProbe) Prepare(context.Context, extension.ToolContext, model.ToolCall) extension.ToolPlan {
-	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: "secondary"}}}
+	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: harness.PermissionChildLaunch, Target: (harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "secondary"}).PermissionTarget()}}}
 }
 func (p *bridgeChildProbe) Execute(ctx context.Context, tc extension.ToolContext, _ extension.ToolPlan) harness.ToolOutcome {
 	arguments := bridgeChildLaunchArguments("probe-child-op")
