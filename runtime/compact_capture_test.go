@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/extension"
+	agents "github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -123,21 +124,14 @@ func compactPrepRequest() harness.PreparationRequest {
 
 func compactPrepSelection(t *testing.T, captured configurationCapture, agentName string) selection {
 	t.Helper()
-	agent, err := resolveAgentType(agentName, captured.snapshot.agentTypes())
-	testassert.Require(t, err == nil, "ResolveAgentType(%q): %v", agentName, err)
+	inputs, err := resolveDefinition(context.Background(), captured.snapshot, harness.DefinitionRef{ExtensionID: agents.ExtensionID, CapabilityID: agents.DefinitionsCapabilityID, DefinitionID: agentName})
+	testassert.Require(t, err == nil, "resolveDefinition(%q): %v", agentName, err)
 	sc := mustOpenScope(t, captured.snapshot.composition, context.Background(), ScopeInfo{Kind: ScopeRuntime, DataDir: t.TempDir()}, nil)
 	t.Cleanup(func() { _ = sc.close() })
-	selected := append([]string(nil), agent.Capabilities...)
-	selected = append(selected, agent.Tools...)
+	selected := append([]string(nil), inputs.Capabilities...)
+	selected = append(selected, inputs.Tools...)
 	return selection{
-		inputs: harness.AgentInputs{
-			Model:        agent.Model,
-			Instructions: agent.Prompt,
-			AssemblyMode: agent.SystemPrompt,
-			Tools:        agent.Tools,
-			Capabilities: agent.Capabilities,
-			Constraints:  harness.ToolConstraints{Readonly: agent.Readonly, WriteDir: agent.WriteDir},
-		}.Owned(),
+		inputs:      inputs,
 		scopes:      []*scope{sc},
 		selected:    selected,
 		invocation:  Invocation{snapshot: captured.snapshot},

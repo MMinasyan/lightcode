@@ -197,24 +197,26 @@ func TestNewConfigurationKeepsExistingWarningTypes(t *testing.T) {
 	testassert.Require(t, len(snapshot.catalogWarnings) == 1 && snapshot.catalogWarnings[0].Kind == "user_config_skip", "catalog warnings = %+v, want the retained catalog warning type", snapshot.catalogWarnings)
 }
 
-// TestConfigurationAgentTypesProjection proves the per-Agent view over the
-// reused instances: the roster order is preserved, identity and prompts
-// survive as public values, the capability selection reaches the Harness
-// unchanged, and every returned slice is owned by the caller.
+// TestConfigurationAgentTypesProjection proves the production resolver and
+// the source-qualified roster projection agree: the roster order is preserved,
+// the resolved identity and prompts survive as public values, the capability
+// selection reaches the Harness unchanged, and every returned slice is owned
+// by the caller.
 func TestConfigurationAgentTypesProjection(t *testing.T) {
 	snapshot := testSnapshot(t)
-	types := snapshot.agentTypes()
+	roster := projectAgents(snapshot)
 
 	want := []string{"primary", "secondary", "explore", "review", "compact", "plan"}
-	got := make([]string, len(types))
-	for i, at := range types {
-		got[i] = at.Name
+	got := make([]string, len(roster))
+	for i, agent := range roster {
+		got[i] = agent.Name
 	}
 	testassert.Require(t, reflect.DeepEqual(got, want), "projected roster = %q, want %q", got, want)
 
-	plan, err := resolveAgentType("plan", types)
+	planRef := harness.DefinitionRef{ExtensionID: agents.ExtensionID, CapabilityID: agents.DefinitionsCapabilityID, DefinitionID: "plan"}
+	plan, err := resolveDefinition(context.Background(), snapshot, planRef)
 	testassert.NoError(t, err)
-	testassert.Require(t, plan.Model == (model.ModelRef{Provider: "prov", Model: "m"}) && plan.SystemPrompt == "simple" && plan.Prompt == "plan prompt", "plan view = %+v, want the public identity and prompt fields", plan)
+	testassert.Require(t, plan.Model == (model.ModelRef{Provider: "prov", Model: "m"}) && plan.AssemblyMode == "simple" && plan.Instructions == "plan prompt", "plan inputs = %+v, want the resolved identity and prompt fields", plan)
 	{
 		wantTools := []string{"plan_tool", "plan_tool", "read_file"}
 		testassert.Require(t, reflect.DeepEqual(plan.Tools, wantTools), "plan tools = %q, want the retained configured names", plan.Tools)
@@ -223,44 +225,49 @@ func TestConfigurationAgentTypesProjection(t *testing.T) {
 		wantCaps := []string{"cap-b", "cap-a"}
 		testassert.Require(t, reflect.DeepEqual(plan.Capabilities, wantCaps), "plan capabilities = %q, want the selected order", plan.Capabilities)
 	}
-	testassert.Require(t, plan.Readonly && plan.WriteDir == "/tmp/plan", "plan permission constraints = %v %q", plan.Readonly, plan.WriteDir)
-	primaryView, err := resolveAgentType("primary", types)
+	testassert.Require(t, plan.Constraints.Readonly && plan.Constraints.WriteDir == "/tmp/plan", "plan permission constraints = %+v", plan.Constraints)
+	primary, err := resolveDefinition(context.Background(), snapshot, harness.DefinitionRef{ExtensionID: agents.ExtensionID, CapabilityID: agents.DefinitionsCapabilityID, DefinitionID: "primary"})
 	testassert.NoError(t, err)
-	testassert.Require(t, !primaryView.Readonly && primaryView.WriteDir == "", "primary permission constraints = %v %q", primaryView.Readonly, primaryView.WriteDir)
+	testassert.Require(t, !primary.Constraints.Readonly && primary.Constraints.WriteDir == "", "primary permission constraints = %+v", primary.Constraints)
 
-	// WriteDir is trimmed exactly once at projection, preserving the legacy
+	// WriteDir is trimmed exactly once at resolution, preserving the legacy
 	// whitespace-as-unset behavior: padded paths arrive clean and a
 	// whitespace-only path arrives as unset.
 	padded, err := assembleConfiguration(t, 4, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "  /tmp/plan  "`, 1), testCapabilities())
 	testassert.NoError(t, err)
-	paddedPlan, err := resolveAgentType("plan", padded.agentTypes())
+	paddedPlan, err := resolveDefinition(context.Background(), padded, planRef)
 	testassert.NoError(t, err)
-	testassert.Equal(t, paddedPlan.WriteDir, "/tmp/plan")
+	testassert.Equal(t, paddedPlan.Constraints.WriteDir, "/tmp/plan")
 	blank, err := assembleConfiguration(t, 5, testConfigDocument, strings.Replace(testAgentsDocument, `"write_dir": "/tmp/plan"`, `"write_dir": "   "`, 1), testCapabilities())
 	testassert.NoError(t, err)
-	blankPlan, err := resolveAgentType("plan", blank.agentTypes())
+	blankPlan, err := resolveDefinition(context.Background(), blank, planRef)
 	testassert.NoError(t, err)
-	testassert.Equal(t, blankPlan.WriteDir, "")
+	testassert.Equal(t, blankPlan.Constraints.WriteDir, "")
 
-	// Two Agent types selected from one projection keep their own views:
+	// Two Agent types resolved from one snapshot keep their own inputs:
 	// explore inherits primary's tools with no capability selection of its
 	// own, so declared-but-unselected IDs never appear in it. The inherited
 	// default tools are intersected with the compiled tool universe.
-	explore, err := resolveAgentType("explore", types)
+	explore, err := resolveDefinition(context.Background(), snapshot, harness.DefinitionRef{ExtensionID: agents.ExtensionID, CapabilityID: agents.DefinitionsCapabilityID, DefinitionID: "explore"})
 	testassert.NoError(t, err)
-	testassert.Require(t, explore.Model == plan.Model && explore.Capabilities == nil && reflect.DeepEqual(explore.Tools, []string{"read_file"}), "explore view = %+v, want the inherited model, an empty selection and the intersected default tools", explore)
+	testassert.Require(t, explore.Model == plan.Model && explore.Capabilities == nil && reflect.DeepEqual(explore.Tools, []string{"read_file"}), "explore inputs = %+v, want the inherited model, an empty selection and the intersected default tools", explore)
 	{
-		_, err := resolveAgentType("not-loaded", types)
+		_, err := resolveDefinition(context.Background(), snapshot, harness.DefinitionRef{ExtensionID: agents.ExtensionID, CapabilityID: agents.DefinitionsCapabilityID, DefinitionID: "not-loaded"})
 		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "unknown selection = %v, want ErrInvalid", err)
 	}
 
-	// Alias isolation: mutating a projection never feeds back into the
-	// snapshot or a later projection of the same snapshot.
+	// Alias isolation: mutating one projection or one resolution never feeds
+	// back into the snapshot or a later caller-owned result.
+	projectedPlan := roster[len(roster)-1]
+	projectedPlan.Tools[0] = "tampered"
+	projectedPlan.Capabilities[0] = "tampered"
 	plan.Tools[0] = "tampered"
 	plan.Capabilities[0] = "tampered"
-	again, err := resolveAgentType("plan", snapshot.agentTypes())
+	again := projectAgents(snapshot)
+	testassert.Require(t, again[len(again)-1].Tools[0] == "plan_tool" && again[len(again)-1].Capabilities[0] == "cap-b", "projection aliases the snapshot storage: %+v", again[len(again)-1])
+	againPlan, err := resolveDefinition(context.Background(), snapshot, planRef)
 	testassert.NoError(t, err)
-	testassert.Require(t, again.Tools[0] == "plan_tool" && again.Capabilities[0] == "cap-b", "projection aliases the snapshot storage: %+v", again)
+	testassert.Require(t, againPlan.Tools[0] == "plan_tool" && againPlan.Capabilities[0] == "cap-b", "resolution aliases the snapshot storage: %+v", againPlan)
 }
 
 // TestInvocationAgentTypesReturnsOwnedRoster proves the public roster view:

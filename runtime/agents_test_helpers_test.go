@@ -3,66 +3,16 @@ package runtime
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/MMinasyan/lightcode/extension"
 	agents "github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
-// agentType is a test-only assertion view over one projection entry. It is
-// not an execution value: production admission and capture consume the
-// complete harness.AgentInputs.
-type agentType struct {
-	Name         string
-	Model        model.ModelRef
-	SystemPrompt string
-	Prompt       string
-	Tools        []string
-	Capabilities []string
-	Readonly     bool
-	WriteDir     string
-}
-
 // suppliedDefinition builds one supplied Agents named selection for tests.
 func suppliedDefinition(name string) harness.AgentSelection {
-	return harness.AgentSelection{Definition: &harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: name}}
-}
-
-// agentTypes projects the captured immutable roster projection onto the
-// Harness execution view for tests that assert the resolved values. Named
-// admission resolves afresh through the provider; this helper reads only the
-// published projection.
-func (c *configuration) agentTypes() []agentType {
-	if c == nil {
-		return nil
-	}
-	out := make([]agentType, 0, len(c.definitions))
-	for _, definition := range c.definitions {
-		inputs := definition.inputs
-		out = append(out, agentType{
-			Name:         definition.name,
-			Model:        inputs.Model,
-			SystemPrompt: inputs.AssemblyMode,
-			Prompt:       inputs.Instructions,
-			Tools:        append([]string(nil), inputs.Tools...),
-			Capabilities: append([]string(nil), inputs.Capabilities...),
-			Readonly:     inputs.Constraints.Readonly,
-			WriteDir:     inputs.Constraints.WriteDir,
-		})
-	}
-	return out
-}
-
-func resolveAgentType(name string, available []agentType) (agentType, error) {
-	for _, agent := range available {
-		if agent.Name == name {
-			return agent, nil
-		}
-	}
-	return agentType{}, fmt.Errorf("unknown agent type %q: %w", name, harness.ErrInvalid)
+	return harness.AgentSelection{Definition: &harness.DefinitionRef{ExtensionID: agents.ExtensionID, CapabilityID: agents.DefinitionsCapabilityID, DefinitionID: name}}
 }
 
 // agentsTestNative builds the real supplied Agents extension over the

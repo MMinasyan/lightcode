@@ -739,19 +739,6 @@ func (c *Compiled) Components(lifetime Lifetime) []*CompiledComponent {
 	return c.byLifetime[lifetime]
 }
 
-// ToolIDs returns every declared tool capability ID in registration order.
-func (c *Compiled) ToolIDs() []string {
-	var ids []string
-	for _, declaration := range c.declarations {
-		for _, capability := range declaration.Declaration.Capabilities {
-			if capability.Kind == KindTool {
-				ids = append(ids, capability.ID)
-			}
-		}
-	}
-	return ids
-}
-
 // ValidateSection validates one active non-secret section against its local
 // schema.
 func (c *Compiled) ValidateSection(id string, section json.RawMessage) error {
@@ -800,16 +787,6 @@ func (c *Compiled) ValidateInstance(extensionID, componentID string, instance In
 }
 
 func (c *Compiled) component(extensionID, componentID string) (*CompiledComponent, bool) {
-	declaration, ok := c.byID[extensionID]
-	if !ok {
-		return nil, false
-	}
-	component, ok := declaration.Components[componentID]
-	return component, ok
-}
-
-// ComponentByID resolves one component by its extension/component identity.
-func (c *Compiled) ComponentByID(extensionID, componentID string) (*CompiledComponent, bool) {
 	declaration, ok := c.byID[extensionID]
 	if !ok {
 		return nil, false
@@ -966,13 +943,6 @@ func schemaStructurallyEqual(a, b json.RawMessage) bool {
 		return false
 	}
 	return reflect.DeepEqual(left, right)
-}
-
-func strategyEqual(a, b *StrategyDecl) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
 }
 
 func hasBoundary(hooks []Hook, boundary HookBoundary) bool {

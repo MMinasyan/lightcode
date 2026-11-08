@@ -6,7 +6,7 @@
   import { settings } from '../lib/settings.js';
   import { ProvisionalActivity } from './activity';
   import { AttemptLedger } from './attempts';
-  import { decodeDeletionResult, invokeNative } from './results';
+  import { invokeNative } from './results';
   import { classifyRestore, restoreLines } from './restore';
   import { composeForkBody, composeObjectPatch, parseExactJSON, presentNumber } from './exactjson';
   import { SessionReader, okRead, failRead, sameStamp } from './reader';
@@ -893,7 +893,7 @@
       return;
     }
     void refreshPicker();
-    const removed = await invoke('session delete', 'DeleteSession', JSON.stringify({ session_id: id }), decodeDeletionResult);
+    const removed = await invoke('session delete', 'DeleteSession', JSON.stringify({ session_id: id }), JSON.parse);
     reportDeletion(removed, `session ${id}`);
     await refreshPicker();
   }

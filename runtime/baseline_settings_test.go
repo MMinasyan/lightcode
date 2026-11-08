@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	agents "github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -54,28 +55,19 @@ func TestBaselineSettingsDriveToolsJobsAndCompaction(t *testing.T) {
 
 	// The five builtin Agent positions remain, and the compact definition
 	// keeps its own overlay.
-	var compact agentType
-	roster := snapshot.agentTypes()
+	roster := projectAgents(snapshot)
 	var builtinNames []string
-	for _, agent := range roster {
-		if agent.Name == "compact" {
-			compact = agent
-		}
-	}
 	for _, builtin := range []string{"primary", "secondary", "explore", "review", "compact"} {
-		found := false
 		for _, agent := range roster {
 			if agent.Name == builtin {
-				found = true
+				builtinNames = append(builtinNames, builtin)
 				break
 			}
 		}
-		if found {
-			builtinNames = append(builtinNames, builtin)
-		}
 	}
 	testassert.Equal(t, strings.Join(builtinNames, ","), "primary,secondary,explore,review,compact")
-	testassert.Require(t, compact.Name == "compact" && compact.Model.String() == "prov/m3" && compact.Prompt == retainedSummarizerPrompt, "compact definition = %+v, want its independent model overlay and the builtin instructions", compact)
+	compact := compactAgent(t, snapshot)
+	testassert.Require(t, compact.name == "compact" && compact.inputs.Model.String() == "prov/m3" && compact.inputs.Instructions == retainedSummarizerPrompt, "compact definition = %+v, want its independent model overlay and the builtin instructions", compact)
 
 	invocation := Invocation{snapshot: snapshot}
 
@@ -136,15 +128,15 @@ func TestBaselineCompactionAndCompactAgentEditIndependently(t *testing.T) {
 	}
 	snapshot := svc.current()
 	testassert.Require(t, snapshot.compactionValues.model == (model.ModelRef{Provider: "prov", Model: "m2"}) && snapshot.compactionValues.prompt == "baseline edit", "published compaction = %+v, want the baseline section", snapshot.compactionValues)
-	compactBefore := compactAgent(snapshot.agentTypes())
-	testassert.Require(t, compactBefore.Model.IsZero(), "compact Agent model = %s, want the builtin fallback", compactBefore.Model.String())
+	compactBefore := compactAgent(t, snapshot)
+	testassert.Require(t, compactBefore.inputs.Model.IsZero(), "compact Agent model = %s, want the builtin fallback", compactBefore.inputs.Model.String())
 
 	{
 		_, err := svc.mutate(context.Background(), svc.editAgentModel("compact", "prov/m3"))
 		testassert.NoError(t, err)
 	}
 	snapshot = svc.current()
-	testassert.Require(t, compactAgent(snapshot.agentTypes()).Model == (model.ModelRef{Provider: "prov", Model: "m3"}), "compact Agent model = %s, want the saved definition override", compactAgent(snapshot.agentTypes()).Model.String())
+	testassert.Require(t, compactAgent(t, snapshot).inputs.Model == (model.ModelRef{Provider: "prov", Model: "m3"}), "compact Agent model = %s, want the saved definition override", compactAgent(t, snapshot).inputs.Model.String())
 	testassert.Require(t, snapshot.compactionValues.model == (model.ModelRef{Provider: "prov", Model: "m2"}) && snapshot.compactionValues.prompt == "baseline edit", "compaction after the Agent edit = %+v, want the baseline values unchanged", snapshot.compactionValues)
 
 	settings := projectSettings(snapshot.sessions, snapshot.tools, snapshot.jobs, snapshot.compaction, snapshot.extensions)
@@ -155,16 +147,14 @@ func TestBaselineCompactionAndCompactAgentEditIndependently(t *testing.T) {
 	}
 	snapshot = svc.current()
 	testassert.Require(t, snapshot.compactionValues.model == (model.ModelRef{Provider: "prov", Model: "mzero"}) && snapshot.compactionValues.prompt == "settings edit", "compaction after the settings save = %+v, want the written baseline section", snapshot.compactionValues)
-	testassert.Require(t, compactAgent(snapshot.agentTypes()).Model == (model.ModelRef{Provider: "prov", Model: "m3"}), "compact Agent model after the settings save = %s, want the saved override unchanged", compactAgent(snapshot.agentTypes()).Model.String())
+	testassert.Require(t, compactAgent(t, snapshot).inputs.Model == (model.ModelRef{Provider: "prov", Model: "m3"}), "compact Agent model after the settings save = %s, want the saved override unchanged", compactAgent(t, snapshot).inputs.Model.String())
 }
 
-func compactAgent(roster []agentType) agentType {
-	for _, agent := range roster {
-		if agent.Name == "compact" {
-			return agent
-		}
-	}
-	return agentType{}
+func compactAgent(t *testing.T, snapshot *configuration) agentDefinition {
+	t.Helper()
+	agent, ok := snapshot.projectedDefinition(harness.DefinitionRef{ExtensionID: agents.ExtensionID, CapabilityID: agents.DefinitionsCapabilityID, DefinitionID: "compact"})
+	testassert.Require(t, ok, "compact definition is absent from the roster projection")
+	return agent
 }
 
 // TestCompactionSettingsResetRestoresFallbackDefaults proves a settings save
@@ -399,12 +389,12 @@ func TestConcretePrepareCompactionWithoutRoster(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, prep, captured := newBaselineSettingsService(t, tc.configDoc)
-			publishedRoster := len(captured.snapshot.agentTypes())
+			publishedRoster := len(projectAgents(captured.snapshot))
 			testassert.Require(t, publishedRoster != 0, "published roster is empty before the owned copy")
 
 			owned := *captured.snapshot
 			owned.definitions = nil
-			testassert.Equal(t, len(owned.agentTypes()), 0)
+			testassert.Equal(t, len(projectAgents(&owned)), 0)
 			selection := compactPrepSelection(t, captured, "solo")
 			selection.invocation = Invocation{snapshot: &owned}
 			capture, opener, err := prep.concretePrepare(context.Background(), compactPrepRequest(), selection)
@@ -412,7 +402,7 @@ func TestConcretePrepareCompactionWithoutRoster(t *testing.T) {
 			testassert.Require(t, opener != nil, "concretePrepare returned no opener")
 			testassert.Require(t, capture.Compact.Model.String() == tc.wantModel && capture.Compact.SystemPrompt == tc.wantPrompt, "rosterless compact capture = %+v, want %s with %q", capture.Compact, tc.wantModel, tc.wantPrompt)
 			testassert.Require(t, capture.Compact.Pricing != nil && capture.Compact.Pricing.Input != nil && *capture.Compact.Pricing.Input == tc.wantInput, "rosterless compact pricing = %+v, want input %v", capture.Compact.Pricing, tc.wantInput)
-			testassert.Equal(t, len(captured.snapshot.agentTypes()), publishedRoster)
+			testassert.Equal(t, len(projectAgents(captured.snapshot)), publishedRoster)
 		})
 	}
 }

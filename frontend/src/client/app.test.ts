@@ -2171,11 +2171,26 @@ describe('session picker tasks', () => {
 
   it.each([
     ['reports a lost Delete as outcome unknown and never as success', () => Promise.reject(new Error('delete lost'))],
-    ['reports an invalid-delivery Delete as outcome unknown and never as success', () => Promise.resolve(native(200, 'delete body undecodable', true))],
-    ['reports an unusable Delete success shape as outcome unknown and never as success', () => Promise.resolve(native(200, '{"cleanup_failures":null}', false))],
-    ['reports a Delete success shape with an unknown code as outcome unknown', () => Promise.resolve(native(200, '{"cleanup_failures":[{"code":"teapot","message":"x"}]}', false))],
-    ['reports the obsolete Delete 204 as invalid delivery', () => Promise.resolve(native(204, '', false))],
-    ['reports an unexpected Delete 201 as invalid delivery', () => Promise.resolve(native(201, '{"cleanup_failures":[]}', false))],
+    [
+      'reports an invalid-delivery Delete as outcome unknown and never as success',
+      () => Promise.resolve(native(200, 'delete body undecodable', true)),
+    ],
+    [
+      'reports an invalid-delivery Delete with an unusable success shape as outcome unknown',
+      () => Promise.resolve(native(200, '{"cleanup_failures":null}', true)),
+    ],
+    [
+      'reports an invalid-delivery Delete with an unknown failure code as outcome unknown',
+      () => Promise.resolve(native(200, '{"cleanup_failures":[{"code":"teapot","message":"x"}]}', true)),
+    ],
+    [
+      'reports the obsolete Delete 204 as invalid delivery',
+      () => Promise.resolve(native(204, '', true)),
+    ],
+    [
+      'reports an unexpected Delete 201 as invalid delivery',
+      () => Promise.resolve(native(201, '{"cleanup_failures":[]}', true)),
+    ],
   ])('%s', async (_title, deleteOutcome) => {
     vi.mocked(sdk.ArchiveSession).mockResolvedValue(json(200, session('root2', OLDER)));
     vi.mocked(sdk.DeleteSession).mockImplementation(deleteOutcome);
