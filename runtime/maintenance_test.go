@@ -934,9 +934,9 @@ func mustExist(t *testing.T, path, what string) {
 
 // TestPrivateDeleteSessionCleansArtifacts proves the direct deletion row: an
 // archived Session's deletion removes its whole artifact tree and nothing
-// else; the repeated delete and an unknown valid identity return the same
-// idempotent cleanup success; a deletion with no artifact directory at all is
-// already clean; and invalid or uncommitted deletions authorize no cleanup.
+// else; a repeated delete and an unknown valid identity return the ordinary
+// not-found and remove nothing; a deletion with no artifact directory at all
+// is already clean; and invalid or uncommitted deletions authorize no cleanup.
 func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
@@ -979,10 +979,10 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "read after delete = err %v, want ErrNotFound", err)
 		}
 
-		// the repeated delete is the same idempotent result with no artifacts left to clean
+		// a repeated delete is the ordinary not-found with nothing left to clean
 		{
 			_, err := r.deleteSession(ctx, archivedID)
-			testassert.NoError(t, err)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = err %v, want ErrNotFound", err)
 		}
 
 		// canonical deletion with no artifact directory at all is already clean
@@ -994,14 +994,14 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 
-		// an unknown valid identity with planted artifacts still cleans them
+		// an unknown valid identity is the ordinary not-found and leaves its planted artifacts untouched
 		const ghost = "0123456789abcdef0123456789abcdef" // valid hex identity, never registered
 		ghostCode := plantSessionCode(t, e.dataDir, ghost)
 		{
 			_, err := r.deleteSession(ctx, ghost)
-			testassert.NoError(t, err)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleteSession of an unknown identity = err %v, want ErrNotFound", err)
 		}
-		mustNotExist(t, ghostCode, "the unknown identity's artifacts")
+		mustExist(t, ghostCode, "the unknown identity's artifacts")
 
 		// invalid and uncommitted deletions remove nothing
 		open, err := r.createSession(ctx, filepath.Join(e.dataDir, "open"), "solo")

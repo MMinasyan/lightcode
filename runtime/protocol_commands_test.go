@@ -699,7 +699,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		}
 		{
 			_, err := r.deleteSession(ctx, sessionID)
-			testassert.NoError(t, err)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = %v, want harness.ErrNotFound", err)
 		}
 	})
 }

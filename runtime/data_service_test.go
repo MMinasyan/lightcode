@@ -486,7 +486,7 @@ func TestDataServiceClaimRequiresDeclaration(t *testing.T) {
 
 // TestDataServiceOwnersDeletionAndCleanupFailureTokens proves the shared
 // post-commit producer reports local and external failures separately, keeps
-// the canonical deletion, and only the first result can report owners.
+// the canonical deletion, and only the committing deletion can report owners.
 func TestDataServiceOwnersDeletionAndCleanupFailureTokens(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("directory permissions do not block writes as root")
@@ -561,10 +561,52 @@ func TestDataServiceOwnersDeletionAndCleanupFailureTokens(t *testing.T) {
 	testassert.NoError(t, os.Chmod(codeRoot, 0o755))
 	{
 		repeated, err := r.deleteSession(ctx, id)
-		testassert.NoError(t, err)
-		testassert.Require(t, len(repeated.CleanupFailures) == 0, "repeated delete = %+v, want local removal retry with no owner replay", repeated)
+		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = (%+v, %v), want the ordinary not-found", repeated, err)
+		testassert.Require(t, len(repeated.CleanupFailures) == 0, "repeated delete produced a cleanup result: %+v", repeated)
+		testassert.Require(t, goodCalls.Load() == 1 && badCalls.Load() == 1, "repeated delete replayed owner cleanup: calls = (%d, %d)", goodCalls.Load(), badCalls.Load())
 	}
-	mustNotExist(t, filepath.Join(e.dataDir, "code", id), "the retried local Session tree")
+	mustExist(t, filepath.Join(e.dataDir, "code", id), "the unremoved local tree after the absent deletion")
+}
+
+// TestDataServiceDeletionResultOnlyFromCommittingDelete proves only the
+// deletion that commits produces a cleanup result: a repeated delete reports
+// the ordinary not-found and replays no external cleanup.
+func TestDataServiceDeletionResultOnlyFromCommittingDelete(t *testing.T) {
+	e := newOwnerEnv(t)
+	var cleanupCalls atomic.Int64
+	bad := newDataProbe("probe_bad", func(context.Context, extension.CallContext) error {
+		cleanupCalls.Add(1)
+		return errors.New("guest secret detail must not escape")
+	})
+	writeServiceFile(t, e.configPath, dataConfig(e.server.URL, "probe_bad"))
+	e.fixtureStore(storage.NewMemory())
+	ctx := context.Background()
+	r, err := e.open(ctx, bad.native)
+	testassert.NoError(t, err)
+	defer r.Close(ctx)
+	workspace := filepath.Join(e.dataDir, "delete-once-ws")
+	testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+	session, err := r.createSession(ctx, workspace, "solo")
+	testassert.NoError(t, err)
+	id := session.Identity.SessionID
+	view, calls := dataView(t, r, bad.capability, id, nativeGrant{})
+	_, err = callData(t, calls, "claim_external_data")
+	testassert.NoError(t, err)
+	view.end()
+	{
+		_, err := r.archiveSession(ctx, id)
+		testassert.NoError(t, err)
+	}
+
+	result, err := r.deleteSession(ctx, id)
+	testassert.NoError(t, err)
+	testassert.Require(t, len(result.CleanupFailures) == 1 && result.CleanupFailures[0].ExtensionId != nil && *result.CleanupFailures[0].ExtensionId == "probe_bad" && result.CleanupFailures[0].Code == protocol.CleanupFailureCodeUnavailable, "first deletion failures = %+v, want the owner's unavailable failure", result.CleanupFailures)
+	testassert.Require(t, cleanupCalls.Load() == 1, "cleanup calls = %d, want the committing deletion's one attempt", cleanupCalls.Load())
+
+	repeated, err := r.deleteSession(ctx, id)
+	testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = (%+v, %v), want the ordinary not-found", repeated, err)
+	testassert.Require(t, len(repeated.CleanupFailures) == 0, "repeated delete produced a cleanup result: %+v", repeated)
+	testassert.Require(t, cleanupCalls.Load() == 1, "repeated delete replayed external cleanup: calls = %d", cleanupCalls.Load())
 }
 
 // TestDataServiceCleanupDisabledAndRemovedOwners proves a disabled or removed
@@ -922,8 +964,8 @@ func TestDataServiceOperationClaimAndCleanup(t *testing.T) {
 				}
 				{
 					repeated, err := r.deleteSession(ctx, id)
-					testassert.NoError(t, err)
-					testassert.Require(t, len(repeated.CleanupFailures) == 0 && cleanupCalls.Load() == 1, "repeated delete = %+v, cleanup calls %d, want no owner replay", repeated.CleanupFailures, cleanupCalls.Load())
+					testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = (%+v, %v), want the ordinary not-found", repeated, err)
+					testassert.Require(t, cleanupCalls.Load() == 1, "repeated delete replayed cleanup: calls = %d", cleanupCalls.Load())
 				}
 			})
 		})
@@ -1180,8 +1222,8 @@ func TestDataServiceCleanupResultSiblings(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "canonical deletion = %v, want it committed", err)
 		}
 		repeated, err := r.deleteSession(ctx, id)
-		testassert.NoError(t, err)
-		testassert.Require(t, len(repeated.CleanupFailures) == 0, "repeated result = %+v, want no owner replay", repeated.CleanupFailures)
+		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = (%+v, %v), want the ordinary not-found", repeated, err)
+		testassert.Require(t, len(repeated.CleanupFailures) == 0, "repeated delete produced a cleanup result: %+v", repeated)
 		for name, counter := range calls {
 			testassert.Require(t, counter.Load() == 1, "%s cleanup calls after repeat = %d", name, counter.Load())
 		}

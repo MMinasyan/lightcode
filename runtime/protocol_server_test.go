@@ -575,7 +575,7 @@ func TestProtocolServerSessionFamily(t *testing.T) {
 		testassert.Require(t, deleted.JSON200 != nil && len(deleted.JSON200.CleanupFailures) == 0, "DeleteSession = (%+v, %v), want the 200 committed result with no cleanup failures", deleted.JSON200, err)
 		repeated, err := client.DeleteSessionWithResponse(ctx, other)
 		testassert.NoError(t, err)
-		testassert.Require(t, repeated.JSON200 != nil && len(repeated.JSON200.CleanupFailures) == 0, "repeated DeleteSession = (%+v, %v), want the 200 idempotent result", repeated.JSON200, err)
+		testassert.Require(t, repeated.JSON200 == nil && repeated.JSONDefault != nil && repeated.HTTPResponse.StatusCode == http.StatusNotFound && repeated.JSONDefault.Code == protocol.ErrorCodeNotFound, "repeated DeleteSession = (%+v, %v), want the ordinary not-found", repeated.JSONDefault, err)
 		if missing, err := client.GetSessionHydrationWithResponse(ctx, other); err != nil || missing.JSON200 != nil {
 			t.Fatalf("deleted session read = (%d, %+v), want the typed not-found", missing.HTTPResponse.StatusCode, missing.JSON200)
 		} else if missing.JSONDefault == nil || missing.JSONDefault.Code != protocol.ErrorCodeNotFound {

@@ -405,13 +405,13 @@ func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, w
 // cleanup together. The deletion takes the Session's artifact interval
 // nonblockingly around its Harness transition and retains it through the
 // warning and cleanup producer, so a held interval refuses the deletion before
-// any transition; after Harness.DeleteSession commits — or reports the Session
-// already absent for a valid identity, the same idempotent result — the
-// Session's warning groups are removed in one observation section with one
-// runtime-scoped hint, then one producer removes the local tree and calls each
-// once-returned external owner. Any other Harness error (invalid input,
-// corruption, revision races, a closed admission) returns as-is and authorizes
-// no cleanup.
+// any transition. Only a committing deletion produces a result: after
+// Harness.DeleteSession commits, the Session's warning groups are removed in
+// one observation section with one runtime-scoped hint, then one producer
+// removes the local tree and calls each once-returned external owner. An
+// absent Session returns the Harness not-found unchanged, authorizing no
+// cleanup. Any other Harness error (invalid input, corruption, revision
+// races, a closed admission) returns as-is and authorizes no cleanup.
 func (r *Runtime) deleteSession(ctx context.Context, sessionID string) (protocol.DeletionResult, error) {
 	var result protocol.DeletionResult
 	err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
@@ -421,7 +421,7 @@ func (r *Runtime) deleteSession(ctx context.Context, sessionID string) (protocol
 		}
 		defer releaseArtifacts()
 		owners, err := h.DeleteSession(ctx, sessionID)
-		if err != nil && !errors.Is(err, harness.ErrNotFound) {
+		if err != nil {
 			return err
 		}
 		r.passive.removeSessionWarnings([]string{sessionID})
