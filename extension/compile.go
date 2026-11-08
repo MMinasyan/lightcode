@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -40,7 +41,7 @@ type Compiled struct {
 // CompiledDeclaration is one declaration's owned compiled form.
 type CompiledDeclaration struct {
 	Declaration  Declaration
-	Config       *jsonschema.Schema
+	config       *jsonschema.Schema
 	Capabilities map[string]*CompiledCapability
 	Components   map[string]*CompiledComponent
 }
@@ -129,7 +130,7 @@ func (c *Compiled) addDeclaration(declaration Declaration, index int) error {
 	}
 	compiled := &CompiledDeclaration{
 		Declaration:  declaration,
-		Config:       config,
+		config:       config,
 		Capabilities: make(map[string]*CompiledCapability, len(declaration.Capabilities)),
 		Components:   make(map[string]*CompiledComponent, len(declaration.Components)),
 	}
@@ -697,7 +698,7 @@ func (c *Compiled) ValidateSection(id string, section json.RawMessage) error {
 	if err != nil {
 		return invalid("extension %q section: %v", id, err)
 	}
-	if err := declaration.Config.Validate(value); err != nil {
+	if err := declaration.config.Validate(value); err != nil {
 		return invalid("extension %q section: %v", id, err)
 	}
 	return nil
@@ -800,12 +801,30 @@ func validateValue(schema *jsonschema.Schema, raw json.RawMessage, label string)
 	return nil
 }
 
+// schemaCacheKey identifies one compiled schema by its exact resource label
+// and exact schema bytes.
+type schemaCacheKey struct {
+	label string
+	raw   string
+}
+
+// compiledSchemas memoizes successful compilations process-wide. A compiled
+// *jsonschema.Schema is fully built by Compiler.Compile and validated only
+// through per-call validator state, so it is immutable after compilation and
+// safe for concurrent Validate. Failed compilations are never cached.
+var compiledSchemas sync.Map // schemaCacheKey -> *jsonschema.Schema
+
 // compileSchema compiles one local schema. Relative references resolve only
 // inside the supplied document; a remote reference reaches the rejecting
-// loader and fails. The compiler URL is private to this compile call.
-func compileSchema(raw json.RawMessage, _ string) (*jsonschema.Schema, error) {
+// loader and fails. The compiler URL is private to this compile call, and
+// identical label and bytes reuse one compiled schema.
+func compileSchema(raw json.RawMessage, label string) (*jsonschema.Schema, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, errors.New("missing schema")
+	}
+	key := schemaCacheKey{label: label, raw: string(raw)}
+	if cached, ok := compiledSchemas.Load(key); ok {
+		return cached.(*jsonschema.Schema), nil
 	}
 	document, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
 	if err != nil {
@@ -817,7 +836,12 @@ func compileSchema(raw json.RawMessage, _ string) (*jsonschema.Schema, error) {
 	if err := compiler.AddResource(location, document); err != nil {
 		return nil, err
 	}
-	return compiler.Compile(location)
+	schema, err := compiler.Compile(location)
+	if err != nil {
+		return nil, err
+	}
+	compiledSchemas.Store(key, schema)
+	return schema, nil
 }
 
 type rejectingLoader struct{}
@@ -876,6 +900,9 @@ func methodStructurallyEqual(a, b Method) bool {
 }
 
 func schemaStructurallyEqual(a, b json.RawMessage) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
 	emptyA := len(bytes.TrimSpace(a)) == 0
 	emptyB := len(bytes.TrimSpace(b)) == 0
 	if emptyA || emptyB {

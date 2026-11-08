@@ -938,3 +938,82 @@ func TestSessionCleanupAndDataContracts(t *testing.T) {
 		})
 	}
 }
+
+// TestCompileReusesCompiledSchemasForIdenticalDeclaration proves the
+// process-wide schema memoization: compiling the same declaration a second
+// time reuses the identical compiled schema instances and compile and
+// validation outcomes are identical across both compilations, while an
+// identical document under another method label is compiled separately.
+func TestCompileReusesCompiledSchemasForIdenticalDeclaration(t *testing.T) {
+	input := `{"type":"object","required":["name"],"properties":{"name":{"type":"string"}},"additionalProperties":false}`
+	native := testNative("memo", LifetimeHarness, []Capability{ServiceCapability("memo.service", "test.memo",
+		ServiceMethod("call", ModeServiceIO, input, `{"type":"object"}`, "", ""),
+		ServiceMethod("other", ModeServiceIO, input, `{"type":"object"}`, "", ""))}, nil, nil)
+	first, err := Compile([]Native{native})
+	if err != nil {
+		t.Fatalf("first Compile: %v", err)
+	}
+	second, err := Compile([]Native{native})
+	if err != nil {
+		t.Fatalf("second Compile: %v", err)
+	}
+	firstService, _ := first.Capability("memo.service")
+	secondService, _ := second.Capability("memo.service")
+	if firstService.Methods["call"].input != secondService.Methods["call"].input {
+		t.Fatal("second Compile recompiled the identical input schema")
+	}
+	if first.Declarations()[0].config != second.Declarations()[0].config {
+		t.Fatal("second Compile recompiled the identical config schema")
+	}
+	if firstService.Methods["call"].input == firstService.Methods["other"].input {
+		t.Fatal("identical bytes under another method label served the first label's schema")
+	}
+	for _, row := range []struct {
+		name      string
+		arguments string
+		wantValid bool
+	}{
+		{"valid", `{"name":"x"}`, true},
+		{"missing required", `{"other":"x"}`, false},
+		{"wrong type", `{"name":5}`, false},
+	} {
+		firstErr := ValidateArguments(firstService.Methods, "call", json.RawMessage(row.arguments))
+		secondErr := ValidateArguments(secondService.Methods, "call", json.RawMessage(row.arguments))
+		if (firstErr == nil) != row.wantValid || (secondErr == nil) != row.wantValid {
+			t.Fatalf("%s: first error = %v second error = %v, want valid = %v", row.name, firstErr, secondErr, row.wantValid)
+		}
+	}
+}
+
+// TestCompileDoesNotReuseSchemaForSameLabelDifferentBytes proves the memo is
+// keyed by exact bytes: a second declaration carrying a different schema
+// document under the same capability and method labels compiles its own
+// schema, and its validation differs from the first compilation.
+func TestCompileDoesNotReuseSchemaForSameLabelDifferentBytes(t *testing.T) {
+	object := testNative("bytes", LifetimeHarness, []Capability{ServiceCapability("svc", "test.bytes",
+		ServiceMethod("call", ModeServiceIO, `{"type":"object"}`, `{"type":"object"}`, "", ""))}, nil, nil)
+	first, err := Compile([]Native{object})
+	if err != nil {
+		t.Fatalf("first Compile: %v", err)
+	}
+	stringDoc := testNative("bytes", LifetimeHarness, []Capability{ServiceCapability("svc", "test.bytes",
+		ServiceMethod("call", ModeServiceIO, `{"type":"string"}`, `{"type":"object"}`, "", ""))}, nil, nil)
+	second, err := Compile([]Native{stringDoc})
+	if err != nil {
+		t.Fatalf("second Compile: %v", err)
+	}
+	firstService, _ := first.Capability("svc")
+	secondService, _ := second.Capability("svc")
+	if firstService.Methods["call"].input == secondService.Methods["call"].input {
+		t.Fatal("same label with different bytes served the first compilation's schema")
+	}
+	if err := ValidateArguments(firstService.Methods, "call", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("object input schema rejected {}: %v", err)
+	}
+	if err := ValidateArguments(secondService.Methods, "call", json.RawMessage(`{}`)); err == nil {
+		t.Fatal("string input schema accepted {}")
+	}
+	if err := ValidateArguments(secondService.Methods, "call", json.RawMessage(`"x"`)); err != nil {
+		t.Fatalf("string input schema rejected \"x\": %v", err)
+	}
+}
