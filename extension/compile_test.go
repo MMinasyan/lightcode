@@ -270,27 +270,6 @@ func TestCompileAcceptsMultipleHookBoundaries(t *testing.T) {
 	}
 }
 
-func TestCompileExposesIndividualMethodKeys(t *testing.T) {
-	methods := []Method{PureMethod("read", `{}`, `{}`), PureMethod("write", `{}`, `{}`)}
-	capability := ServiceCapability("service", "test.service", methods...)
-	capability.Exposed = []ExposedMethod{{Method: "read", Kind: "query", Target: "session"}}
-	native := testNative("ext", LifetimeHarness, []Capability{capability}, nil, nil)
-	if _, err := Compile([]Native{native}); err != nil {
-		t.Fatalf("Compile with one exposed method: %v", err)
-	}
-	capability.Exposed = []ExposedMethod{
-		{Method: "read", Kind: "query", Target: "session"},
-		{Method: "read", Kind: "management", Target: "harness"},
-	}
-	if _, err := Compile([]Native{testNative("ext", LifetimeHarness, []Capability{capability}, nil, nil)}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("duplicate exposed method error = %v, want ErrInvalid", err)
-	}
-	capability.Exposed = []ExposedMethod{{Method: "ghost", Kind: "query", Target: "session"}}
-	if _, err := Compile([]Native{testNative("ext", LifetimeHarness, []Capability{capability}, nil, nil)}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("undeclared exposed method error = %v, want ErrInvalid", err)
-	}
-}
-
 func TestCompileComparesMethodsBySetAndIgnoresParticipationMetadata(t *testing.T) {
 	providerMethods := []Method{PureMethod("a", `{}`, `{}`), PureMethod("b", `{}`, `{}`)}
 	provider := ServiceCapability("provider", "test.provider", providerMethods...)

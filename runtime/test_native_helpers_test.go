@@ -44,16 +44,6 @@ func testServiceImplementation() extension.Implementation {
 	return extension.Implementation{Service: map[string]extension.Handler{"call": testServiceHandler()}}
 }
 
-func testServiceNative(id string, lifetime extension.Lifetime, open func(context.Context, extension.InstanceContext) (extension.Instance, error)) extension.Native {
-	capabilityID := "capability." + id
-	if open == nil {
-		open = func(context.Context, extension.InstanceContext) (extension.Instance, error) {
-			return extension.Instance{Capabilities: map[string]extension.Implementation{capabilityID: testServiceImplementation()}}, nil
-		}
-	}
-	return testNative(id, lifetime, []extension.Capability{testServiceCapability(capabilityID)}, nil, open)
-}
-
 func testToolNative(id string, lifetime extension.Lifetime, tool extension.Tool, describe func(context.Context, extension.DescribeInput) (extension.ToolDescription, error)) extension.Native {
 	native := testNative(id, lifetime, []extension.Capability{extension.ToolCapability(id)}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
 		return extension.Instance{Capabilities: map[string]extension.Implementation{id: {Tool: tool}}}, nil

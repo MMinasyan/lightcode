@@ -23,7 +23,6 @@ const (
 	ContractData             = "melta.data"
 	ContractSessionCleanup   = "melta.session_cleanup"
 	ContractCredentials      = "melta.credentials" // #nosec G101 -- Protocol contract identifier, not a credential value.
-	ContractCommands         = "melta.commands"
 
 	// ContractVersion is the one accepted version of every fixed contract.
 	ContractVersion = "1"
@@ -151,14 +150,13 @@ type Component struct {
 
 // Capability declares one contributed contract instance.
 type Capability struct {
-	ID              string          `json:"id"`
-	ContractID      string          `json:"contract_id"`
-	ContractVersion string          `json:"contract_version"`
-	Kind            Kind            `json:"kind"`
-	Methods         []Method        `json:"methods,omitempty"`
-	Hooks           []Hook          `json:"hooks,omitempty"`
-	Strategy        *StrategyDecl   `json:"strategy,omitempty"`
-	Exposed         []ExposedMethod `json:"exposed,omitempty"`
+	ID              string        `json:"id"`
+	ContractID      string        `json:"contract_id"`
+	ContractVersion string        `json:"contract_version"`
+	Kind            Kind          `json:"kind"`
+	Methods         []Method      `json:"methods,omitempty"`
+	Hooks           []Hook        `json:"hooks,omitempty"`
+	Strategy        *StrategyDecl `json:"strategy,omitempty"`
 }
 
 // Method declares one named-service method and its closed input/result domain.
@@ -195,14 +193,6 @@ type StrategyDecl struct {
 	RequiresContextWindow bool `json:"requires_context_window"`
 }
 
-// ExposedMethod declares one named-service MethodKey's public invocation
-// shape. It is owned data now; the endpoint lands with its consumer.
-type ExposedMethod struct {
-	Method string `json:"method"`
-	Kind   string `json:"kind"`
-	Target string `json:"target"`
-}
-
 // Binding declares one local dependency name and the exact contract the
 // consumer expects from its provider.
 type Binding struct {
@@ -214,7 +204,7 @@ type Binding struct {
 
 // CapabilityDefinition is the exact structural contract shared by a provider
 // and every consumer: the provider's capability declaration minus its opaque
-// identity and exposure.
+// identity.
 type CapabilityDefinition struct {
 	ContractID      string        `json:"contract_id"`
 	ContractVersion string        `json:"contract_version"`
@@ -298,7 +288,6 @@ func (d Declaration) owned() Declaration {
 			strategy := *capability.Strategy
 			owned.Strategy = &strategy
 		}
-		owned.Exposed = append([]ExposedMethod(nil), capability.Exposed...)
 		out.Capabilities[i] = owned
 	}
 	out.Edits = append([]ConfigurationEdit(nil), d.Edits...)

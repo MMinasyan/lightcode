@@ -33,7 +33,6 @@ var (
 	errFactory      = errors.New("test factory failure")
 	errCloser       = errors.New("test closer failure")
 	errWorkspaceClo = errors.New("test workspace closer failure")
-	errValidator    = errors.New("test validator failure")
 )
 
 func runtimeScopeInfo() ScopeInfo {
@@ -56,13 +55,6 @@ func mustOpenScope(t *testing.T, c *composition, ctx context.Context, info Scope
 	sc, err := c.openScope(ctx, info, ancestors)
 	testassert.Require(t, err == nil, "openScope(%s %q): %v", info.Kind, info.Workspace, err)
 	return sc
-}
-
-func settingsOrNone(raw json.RawMessage) string {
-	if raw == nil {
-		return "none"
-	}
-	return string(raw)
 }
 
 type workspaceFactoryError struct{}

@@ -353,18 +353,12 @@ func compileMethod(capabilityID string, method Method, index int) (*methodContra
 func validateCapabilityShape(declaration *CompiledDeclaration, capability *CompiledCapability) error {
 	switch capability.Kind {
 	case KindTool:
-		if capability.ContractID != ContractTool {
-			return invalid("capability %q: tool kind requires contract %s", capability.ID, ContractTool)
-		}
 		if len(capability.Hooks) != 0 || capability.Strategy != nil {
 			return invalid("capability %q: tool carries hook or strategy metadata", capability.ID)
 		}
-		if !sameMethods(capability.Methods, toolMethods()) {
-			return invalid("capability %q: tool method set differs from %s", capability.ID, ContractTool)
-		}
 	case KindHook:
-		if capability.ContractID != ContractHook || len(capability.Hooks) == 0 {
-			return invalid("capability %q: hook kind requires contract %s and hook metadata", capability.ID, ContractHook)
+		if len(capability.Hooks) == 0 {
+			return invalid("capability %q: hook kind requires hook metadata", capability.ID)
 		}
 		if capability.Strategy != nil {
 			return invalid("capability %q: hook carries strategy metadata", capability.ID)
@@ -385,18 +379,12 @@ func validateCapabilityShape(declaration *CompiledDeclaration, capability *Compi
 				return invalid("capability %q: %s hooks must be pure", capability.ID, hook.Boundary)
 			}
 		}
-		if !sameMethods(capability.Methods, hookMethods(capability.Hooks)) {
-			return invalid("capability %q: hook method set differs from its declared boundaries", capability.ID)
-		}
 	case KindStrategy:
-		if capability.ContractID != ContractContextStrategy || capability.Strategy == nil {
-			return invalid("capability %q: strategy kind requires contract %s and strategy metadata", capability.ID, ContractContextStrategy)
+		if capability.Strategy == nil {
+			return invalid("capability %q: strategy kind requires strategy metadata", capability.ID)
 		}
 		if len(capability.Hooks) != 0 {
 			return invalid("capability %q: strategy carries hook metadata", capability.ID)
-		}
-		if !sameMethods(capability.Methods, strategyMethods()) {
-			return invalid("capability %q: strategy method set differs from %s", capability.ID, ContractContextStrategy)
 		}
 	case KindService:
 		if len(capability.Hooks) != 0 || capability.Strategy != nil {
@@ -406,48 +394,7 @@ func validateCapabilityShape(declaration *CompiledDeclaration, capability *Compi
 			return invalid("capability %q: service declares no methods", capability.ID)
 		}
 	}
-	if len(capability.Exposed) != 0 {
-		if capability.Kind != KindService {
-			return invalid("capability %q: exposed methods require service kind", capability.ID)
-		}
-		seen := make(map[string]bool, len(capability.Exposed))
-		for _, exposed := range capability.Exposed {
-			if _, ok := capability.Methods[exposed.Method]; !ok {
-				return invalid("capability %q: exposed method %q is undeclared", capability.ID, exposed.Method)
-			}
-			if seen[exposed.Method] {
-				return invalid("capability %q: duplicate exposed method %q", capability.ID, exposed.Method)
-			}
-			seen[exposed.Method] = true
-			switch exposed.Kind {
-			case "query", "management", "session_work":
-			default:
-				return invalid("capability %q: invalid exposed kind %q", capability.ID, exposed.Kind)
-			}
-			switch exposed.Target {
-			case "harness", "workspace", "session":
-			default:
-				return invalid("capability %q: invalid exposed target %q", capability.ID, exposed.Target)
-			}
-		}
-	}
 	return nil
-}
-
-func sameMethods(resolved MethodSet, declared []Method) bool {
-	if len(resolved) != len(declared) {
-		return false
-	}
-	for _, method := range declared {
-		compiled, ok := resolved[method.Name]
-		if !ok {
-			return false
-		}
-		if !methodStructurallyEqual(compiled.Method, method) {
-			return false
-		}
-	}
-	return true
 }
 
 func validateComponentRequires(declaration *CompiledDeclaration, component *CompiledComponent) error {

@@ -8,7 +8,6 @@ package runtime
 // call with no Session binding or grant.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"time"
@@ -113,9 +112,6 @@ func (r *Runtime) cleanupExternalOwner(ctx context.Context, snapshot *configurat
 	defer cancel()
 	result, err := composition.invokeProvider(callCtx, provider, capability.Methods, "cleanup", arguments, nil, callIdentity{revision: snapshot.resources.revisionString()}, false)
 	if err != nil || result.Failure != nil {
-		return failure
-	}
-	if !bytes.Equal(bytes.TrimSpace(result.Value), []byte("null")) {
 		return failure
 	}
 	return nil
