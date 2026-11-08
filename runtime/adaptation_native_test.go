@@ -32,6 +32,7 @@ const adaptationRuntimeAgents = `{
   "modenone": {"model": "prov/adaptive", "system_prompt": "none", "tools": ["read_file"], "capabilities": ["model_adaptation"]},
   "bundledfull": {"model": "prov/gpt-5.5", "system_prompt": "full", "tools": ["read_file", "write_file", "edit_file", "apply_patch"], "capabilities": ["model_adaptation"]},
   "bundlednone": {"model": "prov/gpt-5.5", "system_prompt": "none", "tools": ["read_file", "write_file", "edit_file", "apply_patch"], "capabilities": ["model_adaptation"]},
+  "visible": {"model": "prov/adaptive", "system_prompt": "full", "tools": ["read_file", "write_file", "apply_patch"], "capabilities": ["hook.first", "model_adaptation"]},
   "readonly": {"model": "prov/adaptive", "system_prompt": "full", "tools": ["read_file", "write_file"], "readonly": true, "capabilities": ["model_adaptation"]},
   "reload": {"model": "prov/adaptive", "system_prompt": "full", "tools": ["read_file"], "capabilities": ["park.second", "model_adaptation"]}
 }`
@@ -69,16 +70,24 @@ func writeAdaptationEntries(t *testing.T, configPath, entries string) {
 func newAdaptationRuntime(t *testing.T, entries string, extra ...extension.Native) (*productionEnv, *Runtime) {
 	t.Helper()
 	e := newProductionEnv(t, storage.NewMemory())
+	return e, openAdaptationRuntime(t, e, entries, e.hookedHook(), extra...)
+}
+
+// openAdaptationRuntime opens one fixture environment's catalog, agents and
+// configured entries with a caller-supplied preparation contribution placed
+// before the shipped adaptation native.
+func openAdaptationRuntime(t *testing.T, e *productionEnv, entries string, hook *recordHook, extra ...extension.Native) *Runtime {
+	t.Helper()
 	writeServiceFile(t, e.configPath, adaptationConfigDocument(e.server.URL, entries))
 	writeAgentDefinitions(t, e.configPath, adaptationRuntimeAgents)
 	e.server.setScript(func(context.Context, string) []string { return textTurnEvents("done") })
-	plugins := []extension.Native{hookPlugin(e.hookedHook())}
+	plugins := []extension.Native{hookPlugin(hook)}
 	plugins = append(plugins, extra...)
 	plugins = append(plugins, ShippedAdaptationPlugin())
 	r, err := e.openPlugins(context.Background(), plugins...)
 	testassert.NoError(t, err)
 	t.Cleanup(func() { _ = r.Close(context.Background()) })
-	return e, r
+	return r
 }
 
 func adaptationWorkspace(t *testing.T, e *productionEnv, name string) string {
@@ -152,6 +161,39 @@ func assertAdaptationWire(t *testing.T, doc wireChatBody, record harness.Operati
 		if wantDescription != "" {
 			testassert.Require(t, strings.Contains(tool.Function.Description, wantDescription), "wire tool %q description = %q, want %q", tool.Function.Name, tool.Function.Description, wantDescription)
 		}
+	}
+}
+
+// TestAdaptationNativeToolSelectionFollowsPrepareVisibility proves a matched
+// rule selects from the tools the preceding preparation hook left visible,
+// never from the complete eligible catalog the rule also receives.
+func TestAdaptationNativeToolSelectionFollowsPrepareVisibility(t *testing.T) {
+	hider := func() *recordHook {
+		return &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in extension.PreparationInput) extension.PreparationConsequence {
+			visible := make([]string, 0, len(in.Tools))
+			for _, definition := range in.Tools {
+				if definition.Name != "write_file" {
+					visible = append(visible, definition.Name)
+				}
+			}
+			return extension.PreparationConsequence{ToolNames: visible}
+		}}
+	}
+	for _, row := range []struct {
+		name    string
+		entries string
+		want    []string
+	}{
+		{"prompt only", `[{"pattern":"*adaptive*","prompt":"ADAPTED"}]`, []string{"read_file", "apply_patch"}},
+		{"exclusion", `[{"pattern":"*adaptive*","exclude_tools":["apply_patch"]}]`, []string{"read_file"}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			e := newProductionEnv(t, storage.NewMemory())
+			r := openAdaptationRuntime(t, e, row.entries, hider(), parkPlugin(&parkingHook{}))
+			workspace := adaptationWorkspace(t, e, "adapt-visible")
+			record := namedAdaptationOperation(t, r, workspace, "visible", "op-visible")
+			testassert.Require(t, slices.Equal(record.Admission.Execution.InitialToolNames, row.want), "advertisement = %v, want %v", record.Admission.Execution.InitialToolNames, row.want)
+		})
 	}
 }
 

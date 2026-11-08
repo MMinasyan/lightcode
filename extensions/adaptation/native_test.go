@@ -63,6 +63,7 @@ func prepareSection(t *testing.T, section string, ref model.ModelRef, mode promp
 		Assembly: prompt.AssemblyInput{Mode: mode},
 		Prompt:   "BASE_PROMPT",
 		Catalog:  fixtureCatalog(),
+		Tools:    fixtureCatalog(),
 	})
 	testassert.NoError(t, err)
 	return consequence
@@ -123,7 +124,7 @@ func TestConfiguredSchemaValidatesConsumedTypes(t *testing.T) {
 func TestPrepareAppliesShippedBundledRows(t *testing.T) {
 	// The GPT-family row: excluded file tools, the literal description
 	// replacement, the task-execution append paragraph, and the matched view
-	// computed from the complete eligible catalog.
+	// computed from the incoming visible tools.
 	got := prepareHook(t, model.ModelRef{Provider: "openai", Model: "gpt-5.5-mini"}, prompt.ModeFull)
 	testassert.Require(t, reflect.DeepEqual(got.ToolNames, []string{"read_file", "apply_patch", "run_command", "note_editor"}), "selected tools = %q, want the excluded file tools absent in catalog order", got.ToolNames)
 	{
@@ -133,10 +134,10 @@ func TestPrepareAppliesShippedBundledRows(t *testing.T) {
 	testassert.Require(t, got.Prompt != nil && strings.HasPrefix(*got.Prompt, "BASE_PROMPT\n\n") && strings.Contains(*got.Prompt, "Use more tool calls when they can improve the response"), "prompt = %v, want the baseline with the shipped guidance paragraph appended", got.Prompt)
 
 	// The grok and gemini rows carry append paragraphs with no tool levers;
-	// a match still states the complete eligible view.
+	// a match still states the complete visible view.
 	for _, ref := range []model.ModelRef{{Provider: "xai", Model: "grok-build-0.1"}, {Provider: "google", Model: "gemini-3-pro"}} {
 		got := prepareHook(t, ref, prompt.ModeFull)
-		testassert.Require(t, reflect.DeepEqual(got.ToolNames, fixtureToolNames()) && len(got.Descriptions) == 0 && got.Prompt != nil && strings.HasPrefix(*got.Prompt, "BASE_PROMPT\n\n"), "%s treatment = %+v, want append paragraphs and the full eligible view", ref.String(), got)
+		testassert.Require(t, reflect.DeepEqual(got.ToolNames, fixtureToolNames()) && len(got.Descriptions) == 0 && got.Prompt != nil && strings.HasPrefix(*got.Prompt, "BASE_PROMPT\n\n"), "%s treatment = %+v, want append paragraphs and the full visible view", ref.String(), got)
 	}
 }
 
@@ -239,20 +240,54 @@ func TestConfiguredDecodeUsesExactCaseJSONNames(t *testing.T) {
 	testassert.Require(t, got.Descriptions == nil, "literal replacement keys = %q, want no case-folded match against reads one file", got.Descriptions)
 }
 
-func TestConfiguredToolViewIsCatalogMinusExclusions(t *testing.T) {
+func TestConfiguredToolViewIsVisibleMinusExclusions(t *testing.T) {
 	section := `{"enabled":true,"entries":[{"pattern":"*","exclude_tools":["write_file","edit_file"]}]}`
 	got := prepareSection(t, section, model.ModelRef{Provider: "prov", Model: "any"}, prompt.ModeFull)
-	testassert.Require(t, reflect.DeepEqual(got.ToolNames, []string{"read_file", "apply_patch", "run_command", "note_editor"}), "configured view = %q, want the eligible catalog minus its exclusions", got.ToolNames)
+	testassert.Require(t, reflect.DeepEqual(got.ToolNames, []string{"read_file", "apply_patch", "run_command", "note_editor"}), "configured view = %q, want the visible tools minus its exclusions", got.ToolNames)
 
 	all := `{"enabled":true,"entries":[{"pattern":"*","exclude_tools":["read_file","write_file","edit_file","apply_patch","run_command","note_editor"]}]}`
 	got = prepareSection(t, all, model.ModelRef{Provider: "prov", Model: "any"}, prompt.ModeFull)
 	testassert.Require(t, got.ToolNames != nil && len(got.ToolNames) == 0, "all-excluded view = %#v, want a present empty selection", got.ToolNames)
 
-	// The rule cannot recover a tool absent from the complete eligible
-	// catalog it receives.
 	section = `{"enabled":true,"entries":[{"pattern":"*","exclude_tools":[]}]}`
 	got = prepareSection(t, section, model.ModelRef{Provider: "prov", Model: "any"}, prompt.ModeFull)
-	testassert.Require(t, reflect.DeepEqual(got.ToolNames, fixtureToolNames()), "unexcluded view = %q, want exactly the eligible catalog", got.ToolNames)
+	testassert.Require(t, reflect.DeepEqual(got.ToolNames, fixtureToolNames()), "unexcluded view = %q, want exactly the incoming visible tools", got.ToolNames)
+}
+
+// TestConfiguredToolViewFollowsIncomingVisibleSubset proves a match selects
+// from the tools already-run hooks left visible, not from the complete
+// eligible catalog the rule also receives.
+func TestConfiguredToolViewFollowsIncomingVisibleSubset(t *testing.T) {
+	// The incoming subset is deliberately in reverse catalog order, so a view
+	// rebuilt in catalog order is distinguishable from the incoming order.
+	tools := []model.ToolDefinition{
+		{Name: "note_editor", Description: "Edit edit_file or write_file via one call."},
+		{Name: "run_command", Description: bundledGPTGuidanceLine},
+		{Name: "apply_patch", Description: "applies one patch"},
+	}
+	prepare := func(section string, tools []model.ToolDefinition) extension.PreparationConsequence {
+		t.Helper()
+		hook := openHook(t, section)
+		consequence, err := hook(context.Background(), extension.CallContext{}, extension.PreparationInput{
+			Model:    model.ModelRef{Provider: "prov", Model: "any"},
+			Assembly: prompt.AssemblyInput{Mode: prompt.ModeFull},
+			Prompt:   "BASE_PROMPT",
+			Catalog:  fixtureCatalog(),
+			Tools:    tools,
+		})
+		testassert.NoError(t, err)
+		return consequence
+	}
+
+	got := prepare(`{"enabled":true,"entries":[{"pattern":"*","prompt":"SUBSET"}]}`, tools)
+	testassert.Require(t, reflect.DeepEqual(got.ToolNames, []string{"note_editor", "run_command", "apply_patch"}), "prompt-only view = %q, want the incoming visible subset in its order", got.ToolNames)
+
+	got = prepare(`{"enabled":true,"entries":[{"pattern":"*","exclude_tools":["read_file","run_command"]}]}`, tools)
+	testassert.Require(t, reflect.DeepEqual(got.ToolNames, []string{"note_editor", "apply_patch"}), "exclusion view = %q, want the incoming order minus the exclusion, the absent name not restored", got.ToolNames)
+
+	// An earlier hook that hid every tool leaves a present empty selection.
+	got = prepare(`{"enabled":true,"entries":[{"pattern":"*","prompt":"NONE_VISIBLE"}]}`, []model.ToolDefinition{})
+	testassert.Require(t, got.ToolNames != nil && len(got.ToolNames) == 0, "empty incoming view = %#v, want a present empty selection", got.ToolNames)
 }
 
 func TestConfiguredDescriptionReplacementUsesEligibleCatalogText(t *testing.T) {

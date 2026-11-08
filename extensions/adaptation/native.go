@@ -86,8 +86,8 @@ func (h hook) Prepare(_ context.Context, _ extension.CallContext, input extensio
 	for _, name := range matched.adapt.ExcludeTools {
 		excluded[name] = true
 	}
-	visible := make([]string, 0, len(input.Catalog))
-	for _, definition := range input.Catalog {
+	visible := make([]string, 0, len(input.Tools))
+	for _, definition := range input.Tools {
 		if !excluded[definition.Name] {
 			visible = append(visible, definition.Name)
 		}

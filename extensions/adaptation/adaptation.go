@@ -1,8 +1,8 @@
 // Package adaptation owns Lightcode's ordinary native per-model adaptation
 // extension. Ordered configured match entries precede the bundled data rows;
 // the first match decides. A matched entry may replace the complete prompt,
-// append ordered paragraphs, exclude eligible tools, and rewrite literal
-// model-facing tool description text through the extension's single
+// append ordered paragraphs, exclude currently visible tools, and rewrite
+// literal model-facing tool description text through the extension's single
 // preparation hook.
 //
 // The matcher in this package is the only place in the codebase that inspects
@@ -21,9 +21,9 @@ type Adaptation struct {
 	// incoming text in place.
 	Prompt *string
 
-	// ExcludeTools lists eligible tool names excluded from this model's
-	// advertisement. The matched view is the complete eligible catalog minus
-	// these names.
+	// ExcludeTools lists visible tool names excluded from this model's
+	// advertisement. The matched view is the incoming visible tool subset
+	// minus these names.
 	ExcludeTools []string
 
 	// Append lists prompt parts appended to the incoming or explicitly
