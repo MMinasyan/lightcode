@@ -2049,19 +2049,21 @@ func encodeSessionState(v SessionState) (json.RawMessage, error) {
 	wire, err := json.Marshal(struct {
 		Lifecycle          string          `json:"lifecycle"`
 		ArchivedAt         *string         `json:"archived_at,omitempty"`
-		CurrentAgentType   string          `json:"current_agent_type"`
+		AgentSelection     AgentSelection  `json:"agent_selection"`
 		CurrentOperationID string          `json:"current_operation_id,omitempty"`
 		CheckpointEntryID  string          `json:"checkpoint_entry_id,omitempty"`
 		Usage              json.RawMessage `json:"usage"`
 		LastActivity       string          `json:"last_activity"`
+		ExternalDataOwners []string        `json:"external_data_owners"`
 	}{
 		Lifecycle:          string(v.Lifecycle),
 		ArchivedAt:         archivedAt,
-		CurrentAgentType:   v.CurrentAgentType,
+		AgentSelection:     v.AgentSelection,
 		CurrentOperationID: v.CurrentOperationID,
 		CheckpointEntryID:  v.CheckpointEntryID,
 		Usage:              usage,
 		LastActivity:       lastActivity,
+		ExternalDataOwners: append([]string{}, v.ExternalDataOwners...),
 	})
 	if err != nil {
 		return nil, err
@@ -2195,14 +2197,14 @@ func validateSessionIdentity(v SessionIdentity) error {
 
 // decodeSessionState reads the state section with exact keys.
 func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
-	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "current_agent_type", "current_operation_id", "checkpoint_entry_id", "usage", "last_activity"); err != nil {
+	if err := rejectUnknownMembers(obj, "lifecycle", "archived_at", "agent_selection", "current_operation_id", "checkpoint_entry_id", "usage", "last_activity", "external_data_owners"); err != nil {
 		return SessionState{}, err
 	}
 	lifecycle, err := stringMember(obj, "lifecycle", true)
 	if err != nil {
 		return SessionState{}, err
 	}
-	currentAgentType, err := stringMember(obj, "current_agent_type", true)
+	selection, err := decodeAgentSelection(obj["agent_selection"])
 	if err != nil {
 		return SessionState{}, err
 	}
@@ -2230,13 +2232,26 @@ func decodeSessionState(obj map[string]json.RawMessage) (SessionState, error) {
 	if err != nil {
 		return SessionState{}, fmt.Errorf("member %q: %w", "last_activity", err)
 	}
+	ownerItems, err := arrayMember(obj, "external_data_owners", true)
+	if err != nil {
+		return SessionState{}, err
+	}
+	owners := make([]string, 0, len(ownerItems))
+	for i, item := range ownerItems {
+		var owner string
+		if err := json.Unmarshal(item, &owner); err != nil || owner == "" {
+			return SessionState{}, fmt.Errorf("member %q[%d] must be a nonempty string", "external_data_owners", i)
+		}
+		owners = append(owners, owner)
+	}
 	v := SessionState{
 		Lifecycle:          SessionLifecycle(lifecycle),
-		CurrentAgentType:   currentAgentType,
+		AgentSelection:     selection,
 		CurrentOperationID: currentOperationID,
 		CheckpointEntryID:  checkpointEntryID,
 		Usage:              usage,
 		LastActivity:       lastStamped,
+		ExternalDataOwners: owners,
 	}
 	if _, present := obj["archived_at"]; present {
 		archived, err := stringMember(obj, "archived_at", true)
@@ -2271,8 +2286,8 @@ func validateSessionState(v SessionState) error {
 	if v.Lifecycle == LifecycleOpen && v.ArchivedAt != nil {
 		return errors.New("open session must not carry archived_at")
 	}
-	if v.CurrentAgentType == "" {
-		return errors.New("current_agent_type must be non-empty")
+	if err := validateAgentSelection(v.AgentSelection); err != nil {
+		return fmt.Errorf("agent_selection: %w", err)
 	}
 	if v.CurrentOperationID != "" {
 		if err := validateOperationIdentity(v.CurrentOperationID, "current operation id"); err != nil {
@@ -2286,6 +2301,16 @@ func validateSessionState(v SessionState) error {
 	}
 	if v.LastActivity.IsZero() {
 		return errors.New("last_activity must not be zero")
+	}
+	seenOwners := make(map[string]bool, len(v.ExternalDataOwners))
+	for _, owner := range v.ExternalDataOwners {
+		if owner == "" {
+			return errors.New("external_data_owners must hold nonempty extension IDs")
+		}
+		if seenOwners[owner] {
+			return fmt.Errorf("external_data_owners repeats extension ID %q", owner)
+		}
+		seenOwners[owner] = true
 	}
 	return validateUsageTotals(v.Usage)
 }
@@ -2336,21 +2361,21 @@ func encodeOperationAdmission(v OperationAdmission) (json.RawMessage, error) {
 		return nil, err
 	}
 	wire, err := json.Marshal(struct {
-		SessionID     string          `json:"session_id"`
-		OperationID   string          `json:"operation_id"`
-		RequestKind   string          `json:"request_kind"`
-		AdmittedEntry json.RawMessage `json:"admitted_entry,omitempty"`
-		AgentType     string          `json:"agent_type"`
-		Execution     json.RawMessage `json:"execution"`
-		AdmittedAt    string          `json:"admitted_at"`
+		SessionID      string          `json:"session_id"`
+		OperationID    string          `json:"operation_id"`
+		RequestKind    string          `json:"request_kind"`
+		AdmittedEntry  json.RawMessage `json:"admitted_entry,omitempty"`
+		AgentSelection AgentSelection  `json:"agent_selection"`
+		Execution      json.RawMessage `json:"execution"`
+		AdmittedAt     string          `json:"admitted_at"`
 	}{
-		SessionID:     v.SessionID,
-		OperationID:   v.OperationID,
-		RequestKind:   string(v.RequestKind),
-		AdmittedEntry: admittedEntry,
-		AgentType:     v.AgentType,
-		Execution:     execution,
-		AdmittedAt:    admittedAt,
+		SessionID:      v.SessionID,
+		OperationID:    v.OperationID,
+		RequestKind:    string(v.RequestKind),
+		AdmittedEntry:  admittedEntry,
+		AgentSelection: v.AgentSelection,
+		Execution:      execution,
+		AdmittedAt:     admittedAt,
 	})
 	if err != nil {
 		return nil, err
@@ -2407,6 +2432,33 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		}
 		tools = append(tools, raw)
 	}
+	implementations := make([]json.RawMessage, 0, len(v.Implementations))
+	for _, implementation := range v.Implementations {
+		var settings json.RawMessage
+		if len(implementation.Settings) != 0 {
+			settings = frame(implementation.Settings)
+		}
+		wire, err := json.Marshal(struct {
+			ExtensionID string          `json:"extension_id"`
+			Version     string          `json:"version"`
+			Settings    json.RawMessage `json:"settings_base64,omitempty"`
+		}{ExtensionID: implementation.ExtensionID, Version: implementation.Version, Settings: settings})
+		if err != nil {
+			return nil, err
+		}
+		implementations = append(implementations, wire)
+	}
+	initialToolNames := v.InitialToolNames
+	if initialToolNames == nil {
+		initialToolNames = make([]string, 0, len(v.Tools))
+		for _, tool := range v.Tools {
+			initialToolNames = append(initialToolNames, tool.Name)
+		}
+	} else if len(initialToolNames) == 0 {
+		initialToolNames = []string{}
+	} else {
+		initialToolNames = append([]string(nil), initialToolNames...)
+	}
 	wire, err := json.Marshal(struct {
 		ConfigurationRevision string            `json:"configuration_revision"`
 		Model                 json.RawMessage   `json:"model"`
@@ -2414,12 +2466,14 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		OutputReserve         int               `json:"output_reserve"`
 		SystemPrompt          string            `json:"system_prompt"`
 		Tools                 []json.RawMessage `json:"tools"`
+		InitialToolNames      []string          `json:"initial_tool_names"`
 		Capabilities          []string          `json:"capabilities,omitempty"`
 		Readonly              bool              `json:"readonly"`
 		WriteDir              string            `json:"write_dir"`
 		Pricing               json.RawMessage   `json:"pricing,omitempty"`
 		Compact               json.RawMessage   `json:"compact"`
 		Strategy              json.RawMessage   `json:"strategy"`
+		Implementations       []json.RawMessage `json:"implementations,omitempty"`
 	}{
 		ConfigurationRevision: v.ConfigurationRevision,
 		Model:                 modelRaw,
@@ -2427,12 +2481,14 @@ func encodeExecutionCapture(v ExecutionCapture) (json.RawMessage, error) {
 		OutputReserve:         v.OutputReserve,
 		SystemPrompt:          v.SystemPrompt,
 		Tools:                 tools,
+		InitialToolNames:      initialToolNames,
 		Capabilities:          v.Capabilities,
 		Readonly:              v.Readonly,
 		WriteDir:              v.WriteDir,
 		Pricing:               pricingRaw,
 		Compact:               compactRaw,
 		Strategy:              strategyRaw,
+		Implementations:       implementations,
 	})
 	if err != nil {
 		return nil, err
@@ -2486,7 +2542,7 @@ func decodeOperationRegister(reg Register) (OperationRecord, error) {
 
 // decodeOperationAdmission reads the admission section with exact keys.
 func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmission, error) {
-	if err := rejectUnknownMembers(obj, "session_id", "operation_id", "request_kind", "admitted_entry", "agent_type", "execution", "admitted_at"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "operation_id", "request_kind", "admitted_entry", "agent_selection", "execution", "admitted_at"); err != nil {
 		return OperationAdmission{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -2519,7 +2575,7 @@ func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmissio
 			return OperationAdmission{}, fmt.Errorf("member %q must be absent for request kind %q", "admitted_entry", requestKind)
 		}
 	}
-	agentType, err := stringMember(obj, "agent_type", true)
+	selection, err := decodeAgentSelection(obj["agent_selection"])
 	if err != nil {
 		return OperationAdmission{}, err
 	}
@@ -2540,13 +2596,13 @@ func decodeOperationAdmission(obj map[string]json.RawMessage) (OperationAdmissio
 		return OperationAdmission{}, fmt.Errorf("member %q: %w", "admitted_at", err)
 	}
 	v := OperationAdmission{
-		SessionID:     sessionID,
-		OperationID:   operationID,
-		RequestKind:   RequestKind(requestKind),
-		AdmittedEntry: admittedEntry,
-		AgentType:     agentType,
-		Execution:     execution,
-		AdmittedAt:    stamped,
+		SessionID:      sessionID,
+		OperationID:    operationID,
+		RequestKind:    RequestKind(requestKind),
+		AdmittedEntry:  admittedEntry,
+		AgentSelection: selection,
+		Execution:      execution,
+		AdmittedAt:     stamped,
 	}
 	if err := validateOperationAdmission(v); err != nil {
 		return OperationAdmission{}, err
@@ -2579,8 +2635,8 @@ func validateOperationAdmission(v OperationAdmission) error {
 	default:
 		return fmt.Errorf("request kind %q is not one of %q or %q", v.RequestKind, RequestKindMessage, RequestKindCompact)
 	}
-	if v.AgentType == "" {
-		return errors.New("agent_type must be non-empty")
+	if err := validateAgentSelection(v.AgentSelection); err != nil {
+		return fmt.Errorf("agent_selection: %w", err)
 	}
 	if v.AdmittedAt.IsZero() {
 		return errors.New("admitted_at must not be zero")
@@ -2592,7 +2648,7 @@ func validateOperationAdmission(v OperationAdmission) error {
 // tool names, and preserved tool and capability order. The permission
 // capability members are required, including their false and empty values.
 func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, error) {
-	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "context_window", "output_reserve", "system_prompt", "tools", "capabilities", "readonly", "write_dir", "pricing", "compact", "strategy"); err != nil {
+	if err := rejectUnknownMembers(obj, "configuration_revision", "model", "context_window", "output_reserve", "system_prompt", "tools", "initial_tool_names", "capabilities", "readonly", "write_dir", "pricing", "compact", "strategy", "implementations"); err != nil {
 		return ExecutionCapture{}, err
 	}
 	revision, err := stringMember(obj, "configuration_revision", true)
@@ -2670,6 +2726,18 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 		}
 		v.Tools = append(v.Tools, tool)
 	}
+	initialRaw, err := arrayMember(obj, "initial_tool_names", true)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	v.InitialToolNames = make([]string, 0, len(initialRaw))
+	for i, raw := range initialRaw {
+		var name string
+		if err := json.Unmarshal(raw, &name); err != nil {
+			return ExecutionCapture{}, fmt.Errorf("initial_tool_names[%d]: %w", i, err)
+		}
+		v.InitialToolNames = append(v.InitialToolNames, name)
+	}
 	capabilitiesRaw, err := arrayMember(obj, "capabilities", false)
 	if err != nil {
 		return ExecutionCapture{}, err
@@ -2683,6 +2751,44 @@ func decodeExecutionCapture(obj map[string]json.RawMessage) (ExecutionCapture, e
 	}
 	if len(v.Capabilities) == 0 { // omission and the empty array both mean none
 		v.Capabilities = nil
+	}
+	implementationsRaw, err := arrayMember(obj, "implementations", false)
+	if err != nil {
+		return ExecutionCapture{}, err
+	}
+	for i, raw := range implementationsRaw {
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &members); err != nil {
+			return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+		}
+		if err := rejectUnknownMembers(members, "extension_id", "version", "settings_base64"); err != nil {
+			return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+		}
+		extensionID, err := stringMember(members, "extension_id", true)
+		if err != nil {
+			return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+		}
+		version, err := stringMember(members, "version", true)
+		if err != nil {
+			return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+		}
+		var captured ImplementationCapture
+		captured.ExtensionID = extensionID
+		captured.Version = version
+		if _, present := members["settings_base64"]; present {
+			settings, err := framedMember(members, "settings_base64", true)
+			if err != nil {
+				return ExecutionCapture{}, fmt.Errorf("implementations[%d]: %w", i, err)
+			}
+			if !json.Valid(settings) {
+				return ExecutionCapture{}, fmt.Errorf("implementations[%d]: settings must be valid JSON", i)
+			}
+			captured.Settings = model.CloneRaw(settings)
+		}
+		v.Implementations = append(v.Implementations, captured)
+	}
+	if len(v.Implementations) == 0 {
+		v.Implementations = nil
 	}
 	if err := validateExecutionCapture(v); err != nil {
 		return ExecutionCapture{}, err
@@ -2816,6 +2922,38 @@ func validateExecutionCapture(v ExecutionCapture) error {
 	}
 	if err := model.ValidateRequest(model.Request{Tools: v.Tools}); err != nil {
 		return err
+	}
+	seenImplementation := make(map[string]bool, len(v.Implementations))
+	for i, implementation := range v.Implementations {
+		if implementation.ExtensionID == "" || implementation.Version == "" {
+			return fmt.Errorf("implementations[%d]: extension_id and version must be non-empty", i)
+		}
+		if seenImplementation[implementation.ExtensionID] {
+			return fmt.Errorf("implementations[%d]: duplicate extension %q", i, implementation.ExtensionID)
+		}
+		seenImplementation[implementation.ExtensionID] = true
+		if len(implementation.Settings) != 0 && !json.Valid(implementation.Settings) {
+			return fmt.Errorf("implementations[%d]: settings must be valid JSON", i)
+		}
+	}
+	if v.InitialToolNames != nil {
+		tools := make(map[string]bool, len(v.Tools))
+		for _, tool := range v.Tools {
+			tools[tool.Name] = true
+		}
+		names := make(map[string]bool, len(v.InitialToolNames))
+		for i, name := range v.InitialToolNames {
+			if name == "" {
+				return fmt.Errorf("initial_tool_names[%d]: name must be non-empty", i)
+			}
+			if !tools[name] {
+				return fmt.Errorf("initial_tool_names[%d]: %q is outside the captured tool catalog", i, name)
+			}
+			if names[name] {
+				return fmt.Errorf("initial_tool_names[%d]: duplicate name %q", i, name)
+			}
+			names[name] = true
+		}
 	}
 	seen := make(map[string]bool, len(v.Capabilities))
 	for i, capability := range v.Capabilities {

@@ -87,7 +87,7 @@ func TestSessionCommandCreateHeader(t *testing.T) {
 		defer closeProjectionRuntime(r)
 
 		workspace := filepath.Join(e.home, "command-ws")
-		header, err := r.createSessionHeader(ctx, workspace, "solo")
+		header, err := r.createSessionHeader(ctx, workspace, wireSelection("solo"))
 		testassert.NoError(t, err)
 		snap := sessionViewThroughRuntime(t, r, header.SessionId)
 		if !reflect.DeepEqual(header, projectSession(snap.Header)) {
@@ -96,15 +96,15 @@ func TestSessionCommandCreateHeader(t *testing.T) {
 		if header.SessionRevision != wireRevision(snap.Header.Revision) {
 			t.Fatalf("create header revision = %+v, want the read pair %+v", header.SessionRevision, wireRevision(snap.Header.Revision))
 		}
-		testassert.Require(t, header.Workspace == workspace && header.AgentType == "solo" && header.Lifecycle == protocol.Open, "create header = %+v, want workspace %q solo open", header, workspace)
+		testassert.Require(t, header.Workspace == workspace && header.AgentSelection.Definition.DefinitionId == "solo" && header.Lifecycle == protocol.Open, "create header = %+v, want workspace %q solo open", header, workspace)
 
 		unclean := filepath.Join(e.home, "command-ws", "..", "command-ws")
-		uncleanHeader, err := r.createSessionHeader(ctx, unclean, "solo")
+		uncleanHeader, err := r.createSessionHeader(ctx, unclean, wireSelection("solo"))
 		testassert.NoError(t, err)
 		testassert.Equal(t, uncleanHeader.Workspace, workspace)
 
 		{
-			_, err := r.createSessionHeader(ctx, "", "solo")
+			_, err := r.createSessionHeader(ctx, "", wireSelection("solo"))
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "empty workspace header = %v, want harness.ErrInvalid", err)
 		}
 		{
@@ -112,9 +112,9 @@ func TestSessionCommandCreateHeader(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "empty workspace record = %v, want harness.ErrInvalid", err)
 		}
 
-		ghost, err := r.createSessionHeader(ctx, filepath.Join(e.home, "ghost-ws"), "ghost")
+		ghost, err := r.createSessionHeader(ctx, filepath.Join(e.home, "ghost-ws"), wireSelection("ghost"))
 		testassert.NoError(t, err)
-		testassert.Equal(t, ghost.AgentType, "ghost")
+		testassert.Equal(t, ghost.AgentSelection.Definition.DefinitionId, "ghost")
 		{
 			_, err := r.submitSession(ctx, ghost.SessionId, commandSubmitRequest(t, "op-ghost", "hi"))
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit on unknown agent type = %v, want the preparation-time harness.ErrInvalid", err)
@@ -137,15 +137,15 @@ func TestSessionCommandAgentType(t *testing.T) {
 		testassert.NoError(t, err)
 		sessionID := rec.Identity.SessionID
 
-		header, err := r.setSessionAgentType(ctx, sessionID, protocol.SetSessionAgentTypeRequest{AgentType: "ghost"})
+		header, err := r.setSessionAgentType(ctx, sessionID, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("ghost")})
 		testassert.NoError(t, err)
-		testassert.Equal(t, header.AgentType, "ghost")
+		testassert.Equal(t, header.AgentSelection.Definition.DefinitionId, "ghost")
 		snap := sessionViewThroughRuntime(t, r, sessionID)
 		if !reflect.DeepEqual(header, projectSession(snap.Header)) || header.SessionRevision != wireRevision(snap.Header.Revision) {
 			t.Fatalf("ghost header = %+v, want the real read projection %+v", header, projectSession(snap.Header))
 		}
 
-		worker, err := r.setSessionAgentType(ctx, sessionID, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
+		worker, err := r.setSessionAgentType(ctx, sessionID, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
 		testassert.NoError(t, err)
 		workerSnap := sessionViewThroughRuntime(t, r, sessionID)
 		if !reflect.DeepEqual(worker, projectSession(workerSnap.Header)) || worker.SessionRevision != wireRevision(workerSnap.Header.Revision) {
@@ -158,10 +158,10 @@ func TestSessionCommandAgentType(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "empty agent type = %v, want harness.ErrInvalid", err)
 		}
 		after := sessionViewThroughRuntime(t, r, sessionID)
-		testassert.Equal(t, after.Header.CurrentAgentType, "worker")
+		testassert.Equal(t, after.Header.AgentSelection.Definition.DefinitionID, "worker")
 
 		{
-			_, err := r.setSessionAgentType(ctx, "ffffffffffffffffffffffffffffffff", protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
+			_, err := r.setSessionAgentType(ctx, "ffffffffffffffffffffffffffffffff", protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "set on absent session = %v, want harness.ErrNotFound", err)
 		}
 	})
@@ -486,7 +486,10 @@ func TestSessionCommandFork(t *testing.T) {
 			header, err := r.archiveSession(ctx, sourceID)
 			testassert.Require(t, err == nil && header.Lifecycle == protocol.Archived, "archive source = (%+v, %v), want archived", header, err)
 		}
-		testassert.NoError(t, r.deleteSession(ctx, sourceID))
+		{
+			_, err := r.deleteSession(ctx, sourceID)
+			testassert.NoError(t, err)
+		}
 
 		afterDelete, err := r.forkSession(ctx, sourceID, req)
 		testassert.NoError(t, err)
@@ -666,7 +669,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		openSession, err := r.createSession(ctx, filepath.Join(e.home, "life-open"), "solo")
 		testassert.NoError(t, err)
 		{
-			err := r.deleteSession(ctx, openSession.Identity.SessionID)
+			_, err := r.deleteSession(ctx, openSession.Identity.SessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "delete open Session = %v, want the archived-only rule", err)
 		}
 		{
@@ -678,7 +681,10 @@ func TestSessionCommandLifecycle(t *testing.T) {
 			_, err := r.archiveSession(ctx, sessionID)
 			testassert.NoError(t, err)
 		}
-		testassert.NoError(t, r.deleteSession(ctx, sessionID))
+		{
+			_, err := r.deleteSession(ctx, sessionID)
+			testassert.NoError(t, err)
+		}
 		{
 			_, err := os.Stat(ownTree)
 			testassert.Require(t, os.IsNotExist(err), "own artifact tree survived deletion: %v", err)
@@ -691,7 +697,10 @@ func TestSessionCommandLifecycle(t *testing.T) {
 			err := headerErrorThroughRuntime(ctx, r, sessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleted by-ID read = %v, want harness.ErrNotFound", err)
 		}
-		testassert.NoError(t, r.deleteSession(ctx, sessionID))
+		{
+			_, err := r.deleteSession(ctx, sessionID)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = %v, want harness.ErrNotFound", err)
+		}
 	})
 }
 
@@ -911,7 +920,7 @@ func TestSessionCommandClosedOwner(t *testing.T) {
 		req := commandSubmitRequest(t, "op-closed", "x")
 
 		{
-			_, err := r.createSessionHeader(ctx, workspace, "solo")
+			_, err := r.createSessionHeader(ctx, workspace, wireSelection("solo"))
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed create header = %v, want ErrClosed", err)
 		}
 		{
@@ -939,7 +948,7 @@ func TestSessionCommandClosedOwner(t *testing.T) {
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed fork = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.setSessionAgentType(ctx, sessionID, protocol.SetSessionAgentTypeRequest{AgentType: "solo"})
+			_, err := r.setSessionAgentType(ctx, sessionID, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("solo")})
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed agent type = %v, want ErrClosed", err)
 		}
 		{
@@ -959,7 +968,7 @@ func TestSessionCommandClosedOwner(t *testing.T) {
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed stop = %v, want ErrClosed", err)
 		}
 		{
-			err := r.deleteSession(ctx, sessionID)
+			_, err := r.deleteSession(ctx, sessionID)
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed delete = %v, want ErrClosed", err)
 		}
 	})

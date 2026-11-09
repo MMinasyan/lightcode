@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -408,8 +409,8 @@ func TestObservationJobMemberCurrentPairAndInternalSilence(t *testing.T) {
 }
 
 // TestObservationPluginReportsLandWithRealAttribution proves the composition
-// binds each Runtime-scoped factory's copied ScopeInfo to its own registered
-// plugin ID: two factories in one scope report distinct real sources, each
+// binds each Runtime-scoped factory's InstanceContext warning callback to its
+// own registered plugin ID: two factories in one scope report distinct real sources, each
 // report lands only in its own global plugin group with the runtime-scoped
 // warning_changed event, identical reports dedupe without a second event,
 // every Session's hydration and the unfiltered read carry both groups, and
@@ -419,19 +420,18 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 		ctx := context.Background()
 		e := newOwnerEnv(t)
 		reports := make(map[string]func(kind, message string))
-		reporterPlugin := func(id string) Plugin {
-			return Plugin{
-				ID:       id,
-				Scope:    ScopeRuntime,
-				Provides: []CapabilitySpec{Spec[any]("reporter." + id)},
-				Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
-					reports[id] = info.ReportWarning
-					e.events.add("open:" + id)
-					return Instance{Values: map[string]any{"reporter." + id: id}}, nil
-				},
-			}
+		reporterPlugin := func(id string) extension.Native {
+			capabilityID := "reporter." + id
+			capability := testServiceCapability(capabilityID)
+			return testNative(id, extension.LifetimeHarness, []extension.Capability{capability}, nil, func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
+				reports[id] = info.ReportWarning
+				e.events.add("open:" + id)
+				return extension.Instance{Capabilities: map[string]extension.Implementation{capabilityID: testServiceImplementation()}}, nil
+			})
 		}
 		e.fixtureStore(store)
+		enableFixturePlugin(t, e.configPath, "alpha")
+		enableFixturePlugin(t, e.configPath, "beta")
 		r, err := e.open(ctx, reporterPlugin("alpha"), reporterPlugin("beta"))
 		testassert.NoError(t, err)
 		defer func() {

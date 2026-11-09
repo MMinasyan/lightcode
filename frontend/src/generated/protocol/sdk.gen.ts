@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, ServerSentEventsResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { ArchiveSessionData, ArchiveSessionErrors, ArchiveSessionResponses, CompactSessionData, CompactSessionErrors, CompactSessionResponses, ConnectProviderData, ConnectProviderErrors, ConnectProviderResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteProviderDetailData, DeleteProviderDetailErrors, DeleteProviderDetailResponses, DeleteProviderModelData, DeleteProviderModelErrors, DeleteProviderModelResponses, DeleteSessionData, DeleteSessionErrors, DeleteSessionResponses, DisconnectProviderData, DisconnectProviderErrors, DisconnectProviderResponses, DiscoverProviderCandidatesData, DiscoverProviderCandidatesErrors, DiscoverProviderCandidatesResponses, DiscoverProviderModelCandidatesData, DiscoverProviderModelCandidatesErrors, DiscoverProviderModelCandidatesResponses, ForkSessionData, ForkSessionErrors, ForkSessionResponses, GetConfigurationData, GetConfigurationErrors, GetConfigurationResponses, GetEventsData, GetEventsErrors, GetEventsResponse, GetEventsResponses, GetHealthData, GetHealthErrors, GetHealthResponses, GetProviderDetailData, GetProviderDetailErrors, GetProviderDetailResponses, GetSessionCodeSnapshotsData, GetSessionCodeSnapshotsErrors, GetSessionCodeSnapshotsResponses, GetSessionHistoryData, GetSessionHistoryErrors, GetSessionHistoryResponses, GetSessionHydrationData, GetSessionHydrationErrors, GetSessionHydrationResponses, GetWarningsData, GetWarningsErrors, GetWarningsResponses, InterruptSessionData, InterruptSessionErrors, InterruptSessionResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProviderModelsData, ListProviderModelsErrors, ListProviderModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ListWorkspacesData, ListWorkspacesErrors, ListWorkspacesResponses, ReadWorkspaceFileData, ReadWorkspaceFileErrors, ReadWorkspaceFileResponses, ReloadConfigurationData, ReloadConfigurationErrors, ReloadConfigurationResponses, ReopenSessionData, ReopenSessionErrors, ReopenSessionResponses, ResetProviderFieldData, ResetProviderFieldErrors, ResetProviderFieldResponses, ResetProviderModelFieldData, ResetProviderModelFieldErrors, ResetProviderModelFieldResponses, RevertSessionCodeData, RevertSessionCodeErrors, RevertSessionCodeResponses, SetAgentTypeModelData, SetAgentTypeModelErrors, SetAgentTypeModelResponses, SetSessionAgentTypeData, SetSessionAgentTypeErrors, SetSessionAgentTypeResponses, StopSessionData, StopSessionErrors, StopSessionResponses, SubmitSessionData, SubmitSessionErrors, SubmitSessionResponses, UpdateConfigurationSettingsData, UpdateConfigurationSettingsErrors, UpdateConfigurationSettingsResponses, UpdateProviderDetailData, UpdateProviderDetailErrors, UpdateProviderDetailResponses, UpdateProviderModelData, UpdateProviderModelErrors, UpdateProviderModelResponses } from './types.gen';
+import type { ArchiveSessionData, ArchiveSessionErrors, ArchiveSessionResponses, CompactSessionData, CompactSessionErrors, CompactSessionResponses, ConnectProviderData, ConnectProviderErrors, ConnectProviderResponses, CreateProviderData, CreateProviderErrors, CreateProviderResponses, CreateSessionData, CreateSessionErrors, CreateSessionResponses, DeleteProviderDetailData, DeleteProviderDetailErrors, DeleteProviderDetailResponses, DeleteProviderModelData, DeleteProviderModelErrors, DeleteProviderModelResponses, DeleteSessionData, DeleteSessionErrors, DeleteSessionResponses, DisconnectProviderData, DisconnectProviderErrors, DisconnectProviderResponses, DiscoverProviderCandidatesData, DiscoverProviderCandidatesErrors, DiscoverProviderCandidatesResponses, DiscoverProviderModelCandidatesData, DiscoverProviderModelCandidatesErrors, DiscoverProviderModelCandidatesResponses, ForkSessionData, ForkSessionErrors, ForkSessionResponses, GetConfigurationData, GetConfigurationErrors, GetConfigurationResponses, GetEventsData, GetEventsErrors, GetEventsResponse, GetEventsResponses, GetHealthData, GetHealthErrors, GetHealthResponses, GetProviderDetailData, GetProviderDetailErrors, GetProviderDetailResponses, GetSessionCodeSnapshotsData, GetSessionCodeSnapshotsErrors, GetSessionCodeSnapshotsResponses, GetSessionHistoryData, GetSessionHistoryErrors, GetSessionHistoryResponses, GetSessionHydrationData, GetSessionHydrationErrors, GetSessionHydrationResponses, GetWarningsData, GetWarningsErrors, GetWarningsResponses, InterruptSessionData, InterruptSessionErrors, InterruptSessionResponses, ListModelsData, ListModelsErrors, ListModelsResponses, ListProviderModelsData, ListProviderModelsErrors, ListProviderModelsResponses, ListProvidersData, ListProvidersErrors, ListProvidersResponses, ListSessionsData, ListSessionsErrors, ListSessionsResponses, ListWorkspacesData, ListWorkspacesErrors, ListWorkspacesResponses, ReadWorkspaceFileData, ReadWorkspaceFileErrors, ReadWorkspaceFileResponses, ReloadConfigurationData, ReloadConfigurationErrors, ReloadConfigurationResponses, ReopenSessionData, ReopenSessionErrors, ReopenSessionResponses, ResetProviderFieldData, ResetProviderFieldErrors, ResetProviderFieldResponses, ResetProviderModelFieldData, ResetProviderModelFieldErrors, ResetProviderModelFieldResponses, RevertSessionCodeData, RevertSessionCodeErrors, RevertSessionCodeResponses, SetSessionAgentTypeData, SetSessionAgentTypeErrors, SetSessionAgentTypeResponses, SetSessionModelData, SetSessionModelErrors, SetSessionModelResponses, StopSessionData, StopSessionErrors, StopSessionResponses, SubmitSessionData, SubmitSessionErrors, SubmitSessionResponses, UpdateConfigurationSettingsData, UpdateConfigurationSettingsErrors, UpdateConfigurationSettingsResponses, UpdateProviderDetailData, UpdateProviderDetailErrors, UpdateProviderDetailResponses, UpdateProviderModelData, UpdateProviderModelErrors, UpdateProviderModelResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -116,6 +116,16 @@ export const setSessionAgentType = <ThrowOnError extends boolean = false>(option
     }
 });
 
+export const setSessionModel = <ThrowOnError extends boolean = false>(options: Options<SetSessionModelData, ThrowOnError>): RequestResult<SetSessionModelResponses, SetSessionModelErrors, ThrowOnError> => (options.client ?? client).put<SetSessionModelResponses, SetSessionModelErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/v1/sessions/{id}/model',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
 export const getSessionHydration = <ThrowOnError extends boolean = false>(options: Options<GetSessionHydrationData, ThrowOnError>): RequestResult<GetSessionHydrationResponses, GetSessionHydrationErrors, ThrowOnError> => (options.client ?? client).get<GetSessionHydrationResponses, GetSessionHydrationErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v1/sessions/{id}/hydration',
@@ -175,16 +185,6 @@ export const reloadConfiguration = <ThrowOnError extends boolean = false>(option
 export const updateConfigurationSettings = <ThrowOnError extends boolean = false>(options: Options<UpdateConfigurationSettingsData, ThrowOnError>): RequestResult<UpdateConfigurationSettingsResponses, UpdateConfigurationSettingsErrors, ThrowOnError> => (options.client ?? client).put<UpdateConfigurationSettingsResponses, UpdateConfigurationSettingsErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v1/configuration/settings',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
-});
-
-export const setAgentTypeModel = <ThrowOnError extends boolean = false>(options: Options<SetAgentTypeModelData, ThrowOnError>): RequestResult<SetAgentTypeModelResponses, SetAgentTypeModelErrors, ThrowOnError> => (options.client ?? client).put<SetAgentTypeModelResponses, SetAgentTypeModelErrors, ThrowOnError>({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/v1/agent-types/model',
     ...options,
     headers: {
         'Content-Type': 'application/json',

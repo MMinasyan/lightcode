@@ -17,13 +17,11 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/internal/tool"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -406,6 +404,7 @@ func TestConnectProviderUsableWindowRemovedRefuses(t *testing.T) {
 			`"staticp": {"transport": {"base_url": "https://static.test/v1", "api_key_env": "CONNECTION_STATIC_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}}`,
 			`"staticp": {"transport": {"base_url": "https://static.test/v1", "api_key_env": "CONNECTION_STATIC_KEY"}, "discovery": false, "models": {"m": {}}}`, 1)
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		fetches := server.requests()
 
@@ -526,6 +525,7 @@ func TestConnectProviderTransientKeyOverridesConfiguredAuthorization(t *testing.
 		edited := strings.Replace(doc, oldGroq, newGroq, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		{
 			_, err := r.Reload(ctx)
 			testassert.NoError(t, err)
@@ -568,6 +568,7 @@ func TestConnectProviderKeylessFetchKeepsConfiguredAuthorization(t *testing.T) {
 		edited := strings.Replace(doc, oldKeyless, newKeyless, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		{
 			_, err := r.Reload(ctx)
 			testassert.NoError(t, err)
@@ -1025,6 +1026,7 @@ func TestConnectProviderCacheUnsafeIdentityRefuses(t *testing.T) {
 			`"keylessp"`,
 			`"bad\\id": {"transport": {"base_url": "`+server.URL+`", "api_key_env": "CONNECTION_BAD_KEY"}, "discovery": true, "models": {"ghost": {}}}, "keylessp"`, 1)
 		writeServiceFile(t, r.config.configPath, raw)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		{
 			_, err := r.Reload(ctx)
 			testassert.NoError(t, err)
@@ -1543,6 +1545,7 @@ func TestDisconnectProviderLatestRawTransportChangePublishes(t *testing.T) {
 		edited := strings.Replace(doc, oldLine, newLine, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		before, _, _ := runtimeMutationBaseline(t, r)
 
 		mutation, err := r.disconnectProvider(ctx, "usablep")
@@ -1575,6 +1578,7 @@ func TestDisconnectProviderLatestRawEnvRebindKeepsExternalSibling(t *testing.T) 
 		edited := strings.Replace(doc, oldLine, newLine, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		before, _, _ := runtimeMutationBaseline(t, r)
 
 		mutation, err := r.disconnectProvider(ctx, "usablep")
@@ -1611,6 +1615,7 @@ func TestDisconnectProviderLatestCandidateRemovedRefuses(t *testing.T) {
 		edited := strings.Replace(doc, oldTransport, `"transport": {}`, 1)
 		testassert.Require(t, edited != doc, "fixture replacement did not apply")
 		writeServiceFile(t, r.config.configPath, edited)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		_, err = r.disconnectProvider(ctx, "usablep")
@@ -2424,60 +2429,6 @@ func TestCreateProviderNilManagedEnvTypedFailure(t *testing.T) {
 
 // --- full chain ---
 
-// connectEnvEchoTool is the full-chain row's command capability: it resolves
-// the child's environment through the ToolContext's call-time producer
-// exactly as the shipped tools plugin does, and runs one real `sh` child
-// that echoes the two credential markers.
-type connectEnvEchoTool struct{}
-
-func (connectEnvEchoTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
-	definition, err := model.NewToolDefinition(model.ToolDefinition{
-		Name:        "env_echo",
-		Description: "echoes the two marker variables",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
-	})
-	if err != nil {
-		return ToolDescription{}, err
-	}
-	return ToolDescription{Definition: definition, Available: true}, nil
-}
-
-func (connectEnvEchoTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
-	return runtimeNormalize(call)
-}
-
-func (connectEnvEchoTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
-	return harness.PreparedTool{
-		Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "*"}},
-		Execute: func(ctx context.Context) harness.ToolOutcome {
-			if tc.SubprocessEnv == nil {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no subprocess environment producer"}}
-			}
-			env := tc.SubprocessEnv()
-			if env == nil {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no environment"}}
-			}
-			out, err := tool.RunForegroundCommand(ctx, `printf '%s|%s' "$CONNECT_CHAIN_MANAGED" "$CONNECT_CHAIN_EXTERNAL"`, tc.Workspace, 0, 15360, 5000, "", env)
-			if err != nil {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}
-			}
-			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: out}}
-		},
-	}
-}
-
-// connectEnvEchoPlugin declares the full-chain row's tool export.
-func connectEnvEchoPlugin() Plugin {
-	return Plugin{
-		ID:       "envecho",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("env_echo", connectEnvEchoTool{}.describe)},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"env_echo": connectEnvEchoTool{}}}, nil
-		},
-	}
-}
-
 // TestProductionConnectThenCommandEnvironment proves the full chain through
 // the public Open with the concrete preparation: the connect operator adds a
 // managed key AFTER the plugin scopes opened, and a real foreground child
@@ -2487,7 +2438,9 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
 		server := newChainServer(t,
-			chainTurn{respond: func(w http.ResponseWriter) { writeToolCallTurn(w, "call-1", "env_echo", `{}`) }},
+			chainTurn{respond: func(w http.ResponseWriter) {
+				writeToolCallTurn(w, "call-1", "run_command", `{"command":"printf '%s|%s' \"$CONNECT_CHAIN_MANAGED\" \"$CONNECT_CHAIN_EXTERNAL\""}`)
+			}},
 			chainTurn{respond: func(w http.ResponseWriter) { writeTextTurn(w, "done") }},
 		)
 		t.Setenv("CONNECT_CHAIN_EXTERNAL", "sibling-value")
@@ -2495,9 +2448,9 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 		writeServiceFile(t, e.configPath, `{"providers":{`+
 			`"prov":`+nominalProvMember(server.URL, "PRODUCTION_TEST_KEY", `{"m":{"name":"M","context_window":262144}}`)+`,`+
 			`"discp":`+nominalProvMember("https://disc.test/v1", "CONNECT_CHAIN_MANAGED", `{"m":{"name":"M","context_window":4096}}`)+`}}`)
-		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"runner": {"model": "prov/m", "system_prompt": "simple", "tools": ["env_echo"]}}`)
+		writeAgentDefinitions(t, e.configPath, `{"runner": {"model": "prov/m", "system_prompt": "simple", "tools": ["run_command"]}}`)
 
-		r, err := e.openPlugins(ctx, connectEnvEchoPlugin())
+		r, err := e.openPlugins(ctx)
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 
@@ -2516,7 +2469,7 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 
 		results := chainToolResults(t, e.store, session.Identity.SessionID)
 		settled, ok := results["call-1"]
-		testassert.Require(t, ok && settled.Status == model.ResultSuccess, "env_echo result = %+v (ok %v), want success", settled, ok)
+		testassert.Require(t, ok && settled.Status == model.ResultSuccess, "run_command result = %+v (ok %v), want success", settled, ok)
 		testassert.Equal(t, settled.Content, "|sibling-value")
 	})
 }
@@ -2550,6 +2503,7 @@ func TestConnectProviderSpecialIDsAndKeyless(t *testing.T) {
 			`"keylessp"`,
 			`"..": {"transport": {"base_url": "https://dots.test/v1", "api_key_env": "CONNECTION_DOTS_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}}, "keylessp"`, 1)
 		writeServiceFile(t, r.config.configPath, raw)
+		writeAgentDefinitions(t, r.config.configPath, connectionAgentsDocument)
 		{
 			_, err := r.Reload(ctx)
 			testassert.NoError(t, err)

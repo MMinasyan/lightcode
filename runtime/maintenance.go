@@ -90,8 +90,8 @@ func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 		}
 		var (
 			deleted   []string
+			deletions []deletedSession
 			leases    []func() // committed-deletion leases, retained through their cleanups and the batch's warning cleanup
-			cleanErrs []error
 			passErr   error
 		)
 		for _, sessionID := range candidates {
@@ -99,7 +99,7 @@ func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 			if err != nil {
 				continue // a held interval skips this candidate for the pass
 			}
-			commit, err := h.SweepSession(ctx, sessionID, policy, now)
+			commit, owners, err := h.SweepSession(ctx, sessionID, policy, now)
 			if err != nil {
 				releaseArtifacts()
 				var corrupt *harness.CorruptionError
@@ -111,18 +111,18 @@ func (r *Runtime) runSweepPass(ctx context.Context, now time.Time) {
 			}
 			if commit {
 				deleted = append(deleted, sessionID)
+				deletions = append(deletions, deletedSession{sessionID: sessionID, owners: owners})
 				leases = append(leases, releaseArtifacts) // retained through the cleanups and the batch's warning cleanup
 				continue
 			}
 			releaseArtifacts()
 		}
-		// Every committed deleted identity's artifact tree is removed inside
-		// the same admission under its own lease — including successes
-		// collected before a pass failure.
-		for _, sessionID := range deleted {
-			if err := r.removeSessionCode(sessionID); err != nil {
-				cleanErrs = append(cleanErrs, err)
-			}
+		// Every committed deleted identity's tree and external owners are
+		// cleaned inside the same admission under their own leases —
+		// including successes collected before a pass failure.
+		var cleanErrs []error
+		for _, failure := range r.cleanupDeletedSessions(ctx, deletions) {
+			cleanErrs = append(cleanErrs, errors.New(cleanupFailureText(failure)))
 		}
 		// The committed batch's warning cleanup is one section and one hint,
 		// and it runs for every committed identity before the pass error is

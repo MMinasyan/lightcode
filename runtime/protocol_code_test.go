@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/snapshot"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -149,7 +149,7 @@ func openCodeRuntime(t *testing.T, store harness.Storage) *codeRuntime {
 	// composition provides no hooks or tools, and the rows need only ordinary
 	// text turns and manual compaction.
 	e := newOwnerEnv(t)
-	writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
+	writeAgentDefinitions(t, e.configPath, projectionAgentsDocument)
 	e.fixtureStore(store)
 	e.fixtureJobs(newLifecycleStopper())
 	r, _, err := e.openSwept(context.Background())
@@ -620,7 +620,7 @@ func TestCodeRevertPartialTraversalParkedGroup(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the restore never returned after its parked group completed")
 		}
-		testassert.Require(t, out.err != nil && len(out.result.Restored) == 1 && out.result.Restored[0] == target && out.result.Skipped != nil && out.result.Error != nil && out.result.Error.Code == protocol.Internal && out.result.Error.Message != "" && out.result.Error.SessionId == nil, "restore = %+v, want the later bad group's traversal error; partial result = %+v, want the parked group's accumulated restore and a non-nil skip list; partial error = %+v, want the internal class with no target Session id", out.result, out.result, out.result.Error)
+		testassert.Require(t, out.err != nil && len(out.result.Restored) == 1 && out.result.Restored[0] == target && out.result.Skipped != nil && out.result.Error != nil && out.result.Error.Code == protocol.ErrorCodeInternal && out.result.Error.Message != "" && out.result.Error.SessionId == nil, "restore = %+v, want the later bad group's traversal error; partial result = %+v, want the parked group's accumulated restore and a non-nil skip list; partial error = %+v, want the internal class with no target Session id", out.result, out.result, out.result.Error)
 		{
 			data, err := os.ReadFile(target)
 			testassert.Require(t, err == nil && string(data) == "restored", "parked target = (%q, %v), want the FIFO restore to complete", data, err)
@@ -838,7 +838,7 @@ func TestDeleteSessionConflictsWithRestoreInterval(t *testing.T) {
 
 		defer park.flush()
 		{
-			err := r.deleteSession(context.Background(), session)
+			_, err := r.deleteSession(context.Background(), session)
 			testassert.Require(t, errors.Is(err, harness.ErrConflict), "delete during a parked restore = %v, want the conflict class", err)
 		}
 		{
@@ -859,7 +859,10 @@ func TestDeleteSessionConflictsWithRestoreInterval(t *testing.T) {
 		}
 		testassert.Require(t, parked.err == nil, "parked restore = %v", parked.err)
 		// The interval, not the Session, blocked the deletion.
-		testassert.NoError(t, r.deleteSession(context.Background(), session))
+		{
+			_, err := r.deleteSession(context.Background(), session)
+			testassert.NoError(t, err)
+		}
 		{
 			_, err := os.Stat(groupRoot)
 			testassert.Require(t, os.IsNotExist(err), "group root after the deletion = %v, want it removed", err)
@@ -894,15 +897,15 @@ func TestCodeRestoreIntervalKeepsMetadataTransitionsAvailable(t *testing.T) {
 
 		defer park.flush()
 
-		changed, err := r.setSessionAgentType(context.Background(), session, protocol.SetSessionAgentTypeRequest{AgentType: "worker"})
+		changed, err := r.setSessionAgentType(context.Background(), session, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
 		testassert.NoError(t, err)
-		testassert.Equal(t, changed.AgentType, "worker")
+		testassert.Equal(t, changed.AgentSelection.Definition.DefinitionId, "worker")
 		archived, err := r.archiveSession(context.Background(), session)
 		testassert.NoError(t, err)
 		testassert.Equal(t, archived.Lifecycle, protocol.Archived)
 		reopened, err := r.reopenSession(context.Background(), session)
 		testassert.NoError(t, err)
-		testassert.Require(t, reopened.Lifecycle == protocol.Open && reopened.AgentType == "worker", "reopened header = %+v, want open with the changed selection", reopened)
+		testassert.Require(t, reopened.Lifecycle == protocol.Open && reopened.AgentSelection.Definition.DefinitionId == "worker", "reopened header = %+v, want open with the changed selection", reopened)
 
 		park.release("restored")
 		var out restoreOutcome
@@ -1379,7 +1382,7 @@ func TestQueuedDrainOpenerWaitsForRestoreInterval(t *testing.T) {
 func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
-		writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, projectionAgentsDocument)
 		stopper := &stubStopper{events: e.events}
 		e.fixtureStore(store)
 		e.fixtureJobs(stopper)
@@ -1444,23 +1447,20 @@ func TestBackgroundWakeOpenerWaitsForRestoreInterval(t *testing.T) {
 // the registry is reclaimed and the next execution runs normally.
 // failingAgentFactoryPlugin is one Agent-scoped plugin whose factory fails
 // while armed: the concrete opening-failure row.
-func failingAgentFactoryPlugin(fail *atomic.Bool) Plugin {
-	return Plugin{
-		ID:       "failing-agent",
-		Scope:    ScopeAgent,
-		Provides: []CapabilitySpec{Spec[any]("failing.agent.cap")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			if fail.Load() {
-				return Instance{}, errors.New("boom")
-			}
-			return Instance{Values: map[string]any{"failing.agent.cap": "ok"}}, nil
-		},
-	}
+func failingAgentFactoryPlugin(fail *atomic.Bool) extension.Native {
+	capability := testServiceCapability("failing.agent.cap")
+	return testNative("failing-agent", extension.LifetimeInvocation, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		if fail.Load() {
+			return extension.Instance{}, errors.New("boom")
+		}
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"failing.agent.cap": testServiceImplementation()}}, nil
+	})
 }
 
 func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "failing-agent")
 		var fail atomic.Bool
 		fail.Store(true)
 		e.fixtureStore(store)
@@ -1494,27 +1494,24 @@ func TestExecutionOpenerFailureReleasesInterval(t *testing.T) {
 // parkingAgentClosePlugin is one Agent-scoped plugin whose Instance.Close
 // signals its start and then parks on the release gate: the held
 // execution-cleanup row.
-func parkingAgentClosePlugin(started chan struct{}, gate chan struct{}) Plugin {
-	return Plugin{
-		ID:       "parking-agent",
-		Scope:    ScopeAgent,
-		Provides: []CapabilitySpec{Spec[any]("parking.agent.cap")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"parking.agent.cap": "ok"}, Close: func() error {
-				select {
-				case started <- struct{}{}:
-				default:
-				}
-				<-gate
-				return nil
-			}}, nil
-		},
-	}
+func parkingAgentClosePlugin(started chan struct{}, gate chan struct{}) extension.Native {
+	capability := testServiceCapability("parking.agent.cap")
+	return testNative("parking-agent", extension.LifetimeInvocation, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"parking.agent.cap": testServiceImplementation()}, Close: func(context.Context, extension.CallContext) error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-gate
+			return nil
+		}}, nil
+	})
 }
 
 func TestExecutionCleanupReleasesIntervalLast(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
+		enableFixturePlugin(t, e.configPath, "parking-agent")
 		closeGate := make(chan struct{})
 		closeStarted := make(chan struct{}, 1)
 		e.fixtureStore(store)

@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -34,7 +33,7 @@ const projectionAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"sim
 func openProjectionRuntime(t *testing.T, store harness.Storage) (*Runtime, *ownerEnv) {
 	t.Helper()
 	e := newOwnerEnv(t)
-	writeServiceFile(t, agents.PathForConfig(e.configPath), projectionAgentsDocument)
+	writeAgentDefinitions(t, e.configPath, projectionAgentsDocument)
 	e.fixtureStore(store)
 	r, err := e.open(context.Background())
 	testassert.NoError(t, err)
@@ -172,7 +171,7 @@ func launchChildThroughRuntime(t *testing.T, r *Runtime, parent, operationID str
 	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 		res, err := h.LaunchChildSession(ctx, harness.LaunchChildRequest{
 			ParentSessionID: parent,
-			AgentType:       "worker",
+			AgentSelection:  suppliedDefinition("worker"),
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "child work"}},
 			OperationID:     operationID,
 			MaxConcurrent:   1,
@@ -247,7 +246,7 @@ func assertStableHeader(t *testing.T, header protocol.Session, sessionHeader har
 	t.Helper()
 	currentOK := (wantCurrent == "") == (header.CurrentOperationId == nil) &&
 		(wantCurrent == "" || *header.CurrentOperationId == wantCurrent)
-	testassert.Require(t, header.SessionId == sessionID && header.Workspace == workspace && header.Lifecycle == protocol.Open && header.AgentType == agent && header.ArchivedAt == nil && currentOK && header.CreatedAt.Equal(sessionHeader.Identity.CreatedAt) && header.LastActivity.Equal(sessionHeader.LastActivity), "header = %+v, want the open %s header at %s with current operation %q; header times = (%v, %v), want the read times (%v, %v)", header, sessionID, workspace, wantCurrent, header.CreatedAt, header.LastActivity, sessionHeader.Identity.CreatedAt, sessionHeader.LastActivity)
+	testassert.Require(t, header.SessionId == sessionID && header.Workspace == workspace && header.Lifecycle == protocol.Open && header.AgentSelection.Definition.DefinitionId == agent && header.ArchivedAt == nil && currentOK && header.CreatedAt.Equal(sessionHeader.Identity.CreatedAt) && header.LastActivity.Equal(sessionHeader.LastActivity), "header = %+v, want the open %s header at %s with current operation %q; header times = (%v, %v), want the read times (%v, %v)", header, sessionID, workspace, wantCurrent, header.CreatedAt, header.LastActivity, sessionHeader.Identity.CreatedAt, sessionHeader.LastActivity)
 	testassert.Equal(t, header.CreatedAt.Location(), time.UTC)
 	if header.SessionRevision != wantSessionRevision(t, sessionHeader) {
 		t.Fatalf("session_revision = %+v, want the read pair %+v", header.SessionRevision, wantSessionRevision(t, sessionHeader))
@@ -320,7 +319,7 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		awaitModelArrival(t, e)
 
 		active := projectOperation(readOperation(t, r, session, "op-1"))
-		testassert.Require(t, active.OperationId == "op-1" && active.RequestKind == protocol.OperationRequestKindMessage && active.Status == protocol.OperationStatusRunning && active.SettledAt == nil && active.Detail == nil && active.AgentType == "solo" && active.Model == "prov/m" && !active.AdmittedAt.IsZero(), "active projection = %+v, want the running message op-1 with no terminal members", active)
+		testassert.Require(t, active.OperationId == "op-1" && active.RequestKind == protocol.OperationRequestKindMessage && active.Status == protocol.OperationStatusRunning && active.SettledAt == nil && active.Detail == nil && active.AgentSelection.Definition.DefinitionId == "solo" && active.Model == "prov/m" && !active.AdmittedAt.IsZero(), "active projection = %+v, want the running message op-1 with no terminal members", active)
 
 		close(gate)
 		record := awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
@@ -411,7 +410,10 @@ func TestProjectionListAndReadsAroundUnavailableSessions(t *testing.T) {
 			return err
 		})
 		testassert.NoError(t, err)
-		testassert.NoError(t, r.deleteSession(context.Background(), deleted))
+		{
+			_, err := r.deleteSession(context.Background(), deleted)
+			testassert.NoError(t, err)
+		}
 
 		list, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
 		testassert.NoError(t, err)
@@ -465,8 +467,8 @@ func TestProjectionCallerCopyOwnership(t *testing.T) {
 		session := projectionSession(t, r, ws, "solo").Identity.SessionID
 
 		header := projectSession(headerThroughRuntime(t, r, session))
-		wantHeader := header
-		header.AgentType = "mutated"
+		wantHeader := projectSession(headerThroughRuntime(t, r, session))
+		header.AgentSelection.Definition.DefinitionId = "mutated"
 		header.Workspace = "mutated"
 		header.Lifecycle = protocol.Archived
 		header.SessionId = "mutated"
@@ -487,7 +489,7 @@ func TestProjectionCallerCopyOwnership(t *testing.T) {
 		}
 
 		reread := projectSession(headerThroughRuntime(t, r, session))
-		testassert.Equal(t, reread, wantHeader)
+		testassert.Require(t, reflect.DeepEqual(reread, wantHeader), "re-read header = %+v, want %+v", reread, wantHeader)
 		relisted, err := r.listSessions(context.Background(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(relisted, wantList), "re-read list = %+v, want the immutable pre-mutation %+v", relisted, wantList)
@@ -529,7 +531,8 @@ func TestProjectionConcurrentReadDelete(t *testing.T) {
 		defer release()
 		deleteDone := make(chan error, 1)
 		go func() {
-			deleteDone <- r.deleteSession(context.Background(), session)
+			_, err := r.deleteSession(context.Background(), session)
+			deleteDone <- err
 		}()
 		select {
 		case <-blocked.arrived:
@@ -640,13 +643,13 @@ func TestProjectionHeaderCarriesNoInternalRepresentation(t *testing.T) {
 
 		header := projectSession(headerThroughRuntime(t, r, session))
 		assertExactJSONKeys(t, header, []string{
-			"agent_type", "created_at", "last_activity", "lifecycle", "session_id",
+			"agent_selection", "agent_selection.definition", "created_at", "last_activity", "lifecycle", "session_id",
 			"session_revision", "session_revision.durable_revision", "session_revision.instance_id",
 			"session_revision.local_revision", "workspace",
 		})
 		snap := sessionViewThroughRuntime(t, r, session)
 		operationJSON := assertExactJSONKeys(t, projectOperationSummary(snap.Operations[0]), []string{
-			"admitted_at", "agent_type", "model", "operation_id", "request_kind",
+			"admitted_at", "agent_selection", "agent_selection.definition", "model", "operation_id", "request_kind",
 			"settled_at", "status", "usage", "usage.by_model",
 		})
 		testassert.Require(t, strings.Contains(operationJSON, `"by_model":[]`), "empty usage = %s, want the non-nil [] array", operationJSON)
@@ -727,7 +730,7 @@ func TestProjectionCostEstimatesFromCapturedPricing(t *testing.T) {
 		pricedSummary := projectOperationSummary(view.Operations[0])
 		testassert.Require(t, pricedSummary.Usage.EstimatedCostUsd != nil && math.Abs(*pricedSummary.Usage.EstimatedCostUsd-want) < 1e-12, "priced Operation estimate = %+v, want %v", pricedSummary.Usage, want)
 		assertExactJSONKeys(t, pricedSummary, []string{
-			"admitted_at", "agent_type", "model", "operation_id", "request_kind",
+			"admitted_at", "agent_selection", "agent_selection.definition", "model", "operation_id", "request_kind",
 			"settled_at", "status", "usage", "usage.by_model", "usage.estimated_cost_usd",
 		})
 
@@ -749,7 +752,7 @@ func TestProjectionCostEstimatesFromCapturedPricing(t *testing.T) {
 		testassert.Require(t, repriced.Usage.EstimatedCostUsd != nil && math.Abs(*repriced.Usage.EstimatedCostUsd-want) < 1e-12, "priced Operation estimate after the sibling turn = %+v, want %v", repriced.Usage, want)
 		testassert.Require(t, unreported.Usage.EstimatedCostUsd == nil, "unreported Operation estimate = %+v, want absent", unreported.Usage)
 		assertExactJSONKeys(t, unreported, []string{
-			"admitted_at", "agent_type", "model", "operation_id", "request_kind",
+			"admitted_at", "agent_selection", "agent_selection.definition", "model", "operation_id", "request_kind",
 			"settled_at", "status", "usage", "usage.by_model",
 		})
 	})
@@ -848,7 +851,10 @@ func TestProjectionListCandidateDeletionDuringScan(t *testing.T) {
 		}
 		// While the survivor's read is parked, the already-copied victim is
 		// deleted: the scan must observe it as absent, not fail.
-		testassert.NoError(t, r.deleteSession(context.Background(), victim))
+		{
+			_, err := r.deleteSession(context.Background(), victim)
+			testassert.NoError(t, err)
+		}
 		gated.releaseGate()
 		select {
 		case err := <-listDone:

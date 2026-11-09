@@ -10,37 +10,38 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/jobs"
-	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // configuration is the immutable snapshot of one effective input set: the
 // assembled catalog with its build warnings and each model's source label,
-// the complete resolved agent definitions (retaining their private fields)
-// with the definition warnings, the session policy, every compiled plugin's
-// owned raw configuration section, the owned decoded provider user layer this
-// same build consumed, and the captured global and Workspace permission
-// inputs. Input documents are discarded once the snapshot is built; later
-// consumers add their own fields when they land.
+// the immutable Agent roster projection supplied by the active definition
+// resolvers, the session policy, every compiled plugin's owned raw
+// configuration section, the owned decoded provider user layer this same
+// build consumed, and the captured global and Workspace permission inputs.
+// Input documents are discarded once the snapshot is built; later consumers
+// add their own fields when they land.
 type configuration struct {
 	generation           uint64
+	resources            *resourceSet
+	composition          *composition
 	catalog              *catalog.Catalog
 	catalogWarnings      []catalog.Warning
-	definitions          []agents.Resolved
-	agentWarnings        []agents.Warning
+	definitions          []agentDefinition
 	sessions             config.SessionConfig
 	tools                json.RawMessage
 	jobs                 json.RawMessage
 	compaction           json.RawMessage
 	compactionValues     compactionSettings
-	plugins              map[string]json.RawMessage
+	extensions           map[string]json.RawMessage
+	secrets              []declaredSecret
+	declaredBindings     map[declaredField]declaredBinding
 	userProviders        map[string]any
 	permissions          json.RawMessage
 	workspacePermissions map[string]json.RawMessage
@@ -58,8 +59,78 @@ type capturedConfigDocument struct {
 	Tools       json.RawMessage            `json:"tools"`
 	Jobs        json.RawMessage            `json:"jobs"`
 	Compaction  json.RawMessage            `json:"compaction"`
-	Plugins     map[string]json.RawMessage `json:"plugins"`
+	Extensions  map[string]json.RawMessage `json:"extensions"`
 	Permissions json.RawMessage            `json:"permissions"`
+}
+
+// declaredSecret is one active extension SecretRef resolved to the non-secret
+// credential name its section field holds. Only the reference metadata is
+// captured here; values live in the private activation/Operation resources
+// that resolve them.
+type declaredSecret struct {
+	extensionID string
+	field       string
+	lifetime    extension.SecretLifetime
+	name        string
+}
+
+// declaredField identifies one active SecretRef field in its extension.
+type declaredField struct {
+	extensionID string
+	field       string
+}
+
+// declaredBinding is one candidate's private capture of an active declared
+// field: the resolved non-secret credential name and the value captured from
+// the one candidate environment observation. It is never durable.
+type declaredBinding struct {
+	name  string
+	value string
+}
+
+// declaredSecretNames returns the unique non-secret credential names every
+// active declaration references. The live producer unions them with the
+// current provider names; the preparation's one credential observation
+// resolves the same names for its captured values and exclusions.
+func (c *configuration) declaredSecretNames() []string {
+	if c == nil || len(c.secrets) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(c.secrets))
+	names := make([]string, 0, len(c.secrets))
+	for _, secret := range c.secrets {
+		if seen[secret.name] {
+			continue
+		}
+		seen[secret.name] = true
+		names = append(names, secret.name)
+	}
+	return names
+}
+
+// resolveDeclaredSecrets inspects the SecretRef metadata of every active
+// installed declaration against its captured section and records the
+// non-secret credential names without executing extension code.
+func resolveDeclaredSecrets(declarations []extension.Native, sections map[string]json.RawMessage) []declaredSecret {
+	var out []declaredSecret
+	for _, native := range declarations {
+		declaration := native.Declaration
+		if len(declaration.Secrets) == 0 {
+			continue
+		}
+		section := sections[declaration.ID]
+		if !sectionEnabled(section) {
+			continue
+		}
+		for _, secret := range declaration.Secrets {
+			name, ok := extension.SecretName(section, secret.Field)
+			if !ok {
+				continue
+			}
+			out = append(out, declaredSecret{extensionID: declaration.ID, field: secret.Field, lifetime: secret.Lifetime, name: name})
+		}
+	}
+	return out
 }
 
 // decodeCapturedConfig decodes one captured main configuration document in a
@@ -85,14 +156,12 @@ func decodeCapturedConfig(configData []byte) (capturedConfigDocument, error) {
 
 // newConfiguration assembles the complete snapshot from one decoded captured
 // document, the provider assembly already performed for the captured
-// providers layer (a catalog entry never rereads the main configuration), the
-// captured agent-definition bytes, and the captured Workspace permission
-// bytes: it calls ParseSessions and agents.ParseWithCapabilities against the
-// supplied ordinary visible export IDs and the compiled tool universe, with
-// the application-selected default capability IDs (empty selects none), and
-// carries the given publication generation. Plugin-section validation belongs
-// to the publisher, not here.
-func newConfiguration(generation uint64, doc capturedConfigDocument, built catalog.BuildResult, agentsData []byte, capabilityIDs, toolIDs, defaultCapabilityIDs []string, workspacePermissions map[string]json.RawMessage) (*configuration, error) {
+// providers layer (a catalog entry never rereads the main configuration), and
+// the captured Workspace permission bytes. Agent definitions are not parsed
+// here: the active resolver extensions supply the roster projection after
+// their Harness resources are ready. Plugin-section validation belongs to the
+// publisher, not here.
+func newConfiguration(generation uint64, doc capturedConfigDocument, built catalog.BuildResult, workspacePermissions map[string]json.RawMessage) (*configuration, error) {
 	sessions, err := config.ParseSessions(doc.Sessions)
 	if err != nil {
 		return nil, fmt.Errorf("captured configuration sessions: %w", err)
@@ -107,22 +176,16 @@ func newConfiguration(generation uint64, doc capturedConfigDocument, built catal
 	if err != nil {
 		return nil, fmt.Errorf("captured configuration compaction: %w", err)
 	}
-	definitions, err := agents.ParseWithCapabilities(agentsData, capabilityIDs, toolIDs, defaultCapabilityIDs)
-	if err != nil {
-		return nil, fmt.Errorf("decode captured agent definitions: %w", err)
-	}
 	return &configuration{
 		generation:           generation,
 		catalog:              built.Catalog,
 		catalogWarnings:      built.Warnings,
-		definitions:          definitions.All(),
-		agentWarnings:        definitions.Warnings(),
 		sessions:             sessions,
 		tools:                doc.Tools,
 		jobs:                 doc.Jobs,
 		compaction:           doc.Compaction,
 		compactionValues:     compaction,
-		plugins:              doc.Plugins,
+		extensions:           doc.Extensions,
 		userProviders:        doc.Providers,
 		permissions:          doc.Permissions,
 		workspacePermissions: workspacePermissions,
@@ -149,10 +212,10 @@ func projectSettings(sessions config.SessionConfig, tools, jobs, compaction json
 		Tools:      projectSettingsObject(tools),
 		Jobs:       projectSettingsObject(jobs),
 		Compaction: projectSettingsObject(compaction),
-		Plugins:    make(protocol.PluginsSettings, len(plugins)),
+		Extensions: make(protocol.ExtensionsSettings, len(plugins)),
 	}
 	for id, raw := range plugins {
-		out.Plugins[id] = string(raw)
+		out.Extensions[id] = string(raw)
 	}
 	return out
 }
@@ -179,41 +242,4 @@ func (c *configuration) permissionPolicy(workspace string) harness.PermissionPol
 		workspaceRaw = c.workspacePermissions[id]
 	}
 	return harness.ResolvePermissionPolicy(c.permissions, workspaceRaw)
-}
-
-// agentTypes projects the snapshot's resolved definitions onto the Harness
-// view.
-func (c *configuration) agentTypes() []harness.AgentType {
-	return projectAgentTypes(c.definitions)
-}
-
-// projectAgentTypes projects resolved definitions onto the Harness view: the
-// shared producer admission and the Agent-model edit's known-type check both
-// resolve through — public model identity, owned slices, the permission
-// capability constraints with WriteDir trimmed once (preserving the legacy
-// whitespace-as-unset behavior: no environment expansion, no new path
-// syntax), the subagent eligibility and roster description, and the complete
-// roster with no internal package type reaching the view.
-func projectAgentTypes(defs []agents.Resolved) []harness.AgentType {
-	out := make([]harness.AgentType, 0, len(defs))
-	for _, def := range defs {
-		at := harness.AgentType{
-			Name:         def.Name,
-			SystemPrompt: def.SystemPrompt,
-			Prompt:       def.Prompt,
-			Readonly:     def.Readonly,
-			WriteDir:     strings.TrimSpace(def.WriteDir),
-			Subagent:     def.Subagent,
-			Description:  def.Description,
-		}
-		if def.Model != "" {
-			if ref, err := model.Parse(def.Model); err == nil {
-				at.Model = ref
-			}
-		}
-		at.Tools = append([]string(nil), def.Tools...)
-		at.Capabilities = append([]string(nil), def.Capabilities...)
-		out = append(out, at)
-	}
-	return out
 }

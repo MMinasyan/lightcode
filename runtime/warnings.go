@@ -7,10 +7,9 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -294,17 +293,18 @@ func setupWarnings(c *configuration, credentials map[string]config.EnvValue) []p
 	if !anyConnected {
 		out = append(out, protocol.Warning{Source: setupSource, Kind: setupNoProviderKind, Message: setupNoProviderMessage})
 	}
-	// The primary selection comes from the same agentTypes normalization
-	// admission uses: its Model is the resolved ref, zero when the definition
-	// configures none — every accepted nonempty model is already parseable,
-	// so no parse-failure case exists.
-	var configured model.ModelRef
-	for _, at := range c.agentTypes() {
-		if at.Name == "primary" {
-			configured = at.Model
-			break
-		}
+	// The named model warning addresses only the supplied application
+	// definition, exactly like client root creation. A foreign resolver's
+	// primary display name is never a substitute; absent supplied primary
+	// leaves only the independent provider-connectivity posture above.
+	primary, ok := c.projectedDefinition(harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "primary"})
+	if !ok {
+		return out
 	}
+	// Its Model is the resolver input, zero when the definition configures
+	// none — every accepted nonempty model is already parseable, so no
+	// parse-failure case exists.
+	configured := primary.inputs.Model
 	switch {
 	case configured.IsZero():
 		out = append(out, protocol.Warning{Source: setupSource, Kind: setupNoModelKind, Message: setupNoModelMessage})
@@ -337,16 +337,6 @@ func catalogWarnings(warnings []catalog.Warning) []protocol.Warning {
 			message = fmt.Sprintf("%s: %s", w.Provider, message)
 		}
 		out = append(out, protocol.Warning{Source: catalogSource, Kind: w.Kind, Message: message})
-	}
-	return out
-}
-
-// agentWarnings composes one definition parse's warnings with the retained
-// "name: message" form.
-func agentWarnings(warnings []agents.Warning) []protocol.Warning {
-	out := make([]protocol.Warning, 0, len(warnings))
-	for _, w := range warnings {
-		out = append(out, protocol.Warning{Source: agentsSource, Kind: w.Kind, Message: w.Error()})
 	}
 	return out
 }

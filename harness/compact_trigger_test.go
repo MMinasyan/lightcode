@@ -627,7 +627,7 @@ func TestModelEffectCompactTriggerSecondOverflowSameOperation(t *testing.T) {
 	compactCalls := 0
 	var sentTexts [][]string
 	rounds := 0
-	tool := func(_ context.Context, call model.ToolCall) PreparedTool {
+	tool := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	exec := purposeExecution(
@@ -698,7 +698,7 @@ func TestModelEffectCompactTriggerSummaryUsageStaysTotalsOnly(t *testing.T) {
 	compactCalls := 0
 	conversationCalls := 0
 	rounds := 0
-	tool := func(_ context.Context, call model.ToolCall) PreparedTool {
+	tool := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	exec := purposeExecution(
@@ -1057,7 +1057,7 @@ func TestModelEffectCompactTriggerFullInputCommitAttributesUsage(t *testing.T) {
 				refusal.RefusalFragment = "cannot do that"
 				return streamOf(refusal), nil
 			},
-			Tool: func(_ context.Context, call model.ToolCall) PreparedTool {
+			Tool: func(ctx context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 			},
 			NormalizeTool: objectNormalize,
@@ -1083,7 +1083,7 @@ func TestModelEffectCompactTriggerFullInputCommitAttributesUsage(t *testing.T) {
 		queue = queue[1:]
 		return next, nil
 	})
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	sessionID := session.Identity.SessionID
 	c := leaseCoordinator(t, h, sessionID)

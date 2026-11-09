@@ -92,7 +92,7 @@ var operationDescriptors = map[string]descriptor{
 	},
 	"DeleteSession": {
 		session: memberRequired,
-		status:  204,
+		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
 			var pathValue protocol.SessionID
 			if err := bindPath(env.session, &pathValue); err != nil {
@@ -335,18 +335,6 @@ var operationDescriptors = map[string]descriptor{
 			return c.RevertSessionCodeWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
-	"SetAgentTypeModel": {
-		query:  memberRequired,
-		body:   memberRequired,
-		status: 200,
-		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var query protocol.SetAgentTypeModelParams
-			if err := bindQuery(env.query, []string{"agent_type"}, &query); err != nil {
-				return nil, err
-			}
-			return c.SetAgentTypeModelWithBody(ctx, &query, contentTypeJSON, bytes.NewReader(env.body))
-		},
-	},
 	"SetSessionAgentType": {
 		session: memberRequired,
 		body:    memberRequired,
@@ -357,6 +345,18 @@ var operationDescriptors = map[string]descriptor{
 				return nil, err
 			}
 			return c.SetSessionAgentTypeWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
+		},
+	},
+	"SetSessionModel": {
+		session: memberRequired,
+		body:    memberRequired,
+		status:  200,
+		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
+			var pathValue protocol.SessionID
+			if err := bindPath(env.session, &pathValue); err != nil {
+				return nil, err
+			}
+			return c.SetSessionModelWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
 	"StopSession": {

@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -150,20 +149,9 @@ func realJobs(t *testing.T, dataDir string) *jobs.Manager {
 // the given data root and jobs service, optionally composing one extra plugin
 // as an isolated Runtime scope (the zero Plugin composes none) and returning
 // its bound capability values.
-func openToolsComposed(t *testing.T, dataDir string, jobsValue jobs.Jobs, extra Plugin) (map[string]Tool, map[string]any) {
+func openToolsComposed(t *testing.T, dataDir string, jobsValue jobs.Jobs, _ any) (map[string]Tool, map[string]any) {
 	t.Helper()
-	byID := newStandardTools(dataDir, jobsValue)
-	var values map[string]any
-	if extra.ID != "" {
-		composed, closeScope, err := ComposeScopeForTest(context.Background(), ScopeInfo{
-			Kind:    ScopeRuntime,
-			DataDir: dataDir,
-		}, []Plugin{extra})
-		testassert.NoError(t, err)
-		t.Cleanup(func() { _ = closeScope() })
-		values = composed
-	}
-	return byID, values
+	return newStandardTools(dataDir, jobsValue), nil
 }
 
 func openTools(t *testing.T, dataDir string) map[string]Tool {
@@ -173,62 +161,27 @@ func openTools(t *testing.T, dataDir string) map[string]Tool {
 
 // TestStandardToolsCompiledIntoComposition proves the baseline tool universe:
 // the seven standard tool declarations compile into every composition without
-// any registration, they are the capability universe's fixed prefix beside the
-// tool universe, an optional export naming one collides as a duplicate
+// any registration, each resolves through the one export table as an ordinary
+// standard provider, an optional export naming one collides as a duplicate
 // provider, and an ordinary dependency on one resolves through the same
 // provider rules as any other capability.
 func TestStandardToolsCompiledIntoComposition(t *testing.T) {
-	c, err := newComposition(nil)
-	testassert.Require(t, err == nil, "newComposition(nil): %v", err)
-	baseline := make([]string, 0, len(standardToolSpecs()))
-	for _, spec := range standardToolSpecs() {
-		baseline = append(baseline, spec.id)
+	c, err := newNativeComposition(nil)
+	testassert.Require(t, err == nil, "newNativeComposition(nil): %v", err)
+	declarations := standardToolDeclarations()
+	baseline := make([]string, 0, len(declarations))
+	for _, declaration := range declarations {
+		baseline = append(baseline, declaration.id)
 	}
-	testassert.Require(t, slices.Equal(c.capabilityIDs[:len(baseline)], baseline), "capability universe prefix = %v, want the seven standard tools first", c.capabilityIDs)
-	testassert.Require(t, slices.Equal(c.toolIDs[:len(baseline)], baseline), "tool universe prefix = %v, want the seven standard tools first", c.toolIDs)
+	for _, id := range baseline {
+		export, ok := c.exports[id]
+		testassert.Require(t, ok && export.standard && export.standardDescribe != nil, "tool %q has no compiled baseline export", id)
+	}
 	for _, id := range toolExportIDs {
 		spec, ok := c.toolSpec(id)
-		testassert.Require(t, ok && spec.id == id && spec.describe != nil, "tool %q has no compiled baseline declaration", id)
-		testassert.Require(t, slices.Contains(c.capabilityIDs, id), "capability universe = %q, want %q selectable", c.capabilityIDs, id)
+		testassert.Require(t, ok && spec.id == id && spec.standardDescribe != nil, "tool %q has no compiled baseline declaration", id)
 	}
-	{
-		_, err := newComposition([]Plugin{{
-			ID:    "shadow",
-			Scope: ScopeRuntime,
-			Provides: []CapabilitySpec{ToolSpec("run_command", func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
-				return ToolDescription{}, nil
-			})},
-			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				return Instance{Values: map[string]any{"run_command": nil}}, nil
-			},
-		}})
-		testassert.Require(t, err != nil && errors.Is(err, ErrComposition) && strings.Contains(err.Error(), `capability "run_command" already exported by the owner's standard tools`), "plugin exporting a standard tool name = %v, want the duplicate-provider collision", err)
-	}
-	{
-		_, err := newComposition([]Plugin{{
-			ID:       "dependent",
-			Scope:    ScopeWorkspace,
-			Provides: []CapabilitySpec{Spec[any]("marker")},
-			Requires: []CapabilitySpec{Spec[Tool]("write_file")},
-			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				return Instance{Values: map[string]any{"marker": ""}}, nil
-			},
-		}})
-		testassert.Require(t, err == nil, "plugin depending on a standard tool name = %v, want the ordinary provider resolution", err)
-	}
-	{
-		_, err := newComposition([]Plugin{{
-			ID:       "dependent",
-			Scope:    ScopeRuntime,
-			Provides: []CapabilitySpec{Spec[any]("marker")},
-			Requires: []CapabilitySpec{Spec[greeter]("write_file")},
-			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				return Instance{Values: map[string]any{"marker": ""}}, nil
-			},
-		}})
-		testassert.Require(t, err != nil && errors.Is(err, ErrComposition) && strings.Contains(err.Error(), "is not assignable to required"), "plugin depending on a standard tool name with the wrong type = %v, want the ordinary type rule", err)
-	}
-	byID, _ := openToolsComposed(t, t.TempDir(), &fakeJobs{}, Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), &fakeJobs{}, nil)
 	testassert.Equal(t, len(byID), 7)
 }
 
@@ -257,10 +210,6 @@ type scriptBackground struct {
 	startErr error
 }
 
-func (scriptBackground) LaunchChild(ChildRequest) (string, error) {
-	return "", errors.New("unexpected child launch in this fixture")
-}
-
 func (b scriptBackground) StartJob(_ string, spawn func(context.Context, func(string) error) error) error {
 	if b.startErr != nil {
 		return b.startErr
@@ -275,21 +224,6 @@ type harnessBackground struct {
 	h         *harness.Harness
 	sessionID string
 	delivered chan struct{}
-}
-
-func (b *harnessBackground) LaunchChild(req ChildRequest) (string, error) {
-	result, err := b.h.LaunchChildSession(context.Background(), harness.LaunchChildRequest{
-		ParentSessionID: b.sessionID,
-		AgentType:       req.AgentType,
-		Content:         req.Content,
-		OperationID:     req.OperationID,
-		MaxConcurrent:   req.MaxConcurrent,
-		OutputLimit:     req.OutputLimit,
-	})
-	if err != nil {
-		return "", err
-	}
-	return result.ChildSessionID, nil
 }
 
 func (b *harnessBackground) StartJob(jobID string, spawn func(context.Context, func(string) error) error) error {
@@ -394,11 +328,6 @@ type toolsHarnessOpts struct {
 	// store, when non-nil, is the durable store behind the fixture's
 	// Harness; the zero value opens a temporary SQLite store.
 	store harness.Storage
-	// extraPlugin, when non-empty, composes beside the tools plugin in the
-	// same scope, and extraToolID is additionally bound as a tool export —
-	// the fixture's seam for a caller-owned plugin's tool.
-	extraPlugin Plugin
-	extraToolID string
 }
 
 // toolsHarness is one real Harness over one durable store whose
@@ -444,14 +373,7 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 	default:
 		jobsValue = &fakeJobs{}
 	}
-	byID, values := openToolsComposed(t, dataDir, jobsValue, opts.extraPlugin)
-	if opts.extraToolID != "" {
-		value, ok := values[opts.extraToolID]
-		testassert.Require(t, ok, "composition is missing the extra tool export %q", opts.extraToolID)
-		toolValue, ok := value.(Tool)
-		testassert.Require(t, ok, "export %q supplies %T, not a Tool", opts.extraToolID, value)
-		byID[opts.extraToolID] = toolValue
-	}
+	byID, _ := openToolsComposed(t, dataDir, jobsValue, nil)
 	advertise := opts.advertise
 	if advertise == nil {
 		advertise = []string{"read_file", "write_file", "edit_file", "apply_patch"}
@@ -487,12 +409,12 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 						OpenInvocation: func(context.Context, harness.InvocationRequest) (harness.InvocationExecution, error) {
 							return harness.InvocationExecution{
 								Model: modelFn,
-								NormalizeTool: func(call model.ToolCall) (json.RawMessage, error) {
+								NormalizeTool: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 									tool, ok := byID[call.Name]
 									if !ok {
 										return nil, fmt.Errorf("unknown tool %q", call.Name)
 									}
-									return tool.Normalize(tc, call)
+									return tool.Normalize(context.Background(), tc, call)
 								},
 								Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
 									return byID[call.Name].Prepare(ctx, tc, call)
@@ -525,7 +447,7 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 
 func (th *toolsHarness) createSession() string {
 	th.t.Helper()
-	rec, err := th.h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: th.workspace, AgentType: "coder"})
+	rec, err := th.h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: th.workspace, AgentSelection: suppliedDefinition("coder")})
 	if err != nil {
 		th.t.Fatalf("CreateSession: %v", err)
 	}
@@ -923,7 +845,7 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_TEST", "env-value")
 		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED", "managed-secret") // cleanup reservation only
 		testassert.NoError(t, os.Unsetenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED"))
-		byID, _ := openToolsComposed(t, dataDir, &fakeJobs{}, Plugin{})
+		byID, _ := openToolsComposed(t, dataDir, &fakeJobs{}, nil)
 		runCommand := byID["run_command"]
 		// The key connects AFTER the tools plugin opened: the call-time
 		// subprocess-environment producer, not any Open-captured copy, must
@@ -1448,7 +1370,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("handoff rejection renders through the wrapper and aborts the reservation", func(t *testing.T) {
 		fake := &fakeJobs{}
-		byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+		byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 		tc := callToolContext(ws, ToolConstraints{})
 		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 		tc.Background = &scriptBackground{startErr: errors.New("background group is closed or stopping")}
@@ -1461,7 +1383,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("spawn failure renders through the wrapper and aborts the reservation", func(t *testing.T) {
 		fake := &fakeJobs{startErr: errors.New("spawn boom")}
-		byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+		byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 		tc := callToolContext(ws, ToolConstraints{})
 		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 		tc.Background = &scriptBackground{}
@@ -1473,7 +1395,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 
 	t.Run("reserve failure renders through the wrapper without an abort", func(t *testing.T) {
 		fake := &fakeJobs{reserveErr: errors.New("process: manager is closed")}
-		byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+		byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 		tc := callToolContext(ws, ToolConstraints{})
 		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
 		tc.Background = &scriptBackground{}
@@ -1490,7 +1412,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 // sub-one becomes 0, and the immediate result is the retained template.
 func TestReadOnlyBackgroundStartRewritesAndHonorsTimeout(t *testing.T) {
 	fake := &fakeJobs{live: []string{"b0b0b0b0", "11111111"}}
-	byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 	ws := t.TempDir()
 	tc := callToolContext(ws, ToolConstraints{Readonly: true})
 	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
@@ -1866,7 +1788,7 @@ func TestProcessToolReturnsRetainedActionResults(t *testing.T) {
 // no capability call — never permission-denied status.
 func TestProcessToolValidationIsImmediateError(t *testing.T) {
 	fake := &fakeJobs{}
-	byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 	process := byID["process"]
 	ws := t.TempDir()
 	cases := []struct {
@@ -1980,7 +1902,7 @@ func TestRunCommandNilSubprocessEnvNoStart(t *testing.T) {
 func TestBackgroundNilSubprocessEnvNoReservation(t *testing.T) {
 	ws := t.TempDir()
 	fake := &fakeJobs{}
-	byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 	tc := callToolContext(ws, ToolConstraints{})
 	tc.Background = &scriptBackground{}
 	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
@@ -2022,7 +1944,7 @@ func TestRunCommandEnvResolvedAtStartNotPrepare(t *testing.T) {
 func TestBackgroundNilEnvSnapshotAbortsBeforeStart(t *testing.T) {
 	ws := t.TempDir()
 	fake := &fakeJobs{}
-	byID, _ := openToolsComposed(t, t.TempDir(), fake, Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 	tc := callToolContext(ws, ToolConstraints{})
 	tc.SubprocessEnv = func() []string { return nil } // a nil snapshot is never an ambient fallback
 	tc.Background = &scriptBackground{}

@@ -115,7 +115,7 @@ func TestObserveFactKinds(t *testing.T) {
 		}
 		return completedTurnStream(), nil
 	}
-	plan := func(_ context.Context, call model.ToolCall) PreparedTool {
+	plan := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
 	h, _, c, sessionID := newEffectHarness(t, nil)
@@ -510,7 +510,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 	t.Run("create", func(t *testing.T) {
 		h := newTestHarness(t, emptyStore(t), nil)
 		col := observeHarness(h)
-		created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+		created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 		testassert.NoError(t, err)
 		facts := col.invalidations()
 		testassert.Equal(t, len(facts), 1)
@@ -521,7 +521,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 		h := newTestHarness(t, freshSessionStore(t), nil)
 		col := observeHarness(h)
 		{
-			_, err := h.ChangeAgentType(context.Background(), testSessionID, "planner")
+			_, err := h.ChangeAgentType(context.Background(), testSessionID, testSelection("planner"))
 			testassert.NoError(t, err)
 		}
 		{
@@ -728,7 +728,7 @@ func TestObserveIntentOnly(t *testing.T) {
 		}
 		executeStarted := make(chan struct{})
 		release := make(chan struct{})
-		plan := func(_ context.Context, call model.ToolCall) PreparedTool {
+		plan := func(ctx context.Context, call model.ToolCall) PreparedTool {
 			return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
 				close(executeStarted)
 				<-release
@@ -787,7 +787,7 @@ func TestObserveNoWriteAndDelete(t *testing.T) {
 	}
 	col.reset()
 	{
-		err := h.DeleteSession(context.Background(), testSessionID)
+		_, err := h.DeleteSession(context.Background(), testSessionID)
 		testassert.NoError(t, err)
 	}
 	{
@@ -808,7 +808,7 @@ func TestObserveSuppression(t *testing.T) {
 		c := cachedCoordinator(t, h, testSessionID)
 		col := observeHarness(h)
 		{
-			err := h.DeleteSession(context.Background(), testSessionID)
+			_, err := h.DeleteSession(context.Background(), testSessionID)
 			testassert.NoError(t, err)
 		}
 		h.observeInvalidation(c)
@@ -1334,13 +1334,13 @@ func TestObserveToolLifecycle(t *testing.T) {
 		}))
 		return col, err
 	}
-	successPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
+	successPlan := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 	}
-	errorPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
+	errorPlan := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "boom"}}}
 	}
-	deniedPlan := func(_ context.Context, call model.ToolCall) PreparedTool {
+	deniedPlan := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Execute: func(context.Context) ToolOutcome {
 			return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
 		}}
@@ -1357,7 +1357,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 			{name: "success", plan: successPlan, status: model.ResultSuccess},
 			{name: "error", plan: errorPlan, status: model.ResultError},
 			{name: "denied", plan: deniedPlan, status: model.ResultDenied},
-			{name: "executor interrupted", plan: func(_ context.Context, call model.ToolCall) PreparedTool {
+			{name: "executor interrupted", plan: func(ctx context.Context, call model.ToolCall) PreparedTool {
 				return PreparedTool{Permissions: fixturePermission, Execute: func(context.Context) ToolOutcome {
 					return ToolOutcome{Evidence: ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultInterrupted, Content: interruptedToolResultContent}}
 				}}
@@ -1472,7 +1472,7 @@ func TestObserveToolLifecycle(t *testing.T) {
 	t.Run("hooks have no progress kind", func(t *testing.T) {
 		h, _, c, _ := newEffectHarness(t, nil)
 		rounds := 0
-		toolFn := func(_ context.Context, call model.ToolCall) PreparedTool {
+		toolFn := func(ctx context.Context, call model.ToolCall) PreparedTool {
 			return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "done"}}}
 		}
 		hooks := []ToolArgumentsHook{{ID: "h1", ExtensionID: "cap-a", Mode: HookModeEffectful, Run: func(context.Context, model.ToolCall) (json.RawMessage, error) {
@@ -1524,7 +1524,7 @@ func TestObserveRematerializationNoHint(t *testing.T) {
 	col := observeHarness(h)
 	advanceSessionRevision(t, store, testSessionID) // the foreign writer
 	{
-		_, err := h.ChangeAgentType(context.Background(), testSessionID, "planner")
+		_, err := h.ChangeAgentType(context.Background(), testSessionID, testSelection("planner"))
 		testassert.Require(t, errors.Is(err, ErrConflict), "foreign-revision change = %v, want the conflict class", err)
 	}
 	{
@@ -1583,7 +1583,7 @@ func TestObserveRestartNoReplay(t *testing.T) {
 		testassert.Require(t, len(got) == 0, "the new owner's reads replayed %+v", got)
 	}
 	{
-		_, err := restarted.ChangeAgentType(context.Background(), testSessionID, "planner")
+		_, err := restarted.ChangeAgentType(context.Background(), testSessionID, testSelection("planner"))
 		testassert.NoError(t, err)
 	}
 	{
@@ -1664,7 +1664,7 @@ func TestReadObservation(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := h.DeleteSession(context.Background(), testSessionID)
+			_, err := h.DeleteSession(context.Background(), testSessionID)
 			testassert.NoError(t, err)
 		}
 		{

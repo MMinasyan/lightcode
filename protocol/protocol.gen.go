@@ -20,15 +20,21 @@ import (
 	"github.com/oapi-codegen/runtime"
 )
 
-// Defines values for AgentScopeKind.
+// Defines values for AgentInputsAssemblyMode.
 const (
-	AgentScopeKindAgent AgentScopeKind = "agent"
+	AgentAssemblyFull   AgentInputsAssemblyMode = "full"
+	AgentAssemblyNone   AgentInputsAssemblyMode = "none"
+	AgentAssemblySimple AgentInputsAssemblyMode = "simple"
 )
 
-// Valid indicates whether the value is a known member of the AgentScopeKind enum.
-func (e AgentScopeKind) Valid() bool {
+// Valid indicates whether the value is a known member of the AgentInputsAssemblyMode enum.
+func (e AgentInputsAssemblyMode) Valid() bool {
 	switch e {
-	case AgentScopeKindAgent:
+	case AgentAssemblyFull:
+		return true
+	case AgentAssemblyNone:
+		return true
+	case AgentAssemblySimple:
 		return true
 	default:
 		return false
@@ -104,6 +110,24 @@ func (e CheckpointItemKind) Valid() bool {
 	}
 }
 
+// Defines values for CleanupFailureCode.
+const (
+	CleanupFailureCodeStorage     CleanupFailureCode = "storage"
+	CleanupFailureCodeUnavailable CleanupFailureCode = "unavailable"
+)
+
+// Valid indicates whether the value is a known member of the CleanupFailureCode enum.
+func (e CleanupFailureCode) Valid() bool {
+	switch e {
+	case CleanupFailureCodeStorage:
+		return true
+	case CleanupFailureCodeUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ConfigurationChangedEventKind.
 const (
 	ConfigurationChanged ConfigurationChangedEventKind = "configuration_changed"
@@ -121,37 +145,40 @@ func (e ConfigurationChangedEventKind) Valid() bool {
 
 // Defines values for ErrorCode.
 const (
-	Closed        ErrorCode = "closed"
-	Configuration ErrorCode = "configuration"
-	Conflict      ErrorCode = "conflict"
-	Corrupt       ErrorCode = "corrupt"
-	Internal      ErrorCode = "internal"
-	Invalid       ErrorCode = "invalid"
-	NotFound      ErrorCode = "not_found"
-	Storage       ErrorCode = "storage"
-	Unauthorized  ErrorCode = "unauthorized"
+	ErrorCodeClosed        ErrorCode = "closed"
+	ErrorCodeConfiguration ErrorCode = "configuration"
+	ErrorCodeConflict      ErrorCode = "conflict"
+	ErrorCodeCorrupt       ErrorCode = "corrupt"
+	ErrorCodeInternal      ErrorCode = "internal"
+	ErrorCodeInvalid       ErrorCode = "invalid"
+	ErrorCodeNotFound      ErrorCode = "not_found"
+	ErrorCodeStorage       ErrorCode = "storage"
+	ErrorCodeUnauthorized  ErrorCode = "unauthorized"
+	ErrorCodeUnavailable   ErrorCode = "unavailable"
 )
 
 // Valid indicates whether the value is a known member of the ErrorCode enum.
 func (e ErrorCode) Valid() bool {
 	switch e {
-	case Closed:
+	case ErrorCodeClosed:
 		return true
-	case Configuration:
+	case ErrorCodeConfiguration:
 		return true
-	case Conflict:
+	case ErrorCodeConflict:
 		return true
-	case Corrupt:
+	case ErrorCodeCorrupt:
 		return true
-	case Internal:
+	case ErrorCodeInternal:
 		return true
-	case Invalid:
+	case ErrorCodeInvalid:
 		return true
-	case NotFound:
+	case ErrorCodeNotFound:
 		return true
-	case Storage:
+	case ErrorCodeStorage:
 		return true
-	case Unauthorized:
+	case ErrorCodeUnauthorized:
+		return true
+	case ErrorCodeUnavailable:
 		return true
 	default:
 		return false
@@ -181,13 +208,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N8 HealthProtocolVersion = "8"
+	N12 HealthProtocolVersion = "12"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N8:
+	case N12:
 		return true
 	default:
 		return false
@@ -263,6 +290,39 @@ func (e InputOrigin) Valid() bool {
 	case InputOriginRuntime:
 		return true
 	case InputOriginUser:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InvocationScopeKind.
+const (
+	Invocation InvocationScopeKind = "invocation"
+)
+
+// Valid indicates whether the value is a known member of the InvocationScopeKind enum.
+func (e InvocationScopeKind) Valid() bool {
+	switch e {
+	case Invocation:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InvocationScopePurpose.
+const (
+	Conversation InvocationScopePurpose = "conversation"
+	Maintenance  InvocationScopePurpose = "maintenance"
+)
+
+// Valid indicates whether the value is a known member of the InvocationScopePurpose enum.
+func (e InvocationScopePurpose) Valid() bool {
+	switch e {
+	case Conversation:
+		return true
+	case Maintenance:
 		return true
 	default:
 		return false
@@ -856,8 +916,9 @@ func (e WorkspaceScopeKind) Valid() bool {
 
 // Agent defines model for Agent.
 type Agent struct {
-	Capabilities []string `json:"capabilities"`
-	Description  string   `json:"description"`
+	Capabilities []string      `json:"capabilities"`
+	Definition   DefinitionRef `json:"definition"`
+	Description  string        `json:"description"`
 
 	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
 	Model    ModelRef `json:"model"`
@@ -868,23 +929,27 @@ type Agent struct {
 	WriteDir string   `json:"write_dir"`
 }
 
-// AgentMutation defines model for AgentMutation.
-type AgentMutation struct {
-	ConfigurationRevision ConfigurationRevision `json:"configuration_revision"`
-	Result                Agent                 `json:"result"`
+// AgentInputs defines model for AgentInputs.
+type AgentInputs struct {
+	AssemblyMode AgentInputsAssemblyMode `json:"assembly_mode"`
+	Capabilities []string                `json:"capabilities"`
+	Constraints  ToolConstraints         `json:"constraints"`
+	Instructions string                  `json:"instructions"`
+
+	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
+	Model    ModelRef          `json:"model"`
+	Strategy StrategySelection `json:"strategy"`
+	Tools    []string          `json:"tools"`
 }
 
-// AgentScope defines model for AgentScope.
-type AgentScope struct {
-	JobId       *string        `json:"job_id,omitempty"`
-	Kind        AgentScopeKind `json:"kind"`
-	OperationId string         `json:"operation_id"`
-	SessionId   string         `json:"session_id"`
-	Workspace   *string        `json:"workspace,omitempty"`
-}
+// AgentInputsAssemblyMode defines model for AgentInputs.AssemblyMode.
+type AgentInputsAssemblyMode string
 
-// AgentScopeKind defines model for AgentScope.Kind.
-type AgentScopeKind string
+// AgentSelection defines model for AgentSelection.
+type AgentSelection struct {
+	Definition *DefinitionRef `json:"definition,omitempty"`
+	Inputs     *AgentInputs   `json:"inputs,omitempty"`
+}
 
 // AssistantItem defines model for AssistantItem.
 type AssistantItem struct {
@@ -935,6 +1000,17 @@ type CheckpointItem struct {
 // CheckpointItemKind defines model for CheckpointItem.Kind.
 type CheckpointItemKind string
 
+// CleanupFailure One cleanup attempt that did not complete after the canonical Session deletion committed. An absent extension_id is local Session-tree cleanup; an external failure names its extension.
+type CleanupFailure struct {
+	// Code storage for local Session-tree cleanup, unavailable for an external owner's cleanup.
+	Code        CleanupFailureCode `json:"code"`
+	ExtensionId *string            `json:"extension_id,omitempty"`
+	Message     string             `json:"message"`
+}
+
+// CleanupFailureCode storage for local Session-tree cleanup, unavailable for an external owner's cleanup.
+type CleanupFailureCode string
+
 // CodeRevertError defines model for CodeRevertError.
 type CodeRevertError struct {
 	union json.RawMessage
@@ -967,7 +1043,7 @@ type ConfigurationChangedEvent struct {
 	ConfigurationRevision ConfigurationRevision         `json:"configuration_revision"`
 	Kind                  ConfigurationChangedEventKind `json:"kind"`
 
-	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope Scope `json:"scope"`
 }
 
@@ -1027,8 +1103,20 @@ type CreateProviderRequest struct {
 
 // CreateSessionRequest defines model for CreateSessionRequest.
 type CreateSessionRequest struct {
-	AgentType string `json:"agent_type"`
-	Workspace string `json:"workspace"`
+	AgentSelection *AgentSelection `json:"agent_selection,omitempty"`
+	Workspace      string          `json:"workspace"`
+}
+
+// DefinitionRef defines model for DefinitionRef.
+type DefinitionRef struct {
+	CapabilityId string `json:"capability_id"`
+	DefinitionId string `json:"definition_id"`
+	ExtensionId  string `json:"extension_id"`
+}
+
+// DeletionResult The committed Session deletion and every incomplete cleanup attempt. The cleanup_failures array is always present.
+type DeletionResult struct {
+	CleanupFailures []CleanupFailure `json:"cleanup_failures"`
 }
 
 // DiscoveredModelCandidate defines model for DiscoveredModelCandidate.
@@ -1066,6 +1154,20 @@ type Event struct {
 
 // ExecutionEvidence One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
 type ExecutionEvidence string
+
+// ExtensionConfigDocument One extension configuration document as exact JSON text.
+type ExtensionConfigDocument = string
+
+// ExtensionEdit defines model for ExtensionEdit.
+type ExtensionEdit struct {
+	// Arguments The edit call's JSON document, carried as exact text.
+	Arguments   string `json:"arguments"`
+	EditId      string `json:"edit_id"`
+	ExtensionId string `json:"extension_id"`
+}
+
+// ExtensionsSettings Extension sections as JSON document strings, keyed by extension ID.
+type ExtensionsSettings map[string]ExtensionConfigDocument
 
 // ForkRequest defines model for ForkRequest.
 type ForkRequest struct {
@@ -1141,6 +1243,23 @@ type InputModality string
 
 // InputOrigin defines model for InputOrigin.
 type InputOrigin string
+
+// InvocationScope defines model for InvocationScope.
+type InvocationScope struct {
+	InvocationId string                 `json:"invocation_id"`
+	JobId        *string                `json:"job_id,omitempty"`
+	Kind         InvocationScopeKind    `json:"kind"`
+	OperationId  string                 `json:"operation_id"`
+	Purpose      InvocationScopePurpose `json:"purpose"`
+	SessionId    string                 `json:"session_id"`
+	Workspace    *string                `json:"workspace,omitempty"`
+}
+
+// InvocationScopeKind defines model for InvocationScope.Kind.
+type InvocationScopeKind string
+
+// InvocationScopePurpose defines model for InvocationScope.Purpose.
+type InvocationScopePurpose string
 
 // JSONObject One validated JSON object of arbitrary members, carried with its raw values intact: no member's JSON kind is constrained.
 type JSONObject = map[string]json.RawMessage
@@ -1283,9 +1402,9 @@ type OpaquePartKind string
 
 // Operation defines model for Operation.
 type Operation struct {
-	AdmittedAt time.Time `json:"admitted_at"`
-	AgentType  string    `json:"agent_type"`
-	Detail     *string   `json:"detail,omitempty"`
+	AdmittedAt     time.Time      `json:"admitted_at"`
+	AgentSelection AgentSelection `json:"agent_selection"`
+	Detail         *string        `json:"detail,omitempty"`
 
 	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
 	Model       ModelRef             `json:"model"`
@@ -1342,12 +1461,6 @@ type PendingQueues struct {
 	Queued   []PendingInput `json:"queued"`
 	Steering []PendingInput `json:"steering"`
 }
-
-// PluginConfigDocument One compiled plugin's own configuration document: the exact JSON object text the selected plugin declaration owns, carried as a string so the transport never interprets, renumbers or drops its members.
-type PluginConfigDocument = string
-
-// PluginsSettings Every owned plugin section as its JSON document string, keyed by the compiled plugin ID; an absent ID uses that plugin's own defaults.
-type PluginsSettings map[string]PluginConfigDocument
 
 // ProtocolMetadata defines model for ProtocolMetadata.
 type ProtocolMetadata struct {
@@ -1440,7 +1553,7 @@ type RefusalDeltaEvent struct {
 	Content string                `json:"content"`
 	Kind    RefusalDeltaEventKind `json:"kind"`
 
-	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope Scope `json:"scope"`
 }
 
@@ -1469,7 +1582,7 @@ type RuntimeScope struct {
 // RuntimeScopeKind defines model for RuntimeScope.Kind.
 type RuntimeScopeKind string
 
-// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 type Scope struct {
 	union json.RawMessage
 }
@@ -1478,7 +1591,7 @@ type Scope struct {
 type ScopeEvent struct {
 	Kind ScopeEventKind `json:"kind"`
 
-	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope Scope `json:"scope"`
 }
 
@@ -1487,7 +1600,7 @@ type ScopeEventKind string
 
 // Session defines model for Session.
 type Session struct {
-	AgentType          string           `json:"agent_type"`
+	AgentSelection     AgentSelection   `json:"agent_selection"`
 	ArchivedAt         *time.Time       `json:"archived_at,omitempty"`
 	CreatedAt          time.Time        `json:"created_at"`
 	CurrentOperationId *string          `json:"current_operation_id,omitempty"`
@@ -1504,7 +1617,7 @@ type Session struct {
 type SessionChangedEvent struct {
 	Kind SessionChangedEventKind `json:"kind"`
 
-	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope           Scope           `json:"scope"`
 	SessionRevision SessionRevision `json:"session_revision"`
 }
@@ -1541,15 +1654,15 @@ type SessionsSettings struct {
 	DeleteAfterArchiveDays int  `json:"delete_after_archive_days"`
 }
 
-// SetAgentTypeModelRequest defines model for SetAgentTypeModelRequest.
-type SetAgentTypeModelRequest struct {
-	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
-	Model ModelRef `json:"model"`
-}
-
 // SetSessionAgentTypeRequest defines model for SetSessionAgentTypeRequest.
 type SetSessionAgentTypeRequest struct {
-	AgentType string `json:"agent_type"`
+	AgentSelection AgentSelection `json:"agent_selection"`
+}
+
+// SetSessionModelRequest defines model for SetSessionModelRequest.
+type SetSessionModelRequest struct {
+	// Model A full model identity spelled as the "provider/model" string, split at the first slash; provider identifiers never contain a slash, so a slash-containing model suffix stays unambiguous.
+	Model ModelRef `json:"model"`
 }
 
 // Settings defines model for Settings.
@@ -1557,11 +1670,11 @@ type Settings struct {
 	// Compaction The baseline compaction configuration object: an optional independent summarizer model reference and an optional custom nonempty prompt, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults apply at consumption.
 	Compaction CompactionSettings `json:"compaction"`
 
-	// Jobs The baseline background jobs configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the jobs service applies at consumption.
-	Jobs JobsSettings `json:"jobs"`
+	// Extensions Extension sections as JSON document strings, keyed by extension ID.
+	Extensions ExtensionsSettings `json:"extensions"`
 
-	// Plugins Every owned plugin section as its JSON document string, keyed by the compiled plugin ID; an absent ID uses that plugin's own defaults.
-	Plugins  PluginsSettings  `json:"plugins"`
+	// Jobs The baseline background jobs configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the jobs service applies at consumption.
+	Jobs     JobsSettings     `json:"jobs"`
 	Sessions SessionsSettings `json:"sessions"`
 
 	// Tools The baseline standard tools' configuration object, carried with its accepted raw members and exact numeric lexemes. An absent section is the empty object, whose defaults the tools apply at consumption.
@@ -1603,6 +1716,12 @@ type SnapshotFile struct {
 	Path    string `json:"path"`
 }
 
+// StrategySelection defines model for StrategySelection.
+type StrategySelection struct {
+	Id       string `json:"id"`
+	Settings string `json:"settings"`
+}
+
 // SubmitRequest defines model for SubmitRequest.
 type SubmitRequest struct {
 	Content     []ContentPart     `json:"content"`
@@ -1631,7 +1750,7 @@ type TextDeltaEvent struct {
 	Kind     TextDeltaEventKind `json:"kind"`
 	Position int                `json:"position"`
 
-	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope Scope `json:"scope"`
 }
 
@@ -1679,6 +1798,12 @@ type ToolCallView struct {
 	Status         *ToolCallStatus `json:"status,omitempty"`
 }
 
+// ToolConstraints defines model for ToolConstraints.
+type ToolConstraints struct {
+	Readonly bool   `json:"readonly"`
+	WriteDir string `json:"write_dir"`
+}
+
 // ToolFinishedEvent defines model for ToolFinishedEvent.
 type ToolFinishedEvent struct {
 	CallId string `json:"call_id"`
@@ -1687,7 +1812,7 @@ type ToolFinishedEvent struct {
 	Evidence *ExecutionEvidence    `json:"evidence,omitempty"`
 	Kind     ToolFinishedEventKind `json:"kind"`
 
-	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope  Scope          `json:"scope"`
 	Status ToolCallStatus `json:"status"`
 }
@@ -1705,7 +1830,7 @@ type ToolStartedEvent struct {
 	Name    string               `json:"name"`
 	Ordinal int                  `json:"ordinal"`
 
-	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope Scope `json:"scope"`
 }
 
@@ -1725,9 +1850,10 @@ type UpdateProviderModelRequest struct {
 	Model ModelEdit `json:"model"`
 }
 
-// UpdateSettingsRequest defines model for UpdateSettingsRequest.
+// UpdateSettingsRequest Exactly one of the complete settings shape or one declared extension configuration edit; the accepting owner rejects zero or both.
 type UpdateSettingsRequest struct {
-	Settings Settings `json:"settings"`
+	ExtensionEdit *ExtensionEdit `json:"extension_edit,omitempty"`
+	Settings      *Settings      `json:"settings,omitempty"`
 }
 
 // UsageContext defines model for UsageContext.
@@ -1769,7 +1895,7 @@ type Warning struct {
 type WarningChangedEvent struct {
 	Kind WarningChangedEventKind `json:"kind"`
 
-	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and agent carry session_id and operation_id, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
+	// Scope One SSE event's applicable scope, discriminated by kind. Every non-global kind must address its subject: workspace carries workspace, session carries session_id, operation and invocation carry session_id and operation_id, invocation additionally carries invocation_id and purpose, and job carries session_id and job_id. Each branch keeps the same closed member vocabulary, so attribution members beyond the required identities are allowed; every supplied member is nonempty and session_id always matches its pattern.
 	Scope            Scope            `json:"scope"`
 	WarningsRevision WarningsRevision `json:"warnings_revision"`
 }
@@ -1821,11 +1947,6 @@ type SessionID = string
 
 // WorkspaceQuery defines model for WorkspaceQuery.
 type WorkspaceQuery = string
-
-// SetAgentTypeModelParams defines parameters for SetAgentTypeModel.
-type SetAgentTypeModelParams struct {
-	AgentType string `form:"agent_type" json:"agent_type"`
-}
 
 // ListModelsParams defines parameters for ListModels.
 type ListModelsParams struct {
@@ -1901,9 +2022,6 @@ type GetSessionHistoryParams struct {
 	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
 }
 
-// SetAgentTypeModelJSONRequestBody defines body for SetAgentTypeModel for application/json ContentType.
-type SetAgentTypeModelJSONRequestBody = SetAgentTypeModelRequest
-
 // UpdateConfigurationSettingsJSONRequestBody defines body for UpdateConfigurationSettings for application/json ContentType.
 type UpdateConfigurationSettingsJSONRequestBody = UpdateSettingsRequest
 
@@ -1933,6 +2051,9 @@ type CompactSessionJSONRequestBody = CompactRequest
 
 // ForkSessionJSONRequestBody defines body for ForkSession for application/json ContentType.
 type ForkSessionJSONRequestBody = ForkRequest
+
+// SetSessionModelJSONRequestBody defines body for SetSessionModel for application/json ContentType.
+type SetSessionModelJSONRequestBody = SetSessionModelRequest
 
 // RevertSessionCodeJSONRequestBody defines body for RevertSessionCode for application/json ContentType.
 type RevertSessionCodeJSONRequestBody = RevertCodeRequest
@@ -2742,31 +2863,31 @@ func (t *Scope) MergeOperationScope(v OperationScope) error {
 	return err
 }
 
-// AsAgentScope returns the union data inside the Scope as a AgentScope
-func (t Scope) AsAgentScope() (AgentScope, error) {
-	var body AgentScope
+// AsInvocationScope returns the union data inside the Scope as a InvocationScope
+func (t Scope) AsInvocationScope() (InvocationScope, error) {
+	var body InvocationScope
 	err := json.Unmarshal(t.union, &body)
 	return body, err
 }
 
-// FromAgentScope overwrites any union data inside the Scope as the provided AgentScope
-func (t *Scope) FromAgentScope(v AgentScope) error {
+// FromInvocationScope overwrites any union data inside the Scope as the provided InvocationScope
+func (t *Scope) FromInvocationScope(v InvocationScope) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	b, err = runtime.JSONMerge(b, []byte(`{"kind":"agent"}`))
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"invocation"}`))
 	t.union = b
 	return err
 }
 
-// MergeAgentScope performs a merge with any union data inside the Scope, using the provided AgentScope
-func (t *Scope) MergeAgentScope(v AgentScope) error {
+// MergeInvocationScope performs a merge with any union data inside the Scope, using the provided InvocationScope
+func (t *Scope) MergeInvocationScope(v InvocationScope) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	b, err = runtime.JSONMerge(b, []byte(`{"kind":"agent"}`))
+	b, err = runtime.JSONMerge(b, []byte(`{"kind":"invocation"}`))
 	if err != nil {
 		return err
 	}
@@ -2824,8 +2945,8 @@ func (t Scope) ValueByDiscriminator() (interface{}, error) {
 		return nil, err
 	}
 	switch discriminator {
-	case "agent":
-		return t.AsAgentScope()
+	case "invocation":
+		return t.AsInvocationScope()
 	case "job":
 		return t.AsJobScope()
 	case "operation":
@@ -2924,14 +3045,6 @@ func WithRequestEditorFn(fn RequestEditorFn) ClientOption {
 
 // The interface specification for the client above.
 type ClientInterface interface {
-
-	// SetAgentTypeModelWithBody performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request,
-	// with any type of body and a specified content type.
-	SetAgentTypeModelWithBody(ctx context.Context, params *SetAgentTypeModelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// SetAgentTypeModel performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request.
-	// Takes a body of the `application/json` content type.
-	SetAgentTypeModel(ctx context.Context, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetConfiguration performs a GET /v1/configuration (the `GetConfiguration` operationId) request.
 	GetConfiguration(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -3076,6 +3189,14 @@ type ClientInterface interface {
 	// InterruptSession performs a POST /v1/sessions/{id}/interrupt (the `InterruptSession` operationId) request.
 	InterruptSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// SetSessionModelWithBody performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request,
+	// with any type of body and a specified content type.
+	SetSessionModelWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// SetSessionModel performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request.
+	// Takes a body of the `application/json` content type.
+	SetSessionModel(ctx context.Context, id SessionID, body SetSessionModelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// ReopenSession performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
 	ReopenSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -3111,34 +3232,6 @@ type ClientInterface interface {
 	// ReadWorkspaceFile performs a POST /v1/workspaces/files/read (the `ReadWorkspaceFile` operationId) request.
 	// Takes a body of the `application/json` content type.
 	ReadWorkspaceFile(ctx context.Context, body ReadWorkspaceFileJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-}
-
-// SetAgentTypeModelWithBody performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request,
-// with any type of body and a specified content type.
-func (c *Client) SetAgentTypeModelWithBody(ctx context.Context, params *SetAgentTypeModelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewSetAgentTypeModelRequestWithBody(c.Server, params, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// SetAgentTypeModel performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request.
-// Takes a body of the `application/json` content type.
-func (c *Client) SetAgentTypeModel(ctx context.Context, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewSetAgentTypeModelRequest(c.Server, params, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
 }
 
 // GetConfiguration performs a GET /v1/configuration (the `GetConfiguration` operationId) request.
@@ -3694,6 +3787,34 @@ func (c *Client) InterruptSession(ctx context.Context, id SessionID, reqEditors 
 	return c.Client.Do(req)
 }
 
+// SetSessionModelWithBody performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request,
+// with any type of body and a specified content type.
+func (c *Client) SetSessionModelWithBody(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewSetSessionModelRequestWithBody(c.Server, id, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// SetSessionModel performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request.
+// Takes a body of the `application/json` content type.
+func (c *Client) SetSessionModel(ctx context.Context, id SessionID, body SetSessionModelJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewSetSessionModelRequest(c.Server, id, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 // ReopenSession performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
 func (c *Client) ReopenSession(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewReopenSessionRequest(c.Server, id)
@@ -3828,69 +3949,6 @@ func (c *Client) ReadWorkspaceFile(ctx context.Context, body ReadWorkspaceFileJS
 		return nil, err
 	}
 	return c.Client.Do(req)
-}
-
-// NewSetAgentTypeModelRequest calls the generic SetAgentTypeModel builder with application/json body
-func NewSetAgentTypeModelRequest(server string, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewSetAgentTypeModelRequestWithBody(server, params, "application/json", bodyReader)
-}
-
-// NewSetAgentTypeModelRequestWithBody constructs an http.Request for the SetAgentTypeModel method, with any body, and a specified content type
-func NewSetAgentTypeModelRequestWithBody(server string, params *SetAgentTypeModelParams, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/v1/agent-types/model")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	if params != nil {
-		// queryValues collects non-styled parameters (passthrough, JSON)
-		// that are safe to round-trip through url.Values.Encode().
-		queryValues := queryURL.Query()
-		// rawQueryFragments collects pre-encoded query fragments from
-		// styled parameters, preserving literal commas as delimiters
-		// per the OpenAPI spec (e.g. "color=blue,black,brown").
-		var rawQueryFragments []string
-
-		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "agent_type", params.AgentType, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
-			return nil, err
-		} else {
-			for _, qp := range strings.Split(queryFrag, "&") {
-				rawQueryFragments = append(rawQueryFragments, qp)
-			}
-		}
-
-		if encoded := queryValues.Encode(); encoded != "" {
-			rawQueryFragments = append(rawQueryFragments, encoded)
-		}
-		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
-	}
-
-	req, err := http.NewRequest(http.MethodPut, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
 }
 
 // NewGetConfigurationRequest constructs an http.Request for the GetConfiguration method
@@ -5295,6 +5353,53 @@ func NewInterruptSessionRequest(server string, id SessionID) (*http.Request, err
 	return req, nil
 }
 
+// NewSetSessionModelRequest calls the generic SetSessionModel builder with application/json body
+func NewSetSessionModelRequest(server string, id SessionID, body SetSessionModelJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewSetSessionModelRequestWithBody(server, id, "application/json", bodyReader)
+}
+
+// NewSetSessionModelRequestWithBody constructs an http.Request for the SetSessionModel method, with any body, and a specified content type
+func NewSetSessionModelRequestWithBody(server string, id SessionID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "id", id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/sessions/%s/model", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPut, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewReopenSessionRequest constructs an http.Request for the ReopenSession method
 func NewReopenSessionRequest(server string, id SessionID) (*http.Request, error) {
 	var err error
@@ -5595,16 +5700,6 @@ func WithBaseURL(baseURL string) ClientOption {
 // ClientWithResponsesInterface is the interface specification for the client with responses above.
 type ClientWithResponsesInterface interface {
 
-	// SetAgentTypeModelWithBodyWithResponse performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request,
-	// with any type of body and a specified content type.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	SetAgentTypeModelWithBodyWithResponse(ctx context.Context, params *SetAgentTypeModelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetAgentTypeModelResponse, error)
-
-	// SetAgentTypeModelWithResponse performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request.
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	SetAgentTypeModelWithResponse(ctx context.Context, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody, reqEditors ...RequestEditorFn) (*SetAgentTypeModelResponse, error)
-
 	// GetConfigurationWithResponse performs a GET /v1/configuration (the `GetConfiguration` operationId) request.
 	//
 	// Returns a wrapper object for the known response body format(s).
@@ -5810,6 +5905,16 @@ type ClientWithResponsesInterface interface {
 	// Returns a wrapper object for the known response body format(s).
 	InterruptSessionWithResponse(ctx context.Context, id SessionID, reqEditors ...RequestEditorFn) (*InterruptSessionResponse, error)
 
+	// SetSessionModelWithBodyWithResponse performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request,
+	// with any type of body and a specified content type.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	SetSessionModelWithBodyWithResponse(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetSessionModelResponse, error)
+
+	// SetSessionModelWithResponse performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request.
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	SetSessionModelWithResponse(ctx context.Context, id SessionID, body SetSessionModelJSONRequestBody, reqEditors ...RequestEditorFn) (*SetSessionModelResponse, error)
+
 	// ReopenSessionWithResponse performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
 	//
 	// Returns a wrapper object for the known response body format(s).
@@ -5859,54 +5964,6 @@ type ClientWithResponsesInterface interface {
 	// ReadWorkspaceFileWithResponse performs a POST /v1/workspaces/files/read (the `ReadWorkspaceFile` operationId) request.
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	ReadWorkspaceFileWithResponse(ctx context.Context, body ReadWorkspaceFileJSONRequestBody, reqEditors ...RequestEditorFn) (*ReadWorkspaceFileResponse, error)
-}
-
-type SetAgentTypeModelResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON200 the response for an HTTP 200 `application/json` response
-	JSON200 *AgentMutation
-	// JSONDefault the response for an HTTP default `application/json` response
-	JSONDefault *Error
-}
-
-// GetJSON200 returns the response for an HTTP 200 `application/json` response
-func (r SetAgentTypeModelResponse) GetJSON200() *AgentMutation {
-	return r.JSON200
-}
-
-// GetJSONDefault returns the response for an HTTP default `application/json` response
-func (r SetAgentTypeModelResponse) GetJSONDefault() *Error {
-	return r.JSONDefault
-}
-
-// GetBody returns the raw response body bytes
-func (r SetAgentTypeModelResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r SetAgentTypeModelResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r SetAgentTypeModelResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r SetAgentTypeModelResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
 }
 
 type GetConfigurationResponse struct {
@@ -6961,8 +7018,15 @@ func (r CreateSessionResponse) ContentType() string {
 type DeleteSessionResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *DeletionResult
 	// JSONDefault the response for an HTTP default `application/json` response
 	JSONDefault *Error
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r DeleteSessionResponse) GetJSON200() *DeletionResult {
+	return r.JSON200
 }
 
 // GetJSONDefault returns the response for an HTTP default `application/json` response
@@ -7376,6 +7440,54 @@ func (r InterruptSessionResponse) ContentType() string {
 	return ""
 }
 
+type SetSessionModelResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *Session
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r SetSessionModelResponse) GetJSON200() *Session {
+	return r.JSON200
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r SetSessionModelResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r SetSessionModelResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r SetSessionModelResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r SetSessionModelResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r SetSessionModelResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 type ReopenSessionResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -7703,28 +7815,6 @@ func (r ReadWorkspaceFileResponse) ContentType() string {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
 	return ""
-}
-
-// SetAgentTypeModelWithBodyWithResponse performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request,
-// with any type of body and a specified content type.
-//
-// Returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) SetAgentTypeModelWithBodyWithResponse(ctx context.Context, params *SetAgentTypeModelParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetAgentTypeModelResponse, error) {
-	rsp, err := c.SetAgentTypeModelWithBody(ctx, params, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseSetAgentTypeModelResponse(rsp)
-}
-
-// SetAgentTypeModelWithResponse performs a PUT /v1/agent-types/model (the `SetAgentTypeModel` operationId) request.
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-func (c *ClientWithResponses) SetAgentTypeModelWithResponse(ctx context.Context, params *SetAgentTypeModelParams, body SetAgentTypeModelJSONRequestBody, reqEditors ...RequestEditorFn) (*SetAgentTypeModelResponse, error) {
-	rsp, err := c.SetAgentTypeModel(ctx, params, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseSetAgentTypeModelResponse(rsp)
 }
 
 // GetConfigurationWithResponse performs a GET /v1/configuration (the `GetConfiguration` operationId) request.
@@ -8178,6 +8268,28 @@ func (c *ClientWithResponses) InterruptSessionWithResponse(ctx context.Context, 
 	return ParseInterruptSessionResponse(rsp)
 }
 
+// SetSessionModelWithBodyWithResponse performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request,
+// with any type of body and a specified content type.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) SetSessionModelWithBodyWithResponse(ctx context.Context, id SessionID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*SetSessionModelResponse, error) {
+	rsp, err := c.SetSessionModelWithBody(ctx, id, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseSetSessionModelResponse(rsp)
+}
+
+// SetSessionModelWithResponse performs a PUT /v1/sessions/{id}/model (the `SetSessionModel` operationId) request.
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) SetSessionModelWithResponse(ctx context.Context, id SessionID, body SetSessionModelJSONRequestBody, reqEditors ...RequestEditorFn) (*SetSessionModelResponse, error) {
+	rsp, err := c.SetSessionModel(ctx, id, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseSetSessionModelResponse(rsp)
+}
+
 // ReopenSessionWithResponse performs a POST /v1/sessions/{id}/reopen (the `ReopenSession` operationId) request.
 //
 // Returns a wrapper object for the known response body format(s).
@@ -8286,39 +8398,6 @@ func (c *ClientWithResponses) ReadWorkspaceFileWithResponse(ctx context.Context,
 		return nil, err
 	}
 	return ParseReadWorkspaceFileResponse(rsp)
-}
-
-// ParseSetAgentTypeModelResponse parses an HTTP response from a SetAgentTypeModelWithResponse call
-func ParseSetAgentTypeModelResponse(rsp *http.Response) (*SetAgentTypeModelResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &SetAgentTypeModelResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest AgentMutation
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON200 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
-		var dest Error
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSONDefault = &dest
-
-	}
-
-	return response, nil
 }
 
 // ParseGetConfigurationResponse parses an HTTP response from a GetConfigurationWithResponse call
@@ -9054,8 +9133,12 @@ func ParseDeleteSessionResponse(rsp *http.Response) (*DeleteSessionResponse, err
 	}
 
 	switch {
-	case rsp.StatusCode == 204:
-		break // No content-type
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest DeletionResult
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
 		var dest Error
@@ -9329,6 +9412,39 @@ func ParseInterruptSessionResponse(rsp *http.Response) (*InterruptSessionRespons
 	return response, nil
 }
 
+// ParseSetSessionModelResponse parses an HTTP response from a SetSessionModelWithResponse call
+func ParseSetSessionModelResponse(rsp *http.Response) (*SetSessionModelResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &SetSessionModelResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Session
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseReopenSessionResponse parses an HTTP response from a ReopenSessionWithResponse call
 func ParseReopenSessionResponse(rsp *http.Response) (*ReopenSessionResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -9559,9 +9675,6 @@ func ParseReadWorkspaceFileResponse(rsp *http.Response) (*ReadWorkspaceFileRespo
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
 
-	// (PUT /v1/agent-types/model)
-	SetAgentTypeModel(w http.ResponseWriter, r *http.Request, params SetAgentTypeModelParams)
-
 	// (GET /v1/configuration)
 	GetConfiguration(w http.ResponseWriter, r *http.Request)
 
@@ -9655,6 +9768,9 @@ type ServerInterface interface {
 	// (POST /v1/sessions/{id}/interrupt)
 	InterruptSession(w http.ResponseWriter, r *http.Request, id SessionID)
 
+	// (PUT /v1/sessions/{id}/model)
+	SetSessionModel(w http.ResponseWriter, r *http.Request, id SessionID)
+
 	// (POST /v1/sessions/{id}/reopen)
 	ReopenSession(w http.ResponseWriter, r *http.Request, id SessionID)
 
@@ -9685,39 +9801,6 @@ type ServerInterfaceWrapper struct {
 }
 
 type MiddlewareFunc func(http.Handler) http.Handler
-
-// SetAgentTypeModel operation middleware
-func (siw *ServerInterfaceWrapper) SetAgentTypeModel(w http.ResponseWriter, r *http.Request) {
-
-	var err error
-	_ = err
-
-	// Parameter object where we will unmarshal all parameters from the context
-	var params SetAgentTypeModelParams
-
-	// ------------- Required query parameter "agent_type" -------------
-
-	err = runtime.BindQueryParameterWithOptions("form", true, true, "agent_type", r.URL.Query(), &params.AgentType, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
-	if err != nil {
-		var requiredError *runtime.RequiredParameterError
-		if errors.As(err, &requiredError) {
-			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "agent_type"})
-		} else {
-			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "agent_type", Err: err})
-		}
-		return
-	}
-
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.SetAgentTypeModel(w, r, params)
-	}))
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		handler = middleware(handler)
-	}
-
-	handler.ServeHTTP(w, r)
-}
 
 // GetConfiguration operation middleware
 func (siw *ServerInterfaceWrapper) GetConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -10594,6 +10677,32 @@ func (siw *ServerInterfaceWrapper) InterruptSession(w http.ResponseWriter, r *ht
 	handler.ServeHTTP(w, r)
 }
 
+// SetSessionModel operation middleware
+func (siw *ServerInterfaceWrapper) SetSessionModel(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id SessionID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SetSessionModel(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // ReopenSession operation middleware
 func (siw *ServerInterfaceWrapper) ReopenSession(w http.ResponseWriter, r *http.Request) {
 
@@ -10873,6 +10982,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions/{id}/stop", wrapper.StopSession)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/sessions/{id}/fork", wrapper.ForkSession)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/sessions/{id}/agent-type", wrapper.SetSessionAgentType)
+	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/sessions/{id}/model", wrapper.SetSessionModel)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/hydration", wrapper.GetSessionHydration)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/history", wrapper.GetSessionHistory)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/sessions/{id}/code-snapshots", wrapper.GetSessionCodeSnapshots)
@@ -10882,7 +10992,6 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/configuration", wrapper.GetConfiguration)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/configuration/reload", wrapper.ReloadConfiguration)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/configuration/settings", wrapper.UpdateConfigurationSettings)
-	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/agent-types/model", wrapper.SetAgentTypeModel)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/models", wrapper.ListModels)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/providers", wrapper.ListProviders)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/providers", wrapper.CreateProvider)

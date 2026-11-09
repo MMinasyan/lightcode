@@ -248,7 +248,7 @@ func normalizeCallArguments(call model.ToolCall, normalize func(map[string]any) 
 // nil-tracker read path that always returns the bounded requested content.
 type readTool struct{ inst *standardTools }
 
-func (readTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (readTool) describe(_ Invocation, _ harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "read_file",
@@ -259,7 +259,7 @@ func (readTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdent
 	}, nil
 }
 
-func (t readTool) Normalize(tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t readTool) Normalize(_ context.Context, tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	s, err := t.inst.settings(tc.Invocation)
 	if err != nil {
 		return nil, err
@@ -339,11 +339,11 @@ func (in *standardTools) prepareMutation(tc ToolContext, call model.ToolCall, ru
 // writeTool is the write_file tool.
 type writeTool struct{ inst *standardTools }
 
-func (t writeTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (t writeTool) describe(_ Invocation, constraints harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return mutationDescription("write_file", writeFileDescription, writeFileParameters, constraints)
 }
 
-func (writeTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (writeTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeWriteArgs)
 }
 
@@ -366,11 +366,11 @@ func (t writeTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCal
 // built from the committed normalized arguments and the result.
 type editTool struct{ inst *standardTools }
 
-func (t editTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (t editTool) describe(_ Invocation, constraints harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return mutationDescription("edit_file", editFileDescription, editFileParameters, constraints)
 }
 
-func (editTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (editTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeEditArgs)
 }
 
@@ -393,11 +393,11 @@ func (t editTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall
 // other selected eligible tool.
 type patchTool struct{ inst *standardTools }
 
-func (t patchTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (t patchTool) describe(_ Invocation, constraints harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return mutationDescription("apply_patch", applyPatchDescription, applyPatchParameters, constraints)
 }
 
-func (patchTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (patchTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizePatchArgs)
 }
 
@@ -435,7 +435,7 @@ type runCommandTool struct {
 	jobs jobs.Jobs
 }
 
-func (runCommandTool) describe(_ Invocation, constraints ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (runCommandTool) describe(_ Invocation, constraints harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	description := runCommandDescription
 	if constraints.Readonly {
 		description = tool.ReadOnlyRunCommandDescription
@@ -450,7 +450,7 @@ func (runCommandTool) describe(_ Invocation, constraints ToolConstraints, _ harn
 	}, nil
 }
 
-func (t runCommandTool) Normalize(tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t runCommandTool) Normalize(_ context.Context, tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	s, err := t.inst.settings(tc.Invocation)
 	if err != nil {
 		return nil, err
@@ -698,7 +698,7 @@ func commandOutcome(ctx context.Context, callID, command, dir string, timeoutSec
 // execution observes cancellation as an interrupted result.
 type sleepTool struct{}
 
-func (sleepTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (sleepTool) describe(_ Invocation, _ harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "sleep",
@@ -709,7 +709,7 @@ func (sleepTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIden
 	}, nil
 }
 
-func (sleepTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (sleepTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, tool.NormalizeSleepArgs)
 }
 
@@ -746,7 +746,7 @@ func (sleepTool) Prepare(_ context.Context, _ ToolContext, call model.ToolCall) 
 // (list). The jobs service is its own field.
 type processTool struct{ jobs jobs.Jobs }
 
-func (processTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
+func (processTool) describe(_ Invocation, _ harness.ToolConstraints, _ harness.SessionIdentity) (ToolDescription, error) {
 	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        "process",
@@ -757,7 +757,7 @@ func (processTool) describe(_ Invocation, _ ToolConstraints, _ harness.SessionId
 	}, nil
 }
 
-func (processTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (processTool) Normalize(_ context.Context, _ ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return normalizeCallArguments(call, normalizeProcessArgs)
 }
 
@@ -845,7 +845,7 @@ func isJobID(id string) bool {
 // dir — with a nonempty write dir the Harness confines every write to it, so
 // the tool stays available. The description consumes the hard constraints
 // only; no execution instance is constructed.
-func mutationDescription(name, description, parameters string, constraints ToolConstraints) (ToolDescription, error) {
+func mutationDescription(name, description, parameters string, constraints harness.ToolConstraints) (ToolDescription, error) {
 	return ToolDescription{
 		Definition: model.ToolDefinition{
 			Name:        name,
@@ -856,19 +856,26 @@ func mutationDescription(name, description, parameters string, constraints ToolC
 	}, nil
 }
 
-// standardToolSpecs returns the seven standard tool declarations in
+// standardToolDeclaration is one owner-constructed standard tool declaration:
+// its model-visible ID and pure description function.
+type standardToolDeclaration struct {
+	id       string
+	describe func(Invocation, harness.ToolConstraints, harness.SessionIdentity) (ToolDescription, error)
+}
+
+// standardToolDeclarations returns the seven standard tool declarations in
 // declaration order. Every description is pure over the captured Invocation,
 // the hard constraints, and the literal description constants, so the
 // declarations compile once for every composition with no constructed state.
-func standardToolSpecs() []CapabilitySpec {
-	return []CapabilitySpec{
-		ToolSpec("read_file", readTool{}.describe),
-		ToolSpec("write_file", writeTool{}.describe),
-		ToolSpec("edit_file", editTool{}.describe),
-		ToolSpec("apply_patch", patchTool{}.describe),
-		ToolSpec("run_command", runCommandTool{}.describe),
-		ToolSpec("process", processTool{}.describe),
-		ToolSpec("sleep", sleepTool{}.describe),
+func standardToolDeclarations() []standardToolDeclaration {
+	return []standardToolDeclaration{
+		{id: "read_file", describe: readTool{}.describe},
+		{id: "write_file", describe: writeTool{}.describe},
+		{id: "edit_file", describe: editTool{}.describe},
+		{id: "apply_patch", describe: patchTool{}.describe},
+		{id: "run_command", describe: runCommandTool{}.describe},
+		{id: "process", describe: processTool{}.describe},
+		{id: "sleep", describe: sleepTool{}.describe},
 	}
 }
 

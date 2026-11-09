@@ -293,10 +293,10 @@ func (c *CLI) frameLocked(content string) string {
 		if h.SelectedModel != nil {
 			model = *h.SelectedModel
 		}
-		status := fmt.Sprintf("Future: %s / %s", h.Session.AgentType, model)
+		status := fmt.Sprintf("Future: %s / %s", selectionName(h.Session.AgentSelection), model)
 		if h.ActiveOperation != nil {
 			op := h.ActiveOperation
-			status += fmt.Sprintf(" · Active %s, captured conversation: %s / %s", op.RequestKind, op.AgentType, op.Model)
+			status += fmt.Sprintf(" · Active %s, captured conversation: %s / %s", op.RequestKind, selectionName(op.AgentSelection), op.Model)
 		}
 		if c.childID != "" {
 			status += " · child inspection, read only"

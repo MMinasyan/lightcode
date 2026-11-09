@@ -1255,15 +1255,19 @@ func (v *graphValidation) validateEvidenceRefs(what string, evidence *RequestEvi
 }
 
 func (v *graphValidation) validateEvidenceNames(evidence *RequestEvidence, capture ExecutionCapture) error {
-	next := 0
+	catalog := make(map[string]bool, len(capture.Tools))
+	for _, tool := range capture.Tools {
+		catalog[tool.Name] = true
+	}
+	seen := make(map[string]bool, len(evidence.ToolNames))
 	for _, name := range evidence.ToolNames {
-		for next < len(capture.Tools) && capture.Tools[next].Name != name {
-			next++
+		if !catalog[name] {
+			return v.corrupt("evidence tool name %q is outside the captured catalog", name)
 		}
-		if next == len(capture.Tools) {
-			return v.corrupt("evidence tool names are outside captured catalog or out of order")
+		if seen[name] {
+			return v.corrupt("evidence tool name %q is duplicated", name)
 		}
-		next++
+		seen[name] = true
 	}
 	return nil
 }

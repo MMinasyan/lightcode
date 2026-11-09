@@ -29,7 +29,7 @@ const (
 	testCredential = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	// testVersion is the current wire identity every compatible fixture
 	// speaks; the incompatible rows keep the literal old "1".
-	testVersion = string(protocol.N8)
+	testVersion = string(protocol.N12)
 )
 
 // recordContent builds one private four-field discovery document.
@@ -164,11 +164,13 @@ func workspaceEventScope() protocol.Scope {
 // identity, the producer shape of the agent lifecycle hints.
 func agentEventScope() protocol.Scope {
 	var scope protocol.Scope
-	if err := scope.FromAgentScope(protocol.AgentScope{
-		Kind:        protocol.AgentScopeKindAgent,
-		Workspace:   ptr("/w"),
-		SessionId:   testInstance,
-		OperationId: "op-1",
+	if err := scope.FromInvocationScope(protocol.InvocationScope{
+		Kind:         protocol.Invocation,
+		InvocationId: "inv-1",
+		Purpose:      protocol.Conversation,
+		Workspace:    ptr("/w"),
+		SessionId:    testInstance,
+		OperationId:  "op-1",
 	}); err != nil {
 		panic(err) // plain members; the marshal cannot fail
 	}

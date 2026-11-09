@@ -7,11 +7,36 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/MMinasyan/lightcode/model"
 )
+
+// CallbackIdentity is the minimal immutable carrier the Harness binds to one
+// effect callback context: the already-reserved result entry identity of the
+// associated effect, or empty where no effect exists.
+type CallbackIdentity struct {
+	RequestID  string
+	ToolCallID string
+	EffectID   string
+}
+
+type callbackIdentityKey struct{}
+
+// WithCallbackIdentity binds one effect identity to a callback context. The
+// value is immutable and grants nothing by itself; the host reads it when it
+// constructs a native call view.
+func WithCallbackIdentity(ctx context.Context, identity CallbackIdentity) context.Context {
+	return context.WithValue(ctx, callbackIdentityKey{}, identity)
+}
+
+// CallbackIdentityFromContext returns the bound effect identity, if any.
+func CallbackIdentityFromContext(ctx context.Context) CallbackIdentity {
+	identity, _ := ctx.Value(callbackIdentityKey{}).(CallbackIdentity)
+	return identity
+}
 
 // JobStopper is the job-stop seam: the Harness cannot import plugin packages,
 // so the interface is declared at its consumer. Nil is legal; StartJob rejects
@@ -36,8 +61,8 @@ type Dependencies struct {
 // PreparationSession is the revision-free owned Session view one preparation
 // receives.
 type PreparationSession struct {
-	Identity  SessionIdentity
-	AgentType string
+	Identity       SessionIdentity
+	AgentSelection AgentSelection
 }
 
 // PreparationRequest is the input of one preparation call.
@@ -238,7 +263,7 @@ type InvocationExecution struct {
 	// with no filesystem, service, permission or effect I/O. It receives an
 	// owned call and returns one owned JSON object preserving unrelated
 	// accepted fields; its error is a per-call validation failure.
-	NormalizeTool func(model.ToolCall) (json.RawMessage, error)
+	NormalizeTool func(context.Context, model.ToolCall) (json.RawMessage, error)
 	// ToolHooks are the selected argument hooks in configured order. Each
 	// runs after the advertisement gate and before concrete preparation; the
 	// first receives the original raw call arguments, every later one the
@@ -322,8 +347,8 @@ type PreparedTool struct {
 
 // CreateSessionRequest is the input of one root Session creation.
 type CreateSessionRequest struct {
-	Workspace string
-	AgentType string
+	Workspace      string
+	AgentSelection AgentSelection
 }
 
 // SubmitRequest is the input of one public Session message submission.
@@ -467,8 +492,8 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 	if err := validateWorkspace(req.Workspace); err != nil {
 		return SessionRecord{}, invalidInput("workspace: %v", err)
 	}
-	if req.AgentType == "" {
-		return SessionRecord{}, invalidInput("agent type must be non-empty")
+	if err := validateAgentSelection(req.AgentSelection); err != nil {
+		return SessionRecord{}, invalidInput("agent selection: %v", err)
 	}
 	sessionID, err := newHexID()
 	if err != nil {
@@ -478,10 +503,10 @@ func (h *Harness) CreateSession(ctx context.Context, req CreateSessionRequest) (
 	record := SessionRecord{
 		Identity: SessionIdentity{SessionID: sessionID, Workspace: req.Workspace, CreatedAt: now},
 		State: SessionState{
-			Lifecycle:        LifecycleOpen,
-			CurrentAgentType: req.AgentType,
-			Usage:            UsageTotals{},
-			LastActivity:     now,
+			Lifecycle:      LifecycleOpen,
+			AgentSelection: ownAgentSelection(req.AgentSelection),
+			Usage:          UsageTotals{},
+			LastActivity:   now,
 		},
 	}
 	payload, err := encodeSessionRegister(record)
@@ -538,10 +563,122 @@ func (h *Harness) ReadOperation(ctx context.Context, sessionID, operationID stri
 // ChangeAgentType changes the current Agent type of an open Session. It
 // preserves identity, usage, history, and last activity, and never alters an
 // active Operation's admission capture.
-func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType string) (SessionRecord, error) {
-	if agentType == "" {
-		return SessionRecord{}, invalidInput("agent type must be non-empty")
+func (h *Harness) ChangeAgentType(ctx context.Context, sessionID string, selection AgentSelection) (SessionRecord, error) {
+	if err := validateAgentSelection(selection); err != nil {
+		return SessionRecord{}, invalidInput("agent selection: %v", err)
 	}
+	selection = ownAgentSelection(selection)
+	return h.changeSelection(ctx, sessionID, func(AgentSelection) (AgentSelection, error) {
+		return selection, nil
+	})
+}
+
+// SetSessionModel changes only a resolved selection's model for later admissions.
+func (h *Harness) SetSessionModel(ctx context.Context, sessionID string, ref model.ModelRef) (SessionRecord, error) {
+	if (ref.Provider == "") != (ref.Model == "") {
+		return SessionRecord{}, invalidInput("model must be wholly empty or complete")
+	}
+	return h.changeSelection(ctx, sessionID, func(current AgentSelection) (AgentSelection, error) {
+		if current.Inputs == nil {
+			return AgentSelection{}, fmt.Errorf("selection is not resolved: %w", ErrConflict)
+		}
+		current = ownAgentSelection(current)
+		current.Inputs.Model = ref
+		return current, nil
+	})
+}
+
+// ClaimExternalData durably records one installed extension as an owner of
+// external data for one open Session before that data is created. It follows
+// the Agent-type mutation rule: any open Session qualifies, including one with
+// an active Operation, and a repeated claim is a no-op that writes nothing. A
+// refused claim leaves the register unchanged.
+func (h *Harness) ClaimExternalData(ctx context.Context, sessionID, extensionID string) error {
+	if extensionID == "" {
+		return invalidInput("external data owner must be a nonempty extension ID")
+	}
+	c, release, err := h.acquireCoordinator(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	for {
+		if err := c.waitIdle(ctx); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if c.reserved != nil { // a reservation was taken between the wait and the lock
+			c.mu.Unlock()
+			continue
+		}
+		if c.gone { // a deletion committed while this call waited or relocked
+			c.mu.Unlock()
+			return notFoundSession(sessionID)
+		}
+		if c.graph.Session.State.Lifecycle != LifecycleOpen {
+			c.mu.Unlock()
+			return invalidInput("session %q is archived; an external data claim requires an open Session", sessionID)
+		}
+		expected := c.graph.Session.Revision
+		var (
+			updated SessionRecord
+			changed bool
+		)
+		err := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
+			key := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
+			reg, err := tx.ReadRegister(key)
+			if err != nil {
+				return err
+			}
+			current, err := decodeSessionRegister(reg)
+			if err != nil {
+				return corruptSession(sessionID, "session register: %v", err)
+			}
+			if reg.Revision != expected {
+				return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, sessionID, expected, reg.Revision)
+			}
+			if slices.Contains(current.State.ExternalDataOwners, extensionID) {
+				updated = current // a repeated claim is a true no-op
+				return nil
+			}
+			state := current.State
+			state.ExternalDataOwners = append(append([]string(nil), state.ExternalDataOwners...), extensionID)
+			changedRecord := SessionRecord{Identity: current.Identity, State: state}
+			payload, err := encodeSessionRegister(changedRecord)
+			if err != nil {
+				return err
+			}
+			replaced, err := tx.ReplaceRegister(key, reg.Revision, payload)
+			if err != nil {
+				return err
+			}
+			changedRecord.Revision = replaced.Revision
+			updated = changedRecord
+			changed = true
+			return nil
+		})
+		if err != nil {
+			h.markCorrupt(sessionID, err)
+			c.mu.Unlock()
+			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
+				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil {
+					return rerr
+				}
+			}
+			return err
+		}
+		if changed {
+			c.graph.Session = updated
+		}
+		c.mu.Unlock()
+		if changed {
+			h.observeInvalidation(c) // the durable external-data claim
+		}
+		return nil
+	}
+}
+
+func (h *Harness) changeSelection(ctx context.Context, sessionID string, update func(AgentSelection) (AgentSelection, error)) (SessionRecord, error) {
 	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
 		return SessionRecord{}, err
@@ -580,7 +717,10 @@ func (h *Harness) ChangeAgentType(ctx context.Context, sessionID, agentType stri
 				return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, sessionID, expected, reg.Revision)
 			}
 			state := current.State
-			state.CurrentAgentType = agentType
+			state.AgentSelection, err = update(state.AgentSelection)
+			if err != nil {
+				return err
+			}
 			changed := SessionRecord{Identity: current.Identity, State: state}
 			payload, err := encodeSessionRegister(changed)
 			if err != nil {
@@ -944,19 +1084,20 @@ func (h *Harness) ArchiveSession(ctx context.Context, sessionID string) (Session
 }
 
 // DeleteSession deletes one archived Session: the same transaction that
-// validates its state performs the storage deletion. After the commit it uses
-// the post-commit coordinator invalidation: callers already holding that
-// coordinator and later materialization both return ErrNotFound. Deleting an
-// open or absent Session is rejected without a write.
-func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
+// validates its state performs the storage deletion and the committed
+// register's external-data owners are returned only after that commit. After
+// the commit it uses the post-commit coordinator invalidation: callers already
+// holding that coordinator and later materialization both return ErrNotFound.
+// Deleting an open or absent Session is rejected without a write.
+func (h *Harness) DeleteSession(ctx context.Context, sessionID string) ([]string, error) {
 	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer release()
 	for {
 		if err := c.waitIdle(ctx); err != nil {
-			return err
+			return nil, err
 		}
 		c.mu.Lock()
 		if c.reserved != nil { // a reservation was taken between the wait and the lock
@@ -965,13 +1106,14 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 		}
 		if c.gone { // a deletion committed while this call waited or relocked
 			c.mu.Unlock()
-			return notFoundSession(sessionID)
+			return nil, notFoundSession(sessionID)
 		}
 		if c.graph.Session.State.Lifecycle != LifecycleArchived {
 			c.mu.Unlock()
-			return invalidInput("session %q is open; deletion requires an archived Session", sessionID)
+			return nil, invalidInput("session %q is open; deletion requires an archived Session", sessionID)
 		}
 		expected := c.graph.Session.Revision
+		var owners []string
 		err := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
 			key := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
 			reg, err := tx.ReadRegister(key)
@@ -981,22 +1123,30 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 			if reg.Revision != expected {
 				return fmt.Errorf("%w: session %q revision %d changed concurrently to %d", errRevisionRace, sessionID, expected, reg.Revision)
 			}
-			return tx.DeleteSession(sessionID)
+			current, err := decodeSessionRegister(reg)
+			if err != nil {
+				return corruptSession(sessionID, "session register: %v", err)
+			}
+			if err := tx.DeleteSession(sessionID); err != nil {
+				return err
+			}
+			owners = append([]string(nil), current.State.ExternalDataOwners...)
+			return nil
 		})
 		if err != nil {
 			h.markCorrupt(sessionID, err)
 			c.mu.Unlock()
 			if errors.Is(err, errRevisionRace) { // a foreign writer changed the durable state under the resident view
 				if rerr := h.rematerialize(ctx, c, sessionID); rerr != nil { // a discovered corruption or storage failure is the current truth
-					return rerr
+					return nil, rerr
 				}
 			}
-			return err
+			return nil, err
 		}
 		c.invalidate() // post-commit, under the same coordinator ownership: buffers cleared and absence marked before registry removal
 		c.mu.Unlock()
 		h.removeCoordinator(sessionID)
-		return nil
+		return owners, nil
 	}
 }
 
@@ -1012,15 +1162,16 @@ func (h *Harness) DeleteSession(ctx context.Context, sessionID string) error {
 // not-found class and a corrupt one the corruption class, both left
 // unchanged. Deletion uses the same post-commit coordinator invalidation as
 // DeleteSession; archiving adopts the committed record under the same hold.
-// It reports whether the deletion transition committed: the flag is true only
+// It reports whether the deletion transition committed and, only after that
+// commit, the removed register's external-data owners: the flag is true only
 // after the deleting transaction and its post-commit adoption succeeded.
-func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy SweepPolicy, now time.Time) (bool, error) {
+func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy SweepPolicy, now time.Time) (bool, []string, error) {
 	if now.IsZero() {
-		return false, invalidInput("sweep time must not be zero")
+		return false, nil, invalidInput("sweep time must not be zero")
 	}
 	c, release, err := h.acquireCoordinator(ctx, sessionID)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	defer release()
 	return h.sweepOne(ctx, c, sessionID, policy, now)
@@ -1037,26 +1188,28 @@ func (h *Harness) SweepSession(ctx context.Context, sessionID string, policy Swe
 // and a corrupt register the corruption class, both left unchanged. Deletion
 // uses the same post-commit coordinator invalidation as DeleteSession;
 // archiving adopts the committed record under the same hold. It reports
-// whether the deletion transition committed: the flag is true only after the
+// whether the deletion transition committed and, only after that commit, the
+// removed register's external-data owners: the flag is true only after the
 // deleting transaction and its post-commit adoption succeeded.
-func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string, policy SweepPolicy, now time.Time) (bool, error) {
+func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string, policy SweepPolicy, now time.Time) (bool, []string, error) {
 	c.mu.Lock()
 	if c.reserved != nil { // a reserved candidate skips like every other busy state: the pass never waits on admission work
 		c.mu.Unlock()
-		return false, nil
+		return false, nil, nil
 	}
 	if c.gone { // a deletion committed before this transition
 		c.mu.Unlock()
-		return false, notFoundSession(sessionID)
+		return false, nil, notFoundSession(sessionID)
 	}
 	if !c.quiescentLocked() { // running, buffered, or live background work: left unchanged
 		c.mu.Unlock()
-		return false, nil
+		return false, nil, nil
 	}
 	var (
 		archived   SessionRecord
 		didArchive bool
 		deleted    bool
+		owners     []string
 	)
 	err := h.deps.Storage.Transact(ctx, func(tx Transaction) error {
 		key := RegisterKey{SessionID: sessionID, Kind: RegisterSession}
@@ -1101,6 +1254,7 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 			if err := tx.DeleteSession(sessionID); err != nil {
 				return err
 			}
+			owners = append([]string(nil), current.State.ExternalDataOwners...)
 			deleted = true
 		}
 		return nil
@@ -1108,13 +1262,13 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 	if err != nil {
 		h.markCorrupt(sessionID, err)
 		c.mu.Unlock()
-		return false, err
+		return false, nil, err
 	}
 	if deleted { // the same post-commit coordinator invalidation as DeleteSession, under this hold
 		c.invalidate()
 		c.mu.Unlock()
 		h.removeCoordinator(sessionID)
-		return true, nil
+		return true, owners, nil
 	}
 	if didArchive {
 		c.graph.Session = archived
@@ -1123,7 +1277,7 @@ func (h *Harness) sweepOne(ctx context.Context, c *coordinator, sessionID string
 	if didArchive {
 		h.observeInvalidation(c) // the durable sweep archive advance
 	}
-	return false, nil
+	return false, nil, nil
 }
 
 // quiescentLocked applies the one lifecycle gate under the caller-held
@@ -1489,8 +1643,8 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 	c.mu.Unlock()
 
 	prepared, capture, prepCtx, cleanup, err := h.prepareExecution(ctx, PreparationSession{
-		Identity:  view.Identity,
-		AgentType: view.State.CurrentAgentType,
+		Identity:       view.Identity,
+		AgentSelection: view.State.AgentSelection,
 	}, req.Kind)
 	if err != nil {
 		return OperationRecord{}, nil, "", err
@@ -1513,9 +1667,9 @@ func (h *Harness) admitReserved(ctx context.Context, c *coordinator, req admissi
 }
 
 // prepareExecution is the shared outside-lock preparation and validation of
-// one admission producer, used by normal admission and Fork alike: it merges
+// one admission producer, used by normal admission, Fork, and child launch: it merges
 // the caller context with the Harness context, invokes the single preparation
-// callback, requires a non-nil opener and a valid capture, and returns the
+// callback with an owned selection, requires a non-nil opener and a valid capture, and returns the
 // prepared execution with its owned durable capture plus the combined context
 // and its cleanup. A preparation failure returns with the combined context
 // already cleaned up; on success the caller keeps it live through publication
@@ -1539,6 +1693,7 @@ func (h *Harness) prepareExecution(ctx context.Context, session PreparationSessi
 		cleanup()
 		return PreparedExecution{}, ExecutionCapture{}, nil, nil, h.ctx.Err()
 	}
+	session.AgentSelection = ownAgentSelection(session.AgentSelection)
 	prepared, prepErr := h.deps.Prepare(prepCtx, PreparationRequest{
 		Session:     session,
 		RequestKind: kind,
@@ -1714,12 +1869,12 @@ func produceAdmission(tx Transaction, session SessionRecord, capture ExecutionCa
 		now := time.Now().UTC()
 		record := OperationRecord{
 			Admission: OperationAdmission{
-				SessionID:   req.SessionID,
-				OperationID: req.OperationID,
-				RequestKind: req.Kind,
-				AgentType:   session.State.CurrentAgentType,
-				Execution:   capture,
-				AdmittedAt:  now,
+				SessionID:      req.SessionID,
+				OperationID:    req.OperationID,
+				RequestKind:    req.Kind,
+				AgentSelection: ownAgentSelection(session.State.AgentSelection),
+				Execution:      capture,
+				AdmittedAt:     now,
 			},
 			State: OperationCurrentState{
 				Status:           OperationRunning,
@@ -1782,13 +1937,13 @@ func produceAdmission(tx Transaction, session SessionRecord, capture ExecutionCa
 	}
 	record := OperationRecord{
 		Admission: OperationAdmission{
-			SessionID:     req.SessionID,
-			OperationID:   req.OperationID,
-			RequestKind:   req.Kind,
-			AdmittedEntry: EntryRef{SessionID: req.SessionID, EntryID: entryID},
-			AgentType:     session.State.CurrentAgentType,
-			Execution:     capture,
-			AdmittedAt:    inserted.CommittedAt,
+			SessionID:      req.SessionID,
+			OperationID:    req.OperationID,
+			RequestKind:    req.Kind,
+			AdmittedEntry:  EntryRef{SessionID: req.SessionID, EntryID: entryID},
+			AgentSelection: ownAgentSelection(session.State.AgentSelection),
+			Execution:      capture,
+			AdmittedAt:     inserted.CommittedAt,
 		},
 		State: OperationCurrentState{
 			Status:           OperationRunning,
@@ -2090,6 +2245,20 @@ func ownCapture(c ExecutionCapture) ExecutionCapture {
 			out.Tools[i].Parameters = model.CloneRaw(tool.Parameters)
 		}
 	}
+	if c.InitialToolNames == nil {
+		out.InitialToolNames = nil
+	} else {
+		out.InitialToolNames = append([]string{}, c.InitialToolNames...)
+	}
+	if len(c.Implementations) == 0 {
+		out.Implementations = nil
+	} else {
+		out.Implementations = make([]ImplementationCapture, len(c.Implementations))
+		for i, implementation := range c.Implementations {
+			out.Implementations[i] = implementation
+			out.Implementations[i].Settings = model.CloneRaw(implementation.Settings)
+		}
+	}
 	if len(c.Capabilities) == 0 {
 		out.Capabilities = nil
 	} else {
@@ -2114,17 +2283,20 @@ func ownUsageTotals(t UsageTotals) UsageTotals {
 // ownSessionRecord returns an independent owned copy of one Session record.
 func ownSessionRecord(rec SessionRecord) SessionRecord {
 	out := rec
+	out.State.AgentSelection = ownAgentSelection(rec.State.AgentSelection)
 	if rec.State.ArchivedAt != nil {
 		stamped := *rec.State.ArchivedAt
 		out.State.ArchivedAt = &stamped
 	}
 	out.State.Usage = ownUsageTotals(rec.State.Usage)
+	out.State.ExternalDataOwners = append([]string(nil), rec.State.ExternalDataOwners...)
 	return out
 }
 
 // ownOperationRecord returns an independent owned copy of one Operation record.
 func ownOperationRecord(rec OperationRecord) OperationRecord {
 	out := rec
+	out.Admission.AgentSelection = ownAgentSelection(rec.Admission.AgentSelection)
 	out.Admission.Execution = ownCapture(rec.Admission.Execution)
 	out.State.Usage = ownUsageTotals(rec.State.Usage)
 	out.State.PendingToolCalls = make([]PendingToolCall, len(rec.State.PendingToolCalls))

@@ -49,7 +49,7 @@ func snapshotTurnPrepared(script *scriptModel) harness.PreparedExecution {
 	return harness.PreparedExecution{
 		Capture: publicCapture(),
 		Open: func(context.Context, harness.OperationAdmission) (harness.Execution, error) {
-			return publicExecutionOver(script.effect, script.effect, func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			return publicExecutionOver(script.effect, script.effect, func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0],"s":"<>&"}`),
@@ -570,7 +570,7 @@ func TestPublicSnapshotSessionCompactAndDeletion(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := f.h.DeleteSession(ctx, session)
+			_, err := f.h.DeleteSession(ctx, session)
 			testassert.NoError(t, err)
 		}
 		{
@@ -738,7 +738,7 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := lister.h.DeleteSession(ctx, second)
+			_, err := lister.h.DeleteSession(ctx, second)
 			testassert.NoError(t, err)
 		}
 		{
@@ -746,7 +746,7 @@ func TestPublicListSessionsValidationAndFailures(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			err := lister.h.DeleteSession(ctx, third)
+			_, err := lister.h.DeleteSession(ctx, third)
 			testassert.NoError(t, err)
 		}
 		listed, err = lister.h.ListSessions(ctx)
@@ -859,7 +859,7 @@ func TestPublicSnapshotSessionDeletionRace(t *testing.T) {
 				}
 			}()
 		}
-		if err := f.h.DeleteSession(ctx, session); err != nil {
+		if _, err := f.h.DeleteSession(ctx, session); err != nil {
 			errs <- err
 		}
 		close(stop)
@@ -1045,7 +1045,7 @@ func TestPublicSnapshotChildStopRevisions(t *testing.T) {
 
 		res, err := h.LaunchChildSession(ctx, harness.LaunchChildRequest{
 			ParentSessionID: root,
-			AgentType:       "coder",
+			AgentSelection:  publicSelection("coder"),
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "child work"}},
 			OperationID:     "child-op-1",
 			MaxConcurrent:   1,
@@ -1248,7 +1248,7 @@ func TestPublicListSessionsStaleEnumeratedRow(t *testing.T) {
 		}()
 		<-wrapped.listed
 		{
-			err := f.h.DeleteSession(ctx, victim)
+			_, err := f.h.DeleteSession(ctx, victim)
 			testassert.NoError(t, err)
 		}
 		close(wrapped.listRelease)
@@ -1336,13 +1336,13 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 			compactInput := 0.5
 			capture.Pricing = &harness.ModelPricing{Input: &conversationInput, Output: &conversationOutput}
 			capture.Compact.Pricing = &harness.ModelPricing{Input: &compactInput}
-			immediateTool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			immediateTool := func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Immediate: &harness.ToolOutcome{
 					Result:   model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran call"},
 					Metadata: json.RawMessage(`{"n":[1,1.0]}`),
 				}}
 			}
-			parkingTool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+			parkingTool := func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 				return harness.PreparedTool{Permissions: publicPermission, Execute: func(execCtx context.Context) harness.ToolOutcome {
 					close(parkEntered)
 					select {
@@ -1559,7 +1559,7 @@ func TestPublicSnapshotOwnershipMatrix(t *testing.T) {
 		mutated.TotalUsage.ByModel[0].Model.Provider = "mutated"
 		mutated.TotalUsage.ByModel[0].Usage.InputTokens = 999
 		mutated.TotalUsage.ByModel = append(mutated.TotalUsage.ByModel, harness.ModelUsage{})
-		mutated.Header.CurrentAgentType = "mutated"
+		mutated.Header.AgentSelection.Definition.DefinitionID = "mutated"
 		for i := range mutated.Operations {
 			op := &mutated.Operations[i]
 			op.Model.Provider = "mutated"
@@ -1738,7 +1738,7 @@ func TestPublicListSessionsRowOwnership(t *testing.T) {
 		*mutated[0].ArchivedAt = mutated[0].ArchivedAt.Add(time.Hour)
 		mutated[0].Identity.Workspace = "mutated"
 		mutated[0].Lifecycle = "mutated"
-		mutated[0].CurrentAgentType = "mutated"
+		mutated[0].AgentSelection.Definition.DefinitionID = "mutated"
 		mutated = append(mutated, harness.SessionHeader{})
 
 		fresh, err := f.h.ListSessions(ctx)
@@ -1826,7 +1826,8 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 
 			deleteDone := make(chan error, 1)
 			go func() {
-				deleteDone <- h.DeleteSession(context.Background(), session)
+				_, err := h.DeleteSession(context.Background(), session)
+				deleteDone <- err
 			}()
 			<-gate.started // the deleting transaction is parked, holding the coordinator mutex
 
@@ -1866,7 +1867,8 @@ func TestPublicSnapshotDeleteCoherence(t *testing.T) {
 
 			deleteDone := make(chan error, 1)
 			go func() {
-				deleteDone <- h.DeleteSession(context.Background(), session)
+				_, err := h.DeleteSession(context.Background(), session)
+				deleteDone <- err
 			}()
 			<-gate.started
 			close(gate.release)

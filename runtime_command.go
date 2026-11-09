@@ -14,6 +14,14 @@ import (
 //go:embed runtime_identity.md
 var runtimeIdentity string
 
+func installedExtensions() ([]string, []string) {
+	var ids []string
+	for _, plugin := range builtin.Plugins() {
+		ids = append(ids, plugin.Declaration.ID)
+	}
+	return ids, builtin.DefaultCapabilityIDs()
+}
+
 // runRuntime runs the shared managed Runtime owner in the foreground for the
 // lifetime of the signal context. It opens the owner over the normalized
 // paths with the shipped plugin set, attaches the protocol and publishes the
@@ -34,12 +42,11 @@ func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 		return err
 	}
 	owner, err := runtime.Open(ctx, runtime.Options{
-		DataDir:              absDataDir,
-		ConfigPath:           absConfigPath,
-		Plugins:              builtin.Plugins(),
-		DefaultCapabilityIDs: builtin.DefaultCapabilityIDs(),
-		Identity:             runtimeIdentity,
-		GlobalRulesDir:       filepath.Join(home, ".lightcode"),
+		DataDir:        absDataDir,
+		ConfigPath:     absConfigPath,
+		Plugins:        builtin.Plugins(),
+		Identity:       runtimeIdentity,
+		GlobalRulesDir: filepath.Join(home, ".lightcode"),
 	})
 	if errors.Is(err, runtime.ErrOwned) {
 		// Another process owns the data directory; this contender

@@ -2,7 +2,7 @@
 // Session/Hydration shape with fresh defaults per call, and the two lossless
 // response forms the generated bindings return. Callers spread their own
 // overrides shallowly, so deliberate aliases of a supplied object stay.
-import type { Hydration, Session, SessionRevision } from '../generated/protocol/types.gen';
+import type { AgentSelection, Hydration, Session, SessionRevision } from '../generated/protocol/types.gen';
 import type { desktopclient } from '../../client-bindings/wailsjs/go/models';
 
 export const INSTANCE = '0123456789abcdef0123456789abcdef';
@@ -15,13 +15,17 @@ export function revision(durable: string, local = '0', instance = INSTANCE): Ses
   return { instance_id: instance, durable_revision: durable, local_revision: local };
 }
 
+export function definitionSelection(name: string): AgentSelection {
+  return { definition: { extension_id: 'agents', capability_id: 'agents.definitions', definition_id: name } };
+}
+
 export function session(id: string, lastActivity: string, parent?: string): Session {
   return {
     session_id: id,
     workspace: '/ws',
     ...(parent ? { parent_session_id: parent } : {}),
     lifecycle: 'open',
-    agent_type: 'primary',
+    agent_selection: definitionSelection('primary'),
     created_at: '0',
     last_activity: lastActivity,
     session_revision: revision('1'),

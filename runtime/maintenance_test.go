@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -43,7 +42,7 @@ func ownerSweepDocument(sessions string) string {
 // instead of failing for absent metadata.
 func ownerSweepProbedDocument(endpoint, sessions string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
-		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}},"sessions":` + sessions + `}`
+		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":"T1"}},"sessions":` + sessions + `}`
 }
 
 // ownerSweepAgentsDocument selects the local model and the preparation hook
@@ -369,7 +368,7 @@ func seedStaleSession(t *testing.T, store harness.Storage, workspace string, sta
 		},
 	})
 	testassert.NoError(t, err)
-	rec, err := h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: workspace, AgentType: "seeded"})
+	rec, err := h.CreateSession(ctx, harness.CreateSessionRequest{Workspace: workspace, AgentSelection: suppliedDefinition("seeded")})
 	testassert.NoError(t, err)
 	rewriteSessionRegister(t, store, rec.Identity.SessionID, func(state map[string]json.RawMessage) {
 		var last time.Time
@@ -389,7 +388,7 @@ func TestMaintenanceInitialPassRunsAtStartup(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":365}`))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), ownerSweepAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, ownerSweepAgentsDocument)
 		seeded := seedStaleSession(t, store, filepath.Join(e.dataDir, "seeded"), 100*time.Hour)
 		hook := &recordHook{name: "hook.first", events: &traceLog{}}
 		var opOpens, agOpens atomic.Int64
@@ -424,7 +423,7 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"auto_archive":false,"archive_after_days":1,"delete_after_archive_days":1}`))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), ownerSweepAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, ownerSweepAgentsDocument)
 		wrapped := newSweepStore(store)
 		hook := &recordHook{name: "hook.first", events: &traceLog{}}
 		var opOpens, agOpens atomic.Int64
@@ -700,6 +699,7 @@ func TestMaintenanceLeavesRunningSessionsAndAdmitsNoModel(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
+		writeAgentDefinitions(t, e.configPath, ownerAgentsDocument)
 		wrapped := newSweepStore(store)
 		e.fixtureStore(wrapped)
 		r, ticks, err := e.openSwept(context.Background(), hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))
@@ -934,9 +934,9 @@ func mustExist(t *testing.T, path, what string) {
 
 // TestPrivateDeleteSessionCleansArtifacts proves the direct deletion row: an
 // archived Session's deletion removes its whole artifact tree and nothing
-// else; the repeated delete and an unknown valid identity return the same
-// idempotent cleanup success; a deletion with no artifact directory at all is
-// already clean; and invalid or uncommitted deletions authorize no cleanup.
+// else; a repeated delete and an unknown valid identity return the ordinary
+// not-found and remove nothing; a deletion with no artifact directory at all
+// is already clean; and invalid or uncommitted deletions authorize no cleanup.
 func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
@@ -967,7 +967,10 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		unrelated := filepath.Join(e.dataDir, "unrelated.txt")
 		testassert.NoError(t, os.WriteFile(unrelated, []byte("keep"), 0o644))
 
-		testassert.NoError(t, r.deleteSession(ctx, archivedID))
+		{
+			_, err := r.deleteSession(ctx, archivedID)
+			testassert.NoError(t, err)
+		}
 		mustNotExist(t, archivedCode, "the deleted session's artifact tree")
 		mustExist(t, siblingCode, "the sibling session's artifact tree")
 		mustExist(t, unrelated, "unrelated data-directory content")
@@ -976,32 +979,41 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "read after delete = err %v, want ErrNotFound", err)
 		}
 
-		// the repeated delete is the same idempotent result with no artifacts left to clean
-		testassert.NoError(t, r.deleteSession(ctx, archivedID))
+		// a repeated delete is the ordinary not-found with nothing left to clean
+		{
+			_, err := r.deleteSession(ctx, archivedID)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = err %v, want ErrNotFound", err)
+		}
 
 		// canonical deletion with no artifact directory at all is already clean
 		bare, err := r.createSession(ctx, filepath.Join(e.dataDir, "bare"), "solo")
 		testassert.NoError(t, err)
 		archive(bare.Identity.SessionID)
-		testassert.NoError(t, r.deleteSession(ctx, bare.Identity.SessionID))
+		{
+			_, err := r.deleteSession(ctx, bare.Identity.SessionID)
+			testassert.NoError(t, err)
+		}
 
-		// an unknown valid identity with planted artifacts still cleans them
+		// an unknown valid identity is the ordinary not-found and leaves its planted artifacts untouched
 		const ghost = "0123456789abcdef0123456789abcdef" // valid hex identity, never registered
 		ghostCode := plantSessionCode(t, e.dataDir, ghost)
-		testassert.NoError(t, r.deleteSession(ctx, ghost))
-		mustNotExist(t, ghostCode, "the unknown identity's artifacts")
+		{
+			_, err := r.deleteSession(ctx, ghost)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleteSession of an unknown identity = err %v, want ErrNotFound", err)
+		}
+		mustExist(t, ghostCode, "the unknown identity's artifacts")
 
 		// invalid and uncommitted deletions remove nothing
 		open, err := r.createSession(ctx, filepath.Join(e.dataDir, "open"), "solo")
 		testassert.NoError(t, err)
 		openCode := plantSessionCode(t, e.dataDir, open.Identity.SessionID)
 		{
-			err := r.deleteSession(ctx, open.Identity.SessionID)
+			_, err := r.deleteSession(ctx, open.Identity.SessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "deleteSession of an open session = err %v, want ErrInvalid", err)
 		}
 		mustExist(t, openCode, "the open session's artifacts after the rejected delete")
 		{
-			err := r.deleteSession(ctx, "not-a-session-id")
+			_, err := r.deleteSession(ctx, "not-a-session-id")
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "deleteSession of a malformed identity = err %v, want ErrInvalid", err)
 		}
 		mustExist(t, siblingCode, "the sibling session's artifacts after the malformed delete")
@@ -1034,7 +1046,10 @@ func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
 
 		blocked.block(id)
 		done := make(chan error, 1)
-		go func() { done <- r.deleteSession(ctx, id) }()
+		go func() {
+			_, err := r.deleteSession(ctx, id)
+			done <- err
+		}()
 		select {
 		case <-blocked.arrived:
 		case <-time.After(10 * time.Second):
@@ -1068,8 +1083,8 @@ func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
 
 // TestPrivateDeleteSessionReturnsCleanupErrors proves the direct path's
 // cleanup-error half: when the artifact removal fails, deleteSession returns
-// the removal error naming the blocked path while the committed deletion
-// stays committed — never rolled back or recreated.
+// a structured local cleanup failure naming the blocked tree while the
+// committed deletion stays committed — never rolled back or recreated.
 func TestPrivateDeleteSessionReturnsCleanupErrors(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
@@ -1093,8 +1108,9 @@ func TestPrivateDeleteSessionReturnsCleanupErrors(t *testing.T) {
 		testassert.NoError(t, os.Chmod(codeRoot, 0o555))
 		t.Cleanup(func() { os.Chmod(codeRoot, 0o755) })
 
-		delErr := r.deleteSession(ctx, id)
-		testassert.Require(t, delErr != nil && strings.Contains(delErr.Error(), code), "deleteSession with a failing cleanup = err %v, want the removal error naming the blocked tree", delErr)
+		result, delErr := r.deleteSession(ctx, id)
+		testassert.NoError(t, delErr)
+		testassert.Require(t, len(result.CleanupFailures) == 1 && result.CleanupFailures[0].ExtensionId == nil && result.CleanupFailures[0].Code == "storage" && strings.Contains(result.CleanupFailures[0].Message, code), "deleteSession cleanup result = %+v, want one local storage failure naming the blocked tree", result.CleanupFailures)
 		{
 			_, err := store.ReadRegister(ctx, harness.RegisterKey{SessionID: id, Kind: harness.RegisterSession})
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "register after the failed cleanup = err %v, want it gone: the deletion stays committed", err)
@@ -1526,6 +1542,7 @@ func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
+		writeAgentDefinitions(t, e.configPath, ownerAgentsDocument)
 		ctx := context.Background()
 		e.fixtureStore(store)
 		r, err := e.open(ctx, hookPlugin(&recordHook{name: "hook.first", events: &traceLog{}}))

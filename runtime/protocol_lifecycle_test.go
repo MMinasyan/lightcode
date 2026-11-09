@@ -321,7 +321,7 @@ func TestProtocolServerShutdownTopology(t *testing.T) {
 	testassert.NoError(t, ps.PublishDiscovery(record))
 
 	workspace := filepath.Join(e.home, "shutdown")
-	created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentType: "solo"})
+	created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: workspace, AgentSelection: wireSelection("solo")})
 	testassert.Require(t, err == nil && created.JSON201 != nil, "create: %v", err)
 	session := created.JSON201.SessionId
 	{
@@ -452,7 +452,7 @@ func TestProtocolServerDiscoveryPublication(t *testing.T) {
 	if err := decoder.Decode(&published); err != nil {
 		t.Fatalf("decode published record %s: %v", string(data), err)
 	}
-	testassert.Require(t, published.Endpoint == ps.Endpoint() && published.InstanceId == ps.instance && published.ProtocolVersion == string(protocol.N8) && published.Credential == ps.credential, "published record = %+v, want the endpoint, identity, wire version, and credential", published)
+	testassert.Require(t, published.Endpoint == ps.Endpoint() && published.InstanceId == ps.instance && published.ProtocolVersion == string(protocol.N12) && published.Credential == ps.credential, "published record = %+v, want the endpoint, identity, wire version, and credential", published)
 
 	// A second publication is refused — successful publication cannot repeat.
 	second := filepath.Join(dir, "second.json")

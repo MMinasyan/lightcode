@@ -45,7 +45,7 @@ func TestStopJobReaperBarrierAndHarnessStopDelivery(t *testing.T) {
 	})
 	testassert.NoError(t, err)
 	session, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{
-		Workspace: t.TempDir(), AgentType: "coder",
+		Workspace: t.TempDir(), AgentSelection: harness.AgentSelection{Definition: &harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "coder"}},
 	})
 	testassert.NoError(t, err)
 	sid := session.Identity.SessionID

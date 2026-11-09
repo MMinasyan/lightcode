@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -145,8 +145,8 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 
 		// A failed hook (invalid consequence rejected before publication)
 		// changes nothing.
-		hook.set(nil, func(PreparationInput) PreparationConsequence {
-			return PreparationConsequence{ToolNames: []string{"outside_catalog"}}
+		hook.set(nil, func(extension.PreparationInput) extension.PreparationConsequence {
+			return extension.PreparationConsequence{ToolNames: []string{"outside_catalog"}}
 		})
 		hookSession, err := r.createSession(ctx, e.workspace("prompt-ws-4"), "worker")
 		testassert.NoError(t, err)
@@ -235,6 +235,7 @@ func TestWarningsTwoSessionsHydrationFiltersOwnAndGlobals(t *testing.T) {
 		// retained incomplete_model diagnostic with the captured candidate.
 		writeServiceFile(t, e.configPath, strings.Replace(
 			productionConfigDocument(e.server.URL, "T1"), `"models": {`, `"models": {"inc": {"name": "I"},`, 1))
+		writeAgentDefinitions(t, e.configPath, productionAgentsDocument)
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
 		testassert.NoError(t, err)
 		defer closeProjectionRuntime(r)
@@ -258,16 +259,16 @@ func TestWarningsTwoSessionsHydrationFiltersOwnAndGlobals(t *testing.T) {
 		testassert.Require(t, warningOf(all.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) != nil && warningOf(all.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) != nil && warningOf(all.Warnings, "runtime:setup", "setup_no_model", "") != nil, "unfiltered read misses session A's prompt warning: %+v; unfiltered read misses session B's prompt warning: %+v; unfiltered read misses the global setup warning: %+v", all.Warnings, all.Warnings, all.Warnings)
 		catalogWarning := warningOf(all.Warnings, "runtime:catalog", "incomplete_model", "")
 		testassert.Require(t, catalogWarning != nil && strings.Contains(catalogWarning.Message, "prov/inc"), "unfiltered read misses the real catalog warning: %+v", all.Warnings)
-		testassert.Require(t, warningOf(all.Warnings, "runtime:agents", "invalid_agent_type", "") != nil, "unfiltered read misses the global agents warning: %+v", all.Warnings)
+		testassert.Require(t, warningOf(all.Warnings, "runtime:agents", "invalid_agent_type", "") == nil, "valid definitions produced an agent warning: %+v", all.Warnings)
 
 		hydrationA, err := r.buildHydration(ctx, sessionA.Identity.SessionID)
 		testassert.NoError(t, err)
 		hydrationB, err := r.buildHydration(ctx, sessionB.Identity.SessionID)
 		testassert.NoError(t, err)
-		testassert.Require(t, warningOf(hydrationA.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) != nil && warningOf(hydrationA.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) == nil && warningOf(hydrationA.Warnings, "runtime:agents", "invalid_agent_type", "") != nil, "hydration A misses its own prompt warning: %+v; hydration A contains the sibling's prompt warning: %+v; hydration A misses the global agents warning: %+v", hydrationA.Warnings, hydrationA.Warnings, hydrationA.Warnings)
+		testassert.Require(t, warningOf(hydrationA.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) != nil && warningOf(hydrationA.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) == nil && warningOf(hydrationA.Warnings, "runtime:agents", "invalid_agent_type", "") == nil, "hydration A warnings = %+v", hydrationA.Warnings)
 		testassert.Require(t, warningOf(hydrationB.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) != nil && warningOf(hydrationB.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) == nil, "hydration B misses its own prompt warning: %+v; hydration B contains the sibling's prompt warning: %+v", hydrationB.Warnings, hydrationB.Warnings)
 		for _, hydration := range []protocol.Hydration{hydrationA, hydrationB} {
-			testassert.Require(t, warningOf(hydration.Warnings, "runtime:setup", "setup_no_model", "") != nil && warningOf(hydration.Warnings, "runtime:catalog", "incomplete_model", "") != nil && warningOf(hydration.Warnings, "runtime:agents", "invalid_agent_type", "") != nil && hydration.WarningsRevision.Revision == all.WarningsRevision.Revision && hydration.ConfigurationRevision.Generation == "1", "hydration misses the global setup warning: %+v; hydration misses the global catalog warning: %+v; hydration misses the global agents warning: %+v; got %v, want %v; got %v, want %v", hydration.Warnings, hydration.Warnings, hydration.Warnings, hydration.WarningsRevision.Revision, all.WarningsRevision.Revision, hydration.ConfigurationRevision.Generation, "1")
+			testassert.Require(t, warningOf(hydration.Warnings, "runtime:setup", "setup_no_model", "") != nil && warningOf(hydration.Warnings, "runtime:catalog", "incomplete_model", "") != nil && warningOf(hydration.Warnings, "runtime:agents", "invalid_agent_type", "") == nil && hydration.WarningsRevision.Revision == all.WarningsRevision.Revision && hydration.ConfigurationRevision.Generation == "1", "hydration warnings = %+v", hydration.Warnings)
 		}
 		// The warning clock is independent of the Session and configuration
 		// clocks: a later report from the OTHER Session advances this
@@ -376,6 +377,9 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 		failingServer := httptest.NewServer(http.HandlerFunc(attempts.serve))
 		defer failingServer.Close()
 		writeServiceFile(t, e.configPath, productionConfigDocument(failingServer.URL, "T2"))
+		writeAgentDefinitions(t, e.configPath, productionAgentsDocument)
+		enableFixturePlugin(t, e.configPath, "prodtools")
+		enableFixturePlugin(t, e.configPath, "park")
 		{
 			_, err := r.Reload(ctx)
 			testassert.NoError(t, err)
@@ -434,26 +438,28 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		}))
 		t.Cleanup(server.Close)
 		writeServiceFile(t, sh.configPath, warnCompactConfigDocument(server.URL))
-		writeServiceFile(t, agents.PathForConfig(sh.configPath), prepAgentsDocument)
+		writeAgentDefinitions(t, sh.configPath, compactAgentsDocument)
+		enableFixturePlugin(t, sh.configPath, "compacttools")
 		owner, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		comp := mustComposition(t, compactToolsPlugin())
-		runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
-		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs, nil)
+		comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin(compactToolsPlugin()))
+		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs)
+		svc.composition, svc.dataDir = comp, sh.dataDir
 		svc.attachWarnings(r.warnings)
 		{
 			_, err := svc.publish(context.Background())
 			testassert.NoError(t, err)
 		}
-		ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, r.obs)
+		defer svc.current().resources.release()
 		adapter := newObservationAdapter(r.obs, r.warnings)
 		adapter.h = r.harness
-		p := newPreparation(svc, comp, runtimeScope, ws, sh.home, "", "", nil, adapter, nil, nil)
+		p := newPreparation(svc, sh.home, "", "", nil, adapter, nil, nil)
 
 		request := compactPrepRequest()
 		request.Session.Identity.SessionID = sessionID
 		prepared, err := p.bind()(context.Background(), request)
 		testassert.NoError(t, err)
+		defer prepared.Release()
 		execution, err := prepared.Open(context.Background(), harness.OperationAdmission{
 			SessionID:   sessionID,
 			OperationID: "op-compact",
@@ -519,7 +525,10 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 			_, err := r.archiveSession(ctx, sessionID)
 			testassert.NoError(t, err)
 		}
-		testassert.NoError(t, r.deleteSession(ctx, sessionID))
+		{
+			_, err := r.deleteSession(ctx, sessionID)
+			testassert.NoError(t, err)
+		}
 		beforeLate, _ := r.warnings.snapshot()
 		_, _ = inv.Model(context.Background(), diagnostic)
 		afterLate, lateWarnings := r.warnings.snapshot()
@@ -836,7 +845,10 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 
 		// The committed deletion removes the group in one observation section
 		// and publishes exactly one runtime-scoped hint.
-		testassert.NoError(t, r.deleteSession(ctx, victimID))
+		{
+			_, err := r.deleteSession(ctx, victimID)
+			testassert.NoError(t, err)
+		}
 		afterDelete, err := r.getWarnings(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, !sessionWarningPresent(afterDelete.Warnings, victimID) && warningOf(afterDelete.Warnings, "runtime:prompt", "rules_not_found", siblingID) != nil, "the committed deletion kept the Session's group: %+v; the deletion removed the sibling's group: %+v", afterDelete.Warnings, afterDelete.Warnings)
@@ -885,7 +897,10 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		beforeBare, _ := r.warnings.snapshot()
-		testassert.NoError(t, r.deleteSession(ctx, bare.Identity.SessionID))
+		{
+			_, err := r.deleteSession(ctx, bare.Identity.SessionID)
+			testassert.NoError(t, err)
+		}
 		{
 			afterBare, _ := r.warnings.snapshot()
 			testassert.Equal(t, afterBare, beforeBare)

@@ -48,10 +48,10 @@ func factFixtureGraph() *testGraph {
 
 	op2 := OperationRecord{
 		Admission: OperationAdmission{
-			SessionID:   testSessionID,
-			OperationID: "op-compact",
-			RequestKind: RequestKindCompact,
-			AgentType:   "coder",
+			SessionID:      testSessionID,
+			OperationID:    "op-compact",
+			RequestKind:    RequestKindCompact,
+			AgentSelection: testSelection("coder"),
 			Execution: func() ExecutionCapture {
 				capture := testCapture()
 				capture.Pricing = conversationPricing()
@@ -1110,7 +1110,7 @@ func TestBufferedDuplicateDeliveryFinal(t *testing.T) {
 // scripted model over an immediate-success tool plan, so a published call
 // settles at its boundary and the next model boundary drains the steering.
 func steeringPrepared(script *modelScript) PreparedExecution {
-	tool := func(_ context.Context, call model.ToolCall) PreparedTool {
+	tool := func(ctx context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{
 			Permissions: fixturePermission,
 			Immediate:   &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}},

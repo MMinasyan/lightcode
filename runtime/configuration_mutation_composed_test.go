@@ -31,7 +31,7 @@ func composedMutationSettings() protocol.Settings {
 		Tools:      json.RawMessage(`{"command_timeout":90,"max_output_bytes":4096,"read_line_max_chars":4000,"read_max_lines":200}`),
 		Jobs:       json.RawMessage(`{"max_background_processes":5,"max_output_bytes":8192,"read_line_max_chars":4000}`),
 		Compaction: json.RawMessage(`{}`),
-		Plugins:    protocol.PluginsSettings{},
+		Extensions: protocol.ExtensionsSettings{},
 	}
 }
 
@@ -49,7 +49,7 @@ func newMutationEnv(t *testing.T) mutationEnv {
 	home, dataDir, configDir := t.TempDir(), t.TempDir(), t.TempDir()
 	t.Setenv("HOME", home)
 	configPath := filepath.Join(configDir, "config.json")
-	testassert.NoError(t, os.WriteFile(configPath, []byte(`{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`), 0o600))
+	testassert.NoError(t, os.WriteFile(configPath, []byte(`{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"extensions":{"agents":{"enabled":true},"adaptation":{"enabled":true}}}`), 0o600))
 	return mutationEnv{dataDir: dataDir, configPath: configPath}
 }
 
@@ -72,7 +72,9 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	testassert.Require(t, view.ConfigurationRevision.Generation == "1", "initial revision = %+v, want generation 1", view.ConfigurationRevision)
 
 	// The valid write: the real validators accept the marshaled sections.
-	mutation, err := runtime.UpdateSettingsForTest(r, composedMutationSettings())
+	settings := composedMutationSettings()
+	settings.Extensions = view.Settings.Extensions
+	mutation, err := runtime.UpdateSettingsForTest(r, settings)
 	testassert.NoError(t, err)
 	testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Sessions.ArchiveAfterDays == 14 && compactComposed(t, mutation.Result.Tools) == compactComposed(t, composedMutationSettings().Tools) && compactComposed(t, mutation.Result.Jobs) == compactComposed(t, composedMutationSettings().Jobs), "mutation revision = %+v, want generation 2; mutation result = %+v, want the written shape", mutation.ConfigurationRevision, mutation.Result)
 	data, err := os.ReadFile(e.configPath)
@@ -98,6 +100,7 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	warnings, err := runtime.GetWarningsForTest(r)
 	testassert.NoError(t, err)
 	rejected := composedMutationSettings()
+	rejected.Extensions = view.Settings.Extensions
 	rejected.Tools = json.RawMessage(`{"command_timeout":0,"max_output_bytes":0,"read_line_max_chars":0,"read_max_lines":0}`)
 	{
 		mutation, err := runtime.UpdateSettingsForTest(r, rejected)
@@ -118,7 +121,7 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	}
 }
 
-// TestComposedAgentModelMutationThroughRealRoster proves the Agent-model PUT
+// TestComposedAgentModelMutationThroughRealRoster proves the set_model edit
 // over the real roster: a builtin type that needs no explicit user entry is
 // addressable and the written override lands in the owning agents file,
 // while an unknown type fails invalid without creating a bare entry.
@@ -127,35 +130,56 @@ func TestComposedAgentModelMutationThroughRealRoster(t *testing.T) {
 	e := newMutationEnv(t)
 	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
 	testassert.NoError(t, err)
-	agentsPath := filepath.Join(filepath.Dir(e.configPath), "agents.json")
+	agentsPath := e.configPath
 	before, err := os.ReadFile(agentsPath)
 	testassert.NoError(t, err)
 
-	mutation, err := runtime.SetAgentTypeModelForTest(r, "primary", "prov/m")
+	mutation, err := runtime.SetAgentDefinitionModelForTest(r, "primary", "prov/m")
 	testassert.NoError(t, err)
-	testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Model == "prov/m" && mutation.Result.Name == "primary", "mutation = %+v, want the primary override at generation 2", mutation)
-	var root map[string]json.RawMessage
+	testassert.Require(t, mutation.ConfigurationRevision.Generation == "2", "mutation = %+v, want the primary override at generation 2", mutation)
+	view, err := runtime.GetConfigurationForTest(r)
+	testassert.NoError(t, err)
+	primaryFound := false
+	for _, agent := range view.Agents {
+		if agent.Definition.DefinitionId == "primary" && agent.Model == "prov/m" {
+			primaryFound = true
+		}
+	}
+	testassert.Require(t, primaryFound, "roster = %+v, want the primary model override", view.Agents)
+	var root struct {
+		Extensions map[string]struct {
+			Definitions map[string]json.RawMessage `json:"definitions"`
+		} `json:"extensions"`
+	}
 	testassert.NoError(t, json.Unmarshal(before, &root))
 	{
-		_, ok := root["primary"]
+		_, ok := root.Extensions["agents"].Definitions["primary"]
 		testassert.Require(t, !ok, "agents file already had a primary entry: %s", before)
 	}
 	afterData, err := os.ReadFile(agentsPath)
 	testassert.NoError(t, err)
-	var after map[string]json.RawMessage
+	var after struct {
+		Extensions map[string]struct {
+			Definitions map[string]json.RawMessage `json:"definitions"`
+		} `json:"extensions"`
+	}
 	testassert.NoError(t, json.Unmarshal(afterData, &after))
-	testassert.Equal(t, compactComposed(t, after["primary"]), `{"model":"prov/m"}`)
+	testassert.Equal(t, compactComposed(t, after.Extensions["agents"].Definitions["primary"]), `{"model":"prov/m"}`)
 
 	{
-		_, err := runtime.SetAgentTypeModelForTest(r, "ghost", "prov/m")
+		_, err := runtime.SetAgentDefinitionModelForTest(r, "ghost", "prov/m")
 		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "unknown type = %v, want the shared invalid failure", err)
 	}
 	final, err := os.ReadFile(agentsPath)
 	testassert.NoError(t, err)
-	var finalRoot map[string]json.RawMessage
+	var finalRoot struct {
+		Extensions map[string]struct {
+			Definitions map[string]json.RawMessage `json:"definitions"`
+		} `json:"extensions"`
+	}
 	testassert.NoError(t, json.Unmarshal(final, &finalRoot))
 	{
-		_, ok := finalRoot["ghost"]
+		_, ok := finalRoot.Extensions["agents"].Definitions["ghost"]
 		testassert.Require(t, !ok, "a failed mutation created a bare entry: %s", final)
 	}
 }

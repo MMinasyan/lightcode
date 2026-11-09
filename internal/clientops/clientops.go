@@ -120,7 +120,13 @@ func Invoke(ctx context.Context, c *client.Client, operation string, params json
 	if err != nil {
 		return 0, nil, err
 	}
-	return receive(response, expected)
+	status, body, err := receive(response, expected)
+	if err == nil && operation == "DeleteSession" {
+		if _, decodeErr := DecodeDeletionResult(body); decodeErr != nil {
+			return status, body, fmt.Errorf("%v: %w", decodeErr, ErrInvalidResponse)
+		}
+	}
+	return status, body, err
 }
 
 // Call is the thin typed consumer of Invoke: it returns the raw successful

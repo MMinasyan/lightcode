@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -15,8 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -54,7 +56,7 @@ func runtimeNormalize(call model.ToolCall) (json.RawMessage, error) {
 func prepConfigDocument(endpoint, tag string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
 		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096,"cost":{"input":1.5,"output":3,"cache_read":0.5,"cache_write":0.25}},`+
-			`"zero":{"name":"Z","context_window":0}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `}}}`
+			`"zero":{"name":"Z","context_window":0}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":` + fixtureString(tag) + `},"caps":{"enabled":true},"ops":{"enabled":true},"ags":{"enabled":true}}}`
 }
 
 // prepPolicyConfigDocument adds one global deny rule for the declared
@@ -92,7 +94,7 @@ type recordHook struct {
 	inputTools  []model.ToolDefinition
 	inputDesc   string
 	fail        error
-	mutate      func(PreparationInput) PreparationConsequence
+	mutate      func(extension.PreparationInput) extension.PreparationConsequence
 	block       bool
 	blockSignal chan struct{}
 	parkRelease chan struct{}
@@ -104,7 +106,7 @@ type hookCall struct {
 	tag string
 }
 
-func (h *recordHook) Prepare(ctx context.Context, in PreparationInput) (PreparationConsequence, error) {
+func (h *recordHook) Prepare(ctx context.Context, _ extension.CallContext, in extension.PreparationInput) (extension.PreparationConsequence, error) {
 	h.events.add("hook:" + h.name)
 	h.mu.Lock()
 	h.inputTools = in.Tools
@@ -128,7 +130,7 @@ func (h *recordHook) Prepare(ctx context.Context, in PreparationInput) (Preparat
 		select {
 		case <-parkRelease:
 		case <-ctx.Done():
-			return PreparationConsequence{}, ctx.Err()
+			return extension.PreparationConsequence{}, ctx.Err()
 		}
 	}
 	if block {
@@ -141,7 +143,7 @@ func (h *recordHook) Prepare(ctx context.Context, in PreparationInput) (Preparat
 		// Answer with a valid unchanged consequence only after cancellation,
 		// so the Runtime's own between-hooks check is the only observer.
 		<-ctx.Done()
-		return PreparationConsequence{}, nil
+		return extension.PreparationConsequence{}, nil
 	}
 	tag := ""
 	if len(in.Settings) > 0 {
@@ -149,7 +151,7 @@ func (h *recordHook) Prepare(ctx context.Context, in PreparationInput) (Preparat
 			Tag string `json:"tag"`
 		}
 		if err := json.Unmarshal(in.Settings, &settings); err != nil {
-			return PreparationConsequence{}, err
+			return extension.PreparationConsequence{}, err
 		}
 		tag = settings.Tag
 	}
@@ -157,12 +159,12 @@ func (h *recordHook) Prepare(ctx context.Context, in PreparationInput) (Preparat
 	h.seen = append(h.seen, hookCall{tag: tag})
 	h.mu.Unlock()
 	if nextFail != nil {
-		return PreparationConsequence{}, nextFail
+		return extension.PreparationConsequence{}, nextFail
 	}
 	if fail != nil {
-		return PreparationConsequence{}, fail
+		return extension.PreparationConsequence{}, fail
 	}
-	next := PreparationConsequence{}
+	next := extension.PreparationConsequence{}
 	if mutate != nil {
 		next = mutate(in)
 	}
@@ -185,7 +187,7 @@ func (h *recordHook) retainedInputs() ([]model.ToolDefinition, string) {
 	return h.inputTools, h.inputDesc
 }
 
-func (h *recordHook) set(fail error, mutate func(PreparationInput) PreparationConsequence) {
+func (h *recordHook) set(fail error, mutate func(extension.PreparationInput) extension.PreparationConsequence) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.fail, h.mutate = fail, mutate
@@ -228,13 +230,17 @@ type recordArgumentHook struct {
 	revs []string
 }
 
-func (h *recordArgumentHook) BeforeTool(ctx context.Context, in Invocation, call model.ToolCall) (json.RawMessage, error) {
+func (h *recordArgumentHook) BeforeTool(ctx context.Context, in extension.CallContext, call model.ToolCall) (json.RawMessage, error) {
+	return h.record(ctx, in.Revision, call)
+}
+
+func (h *recordArgumentHook) record(ctx context.Context, revision string, call model.ToolCall) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	h.mu.Lock()
 	h.seen = append(h.seen, string(call.Arguments))
-	h.revs = append(h.revs, in.Revision())
+	h.revs = append(h.revs, revision)
 	h.mu.Unlock()
 	return h.replace, nil
 }
@@ -259,31 +265,29 @@ type prepTool struct {
 	fail       bool
 }
 
-func (t *prepTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t *prepTool) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	t.mu.Lock()
 	t.normalized++
 	t.mu.Unlock()
 	return runtimeNormalize(call)
 }
 
-func (t *prepTool) Prepare(_ context.Context, _ ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t *prepTool) Prepare(_ context.Context, _ extension.ToolContext, call model.ToolCall) extension.ToolPlan {
 	t.mu.Lock()
 	t.input = append(t.input, string(call.Arguments))
+	t.mu.Unlock()
+	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: "file.write", Target: "/w/a.txt"}}, CanonicalWorkspace: "/w"}
+}
+
+func (t *prepTool) Execute(_ context.Context, _ extension.ToolContext, _ extension.ToolPlan) harness.ToolOutcome {
+	t.mu.Lock()
+	t.executed++
 	fail := t.fail
 	t.mu.Unlock()
-	return harness.PreparedTool{
-		Permissions:        []harness.PermissionRequest{{Permission: "file.write", Target: "/w/a.txt"}},
-		CanonicalWorkspace: "/w",
-		Execute: func(context.Context) harness.ToolOutcome {
-			t.mu.Lock()
-			t.executed++
-			t.mu.Unlock()
-			if fail {
-				return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "echo failed"}}
-			}
-			return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ran"}}
-		},
+	if fail {
+		return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultError, Content: "echo failed"}}
 	}
+	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultSuccess, Content: "ran"}}
 }
 
 func (t *prepTool) counters() (int, int, []string) {
@@ -354,14 +358,14 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	e := &prepEnv{ownerEnv: newOwnerEnv(t), store: store, echo: &prepTool{}}
 	e.workspace = e.dataDir
 	writeServiceFile(t, e.configPath, prepConfigDocument(e.server.URL, "A"))
-	writeServiceFile(t, agents.PathForConfig(e.configPath), prepAgentsDocument)
-	e.hooks[0] = &recordHook{name: "hook.first", events: e.events, mutate: func(in PreparationInput) PreparationConsequence {
+	writeAgentDefinitions(t, e.configPath, prepAgentsDocument)
+	e.hooks[0] = &recordHook{name: "hook.first", events: e.events, mutate: func(in extension.PreparationInput) extension.PreparationConsequence {
 		prompt := in.Prompt + "|first"
-		return PreparationConsequence{Prompt: &prompt}
+		return extension.PreparationConsequence{Prompt: &prompt}
 	}}
-	e.hooks[1] = &recordHook{name: "hook.second", events: e.events, mutate: func(in PreparationInput) PreparationConsequence {
+	e.hooks[1] = &recordHook{name: "hook.second", events: e.events, mutate: func(in extension.PreparationInput) extension.PreparationConsequence {
 		prompt := in.Prompt + "|second"
-		return PreparationConsequence{Prompt: &prompt}
+		return extension.PreparationConsequence{Prompt: &prompt}
 	}}
 	for i, name := range []string{"arg.runtime", "arg.workspace", "arg.operation", "arg.agent"} {
 		e.argHooks[i] = &recordArgumentHook{replace: json.RawMessage(`{"repaired":"` + name + `"}`)}
@@ -374,82 +378,78 @@ func newPrepEnv(t *testing.T, store harness.Storage) *prepEnv {
 	return e
 }
 
-func (e *prepEnv) plugins() []Plugin {
-	return []Plugin{
-		{
-			ID:       "hooks",
-			Scope:    ScopeRuntime,
-			Provides: []CapabilitySpec{Spec[PreparationHook]("hook.first"), Spec[PreparationHook]("hook.second"), Spec[ToolArgumentsHook]("arg.runtime"), ToolSpec("echo", availableToolDescription("echo")), ToolSpec("read", availableToolDescription("read"))},
-			ValidateConfig: func(raw json.RawMessage) error {
-				var settings struct {
-					Tag string `json:"tag"`
-				}
-				if err := json.Unmarshal(raw, &settings); err != nil || settings.Tag == "" {
-					return errors.New("hooks require a non-empty tag")
-				}
-				return nil
-			},
-			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				e.hookOpens.Add(1)
-				return Instance{Values: map[string]any{"hook.first": e.hooks[0], "hook.second": e.hooks[1], "arg.runtime": e.argHooks[0], "echo": e.echo, "read": noopTool{}}}, nil
-			},
-		},
-		{
-			ID:       "caps",
-			Scope:    ScopeWorkspace,
-			Provides: []CapabilitySpec{Spec[greeter]("cap.shared"), Spec[greeter]("cap.other"), Spec[ToolArgumentsHook]("arg.workspace")},
-			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				e.capOpens.Add(1)
-				return Instance{Values: map[string]any{
-					"cap.shared":    loudGreeter{word: "shared"},
-					"cap.other":     loudGreeter{word: "other"},
-					"arg.workspace": e.argHooks[1],
-				}}, nil
-			},
-		},
-		{
-			ID:       "ops",
-			Scope:    ScopeOperation,
-			Provides: []CapabilitySpec{Spec[greeter]("op.native"), Spec[ToolArgumentsHook]("arg.operation")},
-			Open: func(_ context.Context, info ScopeInfo, _ Bindings) (Instance, error) {
-				e.opOpens.Add(1)
-				e.events.add("op-open:" + info.OperationID)
-				return Instance{
-					Values: map[string]any{"op.native": loudGreeter{word: "op"}, "arg.operation": e.argHooks[2]},
-					Close: func() error {
-						e.events.add("op-close")
-						return nil
-					},
-				}, nil
-			},
-		},
-		{
-			ID:       "ags",
-			Scope:    ScopeAgent,
-			Provides: []CapabilitySpec{Spec[greeter]("ag.native"), Spec[ToolArgumentsHook]("arg.agent")},
-			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				if e.failAgentFactory {
-					return Instance{}, errOpen
-				}
-				e.agOpens.Add(1)
-				e.events.add("ag-open")
-				if e.agGateArrived != nil {
-					select {
-					case e.agGateArrived <- struct{}{}:
-					default:
-					}
-					<-e.agGateRelease
-				}
-				return Instance{
-					Values: map[string]any{"ag.native": loudGreeter{word: "ag"}, "arg.agent": e.argHooks[3]},
-					Close: func() error {
-						e.events.add("ag-close")
-						return e.agentCloseErr
-					},
-				}, nil
-			},
-		},
+func (e *prepEnv) plugins() []extension.Native {
+	hooks := testNative("hooks", extension.LifetimeHarness, []extension.Capability{
+		extension.HookCapability("hook.first", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure)),
+		extension.HookCapability("hook.second", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure)),
+		extension.HookCapability("arg.runtime", extension.SingleHook(extension.BoundaryBeforeTool, extension.HookModeEffectful)),
+		extension.ToolCapability("echo"),
+		extension.ToolCapability("read"),
+	}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		e.hookOpens.Add(1)
+		return extension.Instance{Capabilities: map[string]extension.Implementation{
+			"hook.first":  {Preparation: e.hooks[0].Prepare},
+			"hook.second": {Preparation: e.hooks[1].Prepare},
+			"arg.runtime": {BeforeTool: e.argHooks[0].BeforeTool},
+			"echo":        {Tool: e.echo},
+			"read":        {Tool: noopNativeTool{}},
+		}}, nil
+	})
+	hooks.Declaration.ConfigSchema = json.RawMessage(`{"type":"object","required":["enabled","tag"],"properties":{"enabled":{"type":"boolean"},"tag":{"type":"string","minLength":1}},"additionalProperties":true}`)
+	hooks.Describe = map[string]extension.ToolDescribe{
+		"echo": extensionToolDescribe("echo", availableToolDescription("echo")),
+		"read": extensionToolDescribe("read", availableToolDescription("read")),
 	}
+	caps := testNative("caps", extension.LifetimeWorkspace, []extension.Capability{
+		testServiceCapability("cap.shared"), testServiceCapability("cap.other"),
+		extension.HookCapability("arg.workspace", extension.SingleHook(extension.BoundaryBeforeTool, extension.HookModeEffectful)),
+	}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		e.capOpens.Add(1)
+		return extension.Instance{Capabilities: map[string]extension.Implementation{
+			"cap.shared":    testServiceImplementation(),
+			"cap.other":     testServiceImplementation(),
+			"arg.workspace": {BeforeTool: e.argHooks[1].BeforeTool},
+		}}, nil
+	})
+	ops := testNative("ops", extension.LifetimeOperation, []extension.Capability{
+		testServiceCapability("op.native"),
+		extension.HookCapability("arg.operation", extension.SingleHook(extension.BoundaryBeforeTool, extension.HookModeEffectful)),
+	}, nil, func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
+		e.opOpens.Add(1)
+		e.events.add("op-open:" + info.Scope.OperationID)
+		return extension.Instance{Capabilities: map[string]extension.Implementation{
+			"op.native":     testServiceImplementation(),
+			"arg.operation": {BeforeTool: e.argHooks[2].BeforeTool},
+		}, Close: func(context.Context, extension.CallContext) error {
+			e.events.add("op-close")
+			return nil
+		}}, nil
+	})
+	ags := testNative("ags", extension.LifetimeInvocation, []extension.Capability{
+		testServiceCapability("ag.native"),
+		extension.HookCapability("arg.agent", extension.SingleHook(extension.BoundaryBeforeTool, extension.HookModeEffectful)),
+	}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		if e.failAgentFactory {
+			return extension.Instance{}, errOpen
+		}
+		e.agOpens.Add(1)
+		e.events.add("ag-open")
+		if e.agGateArrived != nil {
+			select {
+			case e.agGateArrived <- struct{}{}:
+			default:
+			}
+			<-e.agGateRelease
+		}
+		return extension.Instance{Capabilities: map[string]extension.Implementation{
+			"ag.native": testServiceImplementation(),
+			"arg.agent": {BeforeTool: e.argHooks[3].BeforeTool},
+		}, Close: func(context.Context, extension.CallContext) error {
+			e.events.add("ag-close")
+			return e.agentCloseErr
+		}}, nil
+	})
+	return []extension.Native{hooks, caps, ops, ags}
 }
 
 // --- fixture control helpers ---
@@ -782,10 +782,10 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 				reloadAgents := strings.Replace(prepAgentsDocument,
 					`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"]}`,
 					`"dual": {"model": "prov/m", "system_prompt": "simple", "tools": ["echo"], "capabilities": ["hook.first", "cap.shared"], "readonly": true, "write_dir": "/tmp/reload"}`, 1)
-				writeServiceFile(t, agents.PathForConfig(e.configPath), reloadAgents)
 				writeServiceFile(t, e.configPath, strings.Replace(prepConfigDocument(e.server.URL, "A"),
 					`"cost":{"input":1.5,"output":3,"cache_read":0.5,"cache_write":0.25}`,
 					`"cost":{"input":9,"output":3,"cache_read":0.5,"cache_write":0.25}`, 1))
+				writeAgentDefinitions(t, e.configPath, reloadAgents)
 				{
 					_, err := e.reload()
 					testassert.NoError(t, err)
@@ -1021,33 +1021,33 @@ func TestPreparationViewClosedConsequenceSemantics(t *testing.T) {
 	view := newPreparationView(prompt.AssemblyInput{Mode: prompt.ModeFull}, "BASE_PROMPT", catalog)
 
 	// The nil consequence is the valid no-op.
-	testassert.NoError(t, view.apply("hook", PreparationConsequence{}))
+	testassert.NoError(t, view.apply("hook", extension.PreparationConsequence{}))
 	testassert.Require(t, view.prompt == "BASE_PROMPT" && slices.Equal(toolNames(view.tools()), []string{"read_file", "write_file", "apply_patch"}), "zero consequence = prompt %q tools %v, want the baseline", view.prompt, toolNames(view.tools()))
 
 	// A present empty prompt removes the prompt; a present empty name list
 	// advertises nothing.
 	empty := ""
-	testassert.NoError(t, view.apply("hook", PreparationConsequence{Prompt: &empty}))
+	testassert.NoError(t, view.apply("hook", extension.PreparationConsequence{Prompt: &empty}))
 	testassert.Require(t, view.prompt == "", "empty prompt consequence = %q, want removal", view.prompt)
-	testassert.NoError(t, view.apply("hook", PreparationConsequence{ToolNames: []string{}}))
+	testassert.NoError(t, view.apply("hook", extension.PreparationConsequence{ToolNames: []string{}}))
 	testassert.Require(t, len(view.tools()) == 0, "empty name consequence = %v, want no advertisement", toolNames(view.tools()))
 
 	// A hidden tool's accepted description remains in the catalog and is seen
 	// when a later contribution restores it, in the order that contribution gives.
-	testassert.NoError(t, view.apply("hook", PreparationConsequence{Descriptions: map[string]string{"write_file": ""}}))
-	testassert.NoError(t, view.apply("hook", PreparationConsequence{ToolNames: []string{"apply_patch"}}))
+	testassert.NoError(t, view.apply("hook", extension.PreparationConsequence{Descriptions: map[string]string{"write_file": ""}}))
+	testassert.NoError(t, view.apply("hook", extension.PreparationConsequence{ToolNames: []string{"apply_patch"}}))
 	testassert.Require(t, slices.Equal(toolNames(view.tools()), []string{"apply_patch"}), "selected names = %v, want only apply_patch", toolNames(view.tools()))
-	testassert.NoError(t, view.apply("hook", PreparationConsequence{ToolNames: []string{"apply_patch", "write_file"}}))
+	testassert.NoError(t, view.apply("hook", extension.PreparationConsequence{ToolNames: []string{"apply_patch", "write_file"}}))
 	testassert.Require(t, slices.Equal(toolNames(view.tools()), []string{"apply_patch", "write_file"}), "restored names = %v, want the given order", toolNames(view.tools()))
 	testassert.Require(t, view.tools()[1].Description == "", "restored description = %q, want the earlier accepted empty text", view.tools()[1].Description)
 
 	for _, row := range []struct {
 		name        string
-		consequence PreparationConsequence
+		consequence extension.PreparationConsequence
 	}{
-		{"foreign description", PreparationConsequence{Descriptions: map[string]string{"extra": "text"}}},
-		{"foreign selection", PreparationConsequence{ToolNames: []string{"extra"}}},
-		{"duplicate selection", PreparationConsequence{ToolNames: []string{"read_file", "read_file"}}},
+		{"foreign description", extension.PreparationConsequence{Descriptions: map[string]string{"extra": "text"}}},
+		{"foreign selection", extension.PreparationConsequence{ToolNames: []string{"extra"}}},
+		{"duplicate selection", extension.PreparationConsequence{ToolNames: []string{"read_file", "read_file"}}},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			testassert.Require(t, errors.Is(view.apply("hook", row.consequence), harness.ErrInvalid), "%s accepted, want harness.ErrInvalid", row.name)
@@ -1072,7 +1072,7 @@ func TestPreparationViewPreservesOpaqueToolBytes(t *testing.T) {
 	testassert.Require(t, bytes.Equal(view.catalog[0].Parameters, raw), "the contribution's in-place parameter mutation reached the view: %q", view.catalog[0].Parameters)
 	testassert.Require(t, bytes.Equal(settings, json.RawMessage(`{"tag":"A"}`)) && view.assembly.Rules.Warnings[0].Message == "m", "the contribution's settings/assembly mutation reached the owner: %q / %+v", settings, view.assembly.Rules.Warnings)
 	empty := ""
-	testassert.NoError(t, view.apply("hook", PreparationConsequence{Prompt: &empty}))
+	testassert.NoError(t, view.apply("hook", extension.PreparationConsequence{Prompt: &empty}))
 	testassert.Require(t, bytes.Equal(view.tools()[0].Parameters, raw), "final tool parameters = %q, want the exact raw bytes", view.tools()[0].Parameters)
 }
 
@@ -1086,41 +1086,41 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 	t.Run("hook input mutation cannot change the core-owned capture", func(t *testing.T) {
 		violations := []struct {
 			name   string
-			mutate func(in PreparationInput) PreparationConsequence
+			mutate func(in extension.PreparationInput) extension.PreparationConsequence
 		}{
-			{"model", func(in PreparationInput) PreparationConsequence {
+			{"model", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Model = model.ModelRef{Provider: "prov", Model: "other"}
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
-			{"readonly", func(in PreparationInput) PreparationConsequence {
+			{"readonly", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Constraints = ToolConstraints{Readonly: true, WriteDir: "/tmp/hook-elsewhere"}
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
-			{"assembly", func(in PreparationInput) PreparationConsequence {
+			{"assembly", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Assembly.Mode = prompt.ModeNone
 				in.Assembly.Instructions = "mutated instructions"
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
-			{"prompt", func(in PreparationInput) PreparationConsequence {
+			{"prompt", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Prompt = "mutated prompt"
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
-			{"catalog definition", func(in PreparationInput) PreparationConsequence {
+			{"catalog definition", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Catalog[0].Description = "mutated description"
 				in.Catalog[0].Name = "renamed"
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
-			{"catalog parameter bytes", func(in PreparationInput) PreparationConsequence {
+			{"catalog parameter bytes", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Catalog[0].Parameters[0] = 'X'
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
-			{"visible definition", func(in PreparationInput) PreparationConsequence {
+			{"visible definition", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Tools[0].Description = "mutated description"
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
-			{"visible parameter bytes", func(in PreparationInput) PreparationConsequence {
+			{"visible parameter bytes", func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Tools[0].Parameters[0] = 'X'
-				return PreparationConsequence{}
+				return extension.PreparationConsequence{}
 			}},
 		}
 		for _, v := range violations {
@@ -1147,16 +1147,16 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 	t.Run("hook tool violations are rejected", func(t *testing.T) {
 		violations := []struct {
 			name   string
-			mutate func(in PreparationInput) PreparationConsequence
+			mutate func(in extension.PreparationInput) extension.PreparationConsequence
 		}{
-			{"tool outside the original catalog", func(PreparationInput) PreparationConsequence {
-				return PreparationConsequence{ToolNames: []string{"echo", "extra"}}
+			{"tool outside the original catalog", func(extension.PreparationInput) extension.PreparationConsequence {
+				return extension.PreparationConsequence{ToolNames: []string{"echo", "extra"}}
 			}},
-			{"duplicate selected tool", func(PreparationInput) PreparationConsequence {
-				return PreparationConsequence{ToolNames: []string{"echo", "echo"}}
+			{"duplicate selected tool", func(extension.PreparationInput) extension.PreparationConsequence {
+				return extension.PreparationConsequence{ToolNames: []string{"echo", "echo"}}
 			}},
-			{"description outside the original catalog", func(PreparationInput) PreparationConsequence {
-				return PreparationConsequence{Descriptions: map[string]string{"extra": "text"}}
+			{"description outside the original catalog", func(extension.PreparationInput) extension.PreparationConsequence {
+				return extension.PreparationConsequence{Descriptions: map[string]string{"extra": "text"}}
 			}},
 		}
 		for _, v := range violations {
@@ -1181,13 +1181,13 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 	t.Run("hooks receive and return owned contributions", func(t *testing.T) {
 		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 			e := newPrepEnv(t, store)
-			e.hooks[0].set(nil, func(in PreparationInput) PreparationConsequence {
+			e.hooks[0].set(nil, func(in extension.PreparationInput) extension.PreparationConsequence {
 				in.Tools[0].Description = "tampered input" // in-place on what it received
 				in.Catalog[0].Description = "tampered catalog"
-				return PreparationConsequence{Descriptions: map[string]string{"echo": "hook.first"}}
+				return extension.PreparationConsequence{Descriptions: map[string]string{"echo": "hook.first"}}
 			})
-			e.hooks[1].set(nil, func(PreparationInput) PreparationConsequence {
-				return PreparationConsequence{Descriptions: map[string]string{"echo": "hook.second"}}
+			e.hooks[1].set(nil, func(extension.PreparationInput) extension.PreparationConsequence {
+				return extension.PreparationConsequence{Descriptions: map[string]string{"echo": "hook.second"}}
 			})
 			session := e.session("wide")
 			res := e.admit(session, "op-1", "x")
@@ -1214,18 +1214,18 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 	t.Run("contributions apply prompt descriptions and visibility in selected order", func(t *testing.T) {
 		eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 			e := newPrepEnv(t, store)
-			e.hooks[0].set(nil, func(PreparationInput) PreparationConsequence {
+			e.hooks[0].set(nil, func(extension.PreparationInput) extension.PreparationConsequence {
 				prompt := "FIRST"
-				return PreparationConsequence{
+				return extension.PreparationConsequence{
 					Prompt:       &prompt,
 					Descriptions: map[string]string{"echo": "first echo"},
 					ToolNames:    []string{},
 				}
 			})
-			e.hooks[1].set(nil, func(in PreparationInput) PreparationConsequence {
+			e.hooks[1].set(nil, func(in extension.PreparationInput) extension.PreparationConsequence {
 				testassert.Require(t, len(in.Tools) == 0 && len(in.Catalog) == 2, "second contribution saw tools %v catalog %v, want the first contribution's empty advertisement over the full eligible catalog", toolNames(in.Tools), toolNames(in.Catalog))
 				prompt := "SECOND"
-				return PreparationConsequence{
+				return extension.PreparationConsequence{
 					Prompt:       &prompt,
 					Descriptions: map[string]string{"echo": "second echo"},
 					ToolNames:    []string{"echo"},
@@ -1236,7 +1236,8 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 			e.awaitTerminal(session, "op-1", harness.OperationSuccess)
 			got := res.Operation.Admission.Execution
 			testassert.Equal(t, got.SystemPrompt, "SECOND")
-			testassert.Require(t, slices.Equal(toolNames(got.Tools), []string{"echo"}), "capture tools = %v, want the second contribution's restored selection", toolNames(got.Tools))
+			testassert.Require(t, slices.Equal(toolNames(got.Tools), []string{"echo", "read"}), "capture catalog = %v, want the complete eligible catalog", toolNames(got.Tools))
+			testassert.Require(t, slices.Equal(got.InitialToolNames, []string{"echo"}), "capture initial visibility = %v, want the second contribution's restored selection", got.InitialToolNames)
 			testassert.Equal(t, got.Tools[0].Description, "second echo")
 			testassert.Require(t, slices.Equal(got.Capabilities, []string{"hook.first", "cap.shared", "hook.second"}), "capture capabilities = %v, want the definition's selection untouched", got.Capabilities)
 			testassert.NoError(t, e.converge())
@@ -1324,7 +1325,7 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 				done <- err
 			}()
 			<-arrived
-			testassert.NoError(t, e.r.runtimeScope.close())
+			testassert.NoError(t, e.r.config.current().resources.runtime.close())
 			close(release)
 			{
 				err := <-done
@@ -1359,7 +1360,7 @@ func TestPreparationDistinctSelectionsOverReusedInstances(t *testing.T) {
 		e.admitOrBuffer(solo, "op-3", "three")
 		third := e.awaitTerminal(solo, "op-3", harness.OperationSuccess)
 
-		testassert.Equal(t, first.Admission.AgentType, "dual")
+		testassert.Equal(t, first.Admission.AgentSelection.Definition.DefinitionID, "dual")
 		{
 			got := first.Admission.Execution.Capabilities
 			testassert.Require(t, slices.Equal(got, []string{"hook.first", "cap.shared"}), "dual committed capabilities = %v", got)
@@ -1368,7 +1369,7 @@ func TestPreparationDistinctSelectionsOverReusedInstances(t *testing.T) {
 			got := toolNames(first.Admission.Execution.Tools)
 			testassert.Require(t, slices.Equal(got, []string{"echo"}), "dual committed tools = %v", got)
 		}
-		testassert.Equal(t, second.Admission.AgentType, "dup")
+		testassert.Equal(t, second.Admission.AgentSelection.Definition.DefinitionID, "dup")
 		{
 			got := second.Admission.Execution.Capabilities
 			testassert.Require(t, slices.Equal(got, []string{"hook.second", "cap.other"}), "dup committed capabilities = %v", got)
@@ -1405,10 +1406,10 @@ func TestPreparationSelectsShortScopeCapabilitiesAtOpen(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newPrepEnv(t, store)
 		var hookSawOp, hookSawAg atomic.Int64
-		e.hooks[0].set(nil, func(PreparationInput) PreparationConsequence {
+		e.hooks[0].set(nil, func(extension.PreparationInput) extension.PreparationConsequence {
 			hookSawOp.Store(e.opOpens.Load())
 			hookSawAg.Store(e.agOpens.Load())
-			return PreparationConsequence{}
+			return extension.PreparationConsequence{}
 		})
 		session := e.session("deep")
 		e.admit(session, "op-1", "one")
@@ -1545,6 +1546,7 @@ func TestPreparationForwardsCapturedPolicyAndNormalizer(t *testing.T) {
 		e := newPrepEnv(t, store)
 		t.Cleanup(func() { e.converge() })
 		writeServiceFile(t, e.configPath, prepPolicyConfigDocument(e.server.URL, "A"))
+		writeAgentDefinitions(t, e.configPath, prepAgentsDocument)
 		{
 			_, err := e.reload()
 			testassert.NoError(t, err)
@@ -1698,4 +1700,439 @@ func TestPreparationForwardsToolArgumentHooksAcrossScopes(t *testing.T) {
 			testassert.Require(t, result.HookID != "hook.first", "preparation hook bound as an argument hook")
 		}
 	})
+}
+
+type visibilityTool struct{ executes *atomic.Int64 }
+
+func (t visibilityTool) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
+	return call.Arguments, nil
+}
+func (visibilityTool) Prepare(context.Context, extension.ToolContext, model.ToolCall) extension.ToolPlan {
+	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: harness.PermissionCommandRun, Target: "test"}}}
+}
+func (t visibilityTool) Execute(_ context.Context, tc extension.ToolContext, _ extension.ToolPlan) harness.ToolOutcome {
+	t.executes.Add(1)
+	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{CallID: tc.Calls.ToolCallID, Status: model.ResultSuccess, Content: "hidden-ok"}}
+}
+
+type visibilityRequestTool struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type visibilityRequest struct {
+	Messages []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	} `json:"messages"`
+	Tools []struct {
+		Function visibilityRequestTool `json:"function"`
+	} `json:"tools"`
+}
+
+func parseVisibilityRequest(t *testing.T, body string) visibilityRequest {
+	t.Helper()
+	var doc visibilityRequest
+	testassert.NoError(t, json.Unmarshal([]byte(body), &doc))
+	return doc
+}
+
+func visibilityToolMessages(doc visibilityRequest) int {
+	count := 0
+	for _, message := range doc.Messages {
+		if message.Role == "tool" {
+			count++
+		}
+	}
+	return count
+}
+
+// TestPreparationVisibilityRestoresThroughRequestHooks proves the separation
+// between the full eligible transformed catalog and preparation-selected
+// starting visibility: a hidden tool is unadvertised and refused before a
+// request hook restores it, then executes; initial order is preserved; an
+// empty initial selection advertises nothing; an ineligible restore is
+// refused; and the canonical capture and evidence survive a cold reopen.
+func TestPreparationVisibilityRestoresThroughRequestHooks(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, prepConfigDocument(e.server.URL, "A"))
+		writeAgentDefinitions(t, e.configPath, `{
+  "restorer": {"model": "prov/m", "system_prompt": "simple", "tools": ["hidden", "visible"], "capabilities": ["prepare.hide", "request.restore"]},
+  "reorderer": {"model": "prov/m", "system_prompt": "simple", "tools": ["hidden", "visible"], "capabilities": ["prepare.reorder", "request.none"]},
+  "empty": {"model": "prov/m", "system_prompt": "simple", "tools": ["hidden", "visible"], "capabilities": ["prepare.empty", "request.none"]},
+  "foreigner": {"model": "prov/m", "system_prompt": "simple", "tools": ["hidden", "visible"], "capabilities": ["prepare.hide", "request.foreign"]}
+}`)
+		enableFixturePlugin(t, e.configPath, "gate")
+		e.fixtureStore(store)
+		var executes atomic.Int64
+		native := testNative("gate", extension.LifetimeHarness, []extension.Capability{
+			extension.HookCapability("prepare.hide", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure)),
+			extension.HookCapability("prepare.reorder", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure)),
+			extension.HookCapability("prepare.empty", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure)),
+			extension.HookCapability("request.restore", extension.SingleHook(extension.BoundaryRequest, extension.HookModePure)),
+			extension.HookCapability("request.none", extension.SingleHook(extension.BoundaryRequest, extension.HookModePure)),
+			extension.HookCapability("request.foreign", extension.SingleHook(extension.BoundaryRequest, extension.HookModePure)),
+			extension.ToolCapability("hidden"),
+			extension.ToolCapability("visible"),
+		}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"prepare.hide": {Preparation: func(context.Context, extension.CallContext, extension.PreparationInput) (extension.PreparationConsequence, error) {
+					return extension.PreparationConsequence{ToolNames: []string{}, Descriptions: map[string]string{"hidden": "transformed hidden description"}}, nil
+				}},
+				"prepare.reorder": {Preparation: func(context.Context, extension.CallContext, extension.PreparationInput) (extension.PreparationConsequence, error) {
+					return extension.PreparationConsequence{ToolNames: []string{"visible", "hidden"}}, nil
+				}},
+				"prepare.empty": {Preparation: func(context.Context, extension.CallContext, extension.PreparationInput) (extension.PreparationConsequence, error) {
+					return extension.PreparationConsequence{ToolNames: []string{}}, nil
+				}},
+				"request.restore": {Request: func(_ context.Context, _ extension.CallContext, input harness.RequestHookInput) (harness.RequestConsequence, error) {
+					// The first request keeps the preparation-hidden advertisement;
+					// the next request, after the refused call, restores the tool.
+					for _, message := range input.Messages {
+						if message.Role == model.RoleTool {
+							return harness.RequestConsequence{ToolNames: []string{"hidden"}}, nil
+						}
+					}
+					return harness.RequestConsequence{}, nil
+				}},
+				"request.none": {Request: func(context.Context, extension.CallContext, harness.RequestHookInput) (harness.RequestConsequence, error) {
+					return harness.RequestConsequence{}, nil
+				}},
+				"request.foreign": {Request: func(context.Context, extension.CallContext, harness.RequestHookInput) (harness.RequestConsequence, error) {
+					return harness.RequestConsequence{ToolNames: []string{"foreign"}}, nil
+				}},
+				"hidden":  {Tool: visibilityTool{executes: &executes}},
+				"visible": {Tool: visibilityTool{executes: &executes}},
+			}}, nil
+		})
+		native.Describe = map[string]extension.ToolDescribe{
+			"hidden":  testDescribeTool("hidden"),
+			"visible": testDescribeTool("visible"),
+		}
+		e.server.setScript(func(_ context.Context, body string) []string {
+			doc := visibilityRequest{Messages: nil}
+			_ = json.Unmarshal([]byte(body), &doc)
+			switch lastUserText(body) {
+			case "restorer run":
+				if visibilityToolMessages(doc) == 0 {
+					return toolCallTurnEvents("call-hidden-1", "hidden", `{}`)
+				}
+				if visibilityToolMessages(doc) == 1 {
+					return toolCallTurnEvents("call-hidden-2", "hidden", `{}`)
+				}
+				return textTurnEvents("done")
+			case "reorder run":
+				if visibilityToolMessages(doc) == 0 {
+					return toolCallTurnEvents("call-reordered", "hidden", `{}`)
+				}
+				return textTurnEvents("done")
+			default:
+				return textTurnEvents("done")
+			}
+		})
+		ctx := context.Background()
+		r, err := e.open(ctx, native)
+		testassert.NoError(t, err)
+
+		restorerSession, err := r.createSession(ctx, e.dataDir, "restorer")
+		testassert.NoError(t, err)
+		restorer := restorerSession.Identity.SessionID
+		submitThroughRuntime(t, r, restorer, "op-restorer", "restorer run")
+		restorerRec := awaitOperation(t, r, restorer, "op-restorer", harness.OperationSuccess)
+		testassert.Require(t, slices.Equal(restorerRec.Admission.Execution.InitialToolNames, []string{}), "restorer initial visibility = %v, want present empty", restorerRec.Admission.Execution.InitialToolNames)
+		testassert.Require(t, slices.Equal(toolNames(restorerRec.Admission.Execution.Tools), []string{"hidden", "visible"}), "restorer catalog = %v, want the full eligible catalog", toolNames(restorerRec.Admission.Execution.Tools))
+
+		reordererSession, err := r.createSession(ctx, e.dataDir, "reorderer")
+		testassert.NoError(t, err)
+		reorderer := reordererSession.Identity.SessionID
+		submitThroughRuntime(t, r, reorderer, "op-reorder", "reorder run")
+		reorderRec := awaitOperation(t, r, reorderer, "op-reorder", harness.OperationSuccess)
+		testassert.Require(t, slices.Equal(reorderRec.Admission.Execution.InitialToolNames, []string{"visible", "hidden"}), "reordered initial visibility = %v, want the preparation-selected order", reorderRec.Admission.Execution.InitialToolNames)
+
+		emptySession, err := r.createSession(ctx, e.dataDir, "empty")
+		testassert.NoError(t, err)
+		empty := emptySession.Identity.SessionID
+		submitThroughRuntime(t, r, empty, "op-empty", "empty run")
+		emptyRec := awaitOperation(t, r, empty, "op-empty", harness.OperationSuccess)
+		testassert.Require(t, emptyRec.Admission.Execution.InitialToolNames != nil && len(emptyRec.Admission.Execution.InitialToolNames) == 0, "empty initial visibility = %v, want present empty", emptyRec.Admission.Execution.InitialToolNames)
+
+		foreignerSession, err := r.createSession(ctx, e.dataDir, "foreigner")
+		testassert.NoError(t, err)
+		foreigner := foreignerSession.Identity.SessionID
+		beforeForeign := e.server.requests()
+		submitThroughRuntime(t, r, foreigner, "op-foreign", "foreign run")
+		awaitOperation(t, r, foreigner, "op-foreign", harness.OperationFailure)
+		testassert.Equal(t, e.server.requests(), beforeForeign)
+		testassert.Equal(t, executes.Load(), int64(2))
+
+		// Find the restorer and reorderer request bodies by the actual wire
+		// conversation and assert advertisement behavior.
+		var restorerRequests, reorderRequests []visibilityRequest
+		for i := 0; i < e.server.requests(); i++ {
+			body := e.server.bodyAt(i)
+			doc := parseVisibilityRequest(t, body)
+			switch lastUserText(body) {
+			case "restorer run":
+				restorerRequests = append(restorerRequests, doc)
+			case "reorder run":
+				reorderRequests = append(reorderRequests, doc)
+			}
+		}
+		testassert.Require(t, len(restorerRequests) >= 3, "restorer requests = %d, want the refused call, restored call, and follow-up", len(restorerRequests))
+		testassert.Require(t, len(restorerRequests[0].Tools) == 0, "pre-restoration advertisement = %+v, want none", restorerRequests[0].Tools)
+		testassert.Require(t, len(restorerRequests[1].Tools) == 1 && restorerRequests[1].Tools[0].Function.Name == "hidden" && restorerRequests[1].Tools[0].Function.Description == "transformed hidden description", "restored advertisement = %+v, want the hidden tool with the transformed description", restorerRequests[1].Tools)
+		testassert.Require(t, strings.Contains(string(restorerRequests[1].Messages[len(restorerRequests[1].Messages)-1].Content), `Tool \"hidden\" is not available.`), "pre-restoration tool result = %s, want the unavailable refusal", restorerRequests[1].Messages[len(restorerRequests[1].Messages)-1].Content)
+		testassert.Require(t, strings.Contains(string(restorerRequests[2].Messages[len(restorerRequests[2].Messages)-1].Content), "hidden-ok"), "restored tool result = %s, want the executed content", restorerRequests[2].Messages[len(restorerRequests[2].Messages)-1].Content)
+		testassert.Require(t, len(reorderRequests) >= 2 && len(reorderRequests[0].Tools) == 2 && reorderRequests[0].Tools[0].Function.Name == "visible" && reorderRequests[0].Tools[1].Function.Name == "hidden", "reordered advertisement = %+v, want visible then hidden", reorderRequests[0].Tools)
+
+		testassert.NoError(t, r.Close(ctx))
+		// Cold reopen: the canonical capture and the evidence names validate
+		// from durable bytes, including the reordered preparation selection.
+		r2, err := e.open(ctx, native)
+		testassert.NoError(t, err)
+		for _, row := range []struct {
+			session, operation string
+			want               []string
+		}{
+			{restorer, "op-restorer", []string{}},
+			{reorderer, "op-reorder", []string{"visible", "hidden"}},
+			{empty, "op-empty", []string{}},
+		} {
+			err := r2.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+				rec, err := h.ReadOperation(ctx, row.session, row.operation)
+				if err != nil {
+					return err
+				}
+				if !slices.Equal(rec.Admission.Execution.InitialToolNames, row.want) {
+					return fmt.Errorf("cold initial visibility = %v, want %v", rec.Admission.Execution.InitialToolNames, row.want)
+				}
+				return nil
+			})
+			testassert.NoError(t, err)
+		}
+		testassert.NoError(t, r2.Close(ctx))
+	})
+}
+
+type promptAssemblyProbe struct {
+	mu       sync.Mutex
+	payload  []byte
+	direct   string
+	result   []byte
+	received json.RawMessage
+}
+
+// TestNativePromptServiceUsesCapturedAssemblyInput proves the fixed prompt
+// service consumes the actual public prompt.AssemblyInput through the shared
+// assembly schema: a native preparation hook marshals its captured input,
+// calls the declared service, decodes the raw JSON string result, and matches
+// the direct pure assembler over the same captured value with no ambient read.
+func TestNativePromptServiceUsesCapturedAssemblyInput(t *testing.T) {
+	e := newOwnerEnv(t)
+	enableFixturePlugin(t, e.configPath, "prompt_hook")
+	writeAgentDefinitions(t, e.configPath, `{"prompt_agent":{"model":"prov/m","system_prompt":"full","tools":[],"capabilities":["hook.prompt"]}}`)
+	e.fixtureStore(storage.NewMemory())
+	workspace := filepath.Join(e.dataDir, "prompt-ws")
+	testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+	testassert.NoError(t, os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("# Project rule\n\nuse the captured rules"), 0o600))
+	probe := &promptAssemblyProbe{}
+	promptHost, ok := extension.HostCapability(extension.ContractPrompt)
+	testassert.Require(t, ok, "host prompt capability is missing")
+	binding := extension.Binding{Name: "prompt", Provider: extension.HostProvider, CapabilityID: extension.ContractPrompt, Definition: promptHost}
+	native := extension.Native{
+		Declaration: extension.Declaration{
+			ID:           "prompt_hook",
+			Version:      "1",
+			ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"}},"required":["enabled"]}`),
+			Components:   []extension.Component{{ID: "prompt-hook-c", Lifetime: extension.LifetimeHarness, Provides: []string{"hook.prompt"}, Requires: []extension.Binding{binding}}},
+			Capabilities: []extension.Capability{extension.HookCapability("hook.prompt", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure))},
+		},
+		Open: func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+			return extension.Instance{Capabilities: map[string]extension.Implementation{"hook.prompt": {Preparation: func(ctx context.Context, calls extension.CallContext, input extension.PreparationInput) (extension.PreparationConsequence, error) {
+				payload, err := json.Marshal(input.Assembly)
+				if err != nil {
+					return extension.PreparationConsequence{}, err
+				}
+				direct, err := prompt.Assemble(input.Assembly)
+				if err != nil {
+					return extension.PreparationConsequence{}, err
+				}
+				result, err := calls.Call(ctx, "prompt", "assemble", payload)
+				if err != nil {
+					return extension.PreparationConsequence{}, err
+				}
+				// The service must use the supplied captured value, not reread
+				// ambient rules: mutate the workspace file and repeat the call.
+				if input.Assembly.Workspace != "" {
+					_ = os.WriteFile(filepath.Join(input.Assembly.Workspace, "AGENTS.md"), []byte("# mutated ambient rules"), 0o600)
+				}
+				again, err := calls.Call(ctx, "prompt", "assemble", payload)
+				if err != nil {
+					return extension.PreparationConsequence{}, err
+				}
+				if string(again.Value) != string(result.Value) {
+					return extension.PreparationConsequence{}, fmt.Errorf("prompt service reread ambient rules: %s != %s", again.Value, result.Value)
+				}
+				probe.mu.Lock()
+				probe.payload = append([]byte(nil), payload...)
+				probe.direct = direct
+				probe.result = append([]byte(nil), result.Value...)
+				probe.received = append(json.RawMessage(nil), result.Value...)
+				probe.mu.Unlock()
+				return extension.PreparationConsequence{}, nil
+			}}}}, nil
+		},
+	}
+	e.server.setScript(func(_ context.Context, _ string) []string { return textTurnEvents("done") })
+	ctx := context.Background()
+	r, err := e.open(ctx, native)
+	testassert.NoError(t, err)
+	session, err := r.createSession(ctx, workspace, "prompt_agent")
+	testassert.NoError(t, err)
+	submitThroughRuntime(t, r, session.Identity.SessionID, "op-prompt", "hello")
+	awaitOperation(t, r, session.Identity.SessionID, "op-prompt", harness.OperationSuccess)
+	probe.mu.Lock()
+	payload, direct, result := probe.payload, probe.direct, probe.result
+	probe.mu.Unlock()
+	testassert.Require(t, len(payload) != 0 && direct != "", "the preparation hook never reached the prompt service")
+	var framed map[string]json.RawMessage
+	testassert.NoError(t, json.Unmarshal(payload, &framed))
+	testassert.Require(t, framed["rules"] != nil && framed["global_rules"] == nil && framed["workspace_rules"] == nil, "assembly payload = %s, want the actual nested Rules representation", payload)
+	var rules map[string]json.RawMessage
+	testassert.NoError(t, json.Unmarshal(framed["rules"], &rules))
+	var workspaceRules string
+	testassert.NoError(t, json.Unmarshal(rules["workspace_text"], &workspaceRules))
+	testassert.Require(t, strings.Contains(workspaceRules, "Project rule"), "captured workspace rules = %q, want the actual captured rule text", workspaceRules)
+	var assembled string
+	testassert.Require(t, len(result) != 0 && json.Unmarshal(result, &assembled) == nil, "prompt result = %s, want a raw JSON string rather than a wrapper", result)
+	testassert.Require(t, assembled == direct, "prompt service result = %q, want direct assembly %q", assembled, direct)
+	testassert.Require(t, strings.Contains(assembled, "use the captured rules"), "assembled prompt = %q, want the captured rule text", assembled)
+	testassert.NoError(t, r.Close(ctx))
+}
+
+type describeInputRecord struct {
+	tool        string
+	inputs      harness.AgentInputs
+	model       model.ModelRef
+	constraints harness.ToolConstraints
+}
+
+type describeInputState struct {
+	mu      sync.Mutex
+	records []describeInputRecord
+}
+
+func (s *describeInputState) record(tool string, input extension.DescribeInput) {
+	s.mu.Lock()
+	s.records = append(s.records, describeInputRecord{tool: tool, inputs: input.Inputs.Owned(), model: input.Model, constraints: input.Constraints})
+	s.mu.Unlock()
+}
+
+// TestNativeDescribeReceivesCompleteResolvedInputs proves tool metadata gets
+// the actual resolved AgentInputs for both a named-definition preparation and
+// a supplied-inputs preparation. Equal model/constraints with differing
+// instructions/mode/capabilities stay distinct, and one callback's mutation
+// of its nested tool/capability/settings buffers cannot affect the following
+// callback or the admitted capture.
+func TestNativeDescribeReceivesCompleteResolvedInputs(t *testing.T) {
+	e := newOwnerEnv(t)
+	enableFixturePlugin(t, e.configPath, "metaext")
+	writeAgentDefinitions(t, e.configPath, `{"resolved_agent":{"model":"prov/m","system_prompt":"full","prompt":"resolved instructions","tools":["meta_a","meta_b"],"capabilities":["meta_cap"]}}`)
+	e.fixtureStore(storage.NewMemory())
+	state := &describeInputState{}
+	toolCapabilityA := extension.ToolCapability("meta_a")
+	toolCapabilityB := extension.ToolCapability("meta_b")
+	capability := extension.ServiceCapability("meta_cap", "test.meta_cap", extension.ServiceMethod("call", extension.ModeServiceIO, `{}`, `{}`, "", ""))
+	describe := func(tool string) extension.ToolDescribe {
+		return func(_ context.Context, input extension.DescribeInput) (extension.ToolDescription, error) {
+			state.record(tool, input)
+			if tool == "meta_a" {
+				if len(input.Inputs.Tools) != 0 {
+					input.Inputs.Tools[0] = "mutated_tool"
+				}
+				if len(input.Inputs.Capabilities) != 0 {
+					input.Inputs.Capabilities[0] = "mutated_cap"
+				}
+				if len(input.Inputs.Strategy.Settings) != 0 {
+					input.Inputs.Strategy.Settings[0] = 'x'
+				}
+				input.Inputs.Instructions = "mutated instructions"
+				input.Inputs.AssemblyMode = "none"
+			}
+			return extension.ToolDescription{
+				Definition: model.ToolDefinition{Name: tool, Description: "described " + tool, Parameters: json.RawMessage(`{"type":"object"}`)},
+				Available:  true,
+			}, nil
+		}
+	}
+	native := extension.Native{
+		Declaration: extension.Declaration{
+			ID:           "metaext",
+			Version:      "1",
+			ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"}},"required":["enabled"]}`),
+			Components:   []extension.Component{{ID: "metaext-c", Lifetime: extension.LifetimeHarness, Provides: []string{"meta_a", "meta_b", "meta_cap"}}},
+			Capabilities: []extension.Capability{toolCapabilityA, toolCapabilityB, capability},
+		},
+		Describe: map[string]extension.ToolDescribe{"meta_a": describe("meta_a"), "meta_b": describe("meta_b")},
+		Open: func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"meta_a":   {Tool: noopNativeTool{}},
+				"meta_b":   {Tool: noopNativeTool{}},
+				"meta_cap": {Service: map[string]extension.Handler{"call": testServiceHandler()}},
+			}}, nil
+		},
+	}
+	e.server.setScript(func(_ context.Context, _ string) []string { return textTurnEvents("done") })
+	ctx := context.Background()
+	r, err := e.open(ctx, native)
+	testassert.NoError(t, err)
+	resolved, err := r.createSession(ctx, e.dataDir, "resolved_agent")
+	testassert.NoError(t, err)
+	submitThroughRuntime(t, r, resolved.Identity.SessionID, "op-resolved", "hello")
+	awaitOperation(t, r, resolved.Identity.SessionID, "op-resolved", harness.OperationSuccess)
+
+	var supplied harness.SessionRecord
+	err = r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		var createErr error
+		supplied, createErr = r.createSessionRecord(ctx, h, e.dataDir, harness.AgentSelection{Inputs: &harness.AgentInputs{
+			Model:        model.ModelRef{Provider: "prov", Model: "m"},
+			Instructions: "supplied instructions",
+			AssemblyMode: "simple",
+			Tools:        []string{"meta_a", "meta_b"},
+			Constraints:  harness.ToolConstraints{Readonly: false, WriteDir: ""},
+			Strategy:     harness.StrategySelection{Settings: json.RawMessage(`{"keep":1}`)},
+		}})
+		return createErr
+	})
+	testassert.NoError(t, err)
+	submitThroughRuntime(t, r, supplied.Identity.SessionID, "op-supplied", "hello")
+	awaitOperation(t, r, supplied.Identity.SessionID, "op-supplied", harness.OperationSuccess)
+
+	state.mu.Lock()
+	records := append([]describeInputRecord(nil), state.records...)
+	state.mu.Unlock()
+	find := func(instructions, tool string) (describeInputRecord, bool) {
+		for _, record := range records {
+			if record.inputs.Instructions == instructions && record.tool == tool {
+				return record, true
+			}
+		}
+		return describeInputRecord{}, false
+	}
+	resolvedA, okA := find("resolved instructions", "meta_a")
+	resolvedB, okB := find("resolved instructions", "meta_b")
+	suppliedA, okSA := find("supplied instructions", "meta_a")
+	suppliedB, okSB := find("supplied instructions", "meta_b")
+	testassert.Require(t, okA && okB && okSA && okSB, "metadata records = %+v, want both tools for both preparations", records)
+	testassert.Require(t, resolvedA.inputs.AssemblyMode == "full" && resolvedA.inputs.Model == (model.ModelRef{Provider: "prov", Model: "m"}) && slices.Contains(resolvedA.inputs.Capabilities, "meta_cap") && slices.Equal(resolvedA.inputs.Tools, []string{"meta_a", "meta_b"}), "resolved inputs = %+v, want the resolved definition values", resolvedA.inputs)
+	testassert.Require(t, suppliedA.inputs.AssemblyMode == "simple" && len(suppliedA.inputs.Capabilities) == 0 && suppliedA.inputs.Instructions == "supplied instructions" && string(suppliedA.inputs.Strategy.Settings) == `{"keep":1}`, "supplied inputs = %+v, want the supplied selection values", suppliedA.inputs)
+	testassert.Require(t, resolvedA.model == resolvedA.inputs.Model && resolvedA.constraints == resolvedA.inputs.Constraints && suppliedA.model == suppliedA.inputs.Model && suppliedA.constraints == suppliedA.inputs.Constraints, "DescribeInput Model/Constraints did not derive from the same resolved inputs")
+	testassert.Require(t, slices.Equal(resolvedB.inputs.Tools, []string{"meta_a", "meta_b"}) && slices.Contains(resolvedB.inputs.Capabilities, "meta_cap") && resolvedB.inputs.Instructions == "resolved instructions" && resolvedB.inputs.AssemblyMode == "full", "later resolved metadata = %+v, want the unmutated inputs", resolvedB.inputs)
+	testassert.Require(t, slices.Equal(suppliedB.inputs.Tools, []string{"meta_a", "meta_b"}) && len(suppliedB.inputs.Capabilities) == 0 && suppliedB.inputs.Instructions == "supplied instructions" && suppliedB.inputs.AssemblyMode == "simple" && string(suppliedB.inputs.Strategy.Settings) == `{"keep":1}`, "later supplied metadata = %+v, want the unmutated inputs", suppliedB.inputs)
+
+	suppliedRec := awaitOperation(t, r, supplied.Identity.SessionID, "op-supplied", harness.OperationSuccess)
+	testassert.Require(t, string(suppliedRec.Admission.Execution.Strategy.Settings) == `{"keep":1}`, "captured strategy settings = %s, want the admitted selection unchanged by metadata mutation", suppliedRec.Admission.Execution.Strategy.Settings)
+	testassert.Require(t, slices.Equal(toolNames(suppliedRec.Admission.Execution.Tools), []string{"meta_a", "meta_b"}) && len(suppliedRec.Admission.Execution.Capabilities) == 0, "capture = tools %v capabilities %v, want the admitted selection unchanged by metadata mutation", toolNames(suppliedRec.Admission.Execution.Tools), suppliedRec.Admission.Execution.Capabilities)
+	testassert.NoError(t, r.Close(ctx))
 }

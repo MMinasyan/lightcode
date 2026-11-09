@@ -69,6 +69,32 @@ func OpenDirectory(path string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
+// EnsureDirectory creates path as an owned directory and refuses a planted
+// symlink anywhere in the traversal. Missing parent components and the leaf
+// are created through the same checked no-follow traversal as OpenForWrite;
+// an existing leaf must itself be a real directory. It returns no descriptor:
+// the one caller needs only the owned path.
+func EnsureDirectory(path string, perm os.FileMode) error {
+	parent, base, err := openParent(path, true, perm)
+	if err != nil {
+		return err
+	}
+	defer closeFD(parent)
+	for {
+		fd, err := unix.Openat(parent, base, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+		if err == nil {
+			closeFD(fd)
+			return nil
+		}
+		if err != unix.ENOENT {
+			return &os.PathError{Op: "openat", Path: path, Err: err}
+		}
+		if mkErr := unix.Mkdirat(parent, base, uint32(perm.Perm())); mkErr != nil && mkErr != unix.EEXIST {
+			return &os.PathError{Op: "mkdirat", Path: path, Err: mkErr}
+		}
+	}
+}
+
 // OpenForWrite opens an existing regular file for replacement or creates a
 // missing leaf. Missing parent directories are created through checked
 // no-follow traversal. The returned bool reports whether the file existed.

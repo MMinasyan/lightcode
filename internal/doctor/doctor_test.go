@@ -43,13 +43,14 @@ func run(t *testing.T, p Params) (Report, bool) {
 
 func params(home string) Params {
 	return Params{
-		Home:       home,
-		ConfigPath: filepath.Join(home, ".lightcode", "config.json"),
-		WorkDir:    "/nonexistent-workdir",
-		BinaryPath: "/test/lightcode",
-		Version:    "dev",
-		Platform:   "linux/amd64",
-		LookupEnv:  func(string) (string, bool) { return "", false },
+		Home:                home,
+		ConfigPath:          filepath.Join(home, ".lightcode", "config.json"),
+		WorkDir:             "/nonexistent-workdir",
+		BinaryPath:          "/test/lightcode",
+		Version:             "dev",
+		Platform:            "linux/amd64",
+		LookupEnv:           func(string) (string, bool) { return "", false },
+		InstalledExtensions: []string{"agents", "adaptation"},
 	}
 }
 
@@ -73,9 +74,19 @@ func writeConfig(t *testing.T, home, body string) {
 
 func writeAgents(t *testing.T, home, body string) {
 	t.Helper()
-	dir := filepath.Join(home, ".lightcode")
-	testassert.NoError(t, os.MkdirAll(dir, 0o700))
-	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "agents.json"), []byte(body), 0o600))
+	writeDefinitions(t, filepath.Join(home, ".lightcode", "config.json"), body)
+}
+
+func writeDefinitions(t *testing.T, path, body string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	testassert.NoError(t, err)
+	var root map[string]json.RawMessage
+	testassert.NoError(t, json.Unmarshal(data, &root))
+	root["extensions"] = json.RawMessage(`{"agents":{"enabled":true,"definitions":` + body + `}}`)
+	data, err = json.Marshal(root)
+	testassert.NoError(t, err)
+	testassert.NoError(t, os.WriteFile(path, data, 0o600))
 }
 
 // keyedProviderConfig is a valid user provider with one usable model whose
@@ -101,7 +112,6 @@ func TestFreshHome(t *testing.T) {
 	testassert.Require(t, c.Status == StatusOK && c.Detail == "not created yet (created on first run)", "data/dir = %+v", c)
 	for name, want := range map[string]string{
 		"config": "config.json: not created yet (created on first run)",
-		"agents": "agents.json: not created yet (created on first run)",
 		"env":    ".env: not created yet (created on first run)",
 	} {
 		{
@@ -117,7 +127,7 @@ func TestFreshHome(t *testing.T) {
 
 // TestExternalConfigDiagnosedWithoutDataDir pins that the addressed config
 // path, not the default data directory, governs the read-only diagnosis: an
-// external config.json (and its adjacent agents.json) drives the
+// external config.json and its active Agent section drive the
 // config/agents/provider/model checks while HOME/.lightcode stays absent.
 func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
 	writeExternal := func(t *testing.T, dir, name, body string) string {
@@ -131,7 +141,7 @@ func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
 		home := t.TempDir()
 		external := t.TempDir()
 		configPath := writeExternal(t, external, "config.json", keyedProviderConfig)
-		agentsPath := writeExternal(t, external, "agents.json", `{"primary": {"model": "keyedtest/m1"}}`)
+		writeDefinitions(t, configPath, `{"primary": {"model": "keyedtest/m1"}}`)
 		p := params(home)
 		p.ConfigPath = configPath
 		p.LookupEnv = func(name string) (string, bool) { return "x", name == "DOCTOR_TEST_KEY" }
@@ -148,7 +158,7 @@ func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
 		}
 		{
 			c := find(t, report, "data", "agents")
-			testassert.Require(t, c.Status == StatusOK && c.Detail == agentsPath, "data/agents = %+v, want the addressed adjacent path", c)
+			testassert.Require(t, c.Status == StatusOK && c.Detail == "extensions.agents", "data/agents = %+v, want the active extension", c)
 		}
 		{
 			c := find(t, report, "providers", "keyedtest")
@@ -156,7 +166,7 @@ func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
 		}
 		{
 			c := find(t, report, "setup", "model")
-			testassert.Require(t, c.Status == StatusOK && c.Detail == "keyedtest/m1", "setup/model = %+v, want the external agents.json model diagnosed", c)
+			testassert.Require(t, c.Status == StatusOK && c.Detail == "keyedtest/m1", "setup/model = %+v, want the external Agent model diagnosed", c)
 		}
 		testassert.Require(t, !noProviders, "a connected external provider must clear the fresh-install hint")
 		testassert.Require(t, report.Failures == 0, "external config has failures: %+v", report.Checks)
@@ -185,9 +195,8 @@ func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
 			c := find(t, report, "data", "config")
 			testassert.Require(t, c.Status == StatusOK && c.Detail == "config.json: not created yet (created on first run)", "data/config = %+v", c)
 		}
-		{
-			c := find(t, report, "data", "agents")
-			testassert.Require(t, c.Status == StatusOK && c.Detail == "agents.json: not created yet (created on first run)", "data/agents = %+v", c)
+		for _, c := range report.Checks {
+			testassert.Require(t, !(c.Group == "data" && c.Name == "agents"), "inactive agent check = %+v", c)
 		}
 		testassert.Require(t, report.Failures == 0, "missing external files must not fail: %+v", report.Checks)
 	})
@@ -234,12 +243,50 @@ func TestInvalidConfigFails(t *testing.T) {
 
 func TestEmptySkeletonIsFreshMachine(t *testing.T) {
 	home := t.TempDir()
-	writeConfig(t, home, `{"providers": {}, "default_model": ""}`)
+	writeConfig(t, home, `{"providers": {}, "extensions":{"agents":{"enabled":true}}}`)
 	report, noProviders := run(t, params(home))
 	testassert.Require(t, report.Failures == 0, "empty skeleton has failures: %+v", report.Checks)
 	testassert.Require(t, noProviders, "empty skeleton must report no providers connected")
 	testassert.Require(t, find(t, report, "setup", "provider").Status == StatusWarn, "setup/provider should warn with nothing connected")
 	testassert.Require(t, find(t, report, "setup", "model").Status == StatusWarn, "setup/model should warn on empty primary model")
+}
+
+func TestAgentChecksOnlyForInstalledEnabledSection(t *testing.T) {
+	t.Run("supplied baseline and task capabilities", func(t *testing.T) {
+		home := t.TempDir()
+		writeConfig(t, home, `{"extensions":{"agents":{"enabled":true,"definitions":{"worker":{"capabilities":["read_file","task","model_adaptation"]}}}}}`)
+		p := params(home)
+		p.InstalledCapabilities = []string{"model_adaptation"}
+		report, _ := run(t, p)
+		testassert.Require(t, find(t, report, "data", "agents").Status == StatusOK, "supplied capability definitions rejected: %+v", report.Checks)
+	})
+	for _, tc := range []struct {
+		name        string
+		section     string
+		installed   bool
+		wantFailure bool
+	}{
+		{"enabled invalid", `{"enabled":true,"definitions":{"broken":{"model":"noslash"}}}`, true, true},
+		{"disabled invalid", `{"enabled":false,"definitions":{"broken":{"model":"noslash"}}}`, true, false},
+		{"uninstalled invalid", `{"enabled":true,"definitions":{"broken":{"model":"noslash"}}}`, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			writeConfig(t, home, `{"extensions":{"agents":`+tc.section+`}}`)
+			p := params(home)
+			if !tc.installed {
+				p.InstalledExtensions = nil
+			}
+			report, _ := run(t, p)
+			if tc.wantFailure {
+				testassert.Require(t, find(t, report, "data", "agents").Status == StatusFail, "invalid enabled definitions accepted")
+			} else {
+				for _, check := range report.Checks {
+					testassert.Require(t, !(check.Group == "data" && check.Name == "agents") && !(check.Group == "setup" && check.Name == "model"), "inactive agent diagnostics = %+v", check)
+				}
+			}
+		})
+	}
 }
 
 func TestKeySourceClasses(t *testing.T) {
@@ -441,22 +488,27 @@ func TestPrimaryModelChecks(t *testing.T) {
 				testassert.Require(t, c.Status == tc.wantStatus, "setup/model = %+v, want %s", c, tc.wantStatus)
 			}
 
-			// Custom definitions that the agents parser drops with its own
-			// warnings must not leak into the doctor check stream: the
-			// complete report for the augmented document must equal the
-			// baseline report. Each definition carries a valid model and
-			// fails only at its intended boundary (unavailable capability,
-			// unavailable tool, wrong-typed capabilities member).
+			// A valid custom definition does not change the primary model check.
 			var doc map[string]json.RawMessage
 			testassert.NoError(t, json.Unmarshal([]byte(tc.agents), &doc))
-			doc["custom_ghost_capability"] = json.RawMessage(`{"model": "test/ghost", "capabilities": ["not-declared"]}`)
-			doc["custom_ghost_tool"] = json.RawMessage(`{"model": "test/ghost", "tools": ["not-compiled"]}`)
-			doc["custom_broken_capabilities"] = json.RawMessage(`{"model": "test/ghost", "capabilities": "not-a-list"}`)
+			doc["custom"] = json.RawMessage(`{"model":"test/ghost","tools":[]}`)
 			augmented, err := json.Marshal(doc)
 			testassert.NoError(t, err)
 			writeAgents(t, home, string(augmented))
 			report, _ := run(t, p)
 			testassert.Require(t, reflect.DeepEqual(report, baseline), "custom definitions changed the doctor report:\nbaseline:  %+v\naugmented: %+v", baseline, report)
+			for _, invalid := range []json.RawMessage{
+				json.RawMessage(`{"model":"test/ghost","capabilities":["not-declared"]}`),
+				json.RawMessage(`{"model":"test/ghost","tools":["not-compiled"]}`),
+				json.RawMessage(`{"model":"test/ghost","capabilities":"not-a-list"}`),
+			} {
+				doc["custom"] = invalid
+				augmented, err = json.Marshal(doc)
+				testassert.NoError(t, err)
+				writeAgents(t, home, string(augmented))
+				report, _ = run(t, p)
+				testassert.Require(t, find(t, report, "data", "agents").Status == StatusFail, "invalid active definition was accepted: %s", invalid)
+			}
 		})
 	}
 }

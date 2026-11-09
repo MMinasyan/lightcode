@@ -30,7 +30,8 @@ describe('native invocation contract', () => {
     allows('GetSessionHistory', '{"session_id":"root1","query":{}}');
     allows('GetSessionHistory', '{"session_id":"root1","query":{"cursor":"abc"}}');
     allows('SubmitSession', '{"session_id":"root1","body":{"operation_id":"op1"}}');
-    allows('CreateSession', '{"body":{"workspace":"/ws","agent_type":"primary"}}');
+    allows('CreateSession', '{"body":{"workspace":"/ws","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"}}}}');
+    allows('SetSessionModel', '{"session_id":"root1","body":{"model":"prov/m"}}');
     allows('ResetProviderField', '{"field":"name","query":{"provider_id":"prov1"}}');
     allows('ResetProviderModelField', '{"field":"hidden","query":{"provider_id":"prov1","model_id":"m1"}}');
     allows('UpdateProviderModel', '{"query":{"provider_id":"prov1","model_id":"m1"},"body":{"name":"M"}}');
@@ -67,6 +68,8 @@ describe('native invocation contract', () => {
     rejects('CreateSession', '{"body":5}');
     rejects('SubmitSession', '{}');
     rejects('SubmitSession', '{"body":{"operation_id":"op1"}}');
+    rejects('SetSessionModel', '{"body":{"model":"prov/m"}}');
+    rejects('SetSessionModel', '{"session_id":"root1"}');
   });
 
   it('rejects malformed params text and non-object envelopes', () => {

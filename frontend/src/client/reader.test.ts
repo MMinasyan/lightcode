@@ -21,7 +21,7 @@ import {
   unresolvedAssistantIDs,
   type ReaderOutcome,
 } from './reader';
-import { INSTANCE, hydration as hydrationFixture, revision } from './test-fixtures';
+import { INSTANCE, definitionSelection, hydration as hydrationFixture, revision } from './test-fixtures';
 
 function inputItem(id: string): ConversationItem {
   return {
@@ -64,7 +64,7 @@ function hydration(revisionValue: SessionRevision, items: ConversationItem[], ol
       session_id: 's1',
       workspace: '/ws',
       lifecycle: 'open',
-      agent_type: 'primary',
+      agent_selection: definitionSelection('primary'),
       created_at: '0',
       last_activity: '0',
       session_revision: revisionValue,
@@ -390,7 +390,7 @@ describe('SessionReader newer mid-chain floor', () => {
     harness.hydrationMock
       .mockResolvedValueOnce(okRead(hydration(revision('1'), range(1, 50), 'c1')))
       .mockResolvedValueOnce(okRead(hydration(revision('2'), range(52, 101), 'c2', {
-        operations: [{ operation_id: 'stale-op', request_kind: 'message', status: 'success', admitted_at: '0', agent_type: 'primary', model: 'p/m', usage: { totals: { by_model: [] } } }],
+        operations: [{ operation_id: 'stale-op', request_kind: 'message', status: 'success', admitted_at: '0', agent_selection: definitionSelection('primary'), model: 'p/m', usage: { totals: { by_model: [] } } }],
       })))
       .mockResolvedValueOnce(okRead(hydration(revision('3'), range(2, 101), 'c3')));
     harness.historyMock.mockResolvedValue(okRead(page(revision('3'), range(2, 51), null)));

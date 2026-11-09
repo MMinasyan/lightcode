@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -160,7 +161,7 @@ func newCancelableHarness(t *testing.T, store Storage, prepared PreparedExecutio
 
 func createSession(t *testing.T, h *Harness) string {
 	t.Helper()
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	return session.Identity.SessionID
 }
@@ -299,7 +300,7 @@ func TestSteeringAdmitsHeadsInFIFOOrder(t *testing.T) {
 	openerArrived := make(chan struct{})
 	openerGate := make(chan struct{})
 	var once sync.Once
-	exec := effectExecution(script.model, func(_ context.Context, call model.ToolCall) PreparedTool {
+	exec := effectExecution(script.model, func(ctx context.Context, call model.ToolCall) PreparedTool {
 		return PreparedTool{Permissions: fixturePermission, Immediate: &ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 	})
 	prepared := PreparedExecution{
@@ -798,7 +799,7 @@ func TestAgentTypeChangeDuringBlockedEffect(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	{
-		_, err := h.ChangeAgentType(context.Background(), session, "reviewer")
+		_, err := h.ChangeAgentType(context.Background(), session, testSelection("reviewer"))
 		testassert.NoError(t, err)
 	}
 
@@ -812,7 +813,51 @@ func TestAgentTypeChangeDuringBlockedEffect(t *testing.T) {
 	prepareMu.Lock()
 	defer prepareMu.Unlock()
 	testassert.Equal(t, len(prepareReqs), 2)
-	testassert.Require(t, prepareReqs[0].Session.AgentType == "coder" && prepareReqs[1].Session.AgentType == "reviewer", "preparation agent types = %q then %q, want the capture-time value then the changed one", prepareReqs[0].Session.AgentType, prepareReqs[1].Session.AgentType)
+	testassert.Require(t, prepareReqs[0].Session.AgentSelection.Definition.DefinitionID == "coder" && prepareReqs[1].Session.AgentSelection.Definition.DefinitionID == "reviewer", "preparation agent types = %q then %q, want the capture-time value then the changed one", prepareReqs[0].Session.AgentSelection.Definition.DefinitionID, prepareReqs[1].Session.AgentSelection.Definition.DefinitionID)
+}
+
+func TestSessionModelChangeDuringBlockedEffect(t *testing.T) {
+	store := emptyStore(t)
+	script := newModelScript()
+	script.gate = make(chan struct{})
+	prepared := modelPrepared(script.model)
+	var mu sync.Mutex
+	var requests []PreparationRequest
+	h, cancel := newCancelableHarness(t, store, prepared, func(_ context.Context, req PreparationRequest) (PreparedExecution, error) {
+		mu.Lock()
+		requests = append(requests, req)
+		mu.Unlock()
+		return prepared, nil
+	})
+	defer cancel()
+	initial := AgentInputs{Model: model.ModelRef{Provider: "p", Model: "old"}, Instructions: "unchanged", AssemblyMode: "full", Tools: []string{"read_file"}, Capabilities: []string{"cap"}, Constraints: ToolConstraints{Readonly: true, WriteDir: "sub"}}
+	created, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: AgentSelection{Inputs: &initial}})
+	testassert.NoError(t, err)
+	session := created.Identity.SessionID
+	watch := watchSettlements(store)
+	_, err = submitText(t, h, session, "turn-1", MessageModeRegular, "hello")
+	testassert.NoError(t, err)
+	<-script.arrived
+	_, err = submitText(t, h, session, "turn-2", MessageModeQueued, "later")
+	testassert.NoError(t, err)
+	updated, err := h.SetSessionModel(context.Background(), session, model.ModelRef{Provider: "p", Model: "new"})
+	testassert.NoError(t, err)
+	want := initial
+	want.Model.Model = "new"
+	testassert.Require(t, reflect.DeepEqual(*updated.State.AgentSelection.Inputs, want), "updated inputs = %+v, want %+v", updated.State.AgentSelection.Inputs, want)
+	script.releaseGate()
+	watch.next()
+	watch.next()
+	mu.Lock()
+	testassert.Require(t, len(requests) == 2 && reflect.DeepEqual(*requests[0].Session.AgentSelection.Inputs, initial) && reflect.DeepEqual(*requests[1].Session.AgentSelection.Inputs, want), "captured selections = %+v", requests)
+	mu.Unlock()
+	changed, err := h.ChangeAgentType(context.Background(), session, testSelection("reviewer"))
+	testassert.NoError(t, err)
+	_, err = h.SetSessionModel(context.Background(), session, model.ModelRef{Provider: "p", Model: "other"})
+	testassert.Require(t, errors.Is(err, ErrConflict), "named selection model edit = %v, want conflict", err)
+	read, err := h.ReadSessionHeader(context.Background(), session)
+	testassert.NoError(t, err)
+	testassert.Require(t, read.Revision.DurableRevision == changed.Revision && read.AgentSelection.Definition.DefinitionID == "reviewer", "conflict changed session: %+v", read)
 }
 
 // TestWaitConvergence proves the Harness-lifetime row: Wait returns only after
@@ -1246,7 +1291,7 @@ func TestDrainRetiresItsOwnRunSlot(t *testing.T) {
 		h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
 			return validPrepared(), nil
 		})
-		session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+		session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 		testassert.NoError(t, err)
 		{
 			_, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello"))
@@ -1352,7 +1397,7 @@ func TestSessionsExecuteConcurrently(t *testing.T) {
 // snapshot never takes the coordinator mutex.
 func TestSnapshotCoordinatorsReleasesRegistryMutex(t *testing.T) {
 	h := newTestHarness(t, freshSessionStore(t), nil)
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	c := leaseCoordinator(t, h, session.Identity.SessionID)
 

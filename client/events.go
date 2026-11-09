@@ -357,19 +357,21 @@ func requireMembers(members map[string]json.RawMessage, names ...string) error {
 // alone names the whole Runtime with none.
 var (
 	scopeMembers = map[string]bool{
-		"kind":         true,
-		"workspace":    true,
-		"session_id":   true,
-		"operation_id": true,
-		"job_id":       true,
+		"kind":          true,
+		"workspace":     true,
+		"session_id":    true,
+		"operation_id":  true,
+		"job_id":        true,
+		"invocation_id": true,
+		"purpose":       true,
 	}
 	scopeRequiredIdentities = map[string][]string{
-		"runtime":   nil,
-		"workspace": {"workspace"},
-		"session":   {"session_id"},
-		"operation": {"session_id", "operation_id"},
-		"agent":     {"session_id", "operation_id"},
-		"job":       {"session_id", "job_id"},
+		"runtime":    nil,
+		"workspace":  {"workspace"},
+		"session":    {"session_id"},
+		"operation":  {"session_id", "operation_id"},
+		"invocation": {"session_id", "operation_id", "invocation_id", "purpose"},
+		"job":        {"session_id", "job_id"},
 	}
 )
 
@@ -413,6 +415,9 @@ func validateScope(raw json.RawMessage) error {
 		}
 		if text == "" {
 			return fmt.Errorf("scope member %q is empty", name)
+		}
+		if name == "purpose" && text != "conversation" && text != "maintenance" {
+			return fmt.Errorf("scope purpose %q is outside the closed set", text)
 		}
 	}
 	var kind string

@@ -64,7 +64,7 @@ func scopeSessionIdentity(t *testing.T, scope protocol.Scope) (string, bool) {
 		testassert.NoError(t, err)
 		sessionID = body.SessionId
 	case "agent":
-		body, err := scope.AsAgentScope()
+		body, err := scope.AsInvocationScope()
 		testassert.NoError(t, err)
 		sessionID = body.SessionId
 	case "job":
@@ -101,7 +101,7 @@ func scopeWorkspaceAttribution(t *testing.T, scope protocol.Scope) (string, bool
 		testassert.NoError(t, err)
 		workspace = body.Workspace
 	case "agent":
-		body, err := scope.AsAgentScope()
+		body, err := scope.AsInvocationScope()
 		testassert.NoError(t, err)
 		workspace = body.Workspace
 	case "job":
@@ -194,7 +194,7 @@ func TestRuntimeObservationPublishesCommittedTransitionsInOrder(t *testing.T) {
 		testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
 	}
 	{
-		_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
+		_, err := r.config.current().resources.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
 		testassert.NoError(t, err)
 	}
 	{
@@ -268,7 +268,7 @@ func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 		defer release()
 		getDone := make(chan error, 1)
 		go func() {
-			_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws-paused"})
+			_, err := r.config.current().resources.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: "/ws-paused"})
 			getDone <- err
 		}()
 		select {
@@ -472,7 +472,7 @@ func TestRuntimeShutdownDoesNotWaitForUndrainedObservers(t *testing.T) {
 		}
 	}
 	{
-		_, err := r.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
+		_, err := r.config.current().resources.workspaces.get(context.Background(), ScopeInfo{Kind: ScopeWorkspace, DataDir: e.dataDir, Workspace: obsWorkspace})
 		testassert.NoError(t, err)
 	}
 	closeDone := make(chan error, 1)
@@ -570,6 +570,14 @@ func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 			default:
 				t.Fatalf("unexpected event %s", eventJSON(t, event))
 			}
+		}
+		{
+			body, err := committed[2].AsScopeEvent()
+			testassert.NoError(t, err)
+			invocation, err := body.Scope.AsInvocationScope()
+			testassert.NoError(t, err)
+			testassert.Require(t, invocation.InvocationId != "" && invocation.Purpose == protocol.Conversation, "invocation scope = %+v, want the actual ID and conversation purpose", invocation)
+			want[2] = committed[2]
 		}
 		if !slices.EqualFunc(committed, want, equalEvent) {
 			t.Fatalf("healthy subscriber committed events = %s, want reload events during active execution plus every committed closure in shutdown order: %s", eventsJSON(t, committed), eventsJSON(t, want))

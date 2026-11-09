@@ -11,8 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
+	agents "github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -62,8 +63,10 @@ func compactPrepConfigDocument(endpoint string) string {
 
 // agentsWithCompact appends one compact builtin overlay to the retained
 // preparation agents document.
+const compactAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple","tools":["echo"]}}`
+
 func agentsWithCompact(overlay string) string {
-	return strings.TrimSuffix(prepAgentsDocument, "}") + ",\n  \"compact\": " + overlay + "}"
+	return strings.TrimSuffix(compactAgentsDocument, "}") + ",\n  \"compact\": " + overlay + "}"
 }
 
 // compactPrepConfigDocumentWith appends one top-level compaction section to
@@ -87,35 +90,33 @@ func compactPrepWith(t *testing.T, agentsDoc, configDoc, endpoint string) (confi
 	sh := newServiceHarness(t)
 	t.Setenv("PREP_COMPACT_KEY", "compact-secret")
 	writeServiceFile(t, sh.configPath, configDoc)
-	writeServiceFile(t, agents.PathForConfig(sh.configPath), agentsDoc)
+	writeAgentDefinitions(t, sh.configPath, agentsDoc)
+	enableFixturePlugin(t, sh.configPath, "compacttools")
 	owner, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	comp := mustComposition(t, compactToolsPlugin())
-	runtimeScope := mustOpenScope(t, comp, owner, ScopeInfo{Kind: ScopeRuntime, DataDir: sh.dataDir}, nil)
-	obs := newObservation()
-	ws := newWorkspaceScopes(owner, comp, []*scope{runtimeScope}, obs)
-	svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, obs, nil)
+	compact := compactToolsPlugin()
+	svc := sh.preparedService(owner, compact, fixtureAgentPlugin(compact))
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return captured, newPreparation(svc, comp, runtimeScope, ws, sh.home, "", "", nil, nil, nil, nil)
+	return captured, newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
 }
 
-func compactToolsPlugin() Plugin {
-	return Plugin{
-		ID:       "compacttools",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("echo", staticToolDescription("echo")), ToolSpec("read", staticToolDescription("read"))},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"echo": noopTool{}, "read": noopTool{}}}, nil
-		},
-	}
+func compactToolsPlugin() extension.Native {
+	native := testNative("compacttools", extension.LifetimeHarness, []extension.Capability{extension.ToolCapability("echo"), extension.ToolCapability("read")}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{
+			"echo": {Tool: noopNativeTool{}},
+			"read": {Tool: noopNativeTool{}},
+		}}, nil
+	})
+	native.Describe = map[string]extension.ToolDescribe{"echo": testDescribeTool("echo"), "read": testDescribeTool("read")}
+	return native
 }
 
 func compactPrepRequest() harness.PreparationRequest {
 	return harness.PreparationRequest{
 		Session: harness.PreparationSession{
-			Identity:  harness.SessionIdentity{SessionID: "000000000000000000000000000000aa", Workspace: "/tmp/compact-ws", CreatedAt: time.Now()},
-			AgentType: "solo",
+			Identity:       harness.SessionIdentity{SessionID: "000000000000000000000000000000aa", Workspace: "/tmp/compact-ws", CreatedAt: time.Now()},
+			AgentSelection: suppliedDefinition("solo"),
 		},
 		RequestKind: harness.RequestKindMessage,
 	}
@@ -123,9 +124,19 @@ func compactPrepRequest() harness.PreparationRequest {
 
 func compactPrepSelection(t *testing.T, captured configurationCapture, agentName string) selection {
 	t.Helper()
-	agent, err := harness.ResolveAgentType(agentName, captured.snapshot.agentTypes())
-	testassert.Require(t, err == nil, "ResolveAgentType(%q): %v", agentName, err)
-	return selection{agent: agent, bindings: Bindings{}, invocation: Invocation{snapshot: captured.snapshot}, credentials: captured.credentials}
+	inputs, err := resolveDefinition(context.Background(), captured.snapshot, harness.DefinitionRef{ExtensionID: agents.ExtensionID, CapabilityID: agents.DefinitionsCapabilityID, DefinitionID: agentName})
+	testassert.Require(t, err == nil, "resolveDefinition(%q): %v", agentName, err)
+	sc := mustOpenScope(t, captured.snapshot.composition, context.Background(), ScopeInfo{Kind: ScopeRuntime, DataDir: t.TempDir()}, nil)
+	t.Cleanup(func() { _ = sc.close() })
+	selected := append([]string(nil), inputs.Capabilities...)
+	selected = append(selected, inputs.Tools...)
+	return selection{
+		inputs:      inputs,
+		scopes:      []*scope{sc},
+		selected:    selected,
+		invocation:  Invocation{snapshot: captured.snapshot},
+		credentials: captured.credentials,
+	}
 }
 
 // TestConcretePrepareCompactCapture pins every capture field the compaction
@@ -158,7 +169,7 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 	}{
 		{
 			name:               "conversation model with the reserve fallback",
-			agentsDoc:          prepAgentsDocument,
+			agentsDoc:          compactAgentsDocument,
 			compaction:         `{}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
@@ -171,7 +182,7 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 		},
 		{
 			name:               "compact model override via settings",
-			agentsDoc:          prepAgentsDocument,
+			agentsDoc:          compactAgentsDocument,
 			compaction:         `{"model":"prov/m2"}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
@@ -184,7 +195,7 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 		},
 		{
 			name:               "compact model that does not resolve falls back",
-			agentsDoc:          prepAgentsDocument,
+			agentsDoc:          compactAgentsDocument,
 			compaction:         `{"model":"prov/absent"}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
@@ -197,7 +208,7 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 		},
 		{
 			name:               "compact key that does not resolve falls back",
-			agentsDoc:          prepAgentsDocument,
+			agentsDoc:          compactAgentsDocument,
 			compaction:         `{"model":"p2/m3"}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
@@ -212,7 +223,7 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 			// catalog.Lookup rejects the zero-window model, so the
 			// conversation-model default applies.
 			name:               "compact entry with no positive window falls back",
-			agentsDoc:          prepAgentsDocument,
+			agentsDoc:          compactAgentsDocument,
 			compaction:         `{"model":"prov/mzero"}`,
 			agent:              "solo",
 			wantModel:          conversationRef,
@@ -225,7 +236,7 @@ func TestConcretePrepareCompactCapture(t *testing.T) {
 		},
 		{
 			name:               "conversation reserve from the entry's max output tokens",
-			agentsDoc:          strings.TrimSuffix(prepAgentsDocument, "}") + ",\n  \"reservable\": {\"model\": \"prov/m2\", \"system_prompt\": \"simple\", \"tools\": [\"echo\"]}}",
+			agentsDoc:          strings.TrimSuffix(compactAgentsDocument, "}") + ",\n  \"reservable\": {\"model\": \"prov/m2\", \"system_prompt\": \"simple\", \"tools\": [\"echo\"]}}",
 			compaction:         `{}`,
 			agent:              "reservable",
 			wantModel:          m2Ref,
@@ -324,16 +335,16 @@ func TestConcreteOpenerCompactModel(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			server := newCompactRecordingServer(t)
-			captured, prep := compactPrepWith(t, prepAgentsDocument, compactPrepConfigDocumentWith(server.URL, tc.compaction), server.URL)
+			captured, prep := compactPrepWith(t, compactAgentsDocument, compactPrepConfigDocumentWith(server.URL, tc.compaction), server.URL)
 			sel := compactPrepSelection(t, captured, "solo")
 			capture, opener, err := prep.concretePrepare(context.Background(), compactPrepRequest(), sel)
 			testassert.NoError(t, err)
 			admission := harness.OperationAdmission{
-				SessionID:   "000000000000000000000000000000aa",
-				OperationID: "op-1",
-				AgentType:   "solo",
-				Execution:   capture,
-				AdmittedAt:  time.Now(),
+				SessionID:      "000000000000000000000000000000aa",
+				OperationID:    "op-1",
+				AgentSelection: suppliedDefinition("solo"),
+				Execution:      capture,
+				AdmittedAt:     time.Now(),
 			}
 			inv, err := opener(context.Background(), admission, sel, harness.InvocationRequest{
 				ID:      "inv-maintenance",

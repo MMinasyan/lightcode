@@ -27,10 +27,10 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/client"
+	"github.com/MMinasyan/lightcode/extension"
+	"github.com/MMinasyan/lightcode/extensions/adaptation"
+	"github.com/MMinasyan/lightcode/extensions/agents"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
-	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
-	"github.com/MMinasyan/lightcode/internal/plugins/tasks"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -55,7 +55,8 @@ func composedFlowConfigDocument(modelEndpoint string) string {
   "providers": {
     "prov": {"transport": {"base_url": "` + modelEndpoint + `", "api_key_env": "COMPOSED_TEST_KEY"}, "discovery": false, "models": {"m": {"name": "M", "context_window": 262144}}},
     "connprov": {"transport": {"base_url": "https://conn.test/v1", "api_key_env": "` + composedConnectKeyEnv + `"}, "discovery": false, "models": {"cm": {"name": "CM", "context_window": 8192}}}
-  }
+  },
+  "extensions": {"custom": {"enabled": true, "threshold": 9007199254740993}, "adaptation": {"enabled": true}}
 }`
 }
 
@@ -69,36 +70,49 @@ const composedFlowAgentsDocument = `{
 // mounted generated client must carry unchanged.
 const composedCustomPluginID = "custom"
 
+// composedAgentsNative is the real supplied Agents extension over the
+// shipped standard-tool universe the flow documents select.
+func composedAgentsNative() extension.Native {
+	return agents.Native(agents.Options{
+		CapabilityIDs: append([]string(nil), agents.StandardTools...),
+		ToolIDs:       append([]string(nil), agents.StandardTools...),
+	})
+}
+
 // composedCustomSettingsDocument is the custom plugin's own opaque document;
 // the exact integer lexeme must survive the whole mounted round-trip.
-const composedCustomSettingsDocument = `{"threshold":9007199254740993}`
+const composedCustomSettingsDocument = `{"enabled":true,"threshold":9007199254740993}`
 
 // composedCustomPlugin is the selected custom plugin of the flow: its absent
 // settings section uses the plugin's defaults, its own validator owns the
 // document's interpretation, and its Runtime-scoped factory reports one
 // neutral plugin warning the store attributes to this registration ID.
-func composedCustomPlugin() runtime.Plugin {
-	return runtime.Plugin{
-		ID:       composedCustomPluginID,
-		Scope:    runtime.ScopeRuntime,
-		Provides: []runtime.CapabilitySpec{runtime.Spec[any]("custom.marker")},
-		ValidateConfig: func(raw json.RawMessage) error {
-			if len(raw) == 0 {
-				return nil // the absent section uses the plugin's defaults
-			}
-			var document struct {
-				Threshold *int64 `json:"threshold"`
-			}
-			if err := json.Unmarshal(raw, &document); err != nil || document.Threshold == nil || *document.Threshold < 1 {
-				return errors.New("custom plugin settings require a positive threshold")
-			}
-			return nil
+func composedCustomPlugin() extension.Native {
+	return extension.Native{
+		Declaration: extension.Declaration{
+			ID:           composedCustomPluginID,
+			Version:      "1",
+			ConfigSchema: []byte(`{"type":"object","required":["enabled"],"properties":{"enabled":{"type":"boolean"},"threshold":{"type":"integer","minimum":1}},"additionalProperties":false}`),
+			Components: []extension.Component{{
+				ID:       composedCustomPluginID,
+				Lifetime: extension.LifetimeHarness,
+				Provides: []string{"custom.marker"},
+			}},
+			Capabilities: []extension.Capability{
+				extension.ServiceCapability("custom.marker", "custom.marker.contract", extension.PureMethod("call", `{}`, `{}`)),
+			},
 		},
-		Open: func(_ context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+		Open: func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
 			if info.ReportWarning != nil {
 				info.ReportWarning("notice", "custom plugin scope opened")
 			}
-			return runtime.Instance{Values: map[string]any{"custom.marker": composedCustomPluginID}}, nil
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"custom.marker": {Service: map[string]extension.Handler{
+					"call": func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
+						return extension.Result{Value: json.RawMessage(`{}`)}, nil
+					},
+				}},
+			}}, nil
 		},
 	}
 }
@@ -111,6 +125,9 @@ type composedFlowServer struct {
 	*httptest.Server
 	childGate    chan struct{}
 	releaseChild func()
+
+	mu     sync.Mutex
+	bodies []string
 }
 
 func newComposedFlowServer(t *testing.T) *composedFlowServer {
@@ -126,6 +143,9 @@ func newComposedFlowServer(t *testing.T) *composedFlowServer {
 func (s *composedFlowServer) serve(w http.ResponseWriter, r *http.Request) {
 	raw, _ := io.ReadAll(r.Body)
 	body := string(raw)
+	s.mu.Lock()
+	s.bodies = append(s.bodies, body)
+	s.mu.Unlock()
 	if composedWireRole(body) == "tool" {
 		composedWireTextTurn(w, "done")
 		return
@@ -216,6 +236,40 @@ func composedWireConversationText(body string) string {
 	return b.String()
 }
 
+// composedFlowBodies returns the recorded request bodies in arrival order.
+func (s *composedFlowServer) composedFlowBodies() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.bodies...)
+}
+
+// composedFlowToolResultSeen reports whether one recorded request carries a
+// tool-role message for the call whose content includes the given text.
+func composedFlowToolResultSeen(bodies []string, callID, text string) bool {
+	for _, body := range bodies {
+		var doc struct {
+			Messages []struct {
+				Role       string          `json:"role"`
+				Content    json.RawMessage `json:"content"`
+				ToolCallID string          `json:"tool_call_id"`
+			} `json:"messages"`
+		}
+		if json.Unmarshal([]byte(body), &doc) != nil {
+			continue
+		}
+		for _, message := range doc.Messages {
+			if message.Role != "tool" || message.ToolCallID != callID {
+				continue
+			}
+			var content string
+			if json.Unmarshal(message.Content, &content) == nil && strings.Contains(content, text) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func composedWireSSE(w http.ResponseWriter, events ...string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	for _, event := range events {
@@ -296,6 +350,10 @@ func composedWriteFile(t *testing.T, path, content string) {
 		err := os.WriteFile(path, []byte(content), 0o600)
 		testassert.Require(t, err == nil, "write %s: %v", path, err)
 	}
+}
+
+func composedSelection(name string) *protocol.AgentSelection {
+	return &protocol.AgentSelection{Definition: &protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: name}}
 }
 
 // composedDiscriminator reads one event's discriminator.
@@ -497,7 +555,7 @@ func composedReserveEnv(t *testing.T, name string) {
 // production composition, the mounted authenticated protocol, the generated
 // client, and one authenticated SSE stream, on memory and SQLite stores.
 func TestProtocolComposedFlow(t *testing.T) {
-	run := func(t *testing.T, plugins []runtime.Plugin) {
+	run := func(t *testing.T, plugins []extension.Native) {
 		ctx := context.Background()
 		home := t.TempDir()
 		t.Setenv("HOME", home)
@@ -510,7 +568,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		dataDir := t.TempDir()
 		configPath := filepath.Join(dataDir, "config.json")
 		composedWriteFile(t, configPath, composedFlowConfigDocument(model.URL))
-		composedWriteFile(t, agents.PathForConfig(configPath), composedFlowAgentsDocument)
+		runtime.WriteAgentDefinitionsForTest(t, configPath, composedFlowAgentsDocument)
 
 		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: plugins})
 		testassert.NoError(t, err)
@@ -527,7 +585,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// endpoint is no usable owner.
 		foreign := filepath.Join(t.TempDir(), "foreign.json")
 		wrongCredential := strings.Repeat("0", 64)
-		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N8, wrongCredential))
+		composedWriteFile(t, foreign, fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":%q,"credential":%q}`, ps.Endpoint(), c.InstanceID(), protocol.N12, wrongCredential))
 		{
 			_, err := client.Connect(ctx, foreign)
 			testassert.Require(t, errors.Is(err, client.ErrNoRuntime), "wrong-credential connect = %v, want ErrNoRuntime", err)
@@ -539,7 +597,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 
 		// 1. Create and the real model/tool turn with a captured code group.
 		wsMain := filepath.Join(home, "main-ws")
-		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsMain, AgentType: "main"})
+		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsMain, AgentSelection: composedSelection("main")})
 		testassert.NoError(t, err)
 		testassert.Require(t, created.JSON201 != nil, "CreateSession = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		main := created.JSON201.SessionId
@@ -724,7 +782,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// 5. The child Session runs its own turn and hydrates as an
 		// ordinary Session; the parent receives its completion.
 		composedSubmit(t, c, main, "op-child", "spawn the child")
-		composedAwaitOp(t, c, main, "op-child", protocol.OperationStatusSuccess)
+		h = composedAwaitOp(t, c, main, "op-child", protocol.OperationStatusSuccess)
 		// The child's model turn parks at the server gate, so its background
 		// membership stays observably present on the parent; the identity
 		// comes from the hydrated member, never from a UI string.
@@ -740,6 +798,17 @@ func TestProtocolComposedFlow(t *testing.T) {
 			testassert.Require(t, childID != "" || !time.Now().After(deadline), "the child member never appeared: %+v", h.Background)
 			time.Sleep(10 * time.Millisecond)
 		}
+		// The committed task result carries the actual child identity, and the
+		// parent's next model request receives that result verbatim.
+		childAssistant := composedAssistantOf(t, h.Conversation.Items, "op-child")
+		var childCall *protocol.ToolCallView
+		for i := range childAssistant.ToolCalls {
+			if childAssistant.ToolCalls[i].Id == "call-child" {
+				childCall = &childAssistant.ToolCalls[i]
+			}
+		}
+		testassert.Require(t, childCall != nil && childCall.Name == "task" && childCall.Status != nil && *childCall.Status == protocol.ToolCallStatusSuccess && childCall.Content != nil && strings.Contains(*childCall.Content, childID), "op-child task call = %+v, want a committed success naming the actual child %q", childCall, childID)
+		testassert.Require(t, composedFlowToolResultSeen(model.composedFlowBodies(), "call-child", childID), "no parent model request after the task result carried the actual child identity %q", childID)
 		stream.wait(func(event protocol.Event) bool {
 			if composedDiscriminator(t, event) != "session_changed" {
 				return false
@@ -799,7 +868,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 			testassert.Require(t, strings.Join(got, ",") == strings.Join(olderIDs, ","), "older page after the append = %v, want the anchored %v", got, olderIDs)
 		}
 		wsB := filepath.Join(home, "b-ws")
-		createdB, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsB, AgentType: "main"})
+		createdB, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: wsB, AgentSelection: composedSelection("main")})
 		testassert.NoError(t, err)
 		testassert.Require(t, createdB.JSON201 != nil, "CreateSession(B) = status %d: %s", createdB.HTTPResponse.StatusCode, createdB.Body)
 		sessionB := createdB.JSON201.SessionId
@@ -807,7 +876,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		composedAwaitOp(t, c, sessionB, "op-b", protocol.OperationStatusSuccess)
 		foreignCursor, err := c.GetSessionHistoryWithResponse(ctx, sessionB, &protocol.GetSessionHistoryParams{Cursor: first.OlderCursor})
 		testassert.NoError(t, err)
-		testassert.Require(t, foreignCursor.JSONDefault != nil && foreignCursor.JSONDefault.Code == protocol.Invalid, "cross-session cursor response = %+v (status %d), want the typed invalid refusal", foreignCursor.JSONDefault, foreignCursor.HTTPResponse.StatusCode)
+		testassert.Require(t, foreignCursor.JSONDefault != nil && foreignCursor.JSONDefault.Code == protocol.ErrorCodeInvalid, "cross-session cursor response = %+v (status %d), want the typed invalid refusal", foreignCursor.JSONDefault, foreignCursor.HTTPResponse.StatusCode)
 
 		// 7. Settings: the stale whole-section save succeeds under
 		// last-writer-wins; the top-level tools object and each compiled
@@ -816,37 +885,39 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// opaque document with its exact integer lexeme; the invalid
 		// candidate never publishes.
 		settingsADocument := `{"command_timeout":60,"max_output_bytes":2048,"read_line_max_chars":3000,"read_max_lines":100,"opaque":9007199254740993}`
-		settingsA := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 3, DeleteAfterArchiveDays: 0}, Tools: json.RawMessage(settingsADocument), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`), Plugins: protocol.PluginsSettings{
+		settingsA := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: true, ArchiveAfterDays: 3, DeleteAfterArchiveDays: 0}, Tools: json.RawMessage(settingsADocument), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`), Extensions: protocol.ExtensionsSettings{
 			composedCustomPluginID: composedCustomSettingsDocument,
+			"agents":               `{"enabled":true,"definitions":` + compactComposed(t, []byte(composedFlowAgentsDocument)) + `}`,
+			"adaptation":           `{"enabled":true}`,
 		}}
-		settingsB := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 9, DeleteAfterArchiveDays: 5}, Tools: json.RawMessage(`{}`), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`), Plugins: protocol.PluginsSettings{}}
+		settingsB := protocol.Settings{Sessions: protocol.SessionsSettings{AutoArchive: false, ArchiveAfterDays: 9, DeleteAfterArchiveDays: 5}, Tools: json.RawMessage(`{}`), Jobs: json.RawMessage(`{}`), Compaction: json.RawMessage(`{}`), Extensions: protocol.ExtensionsSettings{}}
 		put := func(settings protocol.Settings) *protocol.UpdateConfigurationSettingsResponse {
 			t.Helper()
-			resp, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: settings})
+			resp, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &settings})
 			testassert.NoError(t, err)
 			return resp
 		}
 		firstPut := put(settingsA)
-		testassert.Require(t, firstPut.JSON200 != nil && firstPut.JSON200.Result.Sessions.AutoArchive && firstPut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && compactComposed(t, firstPut.JSON200.Result.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(firstPut.JSON200.Result.Plugins[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "settings write A = %+v (status %d, body %s), want the published A section with every plugin's exact document", firstPut.JSON200, firstPut.HTTPResponse.StatusCode, firstPut.Body)
+		testassert.Require(t, firstPut.JSON200 != nil && firstPut.JSON200.Result.Sessions.AutoArchive && firstPut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && compactComposed(t, firstPut.JSON200.Result.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(firstPut.JSON200.Result.Extensions[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "settings write A = %+v (status %d, body %s), want the published A section with every plugin's exact document", firstPut.JSON200, firstPut.HTTPResponse.StatusCode, firstPut.Body)
 		secondPut := put(settingsB)
-		testassert.Require(t, secondPut.JSON200 != nil && !secondPut.JSON200.Result.Sessions.AutoArchive && len(secondPut.JSON200.Result.Plugins) == 0, "settings write B = %+v, want the published B section with every plugin section removed", secondPut.JSON200)
+		testassert.Require(t, secondPut.JSON200 != nil && !secondPut.JSON200.Result.Sessions.AutoArchive && len(secondPut.JSON200.Result.Extensions) == 0, "settings write B = %+v, want the published B section with every plugin section removed", secondPut.JSON200)
 		stalePut := put(settingsA)
-		testassert.Require(t, stalePut.JSON200 != nil && stalePut.JSON200.Result.Sessions.AutoArchive && stalePut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays == 0 && compactComposed(t, stalePut.JSON200.Result.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(stalePut.JSON200.Result.Plugins[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "stale whole-section save = %+v, want the wholesale replacement back to A", stalePut.JSON200)
+		testassert.Require(t, stalePut.JSON200 != nil && stalePut.JSON200.Result.Sessions.AutoArchive && stalePut.JSON200.Result.Sessions.ArchiveAfterDays == 3 && stalePut.JSON200.Result.Sessions.DeleteAfterArchiveDays == 0 && compactComposed(t, stalePut.JSON200.Result.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(stalePut.JSON200.Result.Extensions[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "stale whole-section save = %+v, want the wholesale replacement back to A", stalePut.JSON200)
 		publishedGeneration := stalePut.JSON200.ConfigurationRevision.Generation
-		invalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Plugins: protocol.PluginsSettings{"tasks": `{"max_concurrent":99,"max_output_bytes":4096}`}}
-		refused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: invalid})
+		invalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Extensions: protocol.ExtensionsSettings{"agents": `{"enabled":true,"task":{"max_concurrent":99,"max_output_bytes":4096}}`}}
+		refused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &invalid})
 		testassert.NoError(t, err)
-		testassert.Require(t, refused.JSONDefault != nil && refused.JSONDefault.Code == protocol.Configuration, "invalid settings response = %+v (status %d), want the typed configuration refusal", refused.JSONDefault, refused.HTTPResponse.StatusCode)
+		testassert.Require(t, refused.JSONDefault != nil && refused.JSONDefault.Code == protocol.ErrorCodeConfiguration, "invalid settings response = %+v (status %d), want the typed configuration refusal", refused.JSONDefault, refused.HTTPResponse.StatusCode)
 		// The selected custom plugin's own validator refuses its invalid
 		// document with the same configuration class.
-		customInvalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Plugins: protocol.PluginsSettings{composedCustomPluginID: `{"threshold":0}`}}
-		customRefused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: customInvalid})
+		customInvalid := protocol.Settings{Sessions: settingsA.Sessions, Tools: settingsA.Tools, Jobs: settingsA.Jobs, Compaction: settingsA.Compaction, Extensions: protocol.ExtensionsSettings{composedCustomPluginID: `{"enabled":true,"threshold":0}`}}
+		customRefused, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{Settings: &customInvalid})
 		testassert.NoError(t, err)
-		testassert.Require(t, customRefused.JSONDefault != nil && customRefused.JSONDefault.Code == protocol.Configuration, "invalid custom settings response = %+v (status %d), want the typed configuration refusal", customRefused.JSONDefault, customRefused.HTTPResponse.StatusCode)
+		testassert.Require(t, customRefused.JSONDefault != nil && customRefused.JSONDefault.Code == protocol.ErrorCodeConfiguration, "invalid custom settings response = %+v (status %d), want the typed configuration refusal", customRefused.JSONDefault, customRefused.HTTPResponse.StatusCode)
 		view, err := c.GetConfigurationWithResponse(ctx)
 		testassert.NoError(t, err)
 		testassert.Require(t, view.JSON200 != nil, "GetConfiguration = status %d: %s", view.HTTPResponse.StatusCode, view.Body)
-		testassert.Require(t, view.JSON200.ConfigurationRevision.Generation == publishedGeneration && view.JSON200.Settings.Sessions.AutoArchive && view.JSON200.Settings.Sessions.ArchiveAfterDays == 3 && compactComposed(t, view.JSON200.Settings.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(view.JSON200.Settings.Plugins[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "configuration after the refused write = %+v, want the unchanged last publication", view.JSON200)
+		testassert.Require(t, view.JSON200.ConfigurationRevision.Generation == publishedGeneration && view.JSON200.Settings.Sessions.AutoArchive && view.JSON200.Settings.Sessions.ArchiveAfterDays == 3 && compactComposed(t, view.JSON200.Settings.Tools) == compactComposed(t, []byte(settingsADocument)) && compactComposed(t, []byte(view.JSON200.Settings.Extensions[composedCustomPluginID])) == compactComposed(t, []byte(composedCustomSettingsDocument)), "configuration after the refused write = %+v, want the unchanged last publication", view.JSON200)
 
 		// The custom plugin's neutral warning: the Runtime-scoped factory's
 		// report carries its own registered source through the mounted
@@ -883,9 +954,24 @@ func TestProtocolComposedFlow(t *testing.T) {
 		// configured while the provider is connected, the disconnect removes
 		// the managed key, and the following admission refuses with no
 		// published Operation.
-		selected, err := c.SetAgentTypeModelWithResponse(ctx, &protocol.SetAgentTypeModelParams{AgentType: "main"}, protocol.SetAgentTypeModelRequest{Model: "connprov/cm"})
+		editArguments, err := json.Marshal(map[string]string{"definition_id": "main", "model": "connprov/cm"})
 		testassert.NoError(t, err)
-		testassert.Require(t, selected.JSON200 != nil && selected.JSON200.Result.Model == "connprov/cm", "selected model edit = %+v, want the main roster entry's connected-provider model", selected.JSON200)
+		selected, err := c.UpdateConfigurationSettingsWithResponse(ctx, protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
+			ExtensionId: "agents",
+			EditId:      "set_model",
+			Arguments:   string(editArguments),
+		}})
+		testassert.NoError(t, err)
+		testassert.Require(t, selected.JSON200 != nil, "selected model edit = %+v, want the published mutation", selected.JSON200)
+		editedConfiguration, err := c.GetConfigurationWithResponse(ctx)
+		testassert.NoError(t, err)
+		editedModel := false
+		for _, agent := range editedConfiguration.JSON200.Agents {
+			if agent.Definition.DefinitionId == "main" && agent.Model == "connprov/cm" {
+				editedModel = true
+			}
+		}
+		testassert.Require(t, editedModel, "roster = %+v, want the main entry's connected-provider model", editedConfiguration.JSON200.Agents)
 		disconnected, err := c.DisconnectProviderWithResponse(ctx, &protocol.DisconnectProviderParams{ProviderId: "connprov"})
 		testassert.NoError(t, err)
 		testassert.Require(t, disconnected.JSON200 != nil && disconnected.JSON200.Result != nil && !disconnected.JSON200.Result.Connected, "disconnect response = %+v, want the disconnected provider view", disconnected.JSON200)
@@ -897,7 +983,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 			Content:     []protocol.ContentPart{refusedPart},
 		})
 		testassert.NoError(t, err)
-		testassert.Require(t, refusedSubmit.JSONDefault != nil && refusedSubmit.JSONDefault.Code == protocol.Invalid && refusedSubmit.HTTPResponse.StatusCode == http.StatusBadRequest, "refused submit response = %+v (status %d), want the typed invalid refusal over HTTP 400", refusedSubmit.JSONDefault, refusedSubmit.HTTPResponse.StatusCode)
+		testassert.Require(t, refusedSubmit.JSONDefault != nil && refusedSubmit.JSONDefault.Code == protocol.ErrorCodeInvalid && refusedSubmit.HTTPResponse.StatusCode == http.StatusBadRequest, "refused submit response = %+v (status %d), want the typed invalid refusal over HTTP 400", refusedSubmit.JSONDefault, refusedSubmit.HTTPResponse.StatusCode)
 		afterRefusal := composedHydrate(t, c, main)
 		for _, operation := range afterRefusal.Operations {
 			testassert.Require(t, operation.OperationId != "op-refused", "the refused admission published operation %+v, want no Operation", operation)
@@ -918,7 +1004,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		testassert.Require(t, archivedChild.JSON200 != nil, "archive child = status %d: %s", archivedChild.HTTPResponse.StatusCode, archivedChild.Body)
 		deletedChild, err := c.DeleteSessionWithResponse(ctx, childID)
 		testassert.NoError(t, err)
-		testassert.Require(t, deletedChild.HTTPResponse.StatusCode == http.StatusNoContent, "delete child = status %d: %s", deletedChild.HTTPResponse.StatusCode, deletedChild.Body)
+		testassert.Require(t, deletedChild.JSON200 != nil && len(deletedChild.JSON200.CleanupFailures) == 0, "delete child = status %d: %s", deletedChild.HTTPResponse.StatusCode, deletedChild.Body)
 		archived, err := c.ArchiveSessionWithResponse(ctx, main)
 		testassert.NoError(t, err)
 		testassert.Require(t, archived.JSON200 != nil && archived.JSON200.Lifecycle == protocol.Archived, "archive main = %+v (status %d)", archived.JSON200, archived.HTTPResponse.StatusCode)
@@ -933,10 +1019,10 @@ func TestProtocolComposedFlow(t *testing.T) {
 		}
 		deleted, err := c.DeleteSessionWithResponse(ctx, main)
 		testassert.NoError(t, err)
-		testassert.Require(t, deleted.HTTPResponse.StatusCode == http.StatusNoContent, "delete main = status %d: %s", deleted.HTTPResponse.StatusCode, deleted.Body)
+		testassert.Require(t, deleted.JSON200 != nil && len(deleted.JSON200.CleanupFailures) == 0, "delete main = status %d: %s", deleted.HTTPResponse.StatusCode, deleted.Body)
 		missing, err := c.GetSessionHydrationWithResponse(ctx, main)
 		testassert.NoError(t, err)
-		testassert.Require(t, missing.JSON200 == nil && missing.JSONDefault != nil && missing.JSONDefault.Code == protocol.NotFound, "deleted session read = (%+v, %+v), want the typed not-found", missing.JSON200, missing.JSONDefault)
+		testassert.Require(t, missing.JSON200 == nil && missing.JSONDefault != nil && missing.JSONDefault.Code == protocol.ErrorCodeNotFound, "deleted session read = (%+v, %+v), want the typed not-found", missing.JSON200, missing.JSONDefault)
 		mainList, err := c.ListSessionsWithResponse(ctx, &protocol.ListSessionsParams{Workspace: wsMain, Lifecycle: protocol.Open})
 		testassert.NoError(t, err)
 		testassert.Require(t, mainList.JSON200 != nil && len(*mainList.JSON200) == 0, "deleted workspace list = %+v (status %d), want the empty array", mainList.JSON200, mainList.HTTPResponse.StatusCode)
@@ -965,7 +1051,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 
 	// The shipped composition over the included store: the composition's
 	// optional plugins ride the directly constructed baseline services.
-	run(t, []runtime.Plugin{adaptation.Plugin(), tasks.Plugin(), composedCustomPlugin()})
+	run(t, []extension.Native{adaptation.Native(), composedAgentsNative(), composedCustomPlugin()})
 }
 
 func composedHistory(t *testing.T, c *client.Client, sessionID string, cursor *string) *protocol.HistoryPage {
@@ -1232,10 +1318,9 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		dataDir := t.TempDir()
 		configPath := filepath.Join(dataDir, "config.json")
 		composedWriteFile(t, configPath, heldConfigDocument(model.URL, heldOldKeyEnv, false))
-		agentsPath := agents.PathForConfig(configPath)
-		composedWriteFile(t, agentsPath, heldAgentsMain)
+		runtime.WriteAgentDefinitionsForTest(t, configPath, heldAgentsMain)
 
-		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath})
+		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []extension.Native{composedAgentsNative()}})
 		testassert.NoError(t, err)
 		store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
 		testassert.NoError(t, err)
@@ -1249,7 +1334,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		testassert.NoError(t, err)
 
 		ws := filepath.Join(home, "held-ws")
-		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: ws, AgentType: "main"})
+		created, err := c.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: ws, AgentSelection: composedSelection("main")})
 		testassert.NoError(t, err)
 		testassert.Require(t, created.JSON201 != nil, "CreateSession = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		sessionID := created.JSON201.SessionId
@@ -1273,7 +1358,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		// and publish the changed configuration — whose command policy denies
 		// every later command.
 		composedWriteFile(t, configPath, heldConfigDocument(model.URL, heldNewKeyEnv, true))
-		composedWriteFile(t, agentsPath, heldAgentsRetargeted)
+		runtime.WriteAgentDefinitionsForTest(t, configPath, heldAgentsRetargeted)
 		connectKey := heldManagedValue
 		connected, err := c.ConnectProviderWithResponse(ctx, &protocol.ConnectProviderParams{ProviderId: "connprov"}, protocol.ConnectRequest{ApiKey: &connectKey})
 		testassert.NoError(t, err)

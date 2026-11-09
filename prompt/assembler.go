@@ -65,16 +65,16 @@ const agentPromptHeading = "## Your Role and Instructions"
 
 // Warning is one non-fatal rule-reading diagnostic.
 type Warning struct {
-	Kind    string
-	Message string
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
 }
 
 // Rules is the captured rule text one assembly consumes. Warnings carries the
 // diagnostics of the read that produced it.
 type Rules struct {
-	GlobalText    string
-	WorkspaceText string
-	Warnings      []Warning
+	GlobalText    string    `json:"global_text"`
+	WorkspaceText string    `json:"workspace_text"`
+	Warnings      []Warning `json:"warnings,omitempty"`
 }
 
 // AssemblyInput is the complete pure input of one baseline prompt. Identity is
@@ -82,15 +82,15 @@ type Rules struct {
 // OS, Shell and OSDescription are captured environment values rendered by the
 // full and simple sizes; OS is the platform identifier.
 type AssemblyInput struct {
-	Identity      string
-	Instructions  string
-	Mode          Mode
-	Rules         Rules
-	Workspace     string
-	SessionStart  time.Time
-	OS            string
-	Shell         string
-	OSDescription string
+	Identity      string    `json:"identity"`
+	Instructions  string    `json:"instructions"`
+	Mode          Mode      `json:"mode"`
+	Rules         Rules     `json:"rules"`
+	Workspace     string    `json:"workspace"`
+	SessionStart  time.Time `json:"session_start"`
+	OS            string    `json:"os"`
+	Shell         string    `json:"shell"`
+	OSDescription string    `json:"os_description"`
 }
 
 // ReadRules reads the current global and Workspace AGENTS.md text for mode.

@@ -60,7 +60,7 @@ func prepare(t *testing.T, tool Tool, tc ToolContext, name, args string) harness
 // normalize runs one tool's normalization over raw argument bytes.
 func normalize(t *testing.T, tool Tool, tc ToolContext, name, args string) (json.RawMessage, error) {
 	t.Helper()
-	return tool.Normalize(tc, makeCall(t, name, args))
+	return tool.Normalize(context.Background(), tc, makeCall(t, name, args))
 }
 
 // groupDir is the exact per-Operation code-group directory the mutating

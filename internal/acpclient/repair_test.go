@@ -55,7 +55,7 @@ type frameFixture struct {
 // SessionHeader is one generated Session header document for the startup
 // fixtures.
 func SessionHeader(id, workspace, lastActivity string) string {
-	return fmt.Sprintf(`{"session_id":%q,"workspace":%q,"agent_type":"primary","lifecycle":"open","created_at":"2026-10-01T00:00:00Z","last_activity":%q,"session_revision":{"durable_revision":"1","local_revision":"0","instance_id":%q}}`, id, workspace, lastActivity, frameInstance)
+	return fmt.Sprintf(`{"session_id":%q,"workspace":%q,"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"}},"lifecycle":"open","created_at":"2026-10-01T00:00:00Z","last_activity":%q,"session_revision":{"durable_revision":"1","local_revision":"0","instance_id":%q}}`, id, workspace, lastActivity, frameInstance)
 }
 
 func newFrameFixture(t *testing.T, instance string, parkHydration bool) *frameFixture {
@@ -87,9 +87,14 @@ func newFrameFixture(t *testing.T, instance string, parkHydration bool) *frameFi
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"8"}`, f.instance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"12"}`, f.instance)
 	})
 	mux.HandleFunc("/v1/events", f.serveEvents)
+	mux.HandleFunc("/v1/configuration", func(w http.ResponseWriter, r *http.Request) {
+		f.note(r)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"agents":[{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}]}`)
+	})
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		f.note(r)
 		w.Header().Set("Content-Type", "application/json")
@@ -267,7 +272,7 @@ func (f *frameFixture) marker(open int) chan string {
 // writeRecord publishes this fixture's live discovery record.
 func (f *frameFixture) writeRecord(t *testing.T, dataDir string) {
 	t.Helper()
-	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"8","credential":%q}`,
+	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"12","credential":%q}`,
 		f.server.URL, f.instance, frameCredential)
 	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600))
 }

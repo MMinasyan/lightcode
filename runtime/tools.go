@@ -5,28 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
-	"slices"
 	"sync"
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/model"
 )
-
-// toolType is the declared-type identity of the public Tool contract: a
-// Provides declaration whose type is exactly this interface is a tool
-// declaration, its ID is the model-visible tool name, and its description
-// function is mandatory.
-var toolType = reflect.TypeFor[Tool]()
-
-// ToolConstraints carries the selected Agent's hard capability constraints:
-// only the readonly/write-dir boundary. Description receives the resolved
-// Agent definition's values and execution the values from its validated
-// capture; tools supply neither and cannot loosen them.
-type ToolConstraints struct {
-	Readonly bool
-	WriteDir string
-}
 
 // ToolDescription is one static tool description: the model-visible
 // definition and whether the tool is available under the hard constraints
@@ -36,21 +19,11 @@ type ToolDescription struct {
 	Available  bool
 }
 
-// ChildRequest has no parent field: the parent is the calling Session.
-type ChildRequest struct {
-	AgentType     string
-	Content       []model.ContentPart
-	OperationID   string
-	MaxConcurrent int
-	OutputLimit   int
-}
-
-// BackgroundServices is the background-work surface one prepared call carries:
-// child launch, job start, and completion delivery over the Runtime's public
-// Harness methods. The Runtime's implementation is the bound object the
-// production opener creates per tool call; the zero ToolContext carries none.
+// BackgroundServices is the baseline background-work surface one standard tool
+// call carries: job start and completion delivery over the Runtime's public
+// Harness methods. Extension child launch is a declared native host service,
+// never a Go callback on this interface.
 type BackgroundServices interface {
-	LaunchChild(req ChildRequest) (childSessionID string, err error)
 	StartJob(jobID string, spawn func(ctx context.Context, deliver func(content string) error) error) error
 }
 
@@ -71,12 +44,11 @@ type boundBackground struct {
 	bridge    *backgroundBridge
 	sessionID string
 
-	mu          sync.Mutex
-	permissions []harness.PermissionRequest
-	ctx         context.Context
-	cancel      context.CancelFunc
-	closed      bool
-	entries     sync.WaitGroup
+	mu      sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	closed  bool
+	entries sync.WaitGroup
 }
 
 // enter admits one call only while the object is armed, not closed, and its
@@ -120,40 +92,6 @@ func (b *boundBackground) close() {
 	b.entries.Wait()
 }
 
-// permits reports whether the frozen pairs carry the requested child-launch
-// permission.
-func (b *boundBackground) permits(target string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return slices.Contains(b.permissions, harness.PermissionRequest{Permission: harness.PermissionChildLaunch, Target: target})
-}
-
-// LaunchChild launches one child Session under the bound Session and the
-// frozen permission pairs. A target the plan did not declare is refused with
-// the same ErrClosed failure as every other closed-authority call.
-func (b *boundBackground) LaunchChild(req ChildRequest) (string, error) {
-	ctx, done, err := b.enter()
-	if err != nil {
-		return "", err
-	}
-	defer done()
-	if !b.permits(req.AgentType) {
-		return "", fmt.Errorf("background services: child target %q: %w", req.AgentType, ErrClosed)
-	}
-	result, err := b.bridge.h.LaunchChildSession(ctx, harness.LaunchChildRequest{
-		ParentSessionID: b.sessionID,
-		AgentType:       req.AgentType,
-		Content:         req.Content,
-		OperationID:     req.OperationID,
-		MaxConcurrent:   req.MaxConcurrent,
-		OutputLimit:     req.OutputLimit,
-	})
-	if err != nil {
-		return "", err
-	}
-	return result.ChildSessionID, nil
-}
-
 // StartJob starts one background job under the bound Session. The Harness
 // stays the validation owner; a nil spawn is forwarded as nil. A successful
 // start's deliver closure outlives the tool call: delivery is the job's
@@ -175,17 +113,11 @@ func (b *boundBackground) StartJob(jobID string, spawn func(ctx context.Context,
 	return b.bridge.h.StartJob(ctx, b.sessionID, jobID, forwarded)
 }
 
-// bindPlan freezes one prepared plan's permissions and binds this call's
-// background authority to its executor. The frozen clone replaces the plan's
-// pairs, so the Harness evaluates exactly the pairs the object enforces and
-// the producer holds no reference to them. A plan without an executor is
-// returned unchanged and the object never arms.
+// bindPlan binds this standard tool call's background authority to its
+// executor. A plan without an executor is returned unchanged and the object
+// never arms. Extension tools bind their own authorized call context in the
+// native adapter and never pass through this baseline path.
 func (b *boundBackground) bindPlan(plan harness.PreparedTool) harness.PreparedTool {
-	permissions := slices.Clone(plan.Permissions)
-	plan.Permissions = permissions
-	b.mu.Lock()
-	b.permissions = permissions
-	b.mu.Unlock()
 	if plan.Execute == nil {
 		return plan
 	}
@@ -207,10 +139,15 @@ func (b *boundBackground) bindPlan(plan harness.PreparedTool) harness.PreparedTo
 // exposes neither the complete admission register nor file/command-specific
 // numeric fields.
 type ToolContext struct {
+	Session       harness.SessionIdentity
+	Model         model.ModelRef
 	Workspace     string
+	OperationID   string
+	InvocationID  string
+	Purpose       harness.InvocationPurpose
 	AdmittedEntry harness.EntryRef
 	Invocation    Invocation
-	Constraints   ToolConstraints
+	Constraints   harness.ToolConstraints
 	Background    BackgroundServices
 
 	// SubprocessEnv is invoked at each concrete process start — foreground
@@ -231,38 +168,6 @@ type ToolContext struct {
 // receive the same ToolContext; normalization supplies the immutable call
 // facts preparation consumes.
 type Tool interface {
-	Normalize(ToolContext, model.ToolCall) (json.RawMessage, error)
+	Normalize(context.Context, ToolContext, model.ToolCall) (json.RawMessage, error)
 	Prepare(context.Context, ToolContext, model.ToolCall) harness.PreparedTool
-}
-
-// ToolSpec is the Provides declaration for the public Tool contract: it
-// records the tool ID, the Tool interface type, and the pure description
-// function in one CapabilitySpec. The recorded description validates and
-// copies the returned definition and enforces the ID/name match when invoked;
-// no execution instance is constructed to obtain the declaration's metadata.
-// A nil description function records a declaration lacking one, which
-// composition rejects.
-func ToolSpec(id string, describe func(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error)) CapabilitySpec {
-	if describe == nil {
-		return CapabilitySpec{id: id, typ: toolType}
-	}
-	return CapabilitySpec{
-		id:  id,
-		typ: toolType,
-		describe: func(invocation Invocation, constraints ToolConstraints, identity harness.SessionIdentity) (ToolDescription, error) {
-			description, err := describe(invocation, constraints, identity)
-			if err != nil {
-				return ToolDescription{}, err
-			}
-			definition, err := model.NewToolDefinition(description.Definition)
-			if err != nil {
-				return ToolDescription{}, fmt.Errorf("tool %q: %w", id, err)
-			}
-			if definition.Name != id {
-				return ToolDescription{}, fmt.Errorf("tool %q: description declares name %q", id, definition.Name)
-			}
-			description.Definition = definition
-			return description, nil
-		},
-	}
 }

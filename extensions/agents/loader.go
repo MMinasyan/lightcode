@@ -3,17 +3,11 @@ package agents
 import (
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/MMinasyan/lightcode/model"
 )
-
-// PathForConfig returns the agents.json path beside the active config.json.
-func PathForConfig(configPath string) string {
-	return filepath.Join(filepath.Dir(configPath), "agents.json")
-}
 
 type Config struct {
 	defs     map[string]Definition

@@ -818,7 +818,7 @@ func (h *Harness) StartJob(ctx context.Context, sessionID, jobID string, spawn f
 // the completion output limit in UTF-8 bytes.
 type LaunchChildRequest struct {
 	ParentSessionID string
-	AgentType       string
+	AgentSelection  AgentSelection
 	Content         []model.ContentPart
 	OperationID     string // caller-generated, globally unique
 	MaxConcurrent   int    // 1..20
@@ -847,6 +847,10 @@ type LaunchChildResult struct {
 // running Operation for recovery — and the launch never retries nor publishes
 // a partial child.
 func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest) (LaunchChildResult, error) {
+	if err := validateAgentSelection(req.AgentSelection); err != nil {
+		return LaunchChildResult{}, invalidInput("agent selection: %v", err)
+	}
+	req.AgentSelection = ownAgentSelection(req.AgentSelection)
 	if req.MaxConcurrent < 1 || req.MaxConcurrent > 20 {
 		return LaunchChildResult{}, invalidInput("max concurrent %d is outside 1..20", req.MaxConcurrent)
 	}
@@ -885,8 +889,8 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 		ParentSessionID: req.ParentSessionID,
 	}
 	prepared, capture, prepCtx, cleanup, err := h.prepareExecution(ctx, PreparationSession{
-		Identity:  childIdentity,
-		AgentType: req.AgentType,
+		Identity:       childIdentity,
+		AgentSelection: req.AgentSelection,
 	}, RequestKindMessage)
 	if err != nil {
 		return LaunchChildResult{}, err
@@ -905,10 +909,10 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	child := SessionRecord{
 		Identity: childIdentity,
 		State: SessionState{
-			Lifecycle:        LifecycleOpen,
-			CurrentAgentType: req.AgentType,
-			Usage:            UsageTotals{},
-			LastActivity:     now,
+			Lifecycle:      LifecycleOpen,
+			AgentSelection: req.AgentSelection,
+			Usage:          UsageTotals{},
+			LastActivity:   now,
 		},
 	}
 	err = h.deps.Storage.Transact(prepCtx, func(tx Transaction) error {

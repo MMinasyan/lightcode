@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -34,7 +35,7 @@ func (r *Runtime) getConfiguration(ctx context.Context) (protocol.ConfigurationV
 	}
 	return protocol.ConfigurationView{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Settings:              projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.plugins),
+		Settings:              projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.extensions),
 		Agents:                projectAgents(captured.snapshot),
 		Providers:             projectProviders(captured),
 	}, nil
@@ -152,60 +153,41 @@ func (r *Runtime) getWarnings(ctx context.Context) (protocol.WarningsSnapshot, e
 	}, nil
 }
 
-// updateSettings replaces the complete settings shape through the one
-// configuration mutation path: the whole sessions member and the whole
-// plugins member are written as the generated target shape — each plugin
-// document string becomes that plugin's owned raw section, an omitted
-// section removing any newer one — and every successful edit atomically
-// rewrites the owning main configuration and publishes the next generation,
-// identical bytes and absent-member resets included. Unowned top-level root
-// members are untouched. The result projects the returned candidate, never a
-// second current() load that could see a later writer.
-func (r *Runtime) updateSettings(ctx context.Context, settings protocol.Settings) (protocol.SettingsMutation, error) {
+// updateSettings is the one configuration settings/extension-edit writer: the
+// request carries exactly one of the complete settings shape or one declared
+// extension configuration edit. A settings write replaces the whole sessions
+// member and the whole extensions member as the generated target shape — each
+// extension document string becomes that extension's owned raw section, an
+// omitted section removing any newer one — while a declared edit transforms
+// only its own extension's latest raw section. Every successful edit
+// atomically rewrites the owning main configuration and publishes the next
+// generation, identical bytes and absent-member resets included. Unowned
+// top-level root members are untouched. The result projects the returned
+// candidate, never a second current() load that could see a later writer.
+func (r *Runtime) updateSettings(ctx context.Context, request protocol.UpdateSettingsRequest) (protocol.SettingsMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.SettingsMutation{}, err
 	}
 	defer release()
-	captured, err := r.config.mutate(ctx, editSettings(settings))
+	switch {
+	case (request.Settings == nil) == (request.ExtensionEdit == nil):
+		return protocol.SettingsMutation{}, fmt.Errorf("settings request requires exactly one of settings or extension_edit: %w", harness.ErrInvalid)
+	}
+	var edit configurationEdit
+	if request.ExtensionEdit != nil {
+		edit = r.config.editExtension(ctx, request.ExtensionEdit.ExtensionId, request.ExtensionEdit.EditId, json.RawMessage(request.ExtensionEdit.Arguments))
+	} else {
+		edit = editSettings(*request.Settings)
+	}
+	captured, err := r.config.mutate(ctx, edit)
 	if err != nil {
 		return protocol.SettingsMutation{}, err
 	}
 	return protocol.SettingsMutation{
 		ConfigurationRevision: configurationRevision(captured.snapshot),
-		Result:                projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.plugins),
+		Result:                projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.extensions),
 	}, nil
-}
-
-// setAgentTypeModel edits one known Agent type's user model override through
-// the same mutation path: a nonempty ref replaces it, an empty string clears
-// it. Every successful request — set, clear, absent override, identical
-// bytes — writes the owning agents file and publishes the next generation;
-// the no-override exception belongs to the retained public field reset
-// operator, which this client is not. An unknown or dropped type fails
-// invalid and writes nothing; the result projects from the returned
-// candidate.
-func (r *Runtime) setAgentTypeModel(ctx context.Context, agentType, modelRef string) (protocol.AgentMutation, error) {
-	release, err := r.enter(ctx)
-	if err != nil {
-		return protocol.AgentMutation{}, err
-	}
-	defer release()
-	captured, err := r.config.mutate(ctx, r.config.editAgentModel(agentType, modelRef))
-	if err != nil {
-		return protocol.AgentMutation{}, err
-	}
-	mutation := protocol.AgentMutation{ConfigurationRevision: configurationRevision(captured.snapshot)}
-	for _, agent := range projectAgents(captured.snapshot) {
-		if agent.Name == agentType {
-			mutation.Result = agent
-			break
-		}
-	}
-	// The edit's known-type check already guarantees the requested type is a
-	// member of the returned candidate's roster, so Result is always set on
-	// every supported request.
-	return mutation, nil
 }
 
 // The provider/model metadata mutations: every operator is one admitted call
@@ -536,23 +518,27 @@ func projectModelListEntry(prov *catalog.Provider, entry *catalog.Model) protoco
 	}
 }
 
-// projectAgents maps the captured definitions onto the roster view through
-// the existing agentTypes() projection — the one selected-model and
-// write-dir normalization producer admission already uses. Required array
-// members are owned non-nil lists even when the definition carries none, and
-// no private definition field (system prompt, prompt body) is exposed.
+// projectAgents maps the captured resolver roster onto the roster view. Each
+// entry carries its complete source-qualified reference, stamped by the owner
+// from the supplying declaration; two providers may use the same displayed
+// name. Required array members are owned non-nil lists even when the
+// definition carries none, and no private definition field (prompt body) is
+// exposed.
 func projectAgents(captured *configuration) []protocol.Agent {
 	out := make([]protocol.Agent, 0, len(captured.definitions))
-	for _, at := range captured.agentTypes() {
+	for _, at := range captured.definitions {
+		inputs := at.inputs.Owned()
+		deref := inputs.Model
 		out = append(out, protocol.Agent{
-			Name:         at.Name,
-			Description:  at.Description,
-			Subagent:     at.Subagent,
-			Model:        modelRefString(at.Model),
-			Readonly:     at.Readonly,
-			WriteDir:     at.WriteDir,
-			Tools:        ownStrings(at.Tools),
-			Capabilities: ownStrings(at.Capabilities),
+			Name:         at.name,
+			Definition:   protocol.DefinitionRef{ExtensionId: at.ref.ExtensionID, CapabilityId: at.ref.CapabilityID, DefinitionId: at.ref.DefinitionID},
+			Description:  at.description,
+			Subagent:     at.subagent,
+			Model:        modelRefString(deref),
+			Readonly:     inputs.Constraints.Readonly,
+			WriteDir:     inputs.Constraints.WriteDir,
+			Tools:        ownStrings(inputs.Tools),
+			Capabilities: ownStrings(inputs.Capabilities),
 		})
 	}
 	return out

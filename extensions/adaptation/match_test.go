@@ -9,15 +9,15 @@ import (
 	"github.com/MMinasyan/lightcode/internal/testassert"
 )
 
-func TestMatchInOrderingMostSpecificFirst(t *testing.T) {
-	// gpt-oss* is listed before gpt-* so the more specific family wins on overlap.
+func TestMatcherOrderingFirstMatch(t *testing.T) {
+	// gpt-oss* is listed before gpt-* so the first matching row wins on overlap.
 	tbl := []entry{
 		{pattern: "gpt-oss*", adapt: Adaptation{Append: []string{"gpt-oss-addition"}}},
 		{pattern: "gpt-*", adapt: Adaptation{Append: []string{"gpt-addition"}}},
 	}
 	cases := []struct {
 		id   string
-		want string // first append marker, "" means nil
+		want string // first append marker
 	}{
 		{"gpt-oss-20b", "gpt-oss-addition"},
 		{"gpt-oss-120b", "gpt-oss-addition"}, // first match wins on overlap
@@ -26,71 +26,52 @@ func TestMatchInOrderingMostSpecificFirst(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.id, func(t *testing.T) {
-			got := matchIn(tbl, tc.id)
-			testassert.Require(t, got != nil, "matchIn(%q) = nil, want %q", tc.id, tc.want)
-			testassert.Require(t, got.Append[0] == tc.want, "matchIn(%q).Append[0] = %q, want %q", tc.id, got.Append[0], tc.want)
+			got := matchEntryIn(tbl, tc.id)
+			testassert.Require(t, got != nil, "matchEntryIn(%q) = nil, want %q", tc.id, tc.want)
+			testassert.Require(t, got.adapt.Append[0] == tc.want, "matchEntryIn(%q).adapt.Append[0] = %q, want %q", tc.id, got.adapt.Append[0], tc.want)
 		})
 	}
 }
 
-func TestMatchInAbstention(t *testing.T) {
+func TestMatcherAbstention(t *testing.T) {
 	tbl := []entry{{pattern: "gpt-*", adapt: Adaptation{Append: []string{"gpt-addition"}}}}
 	for _, id := range []string{"claude-opus-4-8", "qwen3.7-plus", "", "gp"} {
 		{
-			got := matchIn(tbl, id)
-			testassert.Require(t, got == nil, "matchIn(%q) = %+v, want nil", id, got)
+			got := matchEntryIn(tbl, id)
+			testassert.Require(t, got == nil, "matchEntryIn(%q) = %+v, want nil", id, got)
 		}
 	}
 }
 
-func TestMatchInCaseInsensitive(t *testing.T) {
+func TestMatcherCaseInsensitive(t *testing.T) {
 	tbl := []entry{{pattern: "GPT-OSS*", adapt: Adaptation{Append: []string{"gpt-oss-addition"}}}}
 	// Both the pattern (upper) and the input (mixed) are folded before matching.
 	for _, id := range []string{"gpt-oss-20b", "GPT-OSS-20B", "Gpt-Oss-20b"} {
-		got := matchIn(tbl, id)
-		testassert.Require(t, got != nil && got.Append[0] == "gpt-oss-addition", "matchIn(%q) = %+v, want the gpt-oss row", id, got)
+		got := matchEntryIn(tbl, id)
+		testassert.Require(t, got != nil && got.adapt.Append[0] == "gpt-oss-addition", "matchEntryIn(%q) = %+v, want the gpt-oss row", id, got)
 	}
 }
 
-func TestMatchInSlashContainingBareID(t *testing.T) {
+func TestMatcherSlashContainingBareID(t *testing.T) {
 	// A bare model id can itself contain slashes (coremodel.Parse cuts only the
 	// first '/'), so the wildcard must cross '/'.
 	tbl := []entry{{pattern: "deepseek*", adapt: Adaptation{Append: []string{"deepseek-addition"}}}}
-	got := matchIn(tbl, "deepseek/deepseek-chat")
-	testassert.Require(t, got != nil && got.Append[0] == "deepseek-addition", "matchIn(deepseek/deepseek-chat) = %+v, want the deepseek row", got)
+	got := matchEntryIn(tbl, "deepseek/deepseek-chat")
+	testassert.Require(t, got != nil && got.adapt.Append[0] == "deepseek-addition", "matchEntryIn(deepseek/deepseek-chat) = %+v, want the deepseek row", got)
 }
 
-func TestMatchInIsAnchoredNotSubstring(t *testing.T) {
-	// The resolver is always fed the bare model id; a provider-prefixed string
-	// must not match a pattern that the bare id matches (documents "feed ref.Model").
+func TestMatcherIsAnchoredNotSubstring(t *testing.T) {
+	// The matcher is always fed the bare model id; a provider-prefixed string
+	// must not match a pattern that the bare id matches.
 	tbl := []entry{{pattern: "gpt-5*", adapt: Adaptation{Append: []string{"gpt5-addition"}}}}
 	{
-		got := matchIn(tbl, "gpt-5.4")
-		testassert.Require(t, got != nil && got.Append[0] == "gpt5-addition", "matchIn(gpt-5.4) = %+v, want the gpt-5 row", got)
+		got := matchEntryIn(tbl, "gpt-5.4")
+		testassert.Require(t, got != nil && got.adapt.Append[0] == "gpt5-addition", "matchEntryIn(gpt-5.4) = %+v, want the gpt-5 row", got)
 	}
 	{
-		got := matchIn(tbl, "openai/gpt-5.4")
-		testassert.Require(t, got == nil, "matchIn(openai/gpt-5.4) = %+v, want nil (anchored, not substring)", got)
+		got := matchEntryIn(tbl, "openai/gpt-5.4")
+		testassert.Require(t, got == nil, "matchEntryIn(openai/gpt-5.4) = %+v, want nil (anchored, not substring)", got)
 	}
-}
-
-func TestMatchInReturnsCopyNotAlias(t *testing.T) {
-	tbl := []entry{{pattern: "gpt-*", adapt: Adaptation{
-		ExcludeTools:                []string{"edit_file"},
-		Append:                      []string{"coach"},
-		ToolDescriptionReplacements: map[string]string{"edit_file or write_file": "apply_patch"},
-	}}}
-	got := matchIn(tbl, "gpt-5.4")
-	testassert.Require(t, got != nil, "matchIn returned nil")
-	testassert.Require(t, got != &tbl[0].adapt, "matchIn returned a pointer aliasing the table entry")
-	// Mutating every field of the result must not touch the table entry.
-	got.ExcludeTools[0] = "mutated"
-	got.Append[0] = "mutated"
-	got.Append = append(got.Append, "extra")
-	got.ToolDescriptionReplacements["edit_file or write_file"] = "mutated"
-	testassert.Equal(t, tbl[0].adapt.ExcludeTools[0], "edit_file")
-	testassert.Require(t, len(tbl[0].adapt.Append) == 1 && tbl[0].adapt.Append[0] == "coach", "Append leaked into the table: %v", tbl[0].adapt.Append)
-	testassert.Require(t, len(tbl[0].adapt.ToolDescriptionReplacements) == 1 && tbl[0].adapt.ToolDescriptionReplacements["edit_file or write_file"] == "apply_patch", "ToolDescriptionReplacements leaked into the table: %v", tbl[0].adapt.ToolDescriptionReplacements)
 }
 
 func TestTransformPromptNoOpReturnsIncomingBytes(t *testing.T) {
@@ -149,31 +130,66 @@ func TestTransformPromptEqualTextAndTransformProduceEqualOutput(t *testing.T) {
 	testassert.Equal(t, TransformPrompt(first, adapt), TransformPrompt(second, adapt))
 }
 
-func TestRenderToolDescriptionReplacements(t *testing.T) {
+func TestToolDescriptionReplacerLiteralReplacements(t *testing.T) {
 	description := strings.Join([]string{
 		"use edit_file or write_file",
 		"- removed by adaptation",
 		"done",
 	}, "\n")
 
-	// With no active adaptation the description is the tool's own text.
-	baseline := RenderToolDescription(description, nil)
-	testassert.Equal(t, baseline, description)
+	// No replacement map yields the stdlib zero-pair identity replacer: the
+	// description is the tool's own text.
+	for name, replacements := range map[string]map[string]string{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			testassert.Equal(t, newToolDescriptionReplacer(replacements).Replace(description), description)
+		})
+	}
 
 	// The active adaptation's literal overrides apply: one rewrites the
-	// naming phrase inside its line, the other resolves to empty and removes
-	// the line that is only that value.
-	adapted := RenderToolDescription(description, &Adaptation{
-		ToolDescriptionReplacements: map[string]string{
-			"edit_file or write_file": "apply_patch",
-			"- removed by adaptation": "",
-		},
-	})
-	testassert.Require(t, !strings.Contains(adapted, "removed by adaptation"), "adapted RenderToolDescription = %q", adapted)
+	// naming phrase inside its line, the other erases only its matched
+	// substring and leaves the line's newline in place.
+	adapted := newToolDescriptionReplacer(map[string]string{
+		"edit_file or write_file": "apply_patch",
+		"- removed by adaptation": "",
+	}).Replace(description)
+	testassert.Require(t, !strings.Contains(adapted, "removed by adaptation"), "adapted description = %q", adapted)
 	{
-		want := "use apply_patch\ndone"
+		want := "use apply_patch\n\ndone"
 		testassert.Equal(t, adapted, want)
 	}
+}
+
+// TestToolDescriptionReplacerIsOnePassLongestFirst proves the replacement
+// pass is one strings.NewReplacer over keys ordered by descending byte length
+// then lexical order: original edit_file maps to apply_patch and is never
+// reprocessed into PATCH, an original apply_patch maps to PATCH, an
+// overlapping shorter key never wins at the same position, and map
+// construction order cannot change the result.
+func TestToolDescriptionReplacerIsOnePassLongestFirst(t *testing.T) {
+	description := "edit_file then apply_patch; tail"
+	want := "apply_patch then PATCH; tail"
+	forward := make(map[string]string)
+	forward["apply"] = "WRONG"
+	forward["apply_patch"] = "PATCH"
+	forward["edit_file"] = "apply_patch"
+	reversed := make(map[string]string)
+	reversed["edit_file"] = "apply_patch"
+	reversed["apply_patch"] = "PATCH"
+	reversed["apply"] = "WRONG"
+	for name, replacements := range map[string]map[string]string{"forward": forward, "reversed": reversed} {
+		t.Run(name, func(t *testing.T) {
+			testassert.Equal(t, newToolDescriptionReplacer(replacements).Replace(description), want)
+		})
+	}
+}
+
+// TestToolDescriptionReplacerEmptyValueErasesOnlySubstring proves an empty
+// replacement removes exactly its matched bytes: the surrounding text and
+// every newline stay in place, unlike the removed whole-line erasure policy.
+func TestToolDescriptionReplacerEmptyValueErasesOnlySubstring(t *testing.T) {
+	description := "first\nremove me\nlast"
+	got := newToolDescriptionReplacer(map[string]string{"remove me": ""}).Replace(description)
+	testassert.Equal(t, got, "first\n\nlast")
 }
 
 // TestShippedTableMatchesBundledGPTCodex asserts that the bundled data's
@@ -196,10 +212,11 @@ func TestShippedTableMatchesBundledGPTCodex(t *testing.T) {
 		"gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "openai/gpt-5.4-mini", "openai/gpt-5.5-pro",
 	} {
 		t.Run(id, func(t *testing.T) {
-			got := Match(id)
-			testassert.Require(t, got != nil, "Match(%q) = nil, want gpt-codex", id)
-			testassert.Require(t, slices.Equal(got.Append, codex.Append), "Match(%q).Append = %v, want the %s row append", id, got.Append, codex.Name)
-			testassert.Require(t, reflect.DeepEqual(got.ToolDescriptionReplacements, map[string]string{gptGuidanceLine: gptGuidanceReplacement}), "Match(%q).ToolDescriptionReplacements = %q, want the one literal guidance-line rule", id, got.ToolDescriptionReplacements)
+			matched := matchEntryIn(bundledTable, id)
+			testassert.Require(t, matched != nil, "matchEntryIn(%q) = nil, want gpt-codex", id)
+			got := matched.adapt
+			testassert.Require(t, slices.Equal(got.Append, codex.Append), "matchEntryIn(%q).adapt.Append = %v, want the %s row append", id, got.Append, codex.Name)
+			testassert.Require(t, reflect.DeepEqual(got.ToolDescriptionReplacements, map[string]string{gptGuidanceLine: gptGuidanceReplacement}), "matchEntryIn(%q).adapt.ToolDescriptionReplacements = %q, want the one literal guidance-line rule", id, got.ToolDescriptionReplacements)
 		})
 	}
 }
@@ -211,11 +228,12 @@ func TestShippedTableMatchesBundledGPTApplyPatchBroad(t *testing.T) {
 		"gpt-5.3-codex", "openai/gpt-5.3-codex", "gpt-5", "openai/gpt-5",
 	} {
 		t.Run(id, func(t *testing.T) {
-			got := Match(id)
-			testassert.Require(t, got != nil, "Match(%q) = nil, want gpt-apply-patch", id)
-			testassert.Require(t, reflect.DeepEqual(got.ExcludeTools, ap.ExcludeTools), "Match(%q).ExcludeTools = %v, want the %s row exclude_tools", id, got.ExcludeTools, ap.Name)
-			testassert.Check(t, slices.Contains(got.ExcludeTools, "write_file"), "Match(%q).ExcludeTools = %v, want the file tools the V4A row replaces", id, got.ExcludeTools)
-			testassert.Check(t, len(got.Append) == 0, "Match(%q).Append = %q, want absent (broader gpt-5 has no prompt addition)", id, got.Append)
+			matched := matchEntryIn(bundledTable, id)
+			testassert.Require(t, matched != nil, "matchEntryIn(%q) = nil, want gpt-apply-patch", id)
+			got := matched.adapt
+			testassert.Require(t, reflect.DeepEqual(got.ExcludeTools, ap.ExcludeTools), "matchEntryIn(%q).adapt.ExcludeTools = %v, want the %s row exclude_tools", id, got.ExcludeTools, ap.Name)
+			testassert.Check(t, slices.Contains(got.ExcludeTools, "write_file"), "matchEntryIn(%q).adapt.ExcludeTools = %v, want the file tools the V4A row replaces", id, got.ExcludeTools)
+			testassert.Check(t, len(got.Append) == 0, "matchEntryIn(%q).adapt.Append = %q, want absent (broader gpt-5 has no prompt addition)", id, got.Append)
 		})
 	}
 }
@@ -225,9 +243,10 @@ func TestShippedTableMatchesBundledGrok(t *testing.T) {
 	ge := fixtureRow(fx, "gpt-task-execution")
 	for _, id := range []string{"grok-build-0.1", "x-ai/grok-build-0.1"} {
 		t.Run(id, func(t *testing.T) {
-			got := Match(id)
-			testassert.Require(t, got != nil, "Match(%q) = nil, want adaptation", id)
-			testassert.Require(t, len(got.Append) != 0 && slices.Equal(got.Append, ge.Append), "Match(%q).Append = %q, want the nonempty %s row append", id, got.Append, ge.Name)
+			matched := matchEntryIn(bundledTable, id)
+			testassert.Require(t, matched != nil, "matchEntryIn(%q) = nil, want adaptation", id)
+			got := matched.adapt
+			testassert.Require(t, len(got.Append) != 0 && slices.Equal(got.Append, ge.Append), "matchEntryIn(%q).adapt.Append = %q, want the nonempty %s row append", id, got.Append, ge.Name)
 			testassert.Require(t, len(got.ExcludeTools) == 0 && len(got.ToolDescriptionReplacements) == 0, "grok adaptation carries tool levers %+v, want the append-only row", got)
 		})
 	}
@@ -241,9 +260,10 @@ func TestShippedTableMatchesBundledGoogle(t *testing.T) {
 		"google/gemini-3.5-flash", "gemma-4-26b-a4b", "google/gemma-4-31b",
 	} {
 		t.Run(id, func(t *testing.T) {
-			got := Match(id)
-			testassert.Require(t, got != nil, "Match(%q) = nil, want google-task-execution", id)
-			testassert.Require(t, len(got.Append) != 0 && slices.Equal(got.Append, ge.Append), "Match(%q).Append = %q, want the nonempty %s row append", id, got.Append, ge.Name)
+			matched := matchEntryIn(bundledTable, id)
+			testassert.Require(t, matched != nil, "matchEntryIn(%q) = nil, want google-task-execution", id)
+			got := matched.adapt
+			testassert.Require(t, len(got.Append) != 0 && slices.Equal(got.Append, ge.Append), "matchEntryIn(%q).adapt.Append = %q, want the nonempty %s row append", id, got.Append, ge.Name)
 		})
 	}
 }
@@ -264,8 +284,8 @@ func TestShippedTableLeavesOtherModelsBaseline(t *testing.T) {
 	} {
 		t.Run(id, func(t *testing.T) {
 			{
-				got := Match(id)
-				testassert.Require(t, got == nil, "Match(%q) = %+v, want nil", id, got)
+				got := matchEntryIn(bundledTable, id)
+				testassert.Require(t, got == nil, "matchEntryIn(%q) = %+v, want nil", id, got)
 			}
 		})
 	}

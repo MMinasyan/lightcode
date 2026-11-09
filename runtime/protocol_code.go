@@ -224,7 +224,7 @@ func accumulateCodeRevert(result *protocol.CodeRevertResult, group snapshot.Reve
 // success or a completed rollback. It never fills Error.SessionId — that
 // generated field names a target Session.
 func codeRevertFailure(result protocol.CodeRevertResult, err error) (protocol.CodeRevertResult, error) {
-	result.Error = &protocol.Error{Code: protocol.Internal, Message: err.Error()}
+	result.Error = &protocol.Error{Code: protocol.ErrorCodeInternal, Message: err.Error()}
 	return result, fmt.Errorf("restore code snapshots: %w", err)
 }
 

@@ -445,9 +445,26 @@ func (r *Runner) composeSelection(conn *connection) *rpcError {
 		r.adoptSelection(conn, stamp, newest.SessionId, newest.Workspace)
 		return nil
 	}
-	createParams, _ := json.Marshal(map[string]any{
-		"body": map[string]any{"workspace": workspace, "agent_type": "primary"},
-	})
+	raw, err = clientops.Call(conn.ctx, conn.client, "GetConfiguration", nil)
+	if err != nil {
+		return callError(err)
+	}
+	agents, err := clientops.AgentRoster(raw)
+	if err != nil {
+		return &rpcError{Code: codeTransport, Message: "invalid agent roster"}
+	}
+	body := protocol.CreateSessionRequest{Workspace: workspace}
+	// Root creation selects only the supplied application definition; a
+	// foreign-only roster or a roster without it creates a resolved Session.
+	suppliedPrimary := protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: "primary"}
+	for _, agent := range agents {
+		if agent.Definition == suppliedPrimary {
+			ref := agent.Definition
+			body.AgentSelection = &protocol.AgentSelection{Definition: &ref}
+			break
+		}
+	}
+	createParams, _ := json.Marshal(map[string]any{"body": body})
 	raw, err = clientops.Call(conn.ctx, conn.client, "CreateSession", createParams)
 	if err != nil {
 		return callError(err)

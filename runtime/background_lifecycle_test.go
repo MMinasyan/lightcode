@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -36,7 +36,7 @@ const lifecycleAgentsDocument = `{
 // the selected preparation hook validates.
 func backgroundLifecycleConfigDocument(endpoint string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "",
-		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"plugins":{"hooks":{"tag":"T1"}}}`
+		`{"m":{"name":"M","context_window":262144,"max_output_tokens":4096}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":"T1"}}}`
 }
 
 // newLifecycleID mints one fresh 32-lowercase-hex identity.
@@ -324,7 +324,7 @@ func seedLifecycleRoot(t *testing.T, store harness.Storage, sessionID string) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	payload := fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q},`+
-			`"state":{"lifecycle":"open","current_agent_type":"solo","usage":{"by_model":[]},"last_activity":%q}}`,
+			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"solo"}},"usage":{"by_model":[]},"last_activity":%q,"external_data_owners":[]}}`,
 		sessionID, now, now)
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: sessionID, Kind: harness.RegisterSession}, payload)
 }
@@ -338,7 +338,7 @@ func seedLifecycleChild(t *testing.T, store harness.Storage, parentID, childID, 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	sessionPayload := fmt.Sprintf(
 		`{"identity":{"session_id":%q,"workspace":"/tmp/works","created_at":%q,"parent_session_id":%q},`+
-			`"state":{"lifecycle":"open","current_agent_type":"worker","current_operation_id":%q,"usage":{"by_model":[]},"last_activity":%q}}`,
+			`"state":{"lifecycle":"open","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"worker"}},"current_operation_id":%q,"usage":{"by_model":[]},"last_activity":%q,"external_data_owners":[]}}`,
 		childID, now, parentID, operationID, now)
 	entryID := newLifecycleID(t)
 	lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: childID, Kind: harness.RegisterSession}, sessionPayload)
@@ -365,47 +365,60 @@ func seedLifecycleChild(t *testing.T, store harness.Storage, parentID, childID, 
 // model's tool calls exercise real prepared outcomes.
 type lifecycleTools struct {
 	mu      sync.Mutex
-	prepare func(ctx context.Context, call model.ToolCall) harness.PreparedTool
+	prepare func(ctx context.Context, call model.ToolCall) extension.ToolPlan
+	execute func(ctx context.Context, plan extension.ToolPlan) harness.ToolOutcome
 }
 
-func (t *lifecycleTools) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (t *lifecycleTools) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return runtimeNormalize(call)
 }
 
-func (t *lifecycleTools) Prepare(ctx context.Context, _ ToolContext, call model.ToolCall) harness.PreparedTool {
+func (t *lifecycleTools) Prepare(ctx context.Context, _ extension.ToolContext, call model.ToolCall) extension.ToolPlan {
 	t.mu.Lock()
 	prepare := t.prepare
 	t.mu.Unlock()
 	if prepare != nil {
 		return prepare(ctx, call)
 	}
-	// The fixture's default: one immediate success under the declared
-	// command.run pair, the settled result the plain rows expect.
-	return harness.PreparedTool{
-		Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}},
-		Immediate:   &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}},
-	}
+	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: "command.run", Target: "test"}}, Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultSuccess, Content: "ok"}}}
 }
 
-// setPrepare installs one per-test prepared-outcome dispatcher.
-func (t *lifecycleTools) setPrepare(prepare func(ctx context.Context, call model.ToolCall) harness.PreparedTool) {
+func (t *lifecycleTools) Execute(ctx context.Context, _ extension.ToolContext, plan extension.ToolPlan) harness.ToolOutcome {
+	t.mu.Lock()
+	execute := t.execute
+	t.mu.Unlock()
+	if execute != nil {
+		return execute(ctx, plan)
+	}
+	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultSuccess, Content: "ok"}}
+}
+
+func (t *lifecycleTools) setExecute(execute func(ctx context.Context, plan extension.ToolPlan) harness.ToolOutcome) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.execute = execute
+}
+
+func (t *lifecycleTools) setPrepare(prepare func(ctx context.Context, call model.ToolCall) extension.ToolPlan) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.prepare = prepare
 }
 
-// lifecycleToolsPlugin declares the suite's read and grep tools over the one
-// shared dispatcher; both are always available so the concrete surface
-// advertises them and the model's calls reach the real dispatcher.
-func lifecycleToolsPlugin(tools *lifecycleTools) Plugin {
-	return Plugin{
-		ID:       "bgtools",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{ToolSpec("read", availableToolDescription("read")), ToolSpec("grep", availableToolDescription("grep"))},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"read": tools, "grep": tools}}, nil
-		},
+func lifecycleToolsPlugin(tools *lifecycleTools) extension.Native {
+	native := testNative("bgtools", extension.LifetimeHarness,
+		[]extension.Capability{extension.ToolCapability("read"), extension.ToolCapability("grep")}, nil,
+		func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"read": {Tool: tools},
+				"grep": {Tool: tools},
+			}}, nil
+		})
+	native.Describe = map[string]extension.ToolDescribe{
+		"read": extensionToolDescribe("read", availableToolDescription("read")),
+		"grep": extensionToolDescribe("grep", availableToolDescription("grep")),
 	}
+	return native
 }
 
 // bgRuntime is the background suite's native owner: the solo and worker agent
@@ -423,7 +436,8 @@ func openBackgroundRuntime(t *testing.T, store harness.Storage, stopper jobsServ
 	t.Helper()
 	e := newOwnerEnv(t)
 	writeServiceFile(t, e.configPath, backgroundLifecycleConfigDocument(e.server.URL))
-	writeServiceFile(t, agents.PathForConfig(e.configPath), lifecycleAgentsDocument)
+	writeAgentDefinitions(t, e.configPath, lifecycleAgentsDocument)
+	enableFixturePlugin(t, e.configPath, "bgtools")
 	hook := &recordHook{name: "hook.first", events: &traceLog{}}
 	tools := &lifecycleTools{}
 	e.fixtureStore(store)
@@ -456,7 +470,7 @@ func (b *bgRuntime) launchChild(parent, prompt, operationID string, maxConcurren
 	err := b.r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
 		res, err := h.LaunchChildSession(ctx, harness.LaunchChildRequest{
 			ParentSessionID: parent,
-			AgentType:       "worker",
+			AgentSelection:  suppliedDefinition("worker"),
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: prompt}},
 			OperationID:     operationID,
 			MaxConcurrent:   maxConcurrent,

@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/acpclient"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/cliclient"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
@@ -361,8 +360,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 		}
 	}()
 	configPath := filepath.Join(dataDir, "config.json")
-	writeServiceFile(t, configPath, fmt.Sprintf(`{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"DESKTOP_TEST_KEY"},"discovery":false,"models":{"root":{"context_window":65536,"max_output_tokens":512},"child":{"context_window":65536,"max_output_tokens":512}}}}}`, modelServer.URL+"/v1"))
-	writeServiceFile(t, agents.PathForConfig(configPath), `{"primary":{"model":"prov/root","system_prompt":"simple","tools":["run_command","task"]},"secondary":{"model":"prov/child","system_prompt":"simple","tools":[]}}`)
+	writeServiceFile(t, configPath, fmt.Sprintf(`{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"DESKTOP_TEST_KEY"},"discovery":false,"models":{"root":{"context_window":65536,"max_output_tokens":512},"child":{"context_window":65536,"max_output_tokens":512}}}},"extensions":{"agents":{"enabled":true,"definitions":{"primary":{"model":"prov/root","system_prompt":"simple","tools":["run_command","task"]},"secondary":{"model":"prov/child","system_prompt":"simple","tools":[]}}},"adaptation":{"enabled":true}}}`, modelServer.URL+"/v1"))
 	var owner *runtime.Runtime
 	openOwner := func() string {
 		var err error
@@ -394,7 +392,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	info, err := host.Open()
 	testassert.NoError(t, err)
 	oldInstance := info.InstanceID
-	created, err := host.Call(info.Generation, "CreateSession", fmt.Sprintf(`{"body":{"workspace":%q,"agent_type":"primary"}}`, workspace))
+	created, err := host.Call(info.Generation, "CreateSession", fmt.Sprintf(`{"body":{"workspace":%q,"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"}}}}`, workspace))
 	testassert.Require(t, err == nil && created.Status == http.StatusCreated, "create root: %+v, %v", created, err)
 	var root protocol.Session
 	testassert.NoError(t, json.Unmarshal([]byte(created.Body), &root))

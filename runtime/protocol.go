@@ -99,7 +99,7 @@ func (r *Runtime) listWorkspaces(ctx context.Context) ([]protocol.Workspace, err
 // the protocol server supplies it before wire emission.
 func projectSession(header harness.SessionHeader) protocol.Session {
 	out := protocol.Session{
-		AgentType:       header.CurrentAgentType,
+		AgentSelection:  projectAgentSelection(header.AgentSelection),
 		CreatedAt:       header.Identity.CreatedAt.UTC(),
 		LastActivity:    header.LastActivity.UTC(),
 		Lifecycle:       protocol.SessionLifecycle(header.Lifecycle),
@@ -131,14 +131,14 @@ func projectSession(header harness.SessionHeader) protocol.Session {
 // status and detail, and the canonical register totals as decimal strings.
 func projectOperation(record harness.OperationRecord) protocol.Operation {
 	summary := harness.OperationSummary{
-		OperationID: record.Admission.OperationID,
-		RequestKind: record.Admission.RequestKind,
-		AgentType:   record.Admission.AgentType,
-		Model:       record.Admission.Execution.Model,
-		AdmittedAt:  record.Admission.AdmittedAt,
-		Status:      record.State.Status,
-		SettledAt:   record.State.SettledAt,
-		Usage:       record.State.Usage,
+		OperationID:    record.Admission.OperationID,
+		RequestKind:    record.Admission.RequestKind,
+		AgentSelection: record.Admission.AgentSelection,
+		Model:          record.Admission.Execution.Model,
+		AdmittedAt:     record.Admission.AdmittedAt,
+		Status:         record.State.Status,
+		SettledAt:      record.State.SettledAt,
+		Usage:          record.State.Usage,
 	}
 	if record.State.Terminal != nil {
 		summary.Detail = record.State.Terminal.Detail
@@ -155,13 +155,13 @@ func projectOperationSummary(summary harness.OperationSummary) protocol.Operatio
 	usage := projectUsage(summary.Usage)
 	usage.EstimatedCostUsd = summary.EstimatedCostUSD
 	op := protocol.Operation{
-		AdmittedAt:  summary.AdmittedAt.UTC(),
-		AgentType:   summary.AgentType,
-		Model:       summary.Model.String(),
-		OperationId: summary.OperationID,
-		RequestKind: protocol.OperationRequestKind(summary.RequestKind),
-		Status:      protocol.OperationStatus(summary.Status),
-		Usage:       usage,
+		AdmittedAt:     summary.AdmittedAt.UTC(),
+		AgentSelection: projectAgentSelection(summary.AgentSelection),
+		Model:          summary.Model.String(),
+		OperationId:    summary.OperationID,
+		RequestKind:    protocol.OperationRequestKind(summary.RequestKind),
+		Status:         protocol.OperationStatus(summary.Status),
+		Usage:          usage,
 	}
 	if summary.SettledAt != nil {
 		settled := summary.SettledAt.UTC()
@@ -722,16 +722,21 @@ type sessionSelection struct {
 // that is absent from the captured catalog, or whose entry has no positive
 // window, stays identifiable with a zero window: admission still refuses it
 // and no fallback model is invented.
-func resolveSessionSelection(agentType string, captured *configuration) sessionSelection {
-	agent, err := harness.ResolveAgentType(agentType, captured.agentTypes())
-	if err != nil {
+func resolveSessionSelection(selection harness.AgentSelection, captured *configuration) sessionSelection {
+	var selected model.ModelRef
+	if selection.Inputs != nil {
+		selected = selection.Inputs.Model
+	} else if selection.Definition != nil {
+		definition, ok := captured.projectedDefinition(*selection.Definition)
+		if !ok {
+			return sessionSelection{}
+		}
+		selected = definition.inputs.Model
+	}
+	if selected.IsZero() {
 		return sessionSelection{}
 	}
-	if agent.Model.IsZero() {
-		return sessionSelection{}
-	}
-	selected := agent.Model
-	_, entry, err := captured.catalog.Lookup(catalog.ModelRef{Provider: agent.Model.Provider, Model: agent.Model.Model})
+	_, entry, err := captured.catalog.Lookup(catalog.ModelRef{Provider: selected.Provider, Model: selected.Model})
 	if err != nil || entry.ContextWindow <= 0 {
 		return sessionSelection{model: &selected}
 	}
@@ -805,7 +810,7 @@ func projectHydration(view harness.SessionReadView, page protocol.ConversationPa
 	for _, member := range view.Background {
 		background = append(background, protocol.BackgroundMember{Kind: protocol.BackgroundMemberKind(member.Kind), Id: member.ID})
 	}
-	selection := resolveSessionSelection(view.Header.CurrentAgentType, captured)
+	selection := resolveSessionSelection(view.Header.AgentSelection, captured)
 	var selectedModel *protocol.ModelRef
 	if selection.model != nil {
 		rendered := selection.model.String()

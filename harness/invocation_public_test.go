@@ -73,7 +73,7 @@ func newInvocationRecordingFixture(t *testing.T, store harness.Storage, script *
 							return script.effect(ctx, req)
 						},
 						NormalizeTool: publicNormalize,
-						Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+						Tool: func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 							return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "no tools"}}}
 						},
 						Close: func() error {

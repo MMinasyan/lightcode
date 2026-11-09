@@ -24,6 +24,7 @@
   } from './exactjson';
   export let getClient;
   export let stamp; // () => ReaderStamp
+  export let hasAgents = false;
   const dispatch = createEventDispatcher();
 
   // Top-level baseline controls: exact JSON members of the tools, jobs and
@@ -42,7 +43,7 @@
     compaction: ['model', 'prompt'],
   };
   const PLUGIN_FIELDS = {
-    tasks: ['max_concurrent', 'max_output_bytes'],
+    agents: ['max_concurrent', 'max_output_bytes'],
   };
   const SESSION_FIELDS = ['archive_after_days', 'delete_after_archive_days'];
 
@@ -72,7 +73,7 @@
   $: busy = pending !== 'idle';
   $: parsed = settingsText === null ? null : safeParse(settingsText);
   $: sessions = parsed && parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {};
-  $: plugins = parsed && parsed.plugins && typeof parsed.plugins === 'object' ? parsed.plugins : {};
+  $: plugins = parsed && parsed.extensions && typeof parsed.extensions === 'object' ? parsed.extensions : {};
   $: authoredIDs = Object.keys(plugins);
   $: otherAuthoredIDs = authoredIDs.filter((id) => !Object.hasOwn(PLUGIN_FIELDS, id));
 
@@ -150,18 +151,21 @@
   // A plugin edit patches the member, then places the document back into `plugins`.
   function patchPlugin(pluginID, member, valueText) {
     applyEdit((current) => {
-      const pluginsNow = parseSettingsObject(current).plugins || {};
+      const pluginsNow = parseSettingsObject(current).extensions || {};
       const document = typeof pluginsNow[pluginID] === 'string' ? pluginsNow[pluginID] : '{}';
-      const nextDocument = replaceObjectMembers(document, composeMemberPatch(member, valueText));
-      return replaceObjectMembers(current, composeMemberPatch('plugins', composePluginsPatch(pluginsNow, pluginID, nextDocument)));
+      const section = parseSettingsObject(document);
+      const task = section.task == null ? '{}' : JSON.stringify(section.task);
+      const nextTask = replaceObjectMembers(task, composeMemberPatch(member, valueText));
+      const nextDocument = replaceObjectMembers(document, composeMemberPatch('task', nextTask));
+      return replaceObjectMembers(current, composeMemberPatch('extensions', composePluginsPatch(pluginsNow, pluginID, nextDocument)));
     });
   }
 
   // Raw authoring/edit/remove for any plugin entry; the server decides validity.
   function editDocument(pluginID, document) {
     applyEdit((current) => {
-      const pluginsNow = parseSettingsObject(current).plugins || {};
-      return replaceObjectMembers(current, composeMemberPatch('plugins', composePluginsPatch(pluginsNow, pluginID, document)));
+      const pluginsNow = parseSettingsObject(current).extensions || {};
+      return replaceObjectMembers(current, composeMemberPatch('extensions', composePluginsPatch(pluginsNow, pluginID, document)));
     });
   }
 
@@ -210,7 +214,8 @@
     if (document === null) return {};
     try {
       const value = parseExactJSON(document);
-      return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return {};
+      return value.task !== null && typeof value.task === 'object' && !Array.isArray(value.task) ? value.task : {};
     } catch {
       return {};
     }
@@ -280,7 +285,7 @@
          this settings surface; these are that surface's own nav entries, not a
          toolbar strip. -->
     <div class="nav">
-      <button class="navitem" on:click={() => dispatch('agent')} aria-label="Agent type">Agent type</button>
+      {#if hasAgents}<button class="navitem" on:click={() => dispatch('agent')} aria-label="Agent type">Agent type</button>{/if}
       <button class="navitem" on:click={() => dispatch('providers')} aria-label="Providers">Providers</button>
       <button class="navitem" on:click={() => dispatch('snapshots')} aria-label="Snapshots">Snapshots</button>
       <button class="navitem" on:click={() => dispatch('viewer')} aria-label="File viewer">File viewer</button>

@@ -99,7 +99,7 @@ func newGapHarness(t *testing.T) (*Harness, *graphStorage, *coordinator, string)
 	h := newTestHarness(t, store, func(context.Context, PreparationRequest) (PreparedExecution, error) {
 		return prepared, nil
 	})
-	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentType: "coder"})
+	session, err := h.CreateSession(context.Background(), CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: testSelection("coder")})
 	testassert.NoError(t, err)
 	{
 		_, disposition := mustAdmitWithoutExecution(t, h, session.Identity.SessionID, testOpID, admissionContent("hello"))
@@ -246,7 +246,7 @@ func TestMaintenanceGapAcrossTransitionsAndRecovery(t *testing.T) {
 			}
 			return streamOf(turnDelta("stop", "quiet"), usageDelta(model.Usage{})), nil
 		}
-		tool := func(_ context.Context, call model.ToolCall) PreparedTool {
+		tool := func(ctx context.Context, call model.ToolCall) PreparedTool {
 			// The ordinary model transition has already committed the call.
 			rec, err := h.ReadOperation(context.Background(), sessionID, testOpID)
 			testassert.NoError(t, err)

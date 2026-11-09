@@ -9,7 +9,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/plugins/adaptation"
+	"github.com/MMinasyan/lightcode/extensions/adaptation"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -26,7 +26,7 @@ import (
 // baseline store, jobs, and tools: the complete composition opens over the
 // included SQLite database, reload publishes, and shutdown converges leaving
 // exactly the included store's files.
-func init() { runtime.ShippedAdaptationPlugin = adaptation.Plugin }
+func init() { runtime.ShippedAdaptationPlugin = adaptation.Native }
 
 func TestBuiltinRegistrationComposes(t *testing.T) {
 	ctx := context.Background()

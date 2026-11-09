@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -109,7 +107,7 @@ func metadataBuiltinOverrideDocument() string {
 // subscribed service with its attached warning store.
 func metadataService(t *testing.T, h *serviceHarness) (*configurationService, *Subscription) {
 	t.Helper()
-	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
+	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator), fixtureAgentPlugin())
 	svc.attachWarnings(newWarningStore())
 	{
 		_, err := svc.publish(context.Background())
@@ -188,9 +186,8 @@ func bigLexeme(t *testing.T, data []byte, path string) string {
 func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
-	agentsPath := filepath.Join(h.dataDir, "agents.json")
-	writeServiceFile(t, agentsPath, workerAgentsDocument)
-	agentsBefore := mustRead(t, agentsPath)
+	writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
+	agentsBefore := append(json.RawMessage(nil), fileRoot(t, h.configPath)["extensions"]...)
 	svc, sub := metadataService(t, h)
 	unsetenv(t, "NEW_KEY")
 	// The fixture is a genuine credential consumer: the referenced env
@@ -246,7 +243,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Require(t, strings.Contains(string(mutationBytes), "NEW_KEY") && !strings.Contains(string(mutationBytes), "sk-real-credential-98765"), "mutation result carries the wrong credential bytes: %s", mutationBytes)
 	testassert.Equal(t, bigLexeme(t, data, "providers.new.extra_body.side"), "9007199254740993")
-	testassert.Require(t, string(mustRead(t, agentsPath)) == string(agentsBefore), "the metadata edit changed the agents file")
+	testassert.Require(t, string(root["extensions"]) == string(agentsBefore), "the metadata edit changed extension documents")
 
 	// The provided empty headers map goes through the same wholesale writer
 	// as the update: the raw headers member stays absent, not an empty
@@ -1452,7 +1449,7 @@ func TestRuntimeModelMetadataMutationAffectsNextAdmissions(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, ownerConfigDocument(e.server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), `{"worker":{"model":"prov/m","system_prompt":"simple"}}`)
+		writeAgentDefinitions(t, e.configPath, `{"worker":{"model":"prov/m","system_prompt":"simple"}}`)
 		e.fixtureStore(store)
 		r, err := e.open(context.Background())
 		testassert.NoError(t, err)

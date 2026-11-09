@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/agents"
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/runtime"
@@ -24,7 +24,7 @@ import (
 // credential travels only through the discovery file. The runtime import is
 // test-only and intentional: the repository's dependency-isolation guard
 // rejects it from production files.
-const mountedOwnerConfig = `{"providers":{"prov":{"transport":{"base_url":"http://127.0.0.1:1/v1","api_key_env":"MOUNTED_PROTOCOL_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`
+const mountedOwnerConfig = `{"providers":{"prov":{"transport":{"base_url":"http://127.0.0.1:1/v1","api_key_env":"MOUNTED_PROTOCOL_KEY"},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"extensions":{"agents":{"enabled":true,"definitions":` + mountedOwnerAgents + `},"adaptation":{"enabled":true},"mounted_reporter":{"enabled":true}}}`
 const mountedOwnerAgents = `{"solo":{"model":"prov/m","system_prompt":"simple"},"..":{"model":"prov/m","system_prompt":"simple"}}`
 
 // mountedDiscoveryEnv is the one handshake value the Node process receives:
@@ -76,16 +76,32 @@ func isolateMountedBundledCredentials(t *testing.T) {
 // Runtime-scoped factory that reports one warning through its
 // composition-bound callback at Open, so the generated TypeScript client reads
 // a real plugin:<registered ID> source over the wire.
-func mountedReporterPlugin() runtime.Plugin {
-	return runtime.Plugin{
-		ID:       "mounted_reporter",
-		Scope:    runtime.ScopeRuntime,
-		Provides: []runtime.CapabilitySpec{runtime.Spec[any]("mounted.reporter")},
-		Open: func(_ context.Context, info runtime.ScopeInfo, _ runtime.Bindings) (runtime.Instance, error) {
+func mountedReporterPlugin() extension.Native {
+	return extension.Native{
+		Declaration: extension.Declaration{
+			ID:           "mounted_reporter",
+			Version:      "1",
+			ConfigSchema: []byte(`{"type":"object","properties":{"enabled":{"type":"boolean"}},"required":["enabled"]}`),
+			Components: []extension.Component{{
+				ID:       "mounted_reporter",
+				Lifetime: extension.LifetimeHarness,
+				Provides: []string{"mounted.reporter"},
+			}},
+			Capabilities: []extension.Capability{
+				extension.ServiceCapability("mounted.reporter", "mounted.reporter.contract", extension.PureMethod("call", `{}`, `{}`)),
+			},
+		},
+		Open: func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
 			if info.ReportWarning != nil {
 				info.ReportWarning("mounted_notice", "mounted plugin warning")
 			}
-			return runtime.Instance{Values: map[string]any{"mounted.reporter": "ok"}}, nil
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"mounted.reporter": {Service: map[string]extension.Handler{
+					"call": func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
+						return extension.Result{Value: json.RawMessage(`{}`)}, nil
+					},
+				}},
+			}}, nil
 		},
 	}
 }
@@ -112,7 +128,6 @@ func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeMountedFile(t, configPath, mountedOwnerConfig)
-	writeMountedFile(t, agents.PathForConfig(configPath), mountedOwnerAgents)
 	owner, err := runtime.Open(context.Background(), runtime.Options{
 		DataDir:    dataDir,
 		ConfigPath: configPath,

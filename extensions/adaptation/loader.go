@@ -57,7 +57,7 @@ func loadBundledTable() []entry {
 			panic(fmt.Sprintf("adaptation: bundled data: duplicate row %q / %q", e.Pattern, e.Name))
 		}
 		seen[key] = true
-		out = append(out, entry{pattern: e.Pattern, adapt: Adaptation{
+		out = append(out, entry{bundled: true, pattern: e.Pattern, adapt: Adaptation{
 			ExcludeTools:                append([]string(nil), e.ExcludeTools...),
 			Append:                      append([]string(nil), e.Append...),
 			ToolDescriptionReplacements: cloneStringMap(e.ToolDescriptionReplacements),

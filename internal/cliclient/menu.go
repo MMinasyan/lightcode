@@ -1,10 +1,13 @@
 package cliclient
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
+
 	"github.com/MMinasyan/lightcode/internal/terminal"
 	"github.com/MMinasyan/lightcode/protocol"
-	"strings"
 )
 
 func (c *CLI) invalidateListLocked() {
@@ -107,6 +110,17 @@ func (c *CLI) childrenMenu(s stamp) {
 	c.notifyLocked()
 	c.mu.Unlock()
 }
+
+// agentSourceDetail always exposes the full source tuple beside the display
+// name using the existing menu detail text; names are not globally unique.
+func agentSourceDetail(agent protocol.Agent) string {
+	source := agent.Definition.ExtensionId + "/" + agent.Definition.CapabilityId
+	if agent.Description == "" {
+		return source
+	}
+	return source + " — " + agent.Description
+}
+
 func (c *CLI) selectionMenu(s stamp, name, arg string) {
 	if arg != "" {
 		c.setSelection(s, name, arg)
@@ -120,8 +134,11 @@ func (c *CLI) selectionMenu(s stamp, name, arg string) {
 			c.report(s, terminal.RenderErrorMsg(err.Error()), false)
 			return
 		}
+		if len(configuration.Agents) == 0 {
+			return
+		}
 		for _, agent := range configuration.Agents {
-			items = append(items, terminal.MenuItem{Label: agent.Name, Detail: agent.Description, Selectable: true, Extra: agent.Name})
+			items = append(items, terminal.MenuItem{Label: agent.Name, Detail: agentSourceDetail(agent), Selectable: true, Extra: agent.Definition})
 		}
 	} else {
 		var models protocol.ModelList
@@ -138,30 +155,105 @@ func (c *CLI) selectionMenu(s stamp, name, arg string) {
 	}
 	title := "This Session's future Agent type"
 	if name == "/model" {
-		title = "Type-wide future model — all Sessions using this type"
+		c.mu.Lock()
+		resolved := c.currentLocked(s) && c.root != nil && c.root.hydration != nil && c.root.hydration.Session.AgentSelection.Inputs != nil
+		c.mu.Unlock()
+		if resolved {
+			title = "This Session's future model"
+		} else {
+			title = "Type-wide future model — all Sessions using this type"
+		}
 	}
 	c.showMenu(s, name, title, items)
 }
-func (c *CLI) setSelection(s stamp, name, value string) {
+
+// definitionByName resolves one CLI name shorthand against the complete
+// source-qualified roster: exactly one match sends its full reference, while
+// zero matches report the definition as unavailable and several report the
+// ambiguity. Neither failure sends a selection.
+func (c *CLI) definitionByName(s stamp, name string) (protocol.DefinitionRef, bool) {
+	var configuration protocol.ConfigurationView
+	_, err := call(s, "GetConfiguration", "", nil, nil, &configuration)
+	if err != nil {
+		c.report(s, terminal.RenderErrorMsg(err.Error()), false)
+		return protocol.DefinitionRef{}, false
+	}
+	matches := make([]protocol.DefinitionRef, 0, 1)
+	for _, agent := range configuration.Agents {
+		if agent.Name == name {
+			matches = append(matches, agent.Definition)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		c.report(s, terminal.RenderErrorMsg(fmt.Sprintf("agent definition %q is unavailable", name)), false)
+		return protocol.DefinitionRef{}, false
+	case 1:
+		return matches[0], true
+	default:
+		c.report(s, terminal.RenderErrorMsg(fmt.Sprintf("agent definition %q is ambiguous across %d providers", name, len(matches))), false)
+		return protocol.DefinitionRef{}, false
+	}
+}
+
+func (c *CLI) setSelection(s stamp, name string, value any) {
 	c.mu.Lock()
 	if !c.currentLocked(s) || c.root == nil || c.root.hydration == nil || c.childID != "" {
 		c.mu.Unlock()
 		return
 	}
-	agent := c.root.hydration.Session.AgentType
+	selection := c.root.hydration.Session.AgentSelection
 	c.mu.Unlock()
 	var raw []byte
 	var err error
 	if name == "/agent" {
-		raw, err = call(s, "SetSessionAgentType", s.root, protocol.SetSessionAgentTypeRequest{AgentType: value}, nil, nil)
+		var definition protocol.DefinitionRef
+		switch typed := value.(type) {
+		case protocol.DefinitionRef:
+			definition = typed
+		case string:
+			resolved, ok := c.definitionByName(s, typed)
+			if !ok {
+				return
+			}
+			definition = resolved
+		default:
+			return
+		}
+		raw, err = call(s, "SetSessionAgentType", s.root, protocol.SetSessionAgentTypeRequest{AgentSelection: protocol.AgentSelection{Definition: &definition}}, nil, nil)
+	} else if modelRef, ok := value.(string); !ok {
+		return
+	} else if selection.Inputs != nil {
+		raw, err = call(s, "SetSessionModel", s.root, protocol.SetSessionModelRequest{Model: modelRef}, nil, nil)
+	} else if selection.Definition != nil && selection.Definition.ExtensionId == "agents" && selection.Definition.CapabilityId == "agents.definitions" {
+		arguments, marshalErr := json.Marshal(struct {
+			DefinitionID string `json:"definition_id"`
+			Model        string `json:"model"`
+		}{DefinitionID: selection.Definition.DefinitionId, Model: modelRef})
+		if marshalErr != nil {
+			c.report(s, terminal.RenderErrorMsg(marshalErr.Error()), false)
+			return
+		}
+		raw, err = call(s, "UpdateConfigurationSettings", "", protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
+			ExtensionId: "agents",
+			EditId:      "set_model",
+			Arguments:   string(arguments),
+		}}, nil, nil)
+	} else if selection.Definition != nil {
+		// A read-only or foreign named resolver offers no supplied model edit.
+		// Report the same meaning as the desktop refusal and send nothing.
+		c.report(s, terminal.RenderErrorMsg("This definition does not offer a model edit."), false)
+		return
 	} else {
-		raw, err = call(s, "SetAgentTypeModel", "", protocol.SetAgentTypeModelRequest{Model: value}, protocol.SetAgentTypeModelParams{AgentType: agent}, nil)
+		return
 	}
 	c.report(s, resultText(raw, err), true)
 	c.mu.Lock()
 	if c.currentLocked(s) {
-		c.globalsDirty = true
-		c.kickGlobalsLocked()
+		if name != "/model" || selection.Inputs == nil {
+			c.globalsDirty = true
+			c.kickGlobalsLocked()
+		}
 		c.refreshReadersLocked()
 	}
 	c.mu.Unlock()
@@ -309,7 +401,7 @@ func (c *CLI) menuKeyLocked(key terminal.KeyMsg) func() {
 	case "child":
 		return func() { c.inspectChild(extra.(string)) }
 	case "/agent", "/model":
-		return func() { c.task(func() { c.setSelection(m.stamp, m.kind, extra.(string)) }) }
+		return func() { c.task(func() { c.setSelection(m.stamp, m.kind, extra) }) }
 	case "fork", "revert":
 		if extra == "older" {
 			return func() { c.task(func() { c.olderInputMenu(m.stamp, m.kind == "revert") }) }

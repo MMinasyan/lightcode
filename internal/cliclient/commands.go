@@ -74,6 +74,31 @@ func resultText(raw json.RawMessage, err error) string {
 	return terminal.RenderWarningMsg("Outcome unknown: " + err.Error())
 }
 
+// deletionText reports one committed deletion result: a complete cleanup is
+// ordinary success, while any reported failure says deleted with incomplete
+// cleanup and never a blanket success or rejection.
+func deletionText(raw json.RawMessage, err error) string {
+	if err != nil {
+		return resultText(raw, err)
+	}
+	result, decodeErr := clientops.DecodeDeletionResult(raw)
+	if decodeErr != nil {
+		return terminal.RenderWarningMsg("Outcome unknown: invalid deletion result")
+	}
+	if len(result.CleanupFailures) == 0 {
+		return terminal.RenderSystemMsg("Deleted.")
+	}
+	details := make([]string, 0, len(result.CleanupFailures))
+	for _, failure := range result.CleanupFailures {
+		detail := string(failure.Code) + ": " + failure.Message
+		if failure.ExtensionId != nil {
+			detail += " (extension " + *failure.ExtensionId + ")"
+		}
+		details = append(details, detail)
+	}
+	return terminal.RenderWarningMsg("Deleted with incomplete cleanup: " + strings.Join(details, "; "))
+}
+
 func (c *CLI) navigationLocked() {
 	c.selection++
 	c.listGeneration++
@@ -294,9 +319,37 @@ func (c *CLI) compose(s stamp) {
 	c.mu.Unlock()
 	c.create(s)
 }
+func selectionName(selection protocol.AgentSelection) string {
+	if selection.Definition != nil {
+		return selection.Definition.DefinitionId
+	}
+	return ""
+}
+
 func (c *CLI) create(s stamp) {
+	rawRoster, err := call(s, "GetConfiguration", "", nil, nil, nil)
+	if err != nil {
+		c.navigationReport(s, terminal.RenderErrorMsg(err.Error()))
+		return
+	}
+	agents, err := clientops.AgentRoster(rawRoster)
+	if err != nil {
+		c.navigationReport(s, terminal.RenderErrorMsg(err.Error()))
+		return
+	}
+	var selection *protocol.AgentSelection
+	// Root creation selects only the supplied application definition; a
+	// foreign-only roster or a roster without it creates a resolved Session.
+	suppliedPrimary := protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: "primary"}
+	for _, agent := range agents {
+		if agent.Definition == suppliedPrimary {
+			ref := agent.Definition
+			selection = &protocol.AgentSelection{Definition: &ref}
+			break
+		}
+	}
 	var session protocol.Session
-	raw, err := call(s, "CreateSession", "", protocol.CreateSessionRequest{AgentType: "primary", Workspace: s.workspace}, nil, &session)
+	raw, err := call(s, "CreateSession", "", protocol.CreateSessionRequest{AgentSelection: selection, Workspace: s.workspace}, nil, &session)
 	if err == nil {
 		c.adoptRoot(s, session.Workspace, session.SessionId)
 		c.report(s, resultText(raw, err), true)
@@ -332,7 +385,7 @@ func (c *CLI) refreshList(s stamp, lifecycle string, show bool) {
 	if show {
 		items := make([]terminal.MenuItem, 0, len(list)+1)
 		for _, session := range list {
-			items = append(items, terminal.MenuItem{Label: session.SessionId, Detail: session.AgentType, Selectable: true, Current: session.SessionId == c.rootID, Extra: session})
+			items = append(items, terminal.MenuItem{Label: session.SessionId, Detail: selectionName(session.AgentSelection), Selectable: true, Current: session.SessionId == c.rootID, Extra: session})
 		}
 		outstanding := false
 		for _, a := range c.attempts {
@@ -383,7 +436,7 @@ func (c *CLI) archiveDelete(s stamp, id string, deleteAfter bool) {
 		}
 		// Refresh runs independently: a slow list cannot delay archive-first DELETE.
 		raw, err = call(s, "DeleteSession", id, nil, nil, nil)
-		c.report(s, resultText(raw, err), true)
+		c.report(s, deletionText(raw, err), true)
 		c.mu.Lock()
 		if c.conn == s.conn {
 			c.invalidateListLocked()

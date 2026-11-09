@@ -35,7 +35,7 @@ func liveFixture(t *testing.T, active bool, special func(http.ResponseWriter, *h
 	t.Helper()
 	live := &liveRuntime{feeds: make(chan protocol.Event, 1024), streams: make(chan struct{}, 32), hydration: hydration(rootA, "1", []protocol.ConversationItem{assistant("canonical", "canonical clipboard", false)}, nil), special: special}
 	if active {
-		live.hydration.ActiveOperation = &protocol.Operation{OperationId: strings.Repeat("2", 32), RequestKind: "message", Status: "running", AgentType: "captured", Model: "captured/model"}
+		live.hydration.ActiveOperation = &protocol.Operation{OperationId: strings.Repeat("2", 32), RequestKind: "message", Status: "running", AgentSelection: fixtureSelection("captured"), Model: "captured/model"}
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		live.mu.Lock()

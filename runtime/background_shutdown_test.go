@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/storage"
@@ -68,15 +69,12 @@ func (s *stubStopper) Close() error {
 // jobStopperExportPlugin declares one ordinary capability export of the
 // seam's declared type: the composition treats it like any other value, and
 // the owner's constructed service stays the seam.
-func jobStopperExportPlugin(id string, value harness.JobStopper) Plugin {
-	return Plugin{
-		ID:       id,
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[harness.JobStopper](id + ".stopper")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{id + ".stopper": value}}, nil
-		},
-	}
+func jobStopperExportPlugin(id string, _ harness.JobStopper) extension.Native {
+	capabilityID := id + ".stopper"
+	capability := testServiceCapability(capabilityID)
+	return testNative(id, extension.LifetimeHarness, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{capabilityID: testServiceImplementation()}}, nil
+	})
 }
 
 // startJobThrough admits one StartJob call through the Runtime's ordinary

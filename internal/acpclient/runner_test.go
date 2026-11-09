@@ -58,6 +58,7 @@ func newFixture(t *testing.T, routes map[string]http.HandlerFunc) *fixture {
 		fmt.Fprint(w, healthBody())
 	}
 	f.handlers["/v1/events"] = f.idleEvents
+	f.handlers["/v1/configuration"] = jsonHandler(200, `{"agents":[{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}]}`)
 	// Startup composition defaults: an empty open-root list and one created
 	// primary Session over the selected Workspace's open-lifecycle list query.
 	// A test needing a different startup outcome replaces the handler.
@@ -266,7 +267,7 @@ func startBridge(t *testing.T, f *fixture, workspace string) *bridge {
 func startBridgeWith(t *testing.T, f *fixture, workspace string, writer io.Writer) *bridge {
 	t.Helper()
 	dataDir := t.TempDir()
-	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"8","credential":%q}`,
+	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"12","credential":%q}`,
 		f.server.URL, testInstance, testCredential)
 	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600))
 	return startRunner(t, clienthost.Options{
@@ -493,11 +494,11 @@ func sseFrame(document string) string {
 }
 
 func healthBody() string {
-	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"8"}`, testInstance)
+	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"12"}`, testInstance)
 }
 
 func hydrationBody(sessionID, workspace string) string {
-	return fmt.Sprintf(`{"session":{"session_id":%q,"workspace":%q,"agent_type":"primary"},"conversation":{"items":[]},"operations":[],"pending":{},"background":[],"session_revision":{"durable_revision":"1","local_revision":"0","instance_id":%q},"configuration_revision":{"instance_id":%q,"generation":"1"},"warnings":[],"warnings_revision":{"instance_id":%q,"revision":"1"}}`, sessionID, workspace, testInstance, testInstance, testInstance)
+	return fmt.Sprintf(`{"session":{"session_id":%q,"workspace":%q,"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"}}},"conversation":{"items":[]},"operations":[],"pending":{},"background":[],"session_revision":{"durable_revision":"1","local_revision":"0","instance_id":%q},"configuration_revision":{"instance_id":%q,"generation":"1"},"warnings":[],"warnings_revision":{"instance_id":%q,"revision":"1"}}`, sessionID, workspace, testInstance, testInstance, testInstance)
 }
 
 // TestACPFraming pins the exact JSON-RPC framing, IDs, and null results of
@@ -734,7 +735,7 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 	// The one startup composition created one primary Session in the captured
 	// Workspace (the pre-initialize selection); the scripted list handler
 	// checked its query and method.
-	testassert.Equal(t, f.lastBody(t, "/v1/sessions"), `{"agent_type":"primary","workspace":"/other"}`)
+	testassert.Equal(t, f.lastBody(t, "/v1/sessions"), `{"agent_selection":{"definition":{"capability_id":"agents.definitions","definition_id":"primary","extension_id":"agents"}},"workspace":"/other"}`)
 
 	// A repeated initialize describes the current connection and never
 	// composes or creates again.
@@ -754,6 +755,80 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 	testassert.Equal(t, errorCode(t, b.call(t, "13", "runtime/GetHealth", `{"bogus":true}`)), -32602)
 }
 
+// TestACPReturnsStructuredDeletionResult proves the generic runtime carrier
+// passes the committed deletion result with incomplete cleanup through as the
+// method result, not as a blanket JSON-RPC success or error, and reports an
+// unusable 200 deletion body as invalid delivery.
+func TestACPReturnsStructuredDeletionResult(t *testing.T) {
+	body := `{"cleanup_failures":[{"code":"storage","message":"remove tree: denied"},{"extension_id":"guest","code":"unavailable","message":"extension data cleanup is unavailable"}]}`
+	f := newFixture(t, map[string]http.HandlerFunc{
+		"/v1/sessions/" + startupSessionID: jsonHandler(200, body),
+	})
+	b := startBridge(t, f, "/ws")
+	b.call(t, "1", "initialize", "")
+	frame := b.call(t, "2", "runtime/DeleteSession", `{"session_id":"`+startupSessionID+`"}`)
+	testassert.Equal(t, resultOf(t, frame), body)
+
+	invalid := newFixture(t, map[string]http.HandlerFunc{
+		"/v1/sessions/" + startupSessionID: jsonHandler(200, `{"cleanup_failures":null}`),
+	})
+	invalidBridge := startBridge(t, invalid, "/ws")
+	invalidBridge.call(t, "1", "initialize", "")
+	bad := invalidBridge.call(t, "2", "runtime/DeleteSession", `{"session_id":"`+startupSessionID+`"}`)
+	testassert.Require(t, errorCode(t, bad) == -32001, "invalid DeleteSession result = %s, want the transport invalid-delivery error", bad)
+	{
+		_, hasResult := bad["result"]
+		testassert.Require(t, !hasResult, "invalid DeleteSession carried a result beside the error: %s", bad)
+	}
+}
+
+func TestACPStartupRosterControlsCreation(t *testing.T) {
+	supplied := `{"name":"primary","definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	foreignPrimary := `{"name":"primary","definition":{"extension_id":"guest","capability_id":"guest.definitions","definition_id":"primary"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	foreignOther := `{"name":"reviewer","definition":{"extension_id":"guest","capability_id":"guest.definitions","definition_id":"reviewer"},"description":"","subagent":false,"model":"","readonly":false,"write_dir":"","tools":[],"capabilities":[]}`
+	suppliedBody := `{"agent_selection":{"definition":{"capability_id":"agents.definitions","definition_id":"primary","extension_id":"agents"}},"workspace":"/ws"}`
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		wantBody string
+	}{
+		{"no agents", 200, `{"agents":[]}`, `{"workspace":"/ws"}`},
+		{"supplied primary", 200, `{"agents":[` + supplied + `]}`, suppliedBody},
+		{"foreign-only primary", 200, `{"agents":[` + foreignPrimary + `]}`, `{"workspace":"/ws"}`},
+		{"foreign-only without primary", 200, `{"agents":[` + foreignOther + `]}`, `{"workspace":"/ws"}`},
+		{"duplicate names with supplied primary", 200, `{"agents":[` + foreignPrimary + `,` + supplied + `]}`, suppliedBody},
+		{"duplicate full references", 200, `{"agents":[` + supplied + `,` + supplied + `]}`, ``},
+		{"malformed roster", 200, `{"agents":null}`, ``},
+		{"malformed entry", 200, `{"agents":[{"name":"primary"}]}`, ``},
+		{"read failure", 500, `{"code":"storage","message":"failed"}`, ``},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, map[string]http.HandlerFunc{"/v1/configuration": jsonHandler(tc.status, tc.body)})
+			b := startBridge(t, f, "/ws")
+			response := b.call(t, "1", "initialize", "")
+			if tc.wantBody != "" {
+				_ = resultOf(t, response)
+				testassert.Equal(t, f.lastBody(t, "/v1/sessions"), tc.wantBody)
+			} else {
+				_ = errorCode(t, response)
+				testassert.Equal(t, f.lastBody(t, "/v1/sessions"), "")
+			}
+		})
+	}
+}
+
+func TestACPSessionModelOperation(t *testing.T) {
+	f := newFixture(t, map[string]http.HandlerFunc{
+		"/v1/sessions/s1/model": jsonHandler(200, acpclient.SessionHeader("s1", "/ws", "2026-10-01T00:00:00Z")),
+	})
+	b := startBridge(t, f, "/ws")
+	_ = resultOf(t, b.call(t, "1", "initialize", ""))
+	response := b.call(t, "2", "runtime/SetSessionModel", `{"session_id":"s1","body":{"model":"prov/m"}}`)
+	_ = resultOf(t, response)
+	testassert.Equal(t, f.lastBody(t, "/v1/sessions/s1/model"), `{"model":"prov/m"}`)
+}
+
 // TestACPSelection pins explicit session selection, its Workspace adoption,
 // fresh current reads, the null result with no selection, and that malformed
 // params and received errors keep their JSON-RPC shapes.
@@ -769,7 +844,7 @@ func TestACPSelection(t *testing.T) {
 			fmt.Fprint(w, "["+
 				acpclient.SessionHeader("s-old", "/ws", "2026-10-01T00:00:00Z")+","+
 				acpclient.SessionHeader("s-b", "/ws", "2026-10-02T00:00:00Z")+","+
-				`{"session_id":"s-child","workspace":"/ws","agent_type":"primary","lifecycle":"open","parent_session_id":"s-old","created_at":"2026-10-01T00:00:00Z","last_activity":"2026-10-03T00:00:00Z","session_revision":{"durable_revision":"1","local_revision":"0","instance_id":"`+testInstance+`"}}`+","+
+				`{"session_id":"s-child","workspace":"/ws","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"primary"}},"lifecycle":"open","parent_session_id":"s-old","created_at":"2026-10-01T00:00:00Z","last_activity":"2026-10-03T00:00:00Z","session_revision":{"durable_revision":"1","local_revision":"0","instance_id":"`+testInstance+`"}}`+","+
 				acpclient.SessionHeader("s-a", "/ws", "2026-10-02T00:00:00Z")+"]")
 		},
 		"/v1/sessions/s-a/hydration": jsonHandler(200, hydrationBody("s-a", "/ws")),
@@ -896,7 +971,7 @@ func TestACPEventsAndRepair(t *testing.T) {
 	connected := b.awaitFrame(t, methodFrame("runtime/connected"))
 	var health map[string]any
 	testassert.NoError(t, json.Unmarshal(connected["params"], &health))
-	testassert.Require(t, health["instance_id"] == testInstance && health["protocol_version"] == "8", "runtime/connected params = %v, want the generated Health", health)
+	testassert.Require(t, health["instance_id"] == testInstance && health["protocol_version"] == "12", "runtime/connected params = %v, want the generated Health", health)
 	resync := b.awaitFrame(t, methodFrame("runtime/resync_required"))
 	{
 		params, ok := resync["params"]
@@ -1251,7 +1326,7 @@ func TestACPRuntimeForwarding(t *testing.T) {
 	b := startBridge(t, f, "/ws")
 	b.call(t, "1", "initialize", "")
 
-	body := `{"workspace":"/ws","agent_type":"integrated","opaque":9007199254740993}`
+	body := `{"workspace":"/ws","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"integrated"}},"opaque":9007199254740993}`
 	created := b.call(t, "2", "runtime/CreateSession", `{"body":`+body+`}`)
 	if resultOf(t, created) != `{"session_id":"s1","durable_revision":"9007199254740993"}` {
 		t.Fatalf("CreateSession result = %s, want the exact raw body", resultOf(t, created))

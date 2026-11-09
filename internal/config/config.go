@@ -1,6 +1,6 @@
 // Package config loads the Lightcode config file and resolves process-level
 // settings. Provider/model metadata is owned by internal/catalog and
-// internal/agents; this package keeps only non-model runtime sections.
+// extensions/agents; this package keeps only non-model runtime sections.
 //
 // Secrets are env vars. They are loaded at startup from ~/.lightcode/.env (if
 // present) or inherited from the shell. They are never written to config.json
@@ -64,8 +64,18 @@ type ToolsConfig struct {
 // data so config consumers can round-trip the section, but catalog.Loader is
 // the only code that interprets provider/model metadata.
 type Config struct {
-	Providers map[string]any `json:"providers,omitempty"`
-	Sessions  SessionConfig  `json:"sessions"`
+	Providers  map[string]any             `json:"providers,omitempty"`
+	Sessions   SessionConfig              `json:"sessions"`
+	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
+}
+
+// SectionEnabled reports whether a raw extension section has enabled:true.
+func SectionEnabled(raw json.RawMessage) bool {
+	var section map[string]json.RawMessage
+	if json.Unmarshal(raw, &section) != nil {
+		return false
+	}
+	return string(section["enabled"]) == "true"
 }
 
 // rawSessionConfig is used to detect which sessions fields were present in the
@@ -146,8 +156,9 @@ func checkSweepDays(days int, field string) error {
 // propagated. Provider raw shape is validated at the catalog, not here.
 func Parse(data []byte) (*Config, error) {
 	var doc struct {
-		Providers map[string]any  `json:"providers"`
-		Sessions  json.RawMessage `json:"sessions"`
+		Providers  map[string]any             `json:"providers"`
+		Sessions   json.RawMessage            `json:"sessions"`
+		Extensions map[string]json.RawMessage `json:"extensions"`
 	}
 	if err := decodeJSONUseNumber(data, &doc); err != nil {
 		return nil, err
@@ -159,7 +170,7 @@ func Parse(data []byte) (*Config, error) {
 	if doc.Providers == nil {
 		doc.Providers = map[string]any{}
 	}
-	return &Config{Providers: doc.Providers, Sessions: sessions}, nil
+	return &Config{Providers: doc.Providers, Sessions: sessions, Extensions: doc.Extensions}, nil
 }
 
 func decodeJSONUseNumber(data []byte, target any) error {

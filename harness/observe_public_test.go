@@ -54,7 +54,7 @@ func (publicNoopStopper) StopJob(string, string) {}
 func publicChildLaunch(root string) harness.LaunchChildRequest {
 	return harness.LaunchChildRequest{
 		ParentSessionID: root,
-		AgentType:       "coder",
+		AgentSelection:  publicSelection("coder"),
 		Content:         []model.ContentPart{{Kind: model.PartText, Text: "child"}},
 		OperationID:     "child-op-1",
 		MaxConcurrent:   2,
@@ -464,7 +464,7 @@ func TestObservePublicBothStores(t *testing.T) {
 			testassert.Require(t, len(got) == 0, "the restarted owner replayed %+v", got)
 		}
 		{
-			_, err := restarted.ChangeAgentType(context.Background(), session, "planner")
+			_, err := restarted.ChangeAgentType(context.Background(), session, publicSelection("planner"))
 			testassert.NoError(t, err)
 		}
 		{
@@ -706,7 +706,7 @@ func observedBlockedToolFixture(t *testing.T, store harness.Storage) (*publicFac
 		releaseOnce sync.Once
 	)
 	release := func() { releaseOnce.Do(func() { close(released) }) }
-	tool := func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+	tool := func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 		return harness.PreparedTool{
 			Permissions: publicPermission,
 			Execute: func(context.Context) harness.ToolOutcome {

@@ -287,6 +287,38 @@ func TestBuiltInAllowsChildLaunchAndProcessOwn(t *testing.T) {
 	}
 }
 
+// TestChildLaunchCanonicalTargetPolicyKeepsOpaqueReferencesDistinct proves
+// user policy matches the shared complete-reference target, not one opaque
+// definition component: two same-ID references from different providers stay
+// distinct through delimiter and percent bytes, and an unescaped join matches
+// no exact rule.
+func TestChildLaunchCanonicalTargetPolicyKeepsOpaqueReferencesDistinct(t *testing.T) {
+	definitionID := "shared/with%2Fbytes"
+	own := DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: definitionID}
+	foreign := DefinitionRef{ExtensionID: "guestdefs", CapabilityID: "guestdefs.definitions", DefinitionID: definitionID}
+	policy := ResolvePermissionPolicy(json.RawMessage(levelJSON(
+		rulesJSON(
+			ruleJSON(PermissionChildLaunch, foreign.PermissionTarget(), permissionAccessDeny),
+			ruleJSON(PermissionChildLaunch, own.PermissionTarget(), permissionAccessAllow),
+		),
+		`"default":"deny"`,
+	)), nil)
+	for _, tc := range []struct {
+		name   string
+		target string
+		want   bool
+	}{
+		{"own canonical target", own.PermissionTarget(), true},
+		{"foreign canonical target", foreign.PermissionTarget(), false},
+		{"unescaped join", own.ExtensionID + "/" + own.CapabilityID + "/" + own.DefinitionID, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := policy.evaluate("/w", PermissionRequest{PermissionChildLaunch, tc.target})
+			testassert.Check(t, got == tc.want, "child.launch target %q = %v, want %v", tc.target, got, tc.want)
+		})
+	}
+}
+
 func TestPermissionGlobMatcher(t *testing.T) {
 	globs := []struct {
 		name    string

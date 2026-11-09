@@ -22,7 +22,7 @@ import (
 // Invocation is constructible.
 func TestConfiguredToolsSettingsTakeEffect(t *testing.T) {
 	ctx := context.Background()
-	byID, _ := openToolsComposed(t, t.TempDir(), &fakeJobs{}, Plugin{})
+	byID, _ := openToolsComposed(t, t.TempDir(), &fakeJobs{}, nil)
 	value, ok := byID["read_file"]
 	testassert.Require(t, ok, "plugin instance exports no read_file")
 	readTool := value
@@ -35,13 +35,13 @@ func TestConfiguredToolsSettingsTakeEffect(t *testing.T) {
 
 	configured, err := ConfiguredInvocationForTest(`{"read_max_lines":77}`, "", "", nil)
 	testassert.NoError(t, err)
-	raw, err := readTool.Normalize(ToolContext{Invocation: configured}, call(t, `{"path":"a.txt"}`))
+	raw, err := readTool.Normalize(context.Background(), ToolContext{Invocation: configured}, call(t, `{"path":"a.txt"}`))
 	testassert.NoError(t, err)
 	testassert.Require(t, string(raw) == `{"limit":77,"offset":1,"path":"a.txt"}`, "configured normalization = %s, want the configured default limit 77", raw)
 
 	// The zero Invocation keeps the shipped default: the channel, not the
 	// decoder, carries the configured value.
-	raw, err = readTool.Normalize(ToolContext{}, call(t, `{"path":"a.txt"}`))
+	raw, err = readTool.Normalize(context.Background(), ToolContext{}, call(t, `{"path":"a.txt"}`))
 	testassert.NoError(t, err)
 	testassert.Require(t, string(raw) == `{"limit":500,"offset":1,"path":"a.txt"}`, "zero-Invocation normalization = %s, want the shipped default limit 500", raw)
 
@@ -59,7 +59,7 @@ func TestConfiguredToolsSettingsTakeEffect(t *testing.T) {
 		AdmittedEntry: harness.EntryRef{SessionID: "0123456789abcdef0123456789abcdef", EntryID: "fedcba9876543210fedcba9876543210"},
 		Invocation:    configured,
 	}
-	committed, err := readTool.Normalize(tc, call(t, `{"path":"big.txt"}`))
+	committed, err := readTool.Normalize(context.Background(), tc, call(t, `{"path":"big.txt"}`))
 	testassert.NoError(t, err)
 	plan := readTool.Prepare(ctx, tc, call(t, string(committed)))
 	testassert.Require(t, plan.Immediate == nil && plan.Execute != nil, "plan = %+v, want one executor", plan)

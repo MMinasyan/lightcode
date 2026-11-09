@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"net/http"
 	"testing"
 
 	"github.com/MMinasyan/lightcode/harness"
@@ -57,7 +56,7 @@ func TestMountedGeneratedGoClientWarningLifetime(t *testing.T) {
 		testassert.Require(t, find(victimID), "archive dropped the Session's warning over the mounted read")
 
 		deleted, err := client.DeleteSessionWithResponse(ctx, victimID)
-		testassert.Require(t, err == nil && deleted.HTTPResponse.StatusCode == http.StatusNoContent, "DeleteSession = (%+v, %v), want the 204 deletion", deleted, err)
+		testassert.Require(t, err == nil && deleted.JSON200 != nil && len(deleted.JSON200.CleanupFailures) == 0, "DeleteSession = (%+v, %v), want the 200 deletion result with no cleanup failures", deleted, err)
 		testassert.Require(t, !find(victimID), "the committed deletion kept the Session's warning over the mounted read")
 		testassert.Require(t, find(siblingID), "the committed deletion removed the sibling Session's warning")
 	})

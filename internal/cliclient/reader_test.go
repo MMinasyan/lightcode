@@ -119,13 +119,13 @@ func discovery(t *testing.T, handler http.Handler) (clienthost.Options, *client.
 
 // discoveryRecord builds one private discovery document for the given owner.
 func discoveryRecord(endpoint, owner string) []byte {
-	raw, _ := json.Marshal(map[string]string{"endpoint": endpoint, "instance_id": owner, "protocol_version": string(protocol.N8), "credential": strings.Repeat("1", 64)})
+	raw, _ := json.Marshal(map[string]string{"endpoint": endpoint, "instance_id": owner, "protocol_version": string(protocol.N12), "credential": strings.Repeat("1", 64)})
 	return raw
 }
 
 func health(w http.ResponseWriter, owner string) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N8})
+	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N12})
 }
 
 func fixture(t *testing.T) (*CLI, *scriptedTransport) {
@@ -150,8 +150,12 @@ func fixture(t *testing.T) (*CLI, *scriptedTransport) {
 func revision(n string) protocol.SessionRevision {
 	return protocol.SessionRevision{InstanceId: instance, DurableRevision: n, LocalRevision: "0"}
 }
+func fixtureSelection(name string) protocol.AgentSelection {
+	return protocol.AgentSelection{Definition: &protocol.DefinitionRef{ExtensionId: "agents", CapabilityId: "agents.definitions", DefinitionId: name}}
+}
+
 func configuration(n string) protocol.ConfigurationView {
-	return protocol.ConfigurationView{ConfigurationRevision: protocol.ConfigurationRevision{InstanceId: instance, Generation: n}, Agents: []protocol.Agent{{Name: "primary", Model: "provider/next", Capabilities: []string{}, Tools: []string{}}}, Providers: []protocol.Provider{}, Settings: protocol.Settings{Plugins: protocol.PluginsSettings{}}}
+	return protocol.ConfigurationView{ConfigurationRevision: protocol.ConfigurationRevision{InstanceId: instance, Generation: n}, Agents: []protocol.Agent{{Name: "primary", Definition: *fixtureSelection("primary").Definition, Model: "provider/next", Capabilities: []string{}, Tools: []string{}}}, Providers: []protocol.Provider{}, Settings: protocol.Settings{Extensions: protocol.ExtensionsSettings{}}}
 }
 func warnings(n string) protocol.WarningsSnapshot {
 	return protocol.WarningsSnapshot{WarningsRevision: protocol.WarningsRevision{InstanceId: instance, Revision: n}, Warnings: []protocol.Warning{}}
@@ -160,7 +164,7 @@ func hydration(id, n string, items []protocol.ConversationItem, cursor *string) 
 	if items == nil {
 		items = []protocol.ConversationItem{}
 	}
-	return protocol.Hydration{Session: protocol.Session{SessionId: id, Workspace: "/workspace", AgentType: "primary", Lifecycle: "open", SessionRevision: revision(n)}, SessionRevision: revision(n), ConfigurationRevision: configuration("1").ConfigurationRevision, WarningsRevision: warnings("1").WarningsRevision, Conversation: protocol.ConversationPage{Items: items, OlderCursor: cursor}, Operations: []protocol.Operation{}, Background: []protocol.BackgroundMember{}, Warnings: []protocol.Warning{}, Pending: protocol.PendingQueues{Queued: []protocol.PendingInput{}, Steering: []protocol.PendingInput{}}, Usage: protocol.UsageProjection{Context: protocol.UsageContext{UsedTokens: "0"}, Totals: protocol.UsageTotals{ByModel: []protocol.ModelUsage{}}}}
+	return protocol.Hydration{Session: protocol.Session{SessionId: id, Workspace: "/workspace", AgentSelection: fixtureSelection("primary"), Lifecycle: "open", SessionRevision: revision(n)}, SessionRevision: revision(n), ConfigurationRevision: configuration("1").ConfigurationRevision, WarningsRevision: warnings("1").WarningsRevision, Conversation: protocol.ConversationPage{Items: items, OlderCursor: cursor}, Operations: []protocol.Operation{}, Background: []protocol.BackgroundMember{}, Warnings: []protocol.Warning{}, Pending: protocol.PendingQueues{Queued: []protocol.PendingInput{}, Steering: []protocol.PendingInput{}}, Usage: protocol.UsageProjection{Context: protocol.UsageContext{UsedTokens: "0"}, Totals: protocol.UsageTotals{ByModel: []protocol.ModelUsage{}}}}
 }
 func pointer[T any](v T) *T { return &v }
 

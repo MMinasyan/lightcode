@@ -1,13 +1,13 @@
 # Lightcode Runtime protocol — the single source of truth for HTTP paths,
 # request/response DTOs, closed enums, error payloads, and SSE event frames.
-# Wire version "8" is the protocol identity, independent of the binary
+# The wire version is the protocol identity, independent of the binary
 # release version. This file is hand-maintained; the Go and TypeScript
 # artifacts under protocol/ and frontend/src/generated/protocol/ are
 # generated from it and are never hand-edited.
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "8"
+  version: "12"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -82,8 +82,12 @@ paths:
       parameters:
         - $ref: "#/components/parameters/SessionID"
       responses:
-        "204":
-          description: The archived Session was deleted.
+        "200":
+          description: The committed deletion and any incomplete cleanup.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletionResult"
         default:
           $ref: "#/components/responses/Error"
   /v1/sessions/{id}/archive:
@@ -208,6 +212,26 @@ paths:
       responses:
         "200":
           description: The Session header; only subsequent admissions use the new Agent type.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/model:
+    put:
+      operationId: SetSessionModel
+      parameters:
+        - $ref: "#/components/parameters/SessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetSessionModelRequest"
+      responses:
+        "200":
+          description: The updated Session header.
           content:
             application/json:
               schema:
@@ -363,30 +387,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SettingsMutation"
-        default:
-          $ref: "#/components/responses/Error"
-  /v1/agent-types/model:
-    put:
-      operationId: SetAgentTypeModel
-      parameters:
-        - name: agent_type
-          in: query
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/SetAgentTypeModelRequest"
-      responses:
-        "200":
-          description: The updated Agent roster entry under the mutation envelope.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AgentMutation"
         default:
           $ref: "#/components/responses/Error"
   /v1/models:
@@ -727,12 +727,50 @@ components:
             - closed
             - configuration
             - storage
+            - unavailable
             - internal
         message:
           type: string
         session_id:
           type: string
           pattern: "^[0-9a-f]{32}$"
+    CleanupFailure:
+      description: >
+        One cleanup attempt that did not complete after the canonical Session
+        deletion committed. An absent extension_id is local Session-tree
+        cleanup; an external failure names its extension.
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        extension_id:
+          type: string
+          minLength: 1
+        code:
+          type: string
+          description: >
+            storage for local Session-tree cleanup, unavailable for an
+            external owner's cleanup.
+          enum:
+            - storage
+            - unavailable
+        message:
+          type: string
+    DeletionResult:
+      description: >
+        The committed Session deletion and every incomplete cleanup attempt.
+        The cleanup_failures array is always present.
+      type: object
+      additionalProperties: false
+      required:
+        - cleanup_failures
+      properties:
+        cleanup_failures:
+          type: array
+          items:
+            $ref: "#/components/schemas/CleanupFailure"
     SessionLifecycle:
       type: string
       enum:
@@ -838,13 +876,14 @@ components:
         protocol_version:
           type: string
           enum:
-            - "8"
+            - "12"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
         non-global kind must address its subject: workspace carries workspace,
-        session carries session_id, operation and agent carry session_id and
-        operation_id, and job carries session_id and job_id. Each branch keeps
+        session carries session_id, operation and invocation carry session_id
+        and operation_id, invocation additionally carries invocation_id and
+        purpose, and job carries session_id and job_id. Each branch keeps
         the same closed member vocabulary, so attribution members beyond the
         required identities are allowed; every supplied member is nonempty and
         session_id always matches its pattern.
@@ -853,7 +892,7 @@ components:
         - $ref: "#/components/schemas/WorkspaceScope"
         - $ref: "#/components/schemas/SessionScope"
         - $ref: "#/components/schemas/OperationScope"
-        - $ref: "#/components/schemas/AgentScope"
+        - $ref: "#/components/schemas/InvocationScope"
         - $ref: "#/components/schemas/JobScope"
       discriminator:
         propertyName: kind
@@ -862,7 +901,7 @@ components:
           workspace: "#/components/schemas/WorkspaceScope"
           session: "#/components/schemas/SessionScope"
           operation: "#/components/schemas/OperationScope"
-          agent: "#/components/schemas/AgentScope"
+          invocation: "#/components/schemas/InvocationScope"
           job: "#/components/schemas/JobScope"
     RuntimeScope:
       type: object
@@ -956,18 +995,20 @@ components:
         job_id:
           type: string
           minLength: 1
-    AgentScope:
+    InvocationScope:
       type: object
       additionalProperties: false
       required:
         - kind
         - session_id
         - operation_id
+        - invocation_id
+        - purpose
       properties:
         kind:
           type: string
           enum:
-            - agent
+            - invocation
         workspace:
           type: string
           minLength: 1
@@ -977,6 +1018,14 @@ components:
         operation_id:
           type: string
           minLength: 1
+        invocation_id:
+          type: string
+          minLength: 1
+        purpose:
+          type: string
+          enum:
+            - conversation
+            - maintenance
         job_id:
           type: string
           minLength: 1
@@ -1129,7 +1178,7 @@ components:
         - session_id
         - workspace
         - lifecycle
-        - agent_type
+        - agent_selection
         - created_at
         - last_activity
         - session_revision
@@ -1147,8 +1196,8 @@ components:
           pattern: "^[0-9a-f]{32}$"
         lifecycle:
           $ref: "#/components/schemas/SessionLifecycle"
-        agent_type:
-          type: string
+        agent_selection:
+          $ref: "#/components/schemas/AgentSelection"
         current_operation_id:
           type: string
         created_at:
@@ -1167,12 +1216,11 @@ components:
       additionalProperties: false
       required:
         - workspace
-        - agent_type
       properties:
         workspace:
           type: string
-        agent_type:
-          type: string
+        agent_selection:
+          $ref: "#/components/schemas/AgentSelection"
     Operation:
       type: object
       additionalProperties: false
@@ -1181,7 +1229,7 @@ components:
         - request_kind
         - status
         - admitted_at
-        - agent_type
+        - agent_selection
         - model
         - usage
       properties:
@@ -1205,8 +1253,8 @@ components:
         settled_at:
           type: string
           format: date-time
-        agent_type:
-          type: string
+        agent_selection:
+          $ref: "#/components/schemas/AgentSelection"
         model:
           $ref: "#/components/schemas/ModelRef"
         detail:
@@ -1710,9 +1758,79 @@ components:
       type: object
       additionalProperties: false
       required:
-        - agent_type
+        - agent_selection
       properties:
-        agent_type:
+        agent_selection:
+          $ref: "#/components/schemas/AgentSelection"
+    SetSessionModelRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - model
+      properties:
+        model:
+          $ref: "#/components/schemas/ModelRef"
+    AgentSelection:
+      type: object
+      additionalProperties: false
+      properties:
+        inputs:
+          $ref: "#/components/schemas/AgentInputs"
+        definition:
+          $ref: "#/components/schemas/DefinitionRef"
+    DefinitionRef:
+      type: object
+      additionalProperties: false
+      required: [extension_id, capability_id, definition_id]
+      properties:
+        extension_id:
+          type: string
+        capability_id:
+          type: string
+        definition_id:
+          type: string
+    AgentInputs:
+      type: object
+      additionalProperties: false
+      required: [model, instructions, assembly_mode, tools, capabilities, constraints, strategy]
+      properties:
+        model:
+          $ref: "#/components/schemas/ModelRef"
+        instructions:
+          type: string
+        assembly_mode:
+          type: string
+          enum: [full, simple, none]
+          x-enum-varnames: [AgentAssemblyFull, AgentAssemblySimple, AgentAssemblyNone]
+        tools:
+          type: array
+          items:
+            type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+        constraints:
+          $ref: "#/components/schemas/ToolConstraints"
+        strategy:
+          $ref: "#/components/schemas/StrategySelection"
+    ToolConstraints:
+      type: object
+      additionalProperties: false
+      required: [readonly, write_dir]
+      properties:
+        readonly:
+          type: boolean
+        write_dir:
+          type: string
+    StrategySelection:
+      type: object
+      additionalProperties: false
+      required: [id, settings]
+      properties:
+        id:
+          type: string
+        settings:
           type: string
     RevertCodeRequest:
       type: object
@@ -1858,19 +1976,16 @@ components:
         consumption.
       additionalProperties: true
       x-go-type: json.RawMessage
-    PluginConfigDocument:
+    ExtensionConfigDocument:
       type: string
       description: >-
-        One compiled plugin's own configuration document: the exact JSON
-        object text the selected plugin declaration owns, carried as a string
-        so the transport never interprets, renumbers or drops its members.
-    PluginsSettings:
+        One extension configuration document as exact JSON text.
+    ExtensionsSettings:
       type: object
       description: >-
-        Every owned plugin section as its JSON document string, keyed by the
-        compiled plugin ID; an absent ID uses that plugin's own defaults.
+        Extension sections as JSON document strings, keyed by extension ID.
       additionalProperties:
-        $ref: "#/components/schemas/PluginConfigDocument"
+        $ref: "#/components/schemas/ExtensionConfigDocument"
     Settings:
       type: object
       additionalProperties: false
@@ -1879,7 +1994,7 @@ components:
         - tools
         - jobs
         - compaction
-        - plugins
+        - extensions
       properties:
         sessions:
           $ref: "#/components/schemas/SessionsSettings"
@@ -1889,13 +2004,14 @@ components:
           $ref: "#/components/schemas/JobsSettings"
         compaction:
           $ref: "#/components/schemas/CompactionSettings"
-        plugins:
-          $ref: "#/components/schemas/PluginsSettings"
+        extensions:
+          $ref: "#/components/schemas/ExtensionsSettings"
     Agent:
       type: object
       additionalProperties: false
       required:
         - name
+        - definition
         - description
         - subagent
         - model
@@ -1906,6 +2022,8 @@ components:
       properties:
         name:
           type: string
+        definition:
+          $ref: "#/components/schemas/DefinitionRef"
         description:
           type: string
         subagent:
@@ -1955,12 +2073,33 @@ components:
           $ref: "#/components/schemas/ConfigurationRevision"
     UpdateSettingsRequest:
       type: object
+      description: >-
+        Exactly one of the complete settings shape or one declared extension
+        configuration edit; the accepting owner rejects zero or both.
       additionalProperties: false
-      required:
-        - settings
       properties:
         settings:
           $ref: "#/components/schemas/Settings"
+        extension_edit:
+          $ref: "#/components/schemas/ExtensionEdit"
+    ExtensionEdit:
+      type: object
+      additionalProperties: false
+      required:
+        - extension_id
+        - edit_id
+        - arguments
+      properties:
+        extension_id:
+          type: string
+          minLength: 1
+        edit_id:
+          type: string
+          minLength: 1
+        arguments:
+          type: string
+          description: >-
+            The edit call's JSON document, carried as exact text.
     SettingsMutation:
       type: object
       additionalProperties: false
@@ -1972,25 +2111,6 @@ components:
           $ref: "#/components/schemas/ConfigurationRevision"
         result:
           $ref: "#/components/schemas/Settings"
-    SetAgentTypeModelRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - model
-      properties:
-        model:
-          $ref: "#/components/schemas/ModelRef"
-    AgentMutation:
-      type: object
-      additionalProperties: false
-      required:
-        - configuration_revision
-        - result
-      properties:
-        configuration_revision:
-          $ref: "#/components/schemas/ConfigurationRevision"
-        result:
-          $ref: "#/components/schemas/Agent"
     Cost:
       type: object
       additionalProperties: false

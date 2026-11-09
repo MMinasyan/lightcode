@@ -30,7 +30,7 @@ func (rt *protocolHandlers) GetHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N8}
+	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N12}
 	rt.writeQualifiedJSON(w, http.StatusOK, &health)
 }
 
@@ -59,30 +59,14 @@ func (rt *protocolHandlers) GetConfiguration(w http.ResponseWriter, r *http.Requ
 	rt.writeQualifiedJSON(w, http.StatusOK, &view)
 }
 
-// UpdateConfigurationSettings serves the whole-section settings write.
+// UpdateConfigurationSettings serves the settings/extension-edit writer.
 func (rt *protocolHandlers) UpdateConfigurationSettings(w http.ResponseWriter, r *http.Request) {
 	var body protocol.UpdateSettingsRequest
 	if err := decodeRequestBody(r, &body); err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	mutation, err := rt.updateSettings(r.Context(), body.Settings)
-	if err != nil {
-		writeProtocolError(w, err)
-		return
-	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
-}
-
-// SetAgentTypeModel serves one Agent type's model edit; the type's name is a
-// required query value.
-func (rt *protocolHandlers) SetAgentTypeModel(w http.ResponseWriter, r *http.Request, params protocol.SetAgentTypeModelParams) {
-	var body protocol.SetAgentTypeModelRequest
-	if err := decodeRequestBody(r, &body); err != nil {
-		writeProtocolError(w, err)
-		return
-	}
-	mutation, err := rt.setAgentTypeModel(r.Context(), params.AgentType, string(body.Model))
+	mutation, err := rt.updateSettings(r.Context(), body)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
@@ -299,7 +283,7 @@ func (rt *protocolHandlers) CreateSession(w http.ResponseWriter, r *http.Request
 		writeProtocolError(w, err)
 		return
 	}
-	header, err := rt.createSessionHeader(r.Context(), body.Workspace, body.AgentType)
+	header, err := rt.createSessionHeader(r.Context(), body.Workspace, body.AgentSelection)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
@@ -307,14 +291,29 @@ func (rt *protocolHandlers) CreateSession(w http.ResponseWriter, r *http.Request
 	rt.writeQualifiedJSON(w, http.StatusCreated, &header)
 }
 
-// DeleteSession serves the archived-Session deletion with its idempotent
-// no-content result.
-func (rt *protocolHandlers) DeleteSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	if err := rt.deleteSession(r.Context(), id); err != nil {
+func (rt *protocolHandlers) SetSessionModel(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
+	var body protocol.SetSessionModelRequest
+	if err := decodeRequestBody(r, &body); err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	header, err := rt.setSessionModel(r.Context(), id, body)
+	if err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	rt.writeQualifiedJSON(w, http.StatusOK, &header)
+}
+
+// DeleteSession serves the archived-Session deletion with its structured
+// post-commit cleanup result.
+func (rt *protocolHandlers) DeleteSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
+	result, err := rt.deleteSession(r.Context(), id)
+	if err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	rt.writeQualifiedJSON(w, http.StatusOK, &result)
 }
 
 // ArchiveSession serves the archive control; the returned header is the

@@ -48,9 +48,17 @@ type requestView struct {
 // newRequestView freezes the captured prompt and the canonical projection
 // into one live view.
 func newRequestView(capture ExecutionCapture, checkpoint, boundary string, canonical []model.Message) *requestView {
-	names := make([]string, len(capture.Tools))
-	for i, tool := range capture.Tools {
-		names[i] = tool.Name
+	names := capture.InitialToolNames
+	if names == nil { // the Harness default: every captured eligible tool
+		names = make([]string, 0, len(capture.Tools))
+		for _, tool := range capture.Tools {
+			names = append(names, tool.Name)
+		}
+	} else {
+		names = append([]string(nil), names...)
+		if names == nil {
+			names = []string{}
+		}
 	}
 	return &requestView{
 		capture:    capture,
@@ -76,16 +84,18 @@ func (v *requestView) currentCanonical() []model.Message {
 	return out
 }
 
-// effectiveTools renders the view's effective tool catalog: the captured
-// catalog unchanged, or its selected members in captured catalog order.
+// effectiveTools renders the view's effective tool catalog in its effective
+// visibility order: the preparation-selected order initially, and the
+// request-consequence canonicalization order after a hook selection.
 func (v *requestView) effectiveTools() []model.ToolDefinition {
-	out := make([]model.ToolDefinition, 0, len(v.names))
+	index := make(map[string]model.ToolDefinition, len(v.capture.Tools))
 	for _, tool := range v.capture.Tools {
-		for _, name := range v.names {
-			if name == tool.Name {
-				out = append(out, cloneToolDefinitions([]model.ToolDefinition{tool})...)
-				break
-			}
+		index[tool.Name] = tool
+	}
+	out := make([]model.ToolDefinition, 0, len(v.names))
+	for _, name := range v.names {
+		if tool, ok := index[name]; ok {
+			out = append(out, cloneToolDefinitions([]model.ToolDefinition{tool})...)
 		}
 	}
 	return out

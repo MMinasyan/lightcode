@@ -18,7 +18,7 @@ import (
 // accepts exactly one non-null JSON object and returns the caller's exact
 // argument bytes, so every difference between consumed and committed bytes is
 // attributable to the durable codec.
-func hookNormalize(call model.ToolCall) (json.RawMessage, error) {
+func hookNormalize(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
 		return nil, errors.New("arguments must be one non-null JSON object")
@@ -43,13 +43,13 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 			prepared []string // argument bytes the concrete tool received
 		)
 		hooks := []harness.ToolArgumentsHook{
-			{ID: "cap.hook.one", ExtensionID: "cap-a", Mode: harness.HookModeEffectful, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+			{ID: "cap.hook.one", ExtensionID: "cap-a", Mode: harness.HookModeEffectful, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 				mu.Lock()
 				hookSeen = append(hookSeen, string(call.Arguments))
 				mu.Unlock()
 				return json.RawMessage(`{ "x": "<" }`), nil
 			}},
-			{ID: "cap.hook.two", ExtensionID: "cap-a", Mode: harness.HookModeEffectful, Run: func(_ context.Context, call model.ToolCall) (json.RawMessage, error) {
+			{ID: "cap.hook.two", ExtensionID: "cap-a", Mode: harness.HookModeEffectful, Run: func(ctx context.Context, call model.ToolCall) (json.RawMessage, error) {
 				mu.Lock()
 				hookSeen = append(hookSeen, string(call.Arguments))
 				mu.Unlock()
@@ -71,7 +71,7 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 							Model:         script.effect,
 							NormalizeTool: hookNormalize,
 							ToolHooks:     hooks,
-							Tool: func(_ context.Context, call model.ToolCall) harness.PreparedTool {
+							Tool: func(ctx context.Context, call model.ToolCall) harness.PreparedTool {
 								mu.Lock()
 								prepared = append(prepared, string(call.Arguments))
 								mu.Unlock()

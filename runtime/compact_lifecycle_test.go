@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"path/filepath"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -16,10 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // Native compaction rows over the real preparation: the compaction observer
@@ -57,7 +56,7 @@ func TestCompactLifecycleNativeCompactionObservation(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, compactObservationAgentsDocument)
 		e.fixtureStore(store)
 		r, err := e.open(context.Background())
 		testassert.NoError(t, err)
@@ -198,7 +197,8 @@ func TestCompactLifecycleNativeCompactionAgentScopeCount(t *testing.T) {
 	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
 		e := newOwnerEnv(t)
 		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), compactObservationAgentsDocument)
+		writeAgentDefinitions(t, e.configPath, compactObservationAgentsDocument)
+		enableFixturePlugin(t, e.configPath, "probe-agent")
 		var agOpens atomic.Int64
 		e.fixtureStore(store)
 		r, err := e.open(context.Background(),
@@ -285,17 +285,26 @@ type rawAdmissionValues struct {
 // caller's authored execution values.
 func rawMessageAdmission(sessionID, operationID, entryID string, v rawAdmissionValues) string {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var defs []struct {
+		Name string `json:"name"`
+	}
+	_ = json.Unmarshal([]byte(v.tools), &defs)
+	names := make([]string, 0, len(defs))
+	for _, def := range defs {
+		names = append(names, def.Name)
+	}
+	initialNames, _ := json.Marshal(names)
 	return fmt.Sprintf(
 		`{"session_id":%q,"operation_id":%q,"request_kind":"message",`+
-			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_type":%q,`+
+			`"admitted_entry":{"session_id":%q,"entry_id":%q},"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":%q}},`+
 			`"execution":{"configuration_revision":"rev-1","model":{"provider":%q,"model":%q},`+
 			`"context_window":4096,"output_reserve":%d,`+
-			`"system_prompt":%q,"tools":%s,"readonly":false,"write_dir":"",`+
+			`"system_prompt":%q,"tools":%s,"initial_tool_names":%s,"readonly":false,"write_dir":"",`+
 			`"compact":{"model":{"provider":%q,"model":%q},"system_prompt":%q},`+
 			`"strategy":{"id":"melta.summary/v1","requires_context_window":true}},"admitted_at":%q}`,
 		sessionID, operationID, sessionID, entryID, v.agentType,
 		v.model.Provider, v.model.Model, v.outputReserve,
-		v.systemPrompt, v.tools,
+		v.systemPrompt, v.tools, initialNames,
 		v.compactModel.Provider, v.compactModel.Model, v.compactPrompt, now)
 }
 
@@ -389,16 +398,16 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 		ctx := context.Background()
 		var seenMu sync.Mutex
 		var seenPrompt string
-		hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in PreparationInput) PreparationConsequence {
+		hook := &recordHook{name: "hook.first", events: &traceLog{}, mutate: func(in extension.PreparationInput) extension.PreparationConsequence {
 			seenMu.Lock()
 			seenPrompt = in.Prompt
 			seenMu.Unlock()
-			return PreparationConsequence{}
+			return extension.PreparationConsequence{}
 		}}
 		// The freed phase runs on its own hook instance, so the first
 		// instance's visible contribution is never overwritten.
 		freedHook := &recordHook{name: "hook.freed", events: &traceLog{}}
-		writeServiceFile(t, agents.PathForConfig(e.configPath), productionAgentsWithFreedHook())
+		writeAgentDefinitions(t, e.configPath, productionAgentsWithFreedHook())
 		r, err := e.openWithPlugins(ctx, hook, &parkingHook{}, freedHookPlugin(freedHook))
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
@@ -419,13 +428,13 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 
 		// The prompt and tool-description replacement freedoms hold on a
 		// fresh session under the second hook instance.
-		freedHook.set(nil, func(in PreparationInput) PreparationConsequence {
+		freedHook.set(nil, func(in extension.PreparationInput) extension.PreparationConsequence {
 			prompt := in.Prompt + "|freed"
 			descriptions := make(map[string]string, len(in.Catalog))
 			for _, tool := range in.Catalog {
 				descriptions[tool.Name] = "freed description"
 			}
-			return PreparationConsequence{Prompt: &prompt, Descriptions: descriptions}
+			return extension.PreparationConsequence{Prompt: &prompt, Descriptions: descriptions}
 		})
 		freedSession, err := r.createSession(ctx, e.workspace("compact-freed"), "freedworker")
 		testassert.NoError(t, err)
@@ -444,15 +453,11 @@ func TestCompactLifecycleCapturedCompactionConfiguration(t *testing.T) {
 // identity and capability spec, so only the agent type selecting this spec
 // runs the instance's mutation and the first instance's mutation is never
 // overwritten by the freed phase.
-func freedHookPlugin(hook *recordHook) Plugin {
-	return Plugin{
-		ID:       "freedhooks",
-		Scope:    ScopeRuntime,
-		Provides: []CapabilitySpec{Spec[PreparationHook]("hook.freed")},
-		Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-			return Instance{Values: map[string]any{"hook.freed": hook}}, nil
-		},
-	}
+func freedHookPlugin(hook *recordHook) extension.Native {
+	capability := extension.HookCapability("hook.freed", extension.SingleHook(extension.BoundaryPrepare, extension.HookModePure))
+	return testNative("freedhooks", extension.LifetimeHarness, []extension.Capability{capability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"hook.freed": {Preparation: hook.Prepare}}}, nil
+	})
 }
 
 // productionAgentsWithFreedHook extends the production agents document with
@@ -462,130 +467,570 @@ func productionAgentsWithFreedHook() string {
   "freedworker": {"model": "prov/m", "system_prompt": "simple", "tools": ["prod_write", "prod_read"], "capabilities": ["hook.freed"]}}`
 }
 
-// --- the protocol and client surface pin ---
+type observedInvocation struct {
+	instanceID   string
+	invocationID string
+	purpose      string
+	operationID  string
+	resource     string
+}
 
-// TestCompactLifecycleRuntimeSurfaceUnchanged pins the runtime package's
-// exported declaration set against the fixed current set — top-level
-// exported declarations under their bare names and exported methods on
-// exported receiver types under receiver-qualified names, with pointer and
-// value receivers distinguished in the key the same way the exported check
-// distinguishes them — so an added (*Runtime) method cannot hide behind the
-// top-level-only scan and same-named methods on different receivers cannot
-// collide: the mounted server transport exposes only the Runtime's
-// OpenProtocol and the ProtocolServer's endpoint and discovery publication,
-// while the generated handler methods live on the private transport receiver
-// and are not public surface. A source scan of the package's production
-// files must find exactly the pinned names and no others.
-func TestCompactLifecycleRuntimeSurfaceUnchanged(t *testing.T) {
-	want := map[string]bool{
-		"(*ProtocolServer).Endpoint":         true,
-		"(*ProtocolServer).PublishDiscovery": true,
-		"(*Runtime).Close":                   true,
-		"(*Runtime).OpenProtocol":            true,
-		"(*Runtime).Reload":                  true,
-		"(*Runtime).Subscribe":               true,
-		"(*Subscription).Close":              true,
-		"(*Subscription).Events":             true,
-		"(Invocation).AgentTypes":            true,
-		"(Invocation).Config":                true,
-		"(Invocation).Revision":              true,
-		"BackgroundServices":                 true,
-		"CapabilitySpec":                     true,
-		"Bind":                               true,
-		"Bindings":                           true,
-		"ChildRequest":                       true,
-		"ErrClosed":                          true,
-		"ErrComposition":                     true,
-		"ErrConfiguration":                   true,
-		"ErrOwned":                           true,
-		"Event":                              true,
-		"Instance":                           true,
-		"Invocation":                         true,
-		"Open":                               true,
-		"Options":                            true,
-		"Plugin":                             true,
-		"PreparationConsequence":             true,
-		"PreparationHook":                    true,
-		"PreparationInput":                   true,
-		"ProtocolServer":                     true,
-		"Runtime":                            true,
-		"ScopeAgent":                         true,
-		"ScopeInfo":                          true,
-		"ScopeKind":                          true,
-		"ScopeOperation":                     true,
-		"ScopeRuntime":                       true,
-		"ScopeWorkspace":                     true,
-		"Spec":                               true,
-		"Subscription":                       true,
-		"Tool":                               true,
-		"ToolArgumentsHook":                  true,
-		"ToolConstraints":                    true,
-		"ToolContext":                        true,
-		"ToolDescription":                    true,
-		"ToolSpec":                           true,
+type observedScopeFixture struct {
+	mu                         sync.Mutex
+	owner                      *Runtime
+	operationOpen              int
+	operationClose             int
+	operationID                string
+	operationInst              string
+	operationSawTerminal       bool
+	operationSawCheckpoint     bool
+	invocations                []observedInvocation
+	invocationOpen             int
+	invocationClose            int
+	conversationOpen           int
+	maintenanceOpen            int
+	conversationSawCheckpoint  bool
+	conversationSawTerminal    bool
+	maintenanceSawCheckpoint   bool
+	maintenanceSawRunning      bool
+	maintenanceSawConversation bool
+	dependencyOK               bool
+	dependencyCalls            int
+	operationTerminal          atomic.Bool
+	operationCheckpoint        atomic.Bool
+	resources                  map[string]string
+	resourceByInstance         map[string]string
+	providerResource           string
+	resourceSeq                int64
+	maintenanceRefusedSibling  bool
+	maintenanceRefusedProvider bool
+	maintenanceFreedOwn        bool
+	maintenanceOwn             string
+	maintenanceReleaseErr      string
+	conversationUsedResource   bool
+	providerResourceAtClose    bool
+	parkInvocation             bool
+	invocationArrived          chan struct{}
+}
+
+func (f *observedScopeFixture) native(store harness.Storage) extension.Native {
+	resourceInput := `{"type":"object","required":["resource"],"properties":{"resource":{"type":"string","minLength":1}},"additionalProperties":false}`
+	resourceFailure := `{"type":"object","required":["reason"],"properties":{"reason":{"type":"string"}},"additionalProperties":false}`
+	opCapability := extension.ServiceCapability("op.scope", "test.op.scope",
+		extension.ServiceMethod("call", extension.ModeServiceIO, `{}`, `{"type":"object"}`, "", ""),
+		extension.ServiceMethod("allocate", extension.ModeServiceIO, `{}`, `{"type":"object","required":["resource"],"properties":{"resource":{"type":"string","minLength":1}},"additionalProperties":false}`, "", ""),
+		extension.ServiceMethod("release", extension.ModeServiceIO, resourceInput, `{}`, resourceFailure, ""),
+		extension.ServiceMethod("use", extension.ModeServiceIO, resourceInput, `{}`, resourceFailure, ""),
+	)
+	dep := extension.Binding{Name: "dep", Provider: "scopes/op-c", CapabilityID: "op.scope", Definition: opCapability.Definition()}
+	invCapability := extension.ServiceCapability("inv.scope", "test.inv.scope", extension.ServiceMethod("call", extension.ModeServiceIO, `{}`, `{"type":"object"}`, "", ""))
+	handler := func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
+		return extension.Result{Value: json.RawMessage(`{}`)}, nil
 	}
-	fset := token.NewFileSet()
-	files, err := filepath.Glob("*.go")
-	testassert.NoError(t, err)
-	got := map[string]string{}
-	for _, file := range files {
-		if strings.HasSuffix(file, "_test.go") {
-			continue
+	hasCompaction := func(sessionID string) bool {
+		entries, err := store.ReadEntries(context.Background(), sessionID, 0)
+		if err != nil {
+			return false
 		}
-		parsed, err := parser.ParseFile(fset, file, nil, 0)
-		testassert.Require(t, err == nil, "parse %s: %v", file, err)
-		for _, decl := range parsed.Decls {
-			switch d := decl.(type) {
-			case *ast.FuncDecl:
-				if d.Recv != nil { // exported methods count, keyed receiver-qualified
-					receiver := ""
-					pointer := false
-					switch recv := d.Recv.List[0].Type.(type) {
-					case *ast.StarExpr:
-						if ident, ok := recv.X.(*ast.Ident); ok {
-							receiver, pointer = ident.Name, true
-						}
-					case *ast.Ident:
-						receiver = recv.Name
-					}
-					if ast.IsExported(d.Name.Name) && ast.IsExported(receiver) {
-						if pointer {
-							got["(*"+receiver+")."+d.Name.Name] = file
-						} else {
-							got["("+receiver+")."+d.Name.Name] = file
-						}
-					}
-				} else if ast.IsExported(d.Name.Name) {
-					got[d.Name.Name] = file
-				}
-			case *ast.GenDecl:
-				for _, spec := range d.Specs {
-					switch s := spec.(type) {
-					case *ast.TypeSpec:
-						if ast.IsExported(s.Name.Name) {
-							got[s.Name.Name] = file
-						}
-					case *ast.ValueSpec:
-						for _, name := range s.Names {
-							if ast.IsExported(name.Name) {
-								got[name.Name] = file
-							}
-						}
-					}
-				}
+		for _, entry := range entries {
+			if entry.Kind == harness.EntryCompaction {
+				return true
 			}
 		}
+		return false
 	}
-	testassert.Require(t, len(files) != 0, "the package source scan found no production files")
-	for name := range got {
-		if !want[name] {
-			t.Fatalf("exported declaration %q (%s) is outside the fixed pre-compaction surface", name, got[name])
+	return extension.Native{
+		Declaration: extension.Declaration{
+			ID:           "scopes",
+			Version:      "1",
+			ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"}},"required":["enabled"]}`),
+			Components: []extension.Component{
+				{ID: "op-c", Lifetime: extension.LifetimeOperation, Provides: []string{"op.scope"}},
+				{ID: "inv-c", Lifetime: extension.LifetimeInvocation, Provides: []string{"inv.scope"}, Requires: []extension.Binding{dep}},
+			},
+			Capabilities: []extension.Capability{opCapability, invCapability},
+		},
+		Open: func(ctx context.Context, info extension.InstanceContext) (extension.Instance, error) {
+			switch info.ComponentID {
+			case "op-c":
+				f.mu.Lock()
+				if f.resources == nil {
+					f.resources = map[string]string{}
+					f.resourceByInstance = map[string]string{}
+				}
+				f.operationOpen++
+				f.operationID = info.Scope.OperationID
+				f.operationInst = info.InstanceID
+				f.resourceSeq++
+				providerResource := fmt.Sprintf("provider-%d-%s", f.resourceSeq, info.InstanceID)
+				f.providerResource = providerResource
+				f.resources[providerResource] = info.InstanceID
+				f.resourceByInstance[info.InstanceID] = providerResource
+				f.mu.Unlock()
+				resourceFailure := func(reason string) (extension.Result, error) {
+					return extension.Result{Failure: &extension.Failure{Code: "forbidden", Message: reason}}, nil
+				}
+				ownerOf := func(call extension.CallContext) string { return call.Caller.InstanceID }
+				return extension.Instance{Capabilities: map[string]extension.Implementation{"op.scope": {Service: map[string]extension.Handler{
+					"call": func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
+						f.mu.Lock()
+						f.dependencyCalls++
+						f.mu.Unlock()
+						return extension.Result{Value: json.RawMessage(`{}`)}, nil
+					},
+					"allocate": func(_ context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
+						f.mu.Lock()
+						f.resourceSeq++
+						resource := fmt.Sprintf("resource-%d", f.resourceSeq)
+						f.resources[resource] = ownerOf(call)
+						f.mu.Unlock()
+						value, _ := json.Marshal(struct {
+							Resource string `json:"resource"`
+						}{Resource: resource})
+						return extension.Result{Value: value}, nil
+					},
+					"release": func(_ context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+						var request struct {
+							Resource string `json:"resource"`
+						}
+						if err := json.Unmarshal(arguments, &request); err != nil {
+							return extension.Result{}, err
+						}
+						f.mu.Lock()
+						defer f.mu.Unlock()
+						owner, ok := f.resources[request.Resource]
+						if !ok || owner != ownerOf(call) {
+							return resourceFailure("resource is not owned by the calling instance")
+						}
+						delete(f.resources, request.Resource)
+						return extension.Result{Value: json.RawMessage(`{}`)}, nil
+					},
+					"use": func(_ context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+						var request struct {
+							Resource string `json:"resource"`
+						}
+						if err := json.Unmarshal(arguments, &request); err != nil {
+							return extension.Result{}, err
+						}
+						f.mu.Lock()
+						defer f.mu.Unlock()
+						owner, ok := f.resources[request.Resource]
+						if !ok || owner != ownerOf(call) {
+							return resourceFailure("resource is not owned by the calling instance")
+						}
+						return extension.Result{Value: json.RawMessage(`{}`)}, nil
+					},
+				}}}, Close: func(ctx context.Context, calls extension.CallContext) error {
+					rec, err := f.owner.harness.ReadOperation(context.Background(), info.Scope.SessionID, info.Scope.OperationID)
+					f.mu.Lock()
+					resource := f.providerResource
+					_, f.providerResourceAtClose = f.resources[resource]
+					f.operationClose++
+					f.operationSawTerminal = err == nil && rec.State.Status == harness.OperationSuccess
+					f.operationSawCheckpoint = err == nil && hasCompaction(info.Scope.SessionID)
+					f.operationTerminal.Store(f.operationSawTerminal)
+					f.operationCheckpoint.Store(f.operationSawCheckpoint)
+					f.mu.Unlock()
+					if resource != "" {
+						// The provider frees its own resource through its own
+						// private store: its Close view has no self-binding.
+						f.mu.Lock()
+						delete(f.resources, resource)
+						f.mu.Unlock()
+					}
+					return nil
+				}}, nil
+			case "inv-c":
+				if f.parkInvocation && info.Scope.Purpose == string(harness.InvocationPurposeConversation) {
+					if f.invocationArrived != nil {
+						select {
+						case f.invocationArrived <- struct{}{}:
+						default:
+						}
+					}
+					<-ctx.Done()
+					return extension.Instance{}, ctx.Err()
+				}
+				f.mu.Lock()
+				f.invocationOpen++
+				switch info.Scope.Purpose {
+				case string(harness.InvocationPurposeConversation):
+					f.conversationOpen++
+				case string(harness.InvocationPurposeMaintenance):
+					f.maintenanceOpen++
+				}
+				f.invocations = append(f.invocations, observedInvocation{instanceID: info.InstanceID, invocationID: info.Scope.InvocationID, purpose: info.Scope.Purpose, operationID: info.Scope.OperationID})
+				f.mu.Unlock()
+				allocated, err := info.Call(ctx, "dep", "allocate", json.RawMessage(`{}`))
+				if err != nil {
+					return extension.Instance{}, err
+				}
+				var resourceValue struct {
+					Resource string `json:"resource"`
+				}
+				if err := json.Unmarshal(allocated.Value, &resourceValue); err != nil {
+					return extension.Instance{}, err
+				}
+				f.mu.Lock()
+				f.resourceByInstance[info.InstanceID] = resourceValue.Resource
+				f.invocations[len(f.invocations)-1].resource = resourceValue.Resource
+				f.mu.Unlock()
+				return extension.Instance{Capabilities: map[string]extension.Implementation{"inv.scope": {Service: map[string]extension.Handler{"call": handler}}}, Close: func(ctx context.Context, calls extension.CallContext) error {
+					result, err := calls.Call(ctx, "dep", "call", json.RawMessage(`{}`))
+					rec, readErr := f.owner.harness.ReadOperation(context.Background(), info.Scope.SessionID, info.Scope.OperationID)
+					f.mu.Lock()
+					own := f.resourceByInstance[info.InstanceID]
+					conversationResource := ""
+					for _, invocation := range f.invocations {
+						if invocation.purpose == string(harness.InvocationPurposeConversation) {
+							conversationResource = f.resourceByInstance[invocation.instanceID]
+						}
+					}
+					providerResource := f.providerResource
+					f.invocationClose++
+					f.dependencyOK = err == nil && result.Failure == nil
+					if info.Scope.Purpose == string(harness.InvocationPurposeConversation) {
+						f.conversationSawCheckpoint = readErr == nil && hasCompaction(info.Scope.SessionID)
+						f.conversationSawTerminal = readErr == nil && rec.State.Status == harness.OperationSuccess
+					} else {
+						f.maintenanceSawCheckpoint = readErr == nil && hasCompaction(info.Scope.SessionID)
+						f.maintenanceSawRunning = readErr == nil && rec.State.Status == harness.OperationRunning
+						f.maintenanceSawConversation = f.conversationOpen == 1 && f.invocationClose < f.invocationOpen
+					}
+					f.mu.Unlock()
+					if own == "" {
+						return fmt.Errorf("invocation %s allocated no resource", info.InstanceID)
+					}
+					if info.Scope.Purpose == string(harness.InvocationPurposeConversation) {
+						// The resumed conversation still owns its resource after
+						// maintenance disposal and uses it through the same
+						// Operation provider before terminal disposal.
+						used, callErr := calls.Call(ctx, "dep", "use", resourceArguments(own))
+						f.mu.Lock()
+						f.conversationUsedResource = callErr == nil && used.Failure == nil
+						f.mu.Unlock()
+						if callErr != nil || used.Failure != nil {
+							return fmt.Errorf("conversation resource use: %v %+v", callErr, used.Failure)
+						}
+					} else {
+						// Maintenance must not release either its sibling
+						// conversation's resource or the provider's own resource;
+						// both stay intact while its own resource is freed.
+						var sibling extension.Result
+						var siblingErr error
+						if conversationResource != "" {
+							sibling, siblingErr = calls.Call(ctx, "dep", "release", resourceArguments(conversationResource))
+						}
+						provider, providerErr := calls.Call(ctx, "dep", "release", resourceArguments(providerResource))
+						f.mu.Lock()
+						f.maintenanceRefusedSibling = conversationResource == "" || (siblingErr == nil && sibling.Failure != nil && f.resources[conversationResource] != "")
+						f.maintenanceRefusedProvider = providerErr == nil && provider.Failure != nil && f.resources[providerResource] != ""
+						f.mu.Unlock()
+						if !f.maintenanceRefusedSibling || !f.maintenanceRefusedProvider {
+							return fmt.Errorf("maintenance release refusal: sibling %+v/%v provider %+v/%v", sibling.Failure, siblingErr, provider.Failure, providerErr)
+						}
+					}
+					released, releaseErr := calls.Call(ctx, "dep", "release", resourceArguments(own))
+					f.mu.Lock()
+					if info.Scope.Purpose != string(harness.InvocationPurposeConversation) {
+						f.maintenanceFreedOwn = releaseErr == nil && released.Failure == nil && f.resources[own] == ""
+						f.maintenanceOwn = own
+						if releaseErr != nil {
+							f.maintenanceReleaseErr = releaseErr.Error()
+						} else if released.Failure != nil {
+							f.maintenanceReleaseErr = released.Failure.Message
+						}
+					}
+					delete(f.resourceByInstance, info.InstanceID)
+					f.mu.Unlock()
+					if releaseErr != nil || released.Failure != nil {
+						return fmt.Errorf("invocation resource release: %v %+v", releaseErr, released.Failure)
+					}
+					return nil
+				}}, nil
+			default:
+				return extension.Instance{}, fmt.Errorf("unknown component %q", info.ComponentID)
+			}
+		},
+	}
+}
+
+func resourceArguments(resource string) json.RawMessage {
+	value, _ := json.Marshal(struct {
+		Resource string `json:"resource"`
+	}{Resource: resource})
+	return value
+}
+
+func TestCompactLifecycleNativePressureScopesAndResources(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
+		writeAgentDefinitions(t, e.configPath, compactObservationAgentsDocument)
+		enableFixturePlugin(t, e.configPath, "scopes")
+		e.fixtureStore(store)
+		fixture := &observedScopeFixture{}
+		native := fixture.native(store)
+		r, err := e.open(context.Background(), native)
+		testassert.NoError(t, err)
+		fixture.owner = r
+		ctx := context.Background()
+
+		e.server.setScript(func(_ context.Context, body string) []string {
+			if !strings.Contains(body, `"model":"k"`) && !strings.Contains(body, `"model": "k"`) {
+				if lastUserText(body) == "first question" {
+					return append(textTurnEvents("seeded answer"), `{"usage":{"prompt_tokens":5000,"completion_tokens":10,"total_tokens":5010}}`)
+				}
+				return nil
+			}
+			return append(textTurnEvents("native summary one"), `{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)
+		})
+
+		session, err := r.createSession(ctx, e.dataDir, "tight")
+		testassert.NoError(t, err)
+		sessionID := session.Identity.SessionID
+		submitThroughRuntime(t, r, sessionID, "op-1", "first question")
+		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			fixture.mu.Lock()
+			closed := fixture.operationClose == 1
+			fixture.mu.Unlock()
+			if closed {
+				break
+			}
+			testassert.Require(t, time.Now().Before(deadline), "op-1 Operation scope never closed")
+			time.Sleep(10 * time.Millisecond)
 		}
-	}
-	for name := range want {
-		{
-			_, ok := got[name]
-			testassert.Require(t, ok, "pinned exported declaration %q missing from the package source scan", name)
+		fixture.mu.Lock()
+		fixture.operationOpen, fixture.operationClose = 0, 0
+		fixture.invocations = nil
+		fixture.invocationOpen, fixture.invocationClose = 0, 0
+		fixture.conversationOpen, fixture.maintenanceOpen = 0, 0
+		fixture.operationSawTerminal, fixture.operationSawCheckpoint = false, false
+		fixture.conversationSawCheckpoint, fixture.conversationSawTerminal = false, false
+		fixture.maintenanceSawCheckpoint, fixture.maintenanceSawRunning, fixture.maintenanceSawConversation = false, false, false
+		fixture.dependencyOK = false
+		fixture.mu.Unlock()
+
+		submitThroughRuntime(t, r, sessionID, "op-2", "the overflowing checkpoint")
+		op2 := awaitOperation(t, r, sessionID, "op-2", harness.OperationSuccess)
+		testassert.Require(t, op2.State.Status == harness.OperationSuccess, "overflowing operation = %+v", op2.State)
+		deadline = time.Now().Add(10 * time.Second)
+		for {
+			fixture.mu.Lock()
+			closed := fixture.operationClose == 1 && fixture.invocationClose == 2
+			fixture.mu.Unlock()
+			if closed {
+				break
+			}
+			testassert.Require(t, time.Now().Before(deadline), "scoped disposals never completed")
+			time.Sleep(10 * time.Millisecond)
 		}
-	}
+		fixture.mu.Lock()
+		testassert.Equal(t, fixture.operationOpen, 1)
+		testassert.Equal(t, fixture.invocationOpen, 2)
+		testassert.Require(t, len(fixture.invocations) == 2, "invocations = %+v, want conversation and maintenance", fixture.invocations)
+		testassert.Require(t, fixture.invocations[0].invocationID != fixture.invocations[1].invocationID && fixture.invocations[0].instanceID != fixture.invocations[1].instanceID, "invocations = %+v, want distinct IDs and instances", fixture.invocations)
+		testassert.Require(t, fixture.invocations[0].operationID == "op-2" && fixture.invocations[1].operationID == "op-2", "invocation Operation IDs = %+v, want the shared Operation", fixture.invocations)
+		testassert.Require(t, fixture.invocations[0].resource != "" && fixture.invocations[1].resource != "" && fixture.invocations[0].resource != fixture.invocations[1].resource, "invocation resources = %+v, want distinct owned resources", fixture.invocations)
+		purposes := []string{fixture.invocations[0].purpose, fixture.invocations[1].purpose}
+		testassert.Require(t, slices.Contains(purposes, string(harness.InvocationPurposeConversation)) && slices.Contains(purposes, string(harness.InvocationPurposeMaintenance)), "purposes = %v, want conversation and maintenance", purposes)
+		testassert.Require(t, fixture.maintenanceSawCheckpoint && fixture.maintenanceSawRunning && fixture.maintenanceSawConversation, "maintenance close = checkpoint %v running %v conversation-open %v, want settlement before disposal", fixture.maintenanceSawCheckpoint, fixture.maintenanceSawRunning, fixture.maintenanceSawConversation)
+		testassert.Require(t, fixture.conversationSawCheckpoint && fixture.conversationSawTerminal, "conversation close = checkpoint %v terminal %v, want settlement before disposal", fixture.conversationSawCheckpoint, fixture.conversationSawTerminal)
+		testassert.Require(t, fixture.dependencyOK && fixture.dependencyCalls > 0, "invocation cleanup did not use the still-open Operation provider")
+		testassert.Require(t, fixture.maintenanceRefusedSibling && fixture.maintenanceRefusedProvider, "maintenance release refusals = sibling %v provider %v, want both foreign resources refused and intact", fixture.maintenanceRefusedSibling, fixture.maintenanceRefusedProvider)
+		testassert.Require(t, fixture.maintenanceFreedOwn, "maintenance did not free its own resource %q (release %q, resources %v)", fixture.maintenanceOwn, fixture.maintenanceReleaseErr, fixture.resources)
+		testassert.Require(t, fixture.conversationUsedResource, "the resumed conversation did not use its surviving resource through the Operation provider")
+		testassert.Require(t, fixture.providerResourceAtClose, "the Operation provider's own resource was not intact at Operation Close")
+		testassert.Require(t, len(fixture.resources) == 0, "resources after scoped disposal = %v, want every owned resource freed", fixture.resources)
+		fixture.mu.Unlock()
+		testassert.NoError(t, r.Close(ctx))
+		testassert.Require(t, fixture.operationTerminal.Load() && fixture.operationCheckpoint.Load(), "Operation close = terminal %v checkpoint %v, want committed terminal and checkpoint", fixture.operationTerminal.Load(), fixture.operationCheckpoint.Load())
+	})
+}
+
+func TestCompactLifecycleManualMaintenanceOpensOnlyMaintenanceInstance(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
+		writeAgentDefinitions(t, e.configPath, compactObservationAgentsDocument)
+		enableFixturePlugin(t, e.configPath, "scopes")
+		e.fixtureStore(store)
+		fixture := &observedScopeFixture{}
+		r, err := e.open(context.Background(), fixture.native(store))
+		testassert.NoError(t, err)
+		fixture.owner = r
+		ctx := context.Background()
+		e.server.setScript(func(_ context.Context, body string) []string {
+			if strings.Contains(body, `"model":"k"`) || strings.Contains(body, `"model": "k"`) {
+				return textTurnEvents("manual summary")
+			}
+			return nil
+		})
+		session, err := r.createSession(ctx, e.dataDir, "tight")
+		testassert.NoError(t, err)
+		sessionID := session.Identity.SessionID
+		submitThroughRuntime(t, r, sessionID, "op-seed", "seed")
+		awaitOperation(t, r, sessionID, "op-seed", harness.OperationSuccess)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			fixture.mu.Lock()
+			done := fixture.operationClose == 1
+			fixture.mu.Unlock()
+			if done {
+				break
+			}
+			testassert.Require(t, time.Now().Before(deadline), "seed Operation never closed")
+			time.Sleep(10 * time.Millisecond)
+		}
+		fixture.mu.Lock()
+		fixture.operationOpen, fixture.operationClose = 0, 0
+		fixture.invocations = nil
+		fixture.invocationOpen, fixture.invocationClose = 0, 0
+		fixture.conversationOpen, fixture.maintenanceOpen = 0, 0
+		fixture.mu.Unlock()
+
+		_, err = r.compactSession(ctx, sessionID, protocol.CompactRequest{OperationId: "compact-1"})
+		testassert.NoError(t, err)
+		awaitOperation(t, r, sessionID, "compact-1", harness.OperationSuccess)
+		deadline = time.Now().Add(10 * time.Second)
+		for {
+			fixture.mu.Lock()
+			done := fixture.operationClose == 1 && fixture.invocationClose == 1
+			fixture.mu.Unlock()
+			if done {
+				break
+			}
+			testassert.Require(t, time.Now().Before(deadline), "manual maintenance scopes never closed")
+			time.Sleep(10 * time.Millisecond)
+		}
+		fixture.mu.Lock()
+		testassert.Equal(t, fixture.operationOpen, 1)
+		testassert.Equal(t, fixture.conversationOpen, 0)
+		testassert.Equal(t, fixture.maintenanceOpen, 1)
+		testassert.Require(t, len(fixture.invocations) == 1 && fixture.invocations[0].purpose == string(harness.InvocationPurposeMaintenance), "invocations = %+v, want only the maintenance instance", fixture.invocations)
+		fixture.mu.Unlock()
+		testassert.NoError(t, r.Close(ctx))
+	})
+}
+
+func TestCompactLifecycleFailedSummaryDisposesMaintenanceInstance(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"summary rejected"}}`))
+		}))
+		t.Cleanup(bad.Close)
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember(e.server.URL, "", `{"m":{"name":"M","context_window":8192,"max_output_tokens":4096}}`)+`,"bad":`+nominalProvMember(bad.URL, "", `{"k":{"name":"K","context_window":32768,"max_output_tokens":4096}}`)+`},"compaction":{"model":"bad/k"}}`)
+		writeAgentDefinitions(t, e.configPath, compactObservationAgentsDocument)
+		enableFixturePlugin(t, e.configPath, "scopes")
+		e.fixtureStore(store)
+		fixture := &observedScopeFixture{}
+		r, err := e.open(context.Background(), fixture.native(store))
+		testassert.NoError(t, err)
+		fixture.owner = r
+		ctx := context.Background()
+		e.server.setScript(func(_ context.Context, body string) []string {
+			if lastUserText(body) == "first question" {
+				return append(textTurnEvents("seeded answer"), `{"usage":{"prompt_tokens":5000,"completion_tokens":10,"total_tokens":5010}}`)
+			}
+			return nil
+		})
+		session, err := r.createSession(ctx, e.dataDir, "tight")
+		testassert.NoError(t, err)
+		sessionID := session.Identity.SessionID
+		submitThroughRuntime(t, r, sessionID, "op-seed", "first question")
+		awaitOperation(t, r, sessionID, "op-seed", harness.OperationSuccess)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			fixture.mu.Lock()
+			done := fixture.operationClose == 1
+			fixture.mu.Unlock()
+			if done {
+				break
+			}
+			testassert.Require(t, time.Now().Before(deadline), "seed Operation never closed")
+			time.Sleep(10 * time.Millisecond)
+		}
+		fixture.mu.Lock()
+		fixture.operationOpen, fixture.operationClose = 0, 0
+		fixture.invocations = nil
+		fixture.invocationOpen, fixture.invocationClose = 0, 0
+		fixture.mu.Unlock()
+
+		submitThroughRuntime(t, r, sessionID, "op-failed", "the overflowing checkpoint")
+		awaitOperation(t, r, sessionID, "op-failed", harness.OperationFailure)
+		deadline = time.Now().Add(10 * time.Second)
+		for {
+			fixture.mu.Lock()
+			done := fixture.invocationOpen == 2 && fixture.invocationClose == 2 && fixture.operationClose == 1
+			fixture.mu.Unlock()
+			if done {
+				break
+			}
+			testassert.Require(t, time.Now().Before(deadline), "failed-summary scopes never disposed")
+			time.Sleep(10 * time.Millisecond)
+		}
+		fixture.mu.Lock()
+		testassert.Require(t, len(fixture.invocations) == 2, "invocations = %+v, want conversation and failed maintenance", fixture.invocations)
+		conversation, maintenance := 0, 0
+		for _, invocation := range fixture.invocations {
+			switch invocation.purpose {
+			case string(harness.InvocationPurposeConversation):
+				conversation++
+			case string(harness.InvocationPurposeMaintenance):
+				maintenance++
+			}
+		}
+		testassert.Require(t, conversation == 1 && maintenance == 1, "invocation purposes = %+v", fixture.invocations)
+		testassert.Require(t, !fixture.maintenanceSawCheckpoint, "failed summary left a committed checkpoint")
+		fixture.mu.Unlock()
+		testassert.NoError(t, r.Close(ctx))
+	})
+}
+
+func TestCompactLifecycleCanceledInvocationOpeningDisposesOperation(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		e := newOwnerEnv(t)
+		writeServiceFile(t, e.configPath, compactObservationConfigDocument(e.server.URL))
+		writeAgentDefinitions(t, e.configPath, compactObservationAgentsDocument)
+		enableFixturePlugin(t, e.configPath, "scopes")
+		e.fixtureStore(store)
+		fixture := &observedScopeFixture{parkInvocation: true, invocationArrived: make(chan struct{}, 1)}
+		r, err := e.open(context.Background(), fixture.native(store))
+		testassert.NoError(t, err)
+		fixture.owner = r
+		ctx := context.Background()
+		e.server.setScript(func(context.Context, string) []string { return nil })
+		session, err := r.createSession(ctx, e.dataDir, "tight")
+		testassert.NoError(t, err)
+		sessionID := session.Identity.SessionID
+		submitThroughRuntime(t, r, sessionID, "op-canceled", "cancel me")
+		select {
+		case <-fixture.invocationArrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the invocation opening never parked")
+		}
+		testassert.NoError(t, r.interruptSession(context.Background(), sessionID))
+		awaitOperation(t, r, sessionID, "op-canceled", harness.OperationInterruption)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			fixture.mu.Lock()
+			done := fixture.operationClose == 1
+			fixture.mu.Unlock()
+			if done {
+				break
+			}
+			testassert.Require(t, time.Now().Before(deadline), "canceled opening never disposed the Operation")
+			time.Sleep(10 * time.Millisecond)
+		}
+		fixture.mu.Lock()
+		testassert.Equal(t, fixture.invocationClose, 0)
+		testassert.Require(t, !fixture.operationSawTerminal, "canceled opening retained a success terminal")
+		testassert.Require(t, !fixture.operationCheckpoint.Load(), "canceled opening retained a checkpoint")
+		fixture.mu.Unlock()
+		testassert.NoError(t, r.Close(ctx))
+	})
 }

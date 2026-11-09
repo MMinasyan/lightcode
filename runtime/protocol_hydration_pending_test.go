@@ -103,7 +103,7 @@ func TestProtocolHydrationPendingDuringParkedQueuedDelivery(t *testing.T) {
 		release := sync.OnceFunc(func() { close(gate) })
 		defer release() // LIFO: the gate releases before the owner close joins
 
-		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(e.home, "pending-delivery"), AgentType: "solo"})
+		created, err := client.CreateSessionWithResponse(ctx, protocol.CreateSessionRequest{Workspace: filepath.Join(e.home, "pending-delivery"), AgentSelection: wireSelection("solo")})
 		testassert.NoError(t, err)
 		testassert.Require(t, created.JSON201 != nil, "create = status %d: %s", created.HTTPResponse.StatusCode, created.Body)
 		session := created.JSON201.SessionId

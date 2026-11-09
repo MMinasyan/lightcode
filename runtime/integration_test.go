@@ -11,11 +11,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/agents"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -30,57 +31,51 @@ import (
 
 func assembledConfigDocument(endpoint, tag, label string) string {
 	return `{"providers":{"prov":` + nominalProvMember(endpoint, "ASSEMBLED_TEST_KEY",
-		`{"m":{"name":"M","context_window":262144}}`) + `},"plugins":{"hooks":{"tag":` + fixtureString(tag) + `},"depper":{"label":` + fixtureString(label) + `}}}`
+		`{"m":{"name":"M","context_window":262144}}`) + `},"extensions":{"hooks":{"enabled":true,"tag":` + fixtureString(tag) + `},"depper":{"enabled":true,"label":` + fixtureString(label) + `},"base":{"enabled":true},"probe":{"enabled":true}}}`
 }
 
 // The "leaky" definition selects the Core storage export by ID: raw storage
 // is not in the ordinary capability universe, so the definition drops and the
 // type is unknown at admission — raw storage is never exported into execution.
 const assembledAgentsDocument = `{
-  "integrated": {"model": "prov/m", "system_prompt": "simple", "tools": ["probe"], "capabilities": ["hook.first", "dep.worker"]},
-  "leaky": {"model": "prov/m", "system_prompt": "simple", "capabilities": ["session_store"]}
+  "integrated": {"model": "prov/m", "system_prompt": "simple", "tools": ["probe"], "capabilities": ["hook.first", "dep.worker"]}
 }`
 
-type combinedBase struct{}
+type assembledBase struct{ closed *atomic.Bool }
 
-func (combinedBase) Base() string { return "base" }
-
-// combinedWorker is one dependent capability: its factory receives its
-// declared dependency, and every call reads its own settings from the
-// Invocation the caller passed, never from ambient state.
-type combinedWorker struct{ base combinedBase }
-
-func (w combinedWorker) Work(inv Invocation) string {
-	label := ""
-	if raw := inv.Config("depper"); len(raw) > 0 {
-		var settings struct {
-			Label string `json:"label"`
-		}
-		if err := json.Unmarshal(raw, &settings); err != nil {
-			return "undecodable:" + err.Error()
-		}
-		label = settings.Label
+func (b assembledBase) call(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
+	state := "base"
+	if b.closed != nil && b.closed.Load() {
+		state = "closed"
 	}
-	return label + ":" + w.base.Base()
+	value, _ := json.Marshal(map[string]string{"state": state})
+	return extension.Result{Value: value}, nil
 }
 
-// workspaceOpens records the Workspace identity of every Workspace scope
-// construction, in construction order.
-type workspaceOpens struct {
-	mu   sync.Mutex
-	keys []string
+type assembledWorker struct {
+	label string
+	ws    *workspaceOpens
 }
 
-func (w *workspaceOpens) opened(key string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.keys = append(w.keys, key)
-}
-
-func (w *workspaceOpens) constructed() []string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return append([]string(nil), w.keys...)
+func (w assembledWorker) call(ctx context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
+	if w.ws != nil {
+		w.ws.park()
+	}
+	if w.label == "" {
+		return extension.Result{Value: json.RawMessage(`{"result":"undecodable"}`)}, nil
+	}
+	result, err := call.Call(ctx, "dep", "call", json.RawMessage(`{}`))
+	if err != nil {
+		return extension.Result{}, err
+	}
+	var base struct {
+		State string `json:"state"`
+	}
+	if result.Failure != nil || json.Unmarshal(result.Value, &base) != nil {
+		return extension.Result{Value: json.RawMessage(`{"result":"undecodable"}`)}, nil
+	}
+	value, _ := json.Marshal(map[string]string{"result": w.label + ":" + base.State})
+	return extension.Result{Value: value}, nil
 }
 
 // parkingHook parks exactly one armed admission until released, ignoring its
@@ -94,7 +89,7 @@ type parkingHook struct {
 	usedSig chan struct{}
 }
 
-func (h *parkingHook) Prepare(_ context.Context, _ PreparationInput) (PreparationConsequence, error) {
+func (h *parkingHook) Prepare(_ context.Context, _ extension.CallContext, _ extension.PreparationInput) (extension.PreparationConsequence, error) {
 	h.mu.Lock()
 	park := h.armed && !h.used
 	h.used = h.used || h.armed
@@ -109,42 +104,129 @@ func (h *parkingHook) Prepare(_ context.Context, _ PreparationInput) (Preparatio
 		}
 		<-release
 	}
-	return PreparationConsequence{}, nil
+	return extension.PreparationConsequence{}, nil
 }
 
 func (h *parkingHook) arm(release, used chan struct{}) {
 	h.mu.Lock()
-	h.armed, h.release, h.usedSig = true, release, used
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	h.armed, h.used, h.release, h.usedSig = true, false, release, used
+}
+
+// workspaceOpens records the Workspace identity of every Workspace scope
+// construction, in construction order.
+type workspaceOpens struct {
+	mu      sync.Mutex
+	keys    []string
+	gate    chan struct{}
+	arrived chan struct{}
+}
+
+func (w *workspaceOpens) park() {
+	w.mu.Lock()
+	gate, arrived := w.gate, w.arrived
+	w.gate = nil
+	w.mu.Unlock()
+	if gate == nil {
+		return
+	}
+	if arrived != nil {
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
+	}
+	<-gate
+}
+
+func (w *workspaceOpens) hold(gate, arrived chan struct{}) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.gate, w.arrived = gate, arrived
+}
+
+func (w *workspaceOpens) opened(workspace string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.keys = append(w.keys, workspace)
+}
+
+func (w *workspaceOpens) constructed() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.keys...)
 }
 
 // probeTool is the concrete tool capability of the assembled scenario: its
-// preparation invokes the dependent capability it was constructed with, so
-// every real tool dispatch records one revision-scoped dependency invocation.
+// preparation invokes the dependent service chain it is bound to, so every
+// real tool dispatch records one revision-scoped dependency invocation.
 type probeTool struct {
-	worker combinedWorker
 	events *traceLog
 }
 
-func (t probeTool) describe(Invocation, ToolConstraints, harness.SessionIdentity) (ToolDescription, error) {
-	definition, err := model.NewToolDefinition(model.ToolDefinition{
-		Name:        "probe",
-		Description: "records one dependency invocation",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
-	})
-	if err != nil {
-		return ToolDescription{}, err
-	}
-	return ToolDescription{Definition: definition, Available: true}, nil
+func (probeTool) describe(context.Context, extension.DescribeInput) (extension.ToolDescription, error) {
+	return extension.ToolDescription{Definition: model.ToolDefinition{Name: "probe", Description: "records one dependency invocation", Parameters: json.RawMessage(`{"type":"object","properties":{}}`)}, Available: true}, nil
 }
 
-func (t probeTool) Normalize(_ ToolContext, call model.ToolCall) (json.RawMessage, error) {
+func (probeTool) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	return runtimeNormalize(call)
 }
 
-func (t probeTool) Prepare(_ context.Context, tc ToolContext, call model.ToolCall) harness.PreparedTool {
-	t.events.add("work:" + t.worker.Work(tc.Invocation))
-	return harness.PreparedTool{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "probed"}}}
+func (t probeTool) Prepare(ctx context.Context, tc extension.ToolContext, call model.ToolCall) extension.ToolPlan {
+	result, err := tc.Calls.Call(ctx, "dep", "call", json.RawMessage(`{}`))
+	if err != nil {
+		return extension.ToolPlan{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: err.Error()}}}
+	}
+	var value struct {
+		Result string `json:"result"`
+	}
+	if result.Failure != nil || json.Unmarshal(result.Value, &value) != nil {
+		return extension.ToolPlan{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "undecodable dependency result"}}}
+	}
+	t.events.add("work:" + value.Result)
+	return extension.ToolPlan{Immediate: &harness.ToolOutcome{Result: model.ToolResult{CallID: call.ID, Status: model.ResultError, Content: "probed"}}}
+}
+
+func (probeTool) Execute(context.Context, extension.ToolContext, extension.ToolPlan) harness.ToolOutcome {
+	return harness.ToolOutcome{Evidence: harness.ExecutionObserved, Result: model.ToolResult{Status: model.ResultError, Content: "probed"}}
+}
+
+func assembledPlugins(e *ownerEnv, store harness.Storage, hook *recordHook, ws *workspaceOpens) []extension.Native {
+	e.fixtureStore(store)
+	baseCapability := extension.ServiceCapability("dep.base", "test.dep.base", extension.PureMethod("call", `{}`, `{"type":"object"}`))
+	baseBinding := extension.Binding{Name: "dep", Provider: "base/base#component", CapabilityID: "dep.base", Definition: baseCapability.Definition()}
+	base := testNative("base", extension.LifetimeWorkspace, []extension.Capability{baseCapability}, nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		closed := &atomic.Bool{}
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"dep.base": {Service: map[string]extension.Handler{"call": assembledBase{closed: closed}.call}}}, Close: func(context.Context, extension.CallContext) error {
+			closed.Store(true)
+			e.events.add("close:base")
+			return nil
+		}}, nil
+	})
+	workerCapability := extension.ServiceCapability("dep.worker", "test.dep.worker", extension.PureMethod("call", `{}`, `{"type":"object"}`))
+	workerBinding := extension.Binding{Name: "dep", Provider: "depper/depper#component", CapabilityID: "dep.worker", Definition: workerCapability.Definition()}
+	depper := testNative("depper", extension.LifetimeWorkspace, []extension.Capability{workerCapability}, []extension.Binding{baseBinding}, func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
+		ws.opened(info.Scope.Workspace)
+		label := ""
+		if len(info.Section) != 0 {
+			var settings struct {
+				Label string `json:"label"`
+			}
+			_ = json.Unmarshal(info.Section, &settings)
+			label = settings.Label
+		}
+		worker := assembledWorker{label: label, ws: ws}
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"dep.worker": {Service: map[string]extension.Handler{"call": worker.call}}}, Close: func(context.Context, extension.CallContext) error {
+			e.events.add("close:depper")
+			return nil
+		}}, nil
+	})
+	probeCapability := extension.ToolCapability("probe")
+	probe := testNative("probe", extension.LifetimeWorkspace, []extension.Capability{probeCapability}, []extension.Binding{workerBinding}, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{"probe": {Tool: probeTool{events: e.events}}}}, nil
+	})
+	probe.Describe["probe"] = probeTool{}.describe
+	return []extension.Native{hookPlugin(hook), base, depper, probe}
 }
 
 // lastMessageRole returns the wire role of the request body's last message.
@@ -200,57 +282,6 @@ func writeTextTurn(w http.ResponseWriter, text string) {
 // call under the given call identity.
 func writeToolCallTurn(w http.ResponseWriter, id, name, args string) {
 	writeSSE(w, toolCallTurnEvents(id, name, args)...)
-}
-
-func assembledPlugins(e *ownerEnv, store harness.Storage, hook *recordHook, ws *workspaceOpens) []Plugin {
-	e.fixtureStore(store)
-	return []Plugin{
-		hookPlugin(hook),
-		{
-			ID:       "base",
-			Scope:    ScopeWorkspace,
-			Provides: []CapabilitySpec{Spec[combinedBase]("dep.base")},
-			Open: func(context.Context, ScopeInfo, Bindings) (Instance, error) {
-				return Instance{Values: map[string]any{"dep.base": combinedBase{}}}, nil
-			},
-		},
-		{
-			ID:       "depper",
-			Scope:    ScopeWorkspace,
-			Provides: []CapabilitySpec{Spec[combinedWorker]("dep.worker")},
-			Requires: []CapabilitySpec{Spec[combinedBase]("dep.base")},
-			ValidateConfig: func(raw json.RawMessage) error {
-				var settings struct {
-					Label string `json:"label"`
-				}
-				if err := json.Unmarshal(raw, &settings); err != nil || settings.Label == "" {
-					return errors.New("depper requires a non-empty label")
-				}
-				return nil
-			},
-			Open: func(_ context.Context, info ScopeInfo, bindings Bindings) (Instance, error) {
-				ws.opened(info.Workspace)
-				base, err := Bind[combinedBase](bindings, "dep.base")
-				if err != nil {
-					return Instance{}, err
-				}
-				return Instance{Values: map[string]any{"dep.worker": combinedWorker{base: base}}}, nil
-			},
-		},
-		{
-			ID:       "probe",
-			Scope:    ScopeWorkspace,
-			Provides: []CapabilitySpec{ToolSpec("probe", probeTool{}.describe)},
-			Requires: []CapabilitySpec{Spec[combinedWorker]("dep.worker")},
-			Open: func(_ context.Context, _ ScopeInfo, bindings Bindings) (Instance, error) {
-				worker, err := Bind[combinedWorker](bindings, "dep.worker")
-				if err != nil {
-					return Instance{}, err
-				}
-				return Instance{Values: map[string]any{"probe": probeTool{worker: worker, events: e.events}}}, nil
-			},
-		},
-	}
 }
 
 // operationRegisterStatus reads one Operation register's state status
@@ -317,10 +348,10 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		server := newProductionModelServer(t, "probe", "{}")
 		t.Setenv("ASSEMBLED_TEST_KEY", "assembled-key-1")
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T1", "L1"))
-		writeServiceFile(t, agents.PathForConfig(e.configPath), assembledAgentsDocument)
-		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(in PreparationInput) PreparationConsequence {
+		writeAgentDefinitions(t, e.configPath, assembledAgentsDocument)
+		hook := &recordHook{name: "hook.first", events: e.events, mutate: func(in extension.PreparationInput) extension.PreparationConsequence {
 			prompt := in.Prompt + "|hooked"
-			return PreparationConsequence{Prompt: &prompt}
+			return extension.PreparationConsequence{Prompt: &prompt}
 		}}
 		ws := &workspaceOpens{}
 		plugins := assembledPlugins(e, store, hook, ws)
@@ -394,11 +425,14 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
 		}
 
-		// Blocked Operation on A: the production model request parks at the
-		// test server until the gate releases.
-		server.armGate()
-		submitThroughRuntime(t, r, sessionA.Identity.SessionID, "op-a1", "parked")
+		// Park the actual dependency call, not its model request.
+		ws.mu.Lock()
+		ws.gate, ws.arrived = make(chan struct{}), make(chan struct{}, 1)
+		gate, arrived := ws.gate, ws.arrived
+		ws.mu.Unlock()
+		submitThroughRuntime(t, r, sessionA.Identity.SessionID, "op-a1", "nested")
 		server.awaitRequests(3)
+		<-arrived
 		{
 			got := ws.constructed()
 			testassert.Require(t, slices.Equal(got, []string{wsB, wsA}), "Workspace scope constructions = %v, want one per distinct key in first-use order", got)
@@ -424,13 +458,30 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 
 		// Reload publishes the next revision over the blocked Operation.
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T2", "L2"))
+		writeAgentDefinitions(t, e.configPath, assembledAgentsDocument)
 		{
 			revision, err := r.Reload(ctx)
 			testassert.Require(t, err == nil && revision == "2", "Reload over the blocked Operation = (%q, %v), want 2", revision, err)
 		}
+		testassert.Require(t, countEvents(e.events.all(), "close:depper") == 0 && countEvents(e.events.all(), "close:base") == 0, "retired bindings closed while the nested call was parked: %v", e.events.all())
+		fresh, err := r.createSession(ctx, wsA, "integrated")
+		testassert.NoError(t, err)
+		submitThroughRuntime(t, r, fresh.Identity.SessionID, "op-fresh", "fresh")
+		freshRec := awaitOperation(t, r, fresh.Identity.SessionID, "op-fresh", harness.OperationSuccess)
+		testassert.Equal(t, freshRec.Admission.Execution.ConfigurationRevision, "2")
+		testassert.Require(t, slices.Equal(ws.constructed(), []string{wsB, wsA, wsA}), "resource sets did not construct independent bindings for the same Workspace: %v", ws.constructed())
+		testassert.Require(t, countEvents(e.events.all(), "work:L2:base") == 1 && countEvents(e.events.all(), "close:depper") == 0, "new work did not coexist with parked old work: %v", e.events.all())
+		for {
+			event, ok := nextEvent(t, healthy)
+			testassert.Require(t, ok, "subscription closed before fresh execution cleanup")
+			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID, fresh.Identity.SessionID)
+			if body, closed := scopeClosedEvent(t, event); closed && operationScopeWorkspace(t, body.Scope) == wsA {
+				break
+			}
+		}
 
 		// Release: the blocked Operation completes on its captured revision 1.
-		server.releaseGate()
+		close(gate)
 		awaitOperation(t, r, sessionA.Identity.SessionID, "op-a1", harness.OperationSuccess)
 		{
 			rec := readOperation(t, r, sessionA.Identity.SessionID, "op-a1")
@@ -441,13 +492,14 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		// and the dependency's own settings from the same revision, while the
 		// old capture keeps its content.
 		recA2 := awaitOperation(t, r, sessionA.Identity.SessionID, "op-a2", harness.OperationSuccess)
+		testassert.Require(t, countEvents(e.events.all(), "work:L1:base") == 2 && orderedSubset(e.events.all(), "work:L1:base", "close:depper", "close:base"), "nested call and dependency closure order = %v", e.events.all())
 		testassert.Require(t, recA2.Admission.Execution.ConfigurationRevision == "2", "queued Operation record = %+v, want the revision-2 success", recA2.Admission.Execution)
 		{
 			got := hook.calls()
-			testassert.Require(t, slices.Equal(got, []hookCall{{tag: "T1"}, {tag: "T1"}, {tag: "T2"}}), "hook calls = %v, want the configured tag of each call", got)
+			testassert.Require(t, slices.Equal(got, []hookCall{{tag: "T1"}, {tag: "T1"}, {tag: "T2"}, {tag: "T2"}}), "hook calls = %v, want the configured tag of each call", got)
 		}
-		if n := countEvents(e.events.all(), "work:L2:base"); n != 1 {
-			t.Fatalf("dependency invocations reading revision-2 settings = %d, want 1: %v", n, e.events.all())
+		if n := countEvents(e.events.all(), "work:L2:base"); n != 2 {
+			t.Fatalf("dependency invocations reading revision-2 settings = %d, want 2: %v", n, e.events.all())
 		}
 		// Consume the healthy subscription through op-a2's Operation-close
 		// publication so the remaining sequence is deterministic.
@@ -458,7 +510,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			if body, closed := scopeClosedEvent(t, event); closed && operationScopeWorkspace(t, body.Scope) == wsA {
 				closedOps++
 			}
-			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID)
+			recordCommittedEvent(t, &observed, event, sessionA.Identity.SessionID, sessionB.Identity.SessionID, fresh.Identity.SessionID)
 		}
 
 		// Shutdown joins the parked execution: the third admission's model
@@ -507,9 +559,18 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			committedScope(protocol.ScopeOpened, ScopeWorkspace, wsA, "", ""),
 			committedScope(protocol.ScopeOpened, ScopeOperation, wsA, sessionAID, "op-a1"),
 			committedScope(protocol.ScopeOpened, ScopeAgent, wsA, sessionAID, "op-a1"),
+			committedScope(protocol.ScopeOpened, ScopeRuntime, "", "", ""),
 			configurationChangedEvent(2),
+			committedScope(protocol.ScopeOpened, ScopeWorkspace, wsA, "", ""),
+			committedScope(protocol.ScopeOpened, ScopeOperation, wsA, fresh.Identity.SessionID, "op-fresh"),
+			committedScope(protocol.ScopeOpened, ScopeAgent, wsA, fresh.Identity.SessionID, "op-fresh"),
+			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, fresh.Identity.SessionID, "op-fresh"),
+			committedScope(protocol.ScopeClosed, ScopeOperation, wsA, fresh.Identity.SessionID, "op-fresh"),
 			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, sessionAID, "op-a1"),
 			committedScope(protocol.ScopeClosed, ScopeOperation, wsA, sessionAID, "op-a1"),
+			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsA, "", ""),
+			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsB, "", ""),
+			committedScope(protocol.ScopeClosed, ScopeRuntime, "", "", ""),
 			committedScope(protocol.ScopeOpened, ScopeOperation, wsA, sessionAID, "op-a2"),
 			committedScope(protocol.ScopeOpened, ScopeAgent, wsA, sessionAID, "op-a2"),
 			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, sessionAID, "op-a2"),
@@ -519,10 +580,9 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 			committedScope(protocol.ScopeClosed, ScopeAgent, wsA, sessionAID, "op-a3"),
 			committedScope(protocol.ScopeClosed, ScopeOperation, wsA, sessionAID, "op-a3"),
 			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsA, "", ""),
-			committedScope(protocol.ScopeClosed, ScopeWorkspace, wsB, "", ""),
 			committedScope(protocol.ScopeClosed, ScopeRuntime, "", "", ""),
 		}
-		got := append(observed, committedTail(t, healthy, sessionAID, sessionBID)...)
+		got := normalizeInvocationScopes(t, append(observed, committedTail(t, healthy, sessionAID, sessionBID, fresh.Identity.SessionID)...))
 		if !slices.EqualFunc(got, want, equalEvent) {
 			t.Fatalf("healthy subscriber committed events = %s, want the complete committed sequence %s", eventsJSON(t, got), eventsJSON(t, want))
 		}
@@ -648,4 +708,23 @@ func deref(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func normalizeInvocationScopes(t *testing.T, events []Event) []Event {
+	t.Helper()
+	out := make([]Event, len(events))
+	for i, event := range events {
+		out[i] = event
+		body, err := event.AsScopeEvent()
+		if err != nil {
+			continue
+		}
+		invocation, err := body.Scope.AsInvocationScope()
+		if err != nil || invocation.Kind != protocol.Invocation {
+			continue
+		}
+		testassert.Require(t, invocation.InvocationId != "" && invocation.Purpose == protocol.Conversation, "invocation scope = %+v, want the actual ID and conversation purpose", invocation)
+		out[i] = scopeEvent(body.Kind, ScopeInfo{Kind: ScopeAgent, Workspace: *invocation.Workspace, SessionID: invocation.SessionId, OperationID: invocation.OperationId})
+	}
+	return out
 }

@@ -224,8 +224,9 @@ func (p *ModelPricing) Clone() *ModelPricing {
 // the capture. The captured ConfigurationRevision also identifies the
 // governing permission policy; no rules are durable. Capability names are
 // validated for shape only: no plugin is loaded to read a historical capture.
-// No resolved secret, callback, plugin value, permission representation,
-// retry policy, or arbitrary plugin JSON is durable.
+// No resolved secret, callback, permission representation, retry policy or
+// executable value is durable; implementation provenance retains only the
+// extension identity/version and its non-secret captured section bytes.
 type ExecutionCapture struct {
 	ConfigurationRevision string                 `json:"configuration_revision"`
 	Model                 model.ModelRef         `json:"model"`
@@ -233,12 +234,27 @@ type ExecutionCapture struct {
 	OutputReserve         int                    `json:"output_reserve"`
 	SystemPrompt          string                 `json:"system_prompt"`
 	Tools                 []model.ToolDefinition `json:"tools"`
-	Capabilities          []string               `json:"capabilities,omitempty"`
-	Readonly              bool                   `json:"readonly"`
-	WriteDir              string                 `json:"write_dir"`
-	Pricing               *ModelPricing          `json:"pricing,omitempty"`
-	Compact               CompactCapture         `json:"compact"`
-	Strategy              StrategyCapture        `json:"strategy"`
+	// InitialToolNames is the preparation-selected starting advertisement.
+	// A nil Go value means every captured tool (the Harness default); a
+	// present empty list means none. The canonical durable payload always
+	// carries the materialized array.
+	InitialToolNames []string                `json:"initial_tool_names"`
+	Capabilities     []string                `json:"capabilities,omitempty"`
+	Readonly         bool                    `json:"readonly"`
+	WriteDir         string                  `json:"write_dir"`
+	Pricing          *ModelPricing           `json:"pricing,omitempty"`
+	Compact          CompactCapture          `json:"compact"`
+	Strategy         StrategyCapture         `json:"strategy"`
+	Implementations  []ImplementationCapture `json:"implementations,omitempty"`
+}
+
+// ImplementationCapture is the exact non-secret provenance of one extension
+// implementation that participated in this execution: the implementing
+// extension root, its implementation version, and its captured section bytes.
+type ImplementationCapture struct {
+	ExtensionID string          `json:"extension_id"`
+	Version     string          `json:"version"`
+	Settings    json.RawMessage `json:"settings,omitempty"`
 }
 
 // StrategyCapture is the resolved selected context-strategy input of one
@@ -283,11 +299,16 @@ type SessionIdentity struct {
 type SessionState struct {
 	Lifecycle          SessionLifecycle `json:"lifecycle"`
 	ArchivedAt         *time.Time       `json:"archived_at,omitempty"`
-	CurrentAgentType   string           `json:"current_agent_type"`
+	AgentSelection     AgentSelection   `json:"agent_selection"`
 	CurrentOperationID string           `json:"current_operation_id,omitempty"`
 	CheckpointEntryID  string           `json:"checkpoint_entry_id,omitempty"`
 	Usage              UsageTotals      `json:"usage"`
 	LastActivity       time.Time        `json:"last_activity"`
+
+	// ExternalDataOwners is the ordered unique set of installed extension IDs
+	// that durably claimed external data for this Session. Fork copies leave
+	// it empty; deletion returns it once and never stores it elsewhere.
+	ExternalDataOwners []string `json:"external_data_owners"`
 }
 
 // SessionRecord is one decoded Session register: the payload's identity and
@@ -302,13 +323,13 @@ type SessionRecord struct {
 // OperationAdmission is the immutable admission section of one Operation
 // register. It is the sole durable Agent-type field for its Operation.
 type OperationAdmission struct {
-	SessionID     string           `json:"session_id"`
-	OperationID   string           `json:"operation_id"`
-	RequestKind   RequestKind      `json:"request_kind"`
-	AdmittedEntry EntryRef         `json:"admitted_entry"`
-	AgentType     string           `json:"agent_type"`
-	Execution     ExecutionCapture `json:"execution"`
-	AdmittedAt    time.Time        `json:"admitted_at"`
+	SessionID      string           `json:"session_id"`
+	OperationID    string           `json:"operation_id"`
+	RequestKind    RequestKind      `json:"request_kind"`
+	AdmittedEntry  EntryRef         `json:"admitted_entry"`
+	AgentSelection AgentSelection   `json:"agent_selection"`
+	Execution      ExecutionCapture `json:"execution"`
+	AdmittedAt     time.Time        `json:"admitted_at"`
 }
 
 // ActiveEffect names the one in-flight effect of a running Operation and the

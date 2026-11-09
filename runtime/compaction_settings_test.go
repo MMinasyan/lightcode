@@ -56,7 +56,7 @@ func TestParseCompactionSettings(t *testing.T) {
 func TestCandidateRejectsInvalidBaselineSections(t *testing.T) {
 	valid := `{"providers":{}}`
 	{
-		_, err := assembleConfiguration(1, valid, `{}`, nil)
+		_, err := assembleConfiguration(t, 1, valid, `{}`, nil)
 		testassert.NoError(t, err)
 	}
 	for _, tc := range []struct{ name, document string }{
@@ -70,7 +70,7 @@ func TestCandidateRejectsInvalidBaselineSections(t *testing.T) {
 		{"compaction empty prompt", `{"providers":{},"compaction":{"prompt":""}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := assembleConfiguration(1, tc.document, `{}`, nil)
+			_, err := assembleConfiguration(t, 1, tc.document, `{}`, nil)
 			testassert.Require(t, err != nil && strings.Contains(err.Error(), "captured configuration"), "candidate %s = %v, want a captured-configuration rejection", tc.document, err)
 		})
 	}
@@ -92,7 +92,7 @@ func TestSettingsMutationWritesBaselineRootsExactly(t *testing.T) {
 	settings.Tools = json.RawMessage(`{"read_max_lines":9007199254740993,"unknown":1}`)
 	settings.Jobs = json.RawMessage(`{"max_output_bytes":1048576,"unknown":2}`)
 	settings.Compaction = json.RawMessage(`{"model":"prov/m2","prompt":"  exact prompt  ","unknown":3}`)
-	settings.Plugins = protocol.PluginsSettings{}
+	settings.Extensions = protocol.ExtensionsSettings{}
 	candidate, err := svc.mutate(context.Background(), editSettings(settings))
 	testassert.NoError(t, err)
 	root := fileRoot(t, h.configPath)
@@ -103,7 +103,7 @@ func TestSettingsMutationWritesBaselineRootsExactly(t *testing.T) {
 	} {
 		testassert.Equal(t, compactJSON(t, root[name]), want)
 	}
-	view := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.plugins)
+	view := projectSettings(candidate.snapshot.sessions, candidate.snapshot.tools, candidate.snapshot.jobs, candidate.snapshot.compaction, candidate.snapshot.extensions)
 	testassert.Equal(t, compactJSON(t, view.Tools), `{"read_max_lines":9007199254740993,"unknown":1}`)
 	testassert.Equal(t, compactJSON(t, view.Jobs), `{"max_output_bytes":1048576,"unknown":2}`)
 	testassert.Equal(t, compactJSON(t, view.Compaction), `{"model":"prov/m2","prompt":"  exact prompt  ","unknown":3}`)
