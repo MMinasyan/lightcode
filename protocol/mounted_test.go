@@ -13,6 +13,7 @@ import (
 	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
@@ -127,11 +128,13 @@ func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeMountedFile(t, configPath, mountedOwnerConfig)
-	owner, err := runtime.Open(context.Background(), runtime.Options{
+	host := runtime.NewProtocolHost()
+	owner, err := melta.Open(context.Background(), melta.Options{
 		DataDir:       dataDir,
-		Configuration: runtime.NewFileConfigurationSource(configPath),
-		Credentials:   runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
-		Plugins:       append(builtin.Plugins(), mountedReporterPlugin()),
+		Configuration: melta.NewFileConfigurationSource(configPath),
+		Credentials:   melta.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
+		Extensions:    append(builtin.Plugins(), mountedReporterPlugin()),
+		BeforeRelease: host.BeforeRelease,
 	})
 	testassert.NoError(t, err)
 	defer func() {
@@ -141,7 +144,7 @@ func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 		}
 	}()
 
-	server, err := owner.OpenProtocol(context.Background())
+	server, err := host.OpenProtocol(context.Background(), owner)
 	testassert.NoError(t, err)
 	record := filepath.Join(t.TempDir(), "discovery.json")
 	testassert.NoError(t, server.PublishDiscovery(record))

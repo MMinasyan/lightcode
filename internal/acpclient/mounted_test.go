@@ -17,6 +17,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/clientops"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -70,14 +71,15 @@ func isolateBundledCredentials(t *testing.T) {
 
 // newMountedRuntime opens one production-composition Runtime over isolated
 // HOME, data, and config paths.
-func newMountedRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string, string) {
+func newMountedRuntime(t *testing.T, baseURL string) (*melta.Melta, *runtime.ProtocolHost, string, string) {
 	t.Helper()
 	t.Setenv("ACP_MOUNTED_KEY", "mounted-test-key")
 	isolateBundledCredentials(t)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, fmt.Sprintf(mountedConfigDocument, baseURL, mountedAgentsDocument))
-	r, err := runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, Configuration: runtime.NewFileConfigurationSource(configPath), Credentials: runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")), Plugins: builtin.Plugins()})
+	host := runtime.NewProtocolHost()
+	r, err := melta.Open(context.Background(), melta.Options{DataDir: dataDir, Configuration: melta.NewFileConfigurationSource(configPath), Credentials: melta.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")), Extensions: builtin.Plugins(), BeforeRelease: host.BeforeRelease})
 	testassert.NoError(t, err)
 	t.Cleanup(func() {
 		{
@@ -85,7 +87,7 @@ func newMountedRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string, 
 			testassert.Check(t, err == nil, "runtime.Close: %v", err)
 		}
 	})
-	return r, dataDir, configPath
+	return r, host, dataDir, configPath
 }
 
 // parkedModel is one loopback model endpoint whose first response holds until
@@ -154,8 +156,8 @@ func startMountedBridge(t *testing.T, dataDir, configPath, workspace string) *br
 // parked, and proves the accepted work still settles through the owner.
 func TestACPMountedRuntimeDepartureKeepsAcceptedWork(t *testing.T) {
 	model := newParkedModel(t)
-	owner, dataDir, configPath := newMountedRuntime(t, model.URL)
-	ps, err := owner.OpenProtocol(context.Background())
+	owner, ownerHost, dataDir, configPath := newMountedRuntime(t, model.URL)
+	ps, err := ownerHost.OpenProtocol(context.Background(), owner)
 	testassert.NoError(t, err)
 	record := filepath.Join(dataDir, "runtime.json")
 	testassert.NoError(t, ps.PublishDiscovery(record))

@@ -127,6 +127,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 		harnessPkg          = publicModule + "/harness"
 		extensionPkg        = publicModule + "/extension"
 		storagePkg          = publicModule + "/internal/storage"
+		meltaPkg            = publicModule + "/melta"
 		runtimePkg          = publicModule + "/runtime"
 		configPkg           = publicModule + "/internal/config"
 		toolPkg             = publicModule + "/internal/tool"
@@ -211,8 +212,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			}
 			continue
 		case "runtime_command.go":
-			if imp != runtimePkg && imp != builtinPkg && !std[imp] {
-				problems = append(problems, rel+": runtime_command.go imports "+imp+"; the runtime command may import only the standard library, "+runtimePkg+", and "+builtinPkg)
+			if imp != runtimePkg && imp != meltaPkg && imp != builtinPkg && !std[imp] {
+				problems = append(problems, rel+": runtime_command.go imports "+imp+"; the runtime command may import only the standard library, "+meltaPkg+", "+runtimePkg+", and "+builtinPkg)
 			}
 			continue
 		}
@@ -237,9 +238,13 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			if imp != modelPkg && imp != harnessPkg && imp != promptPkg && imp != protocolPkg && imp != jsonschemaPkg && !std[imp] {
 				problems = append(problems, rel+": extension package imports "+imp+"; extension may import only the standard library, the shared "+modelPkg+", "+harnessPkg+", "+promptPkg+" and "+protocolPkg+" contracts, and "+jsonschemaPkg+", never the Runtime/MELTA owner or a concrete/internal implementation package")
 			}
+		case "melta":
+			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != extensionPkg && imp != promptPkg && imp != configPkg && imp != catalogPkg && imp != atomicfsPkg && imp != snapshotPkg && imp != safefsPkg && imp != pathutilPkg && imp != storagePkg && imp != toolPkg && imp != editprePkg && imp != shellparsePkg && imp != toolargsPkg && imp != jobsPkg && !std[imp] {
+				problems = append(problems, rel+": melta package imports "+imp+"; melta may import only the standard library, "+modelPkg+", "+harnessPkg+", "+protocolPkg+", "+extensionPkg+", "+promptPkg+", and the retained "+configPkg+", "+catalogPkg+", "+atomicfsPkg+", "+snapshotPkg+", "+safefsPkg+", "+pathutilPkg+", "+storagePkg+", "+toolPkg+", "+editprePkg+", "+shellparsePkg+", "+toolargsPkg+", and "+jobsPkg+" helpers, never a concrete plugin, extension, or the SQLite driver")
+			}
 		case "runtime":
-			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != configPkg && imp != catalogPkg && imp != atomicfsPkg && imp != promptPkg && imp != snapshotPkg && imp != safefsPkg && imp != pathutilPkg && imp != storagePkg && imp != toolPkg && imp != editprePkg && imp != shellparsePkg && imp != toolargsPkg && imp != jobsPkg && imp != extensionPkg && !std[imp] {
-				problems = append(problems, rel+": runtime package imports "+imp+"; runtime may import only the standard library, "+modelPkg+", "+harnessPkg+", "+protocolPkg+", and the retained "+configPkg+", "+catalogPkg+", "+atomicfsPkg+", "+promptPkg+", "+snapshotPkg+", "+safefsPkg+", "+pathutilPkg+", "+storagePkg+", "+toolPkg+", "+editprePkg+", "+shellparsePkg+", "+toolargsPkg+", "+jobsPkg+", and "+extensionPkg+" helpers, never any concrete plugin under "+pluginsPkg+" or the SQLite driver")
+			if imp != harnessPkg && imp != protocolPkg && imp != atomicfsPkg && imp != meltaPkg && !std[imp] {
+				problems = append(problems, rel+": runtime package imports "+imp+"; the HTTP host may import only the standard library, "+harnessPkg+", "+protocolPkg+", "+atomicfsPkg+", and "+meltaPkg)
 			}
 		case "internal/catalog":
 			if imp != modelPkg && imp != atomicfsPkg && !std[imp] {
@@ -271,8 +276,8 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				problems = append(problems, rel+": internal/testassert imports "+imp+"; the shared test assertion helper may import only the standard library")
 			}
 		case "internal/plugins/builtin":
-			if imp != runtimePkg && imp != publicModule+"/extensions/adaptation" && imp != extensionsAgentsPkg && imp != extensionPkg && !std[imp] {
-				problems = append(problems, rel+": internal/plugins/builtin imports "+imp+"; the shipped registration set may import only the standard library, "+runtimePkg+", the two supplied extensions it registers, and "+extensionPkg+" — the store and the standard tools are directly constructed by the owner")
+			if imp != publicModule+"/extensions/adaptation" && imp != extensionsAgentsPkg && imp != extensionPkg && !std[imp] {
+				problems = append(problems, rel+": internal/plugins/builtin imports "+imp+"; the shipped registration set may import only the standard library, the two supplied extensions it registers, and "+extensionPkg+" — the store and the standard tools are directly constructed by the owner")
 			}
 		case "protocol":
 			if imp != oapiRuntimePkg && !std[imp] {
@@ -556,13 +561,28 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	// uniformly above), concrete plugins, the public agent package, and the
 	// SQLite driver never enter it.
 	{
-		problems := checkTrackedGoFile("runtime/x.go", []string{"fmt", "encoding/json", publicModule + "/model", publicModule + "/harness", publicModule + "/protocol", publicModule + "/internal/config", publicModule + "/internal/catalog", publicModule + "/internal/atomicfs", publicModule + "/prompt", publicModule + "/internal/snapshot", publicModule + "/internal/safefs", publicModule + "/internal/pathutil", publicModule + "/internal/storage", publicModule + "/internal/tool", publicModule + "/internal/editpreview", publicModule + "/internal/shellparse", publicModule + "/internal/toolargs", publicModule + "/internal/jobs"}, std)
+		problems := checkTrackedGoFile("runtime/x.go", []string{"fmt", "encoding/json", publicModule + "/harness", publicModule + "/protocol", publicModule + "/internal/atomicfs", publicModule + "/melta"}, std)
 		testassert.Check(t, len(problems) == 0, "allowed runtime imports flagged: %v", problems)
 	}
-	for _, imp := range []string{publicModule + "/agent", publicModule + "/internal/agent", sqliteDriverPkg, publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/tasks", publicModule + "/extensions/agents", publicModule + "/extensions/adaptation", publicModule + "/plugins/jobs", publicModule + "/plugins"} {
+	for _, imp := range []string{publicModule + "/model", publicModule + "/agent", publicModule + "/internal/agent", publicModule + "/internal/config", publicModule + "/internal/catalog", publicModule + "/internal/storage", sqliteDriverPkg, publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/tasks", publicModule + "/extensions/agents", publicModule + "/extensions/adaptation", publicModule + "/plugins/jobs", publicModule + "/plugins"} {
 		{
 			problems := checkTrackedGoFile("runtime/x.go", []string{imp}, std)
 			testassert.Check(t, len(problems) == 1, "runtime importing %q: %d problems, want 1: %v", imp, len(problems), problems)
+		}
+	}
+	// The public MELTA owner composes the model and harness foundation, the
+	// extension and prompt contracts, generated protocol data values, and the
+	// retained baseline helpers it constructs directly. Concrete extensions,
+	// the supplied registration set, the HTTP protocol host, and the SQLite
+	// driver never enter it.
+	{
+		problems := checkTrackedGoFile("melta/x.go", []string{"fmt", "encoding/json", publicModule + "/model", publicModule + "/harness", publicModule + "/protocol", publicModule + "/extension", publicModule + "/prompt", publicModule + "/internal/config", publicModule + "/internal/catalog", publicModule + "/internal/atomicfs", publicModule + "/internal/snapshot", publicModule + "/internal/safefs", publicModule + "/internal/pathutil", publicModule + "/internal/storage", publicModule + "/internal/tool", publicModule + "/internal/editpreview", publicModule + "/internal/shellparse", publicModule + "/internal/toolargs", publicModule + "/internal/jobs"}, std)
+		testassert.Check(t, len(problems) == 0, "allowed melta imports flagged: %v", problems)
+	}
+	for _, imp := range []string{publicModule + "/agent", publicModule + "/internal/agent", publicModule + "/runtime", sqliteDriverPkg, publicModule + "/internal/plugins/sqlite", publicModule + "/internal/plugins/tools", publicModule + "/internal/plugins/tasks", publicModule + "/extensions/agents", publicModule + "/extensions/adaptation", publicModule + "/internal/plugins/builtin", publicModule + "/plugins/jobs", publicModule + "/plugins"} {
+		{
+			problems := checkTrackedGoFile("melta/x.go", []string{imp}, std)
+			testassert.Check(t, len(problems) == 1, "melta importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
 	// The shipped registration set imports exactly the runtime contract and
@@ -572,7 +592,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	// enter it.
 	{
 		problems := checkTrackedGoFile("internal/plugins/builtin/x.go", []string{
-			"context", publicModule + "/runtime",
+			"context",
 			publicModule + "/extensions/adaptation", publicModule + "/extensions/agents",
 		}, std)
 		testassert.Check(t, len(problems) == 0, "allowed internal/plugins/builtin imports flagged: %v", problems)
@@ -1013,7 +1033,7 @@ func TestDependencyRulesRootEntryRoles(t *testing.T) {
 	{
 		problems := checkTrackedGoFile("runtime_command.go", []string{
 			"context", "errors", "path/filepath",
-			publicModule + "/runtime", publicModule + "/internal/plugins/builtin",
+			publicModule + "/melta", publicModule + "/runtime", publicModule + "/internal/plugins/builtin",
 		}, std)
 		testassert.Check(t, len(problems) == 0, "allowed runtime_command.go imports flagged: %v", problems)
 	}

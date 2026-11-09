@@ -23,6 +23,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -1044,11 +1045,13 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, fmt.Sprintf(smokeConfigDocument, baseURL, smokeAgentsDocument))
-	owner, err := runtime.Open(context.Background(), runtime.Options{
+	ownerHost := runtime.NewProtocolHost()
+	owner, err := melta.Open(context.Background(), melta.Options{
 		DataDir:       dataDir,
-		Configuration: runtime.NewFileConfigurationSource(configPath),
-		Credentials:   runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
-		Plugins:       builtin.Plugins(),
+		Configuration: melta.NewFileConfigurationSource(configPath),
+		Credentials:   melta.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
+		Extensions:    builtin.Plugins(),
+		BeforeRelease: ownerHost.BeforeRelease,
 	})
 	testassert.NoError(t, err)
 	t.Cleanup(func() {
@@ -1057,7 +1060,7 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 			testassert.Check(t, err == nil, "runtime.Close: %v", err)
 		}
 	})
-	server, err := owner.OpenProtocol(context.Background())
+	server, err := ownerHost.OpenProtocol(context.Background(), owner)
 	testassert.NoError(t, err)
 	testassert.NoError(t, server.PublishDiscovery(filepath.Join(dataDir, "runtime.json")))
 

@@ -35,6 +35,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -105,15 +106,15 @@ func runChild() {
 // otherwise publishes and serves until the stop marker.
 func runOwnerChild(dataDir, configPath string) {
 	awaitGate()
-	r, err := openRuntime(dataDir, configPath)
-	if errors.Is(err, runtime.ErrOwned) {
+	r, ownerHost, err := openRuntime(dataDir, configPath)
+	if errors.Is(err, melta.ErrOwned) {
 		writeLostMarker()
 		os.Exit(0)
 	}
 	if err != nil {
 		childAbort("runtime open: %v", err)
 	}
-	ps, err := r.OpenProtocol(context.Background())
+	ps, err := ownerHost.OpenProtocol(context.Background(), r)
 	if err != nil {
 		childAbort("OpenProtocol: %v", err)
 	}
@@ -121,19 +122,19 @@ func runOwnerChild(dataDir, configPath string) {
 		childAbort("PublishDiscovery: %v", err)
 	}
 	writeMarker(*childReady, ps.Endpoint())
-	awaitStopAndClose(r)
+	awaitStopAndClose(r, ownerHost)
 }
 
 // runHoldChild owns the lock without publishing until its gate opens, so a
 // contender started before publication loses the lock deterministically.
 func runHoldChild(dataDir, configPath string) {
-	r, err := openRuntime(dataDir, configPath)
+	r, ownerHost, err := openRuntime(dataDir, configPath)
 	if err != nil {
 		childAbort("runtime open: %v", err)
 	}
 	writeMarker(*childAcquired, "acquired")
 	awaitGate()
-	ps, err := r.OpenProtocol(context.Background())
+	ps, err := ownerHost.OpenProtocol(context.Background(), r)
 	if err != nil {
 		childAbort("OpenProtocol: %v", err)
 	}
@@ -141,7 +142,7 @@ func runHoldChild(dataDir, configPath string) {
 		childAbort("PublishDiscovery: %v", err)
 	}
 	writeMarker(*childReady, ps.Endpoint())
-	awaitStopAndClose(r)
+	awaitStopAndClose(r, ownerHost)
 }
 
 // runShapedChild publishes the real record first, then answers readiness
@@ -149,11 +150,11 @@ func runHoldChild(dataDir, configPath string) {
 // credential, and rewrites only the record's endpoint. The real owner and
 // its original endpoint stay live for survival checks.
 func runShapedChild(dataDir, configPath, version string, park bool) {
-	r, err := openRuntime(dataDir, configPath)
+	r, ownerHost, err := openRuntime(dataDir, configPath)
 	if err != nil {
 		childAbort("runtime open: %v", err)
 	}
-	ps, err := r.OpenProtocol(context.Background())
+	ps, err := ownerHost.OpenProtocol(context.Background(), r)
 	if err != nil {
 		childAbort("OpenProtocol: %v", err)
 	}
@@ -164,7 +165,7 @@ func runShapedChild(dataDir, configPath, version string, park bool) {
 	shapedEndpoint, originalEndpoint := shapeHealth(recordPath, version, park)
 	writeMarker(*childEndpoint, originalEndpoint)
 	writeMarker(*childReady, shapedEndpoint)
-	awaitStopAndClose(r)
+	awaitStopAndClose(r, ownerHost)
 }
 
 // attemptMarkerPlugin is one inert Runtime-scoped plugin: its factory runs
@@ -206,13 +207,16 @@ type attemptCloser struct{}
 // openRuntime opens one real Runtime through the public constructor with the
 // per-attempt factory marker. No controlled preparation or private constructor
 // is used.
-func openRuntime(dataDir, configPath string) (*runtime.Runtime, error) {
-	return runtime.Open(context.Background(), runtime.Options{
+func openRuntime(dataDir, configPath string) (*melta.Melta, *runtime.ProtocolHost, error) {
+	host := runtime.NewProtocolHost()
+	owner, err := melta.Open(context.Background(), melta.Options{
 		DataDir:       dataDir,
-		Configuration: runtime.NewFileConfigurationSource(configPath),
-		Credentials:   runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
-		Plugins:       []extension.Native{attemptMarkerPlugin()},
+		Configuration: melta.NewFileConfigurationSource(configPath),
+		Credentials:   melta.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
+		Extensions:    []extension.Native{attemptMarkerPlugin()},
+		BeforeRelease: host.BeforeRelease,
 	})
+	return owner, host, err
 }
 
 // shapeHealth starts one test-only health server over the record's published
@@ -342,7 +346,7 @@ func awaitGate() {
 
 // awaitStopAndClose waits for the stop marker, then performs the managed
 // Runtime Close before the process exits.
-func awaitStopAndClose(r *runtime.Runtime) {
+func awaitStopAndClose(r *melta.Melta, _ *runtime.ProtocolHost) {
 	if *childStop == "" {
 		childAbort("publishing helper role requires a stop marker")
 	}

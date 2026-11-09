@@ -1,0 +1,872 @@
+package melta
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"math"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/storage"
+	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
+)
+
+// projectionAgentsDocument is the shared plain solo/worker pair for the
+// storage-only projection fixtures: no tools or capabilities are selected,
+// so it declares coherently under every one of their plugin compositions.
+const projectionAgentsDocument = `{"solo":{"model":"prov/m","system_prompt":"simple"},"worker":{"model":"prov/m","system_prompt":"simple"}}`
+
+// openProjectionRuntime opens one composed Melta over the given store with
+// the plain solo/worker agent pair.
+func openProjectionRuntime(t *testing.T, store harness.Storage) (*Melta, *ownerEnv) {
+	t.Helper()
+	e := newOwnerEnv(t)
+	writeAgentDefinitions(t, e.configPath, projectionAgentsDocument)
+	e.fixtureStore(store)
+	r, err := e.open(context.Background())
+	testassert.NoError(t, err)
+	return r, e
+}
+
+// closeProjectionRuntime joins one test owner's shutdown. Every test defers
+// it immediately inside its eachPrepStore callback, so the owner closes
+// before the callback returns and the SQLite store closes after it.
+func closeProjectionRuntime(r *Melta) {
+	_ = r.Close(context.Background())
+}
+
+func projectionSession(t *testing.T, r *Melta, workspace, agentType string) harness.SessionRecord {
+	t.Helper()
+	rec, err := r.createSession(context.Background(), workspace, agentType)
+	testassert.Require(t, err == nil, "createSession(%s): %v", workspace, err)
+	return rec
+}
+
+func sessionViewThroughRuntime(t *testing.T, r *Melta, sessionID string) harness.SessionReadView {
+	t.Helper()
+	var view harness.SessionReadView
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		var err error
+		view, err = h.ReadSessionView(ctx, sessionID)
+		return err
+	})
+	testassert.Require(t, err == nil, "ReadSessionView(%s): %v", sessionID, err)
+	return view
+}
+
+// headerThroughRuntime reads one Session's owned metadata header through the
+// Melta's admission gate: the narrow producer list rows and command results
+// consume.
+func headerThroughRuntime(t *testing.T, r *Melta, sessionID string) harness.SessionHeader {
+	t.Helper()
+	var header harness.SessionHeader
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		var err error
+		header, err = h.ReadSessionHeader(ctx, sessionID)
+		return err
+	})
+	testassert.Require(t, err == nil, "ReadSessionHeader(%s): %v", sessionID, err)
+	return header
+}
+
+// historyThroughRuntime reads one Session's owned committed history and
+// revision through the Melta's admission gate: the narrow producer the
+// live fork boundary consumes.
+func historyThroughRuntime(t *testing.T, r *Melta, sessionID string) ([]harness.HistoryFact, harness.SessionRevision) {
+	t.Helper()
+	var (
+		facts    []harness.HistoryFact
+		revision harness.SessionRevision
+	)
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		view, err := h.ReadHistoryView(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		facts = historyFactsOf(view)
+		revision = view.Revision
+		return nil
+	})
+	testassert.Require(t, err == nil, "ReadHistoryView(%s): %v", sessionID, err)
+	return facts, revision
+}
+
+// headerErrorThroughRuntime reads one Session header through the Melta's
+// admission gate and returns its typed error unchanged, so closed/canceled/
+// corrupt/deleted oracles share one admission-gated callback path.
+func headerErrorThroughRuntime(ctx context.Context, r *Melta, sessionID string) error {
+	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		_, err := h.ReadSessionHeader(ctx, sessionID)
+		return err
+	})
+}
+
+// historyErrorThroughRuntime reads one Session history through the Melta's
+// admission gate and returns its typed error unchanged.
+func historyErrorThroughRuntime(ctx context.Context, r *Melta, sessionID string) error {
+	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		_, err := h.ReadHistoryView(ctx, sessionID)
+		return err
+	})
+}
+
+// historyFactsOf reads every committed fact of one captured history view: the
+// value-metadata headers select the entry identities the facts accessor
+// consumes.
+func historyFactsOf(view harness.HistoryReadView) []harness.HistoryFact {
+	headers := view.HistoryHeaders()
+	ids := make([]string, 0, len(headers))
+	for _, header := range headers {
+		ids = append(ids, header.EntryID)
+	}
+	return view.HistoryFacts(ids)
+}
+
+// submitQueuedThroughRuntime submits one buffered queued message.
+func submitQueuedThroughRuntime(t *testing.T, r *Melta, sessionID, operationID, text string) {
+	t.Helper()
+	res, err := submitRawThroughRuntime(context.Background(), r, sessionID, operationID, text, harness.MessageModeQueued)
+	testassert.Require(t, err == nil, "queued Submit(%q): %v", operationID, err)
+	testassert.Require(t, res.Disposition == harness.DispositionQueued, "queued submit %q = %+v, want queued", operationID, res.Disposition)
+}
+
+// forkThroughRuntime forks one source Session at the input entry of the named
+// operation and returns the destination identity.
+func forkThroughRuntime(t *testing.T, r *Melta, sourceID, boundaryEntryID, operationID string) string {
+	t.Helper()
+	var dest string
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		res, err := h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
+			SourceSessionID: sourceID,
+			BoundaryEntryID: boundaryEntryID,
+			OperationID:     operationID,
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "forked"}},
+		})
+		if err != nil {
+			return err
+		}
+		dest = res.Session.Identity.SessionID
+		return nil
+	})
+	testassert.NoError(t, err)
+	return dest
+}
+
+// launchChildThroughRuntime launches one child Session of the worker type.
+func launchChildThroughRuntime(t *testing.T, r *Melta, parent, operationID string) string {
+	t.Helper()
+	var childID string
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		res, err := h.LaunchChildSession(ctx, harness.LaunchChildRequest{
+			ParentSessionID: parent,
+			AgentSelection:  suppliedDefinition("worker"),
+			Content:         []model.ContentPart{{Kind: model.PartText, Text: "child work"}},
+			OperationID:     operationID,
+			ExtensionID:     "test.extension",
+			MaxConcurrent:   1,
+			OutputLimit:     4096,
+		})
+		if err != nil {
+			return err
+		}
+		childID = res.ChildSessionID
+		return nil
+	})
+	testassert.NoError(t, err)
+	return childID
+}
+
+// wantSessionRevision derives the expected wire revision pair from one
+// metadata header: the durable register revision and the coordinator-local
+// counter as decimal strings, with the empty pre-server instance identity.
+func wantSessionRevision(t *testing.T, header harness.SessionHeader, instance string) protocol.SessionRevision {
+	t.Helper()
+	return protocol.SessionRevision{
+		InstanceId:      instance,
+		DurableRevision: strconv.FormatInt(header.Revision.DurableRevision, 10),
+		LocalRevision:   strconv.FormatUint(header.Revision.LocalRevision, 10),
+	}
+}
+
+// inputEntryID resolves one operation's committed input entry through the
+// Session's committed history headers.
+func inputEntryID(t *testing.T, r *Melta, sessionID, operationID string) string {
+	t.Helper()
+	view := historyViewThroughRuntime(t, r, sessionID)
+	for _, header := range view.HistoryHeaders() {
+		if header.Kind == harness.EntryInput && header.OperationID == operationID {
+			return header.EntryID
+		}
+	}
+	t.Fatalf("no input entry owned by %q in session %q", operationID, sessionID)
+	return ""
+}
+
+// historyViewThroughRuntime reads one Session's narrow history view through
+// the Melta's admission gate.
+func historyViewThroughRuntime(t *testing.T, r *Melta, sessionID string) harness.HistoryReadView {
+	t.Helper()
+	var view harness.HistoryReadView
+	err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+		var err error
+		view, err = h.ReadHistoryView(ctx, sessionID)
+		return err
+	})
+	testassert.Require(t, err == nil, "ReadHistoryView(%s): %v", sessionID, err)
+	return view
+}
+
+// awaitModelArrival waits for the parked execution to reach its model
+// request on the configured endpoint.
+func awaitModelArrival(t *testing.T, e *ownerEnv) {
+	t.Helper()
+	select {
+	case <-e.server.arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the execution never reached its model effect")
+	}
+}
+
+// assertStableHeader checks every header field that is stable while its
+// subject holds still: identity, workspace, agent, lifecycle, archive
+// absence, the wanted current-operation member, the header times, the UTC
+// zone, and the revision pair.
+func assertStableHeader(t *testing.T, header protocol.Session, sessionHeader harness.SessionHeader, sessionID, workspace, agent, wantCurrent, instance string) {
+	t.Helper()
+	currentOK := (wantCurrent == "") == (header.CurrentOperationId == nil) &&
+		(wantCurrent == "" || *header.CurrentOperationId == wantCurrent)
+	testassert.Require(t, header.SessionId == sessionID && header.Workspace == workspace && header.Lifecycle == protocol.Open && header.AgentSelection.Definition.DefinitionId == agent && header.ArchivedAt == nil && currentOK && header.CreatedAt.Equal(sessionHeader.Identity.CreatedAt) && header.LastActivity.Equal(sessionHeader.LastActivity), "header = %+v, want the open %s header at %s with current operation %q; header times = (%v, %v), want the read times (%v, %v)", header, sessionID, workspace, wantCurrent, header.CreatedAt, header.LastActivity, sessionHeader.Identity.CreatedAt, sessionHeader.LastActivity)
+	testassert.Equal(t, header.CreatedAt.Location(), time.UTC)
+	if header.SessionRevision != wantSessionRevision(t, sessionHeader, instance) {
+		t.Fatalf("session_revision = %+v, want the read pair %+v", header.SessionRevision, wantSessionRevision(t, sessionHeader, instance))
+	}
+}
+
+// TestProjectionSessionHeaderRootForkChild proves one producer's exact header
+// fields for every lineage kind over both stores. Each subject is asserted
+// only while it is actually stable: the root before any Operation starts,
+// the fork and child parked on their running models, so no read races the
+// root's later child-completion delivery.
+func TestProjectionSessionHeaderRootForkChild(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		workspace := filepath.Join(e.home, "lineage")
+		root := projectionSession(t, r, workspace, "solo")
+
+		// The root header before any Operation starts.
+		rootHeader := projectSession(headerThroughRuntime(t, r, root.Identity.SessionID), r.instance)
+		assertStableHeader(t, rootHeader, headerThroughRuntime(t, r, root.Identity.SessionID),
+			root.Identity.SessionID, workspace, "solo", "", r.instance)
+		testassert.Require(t, rootHeader.ParentSessionId == nil && rootHeader.SourceSessionId == nil, "root lineage pointers = (%v, %v), want none", rootHeader.ParentSessionId, rootHeader.SourceSessionId)
+
+		// One settled admission gives the fork its committed input boundary;
+		// its terminal cleanup proves the settled idle source Fork requires.
+		submitThroughRuntime(t, r, root.Identity.SessionID, "op-1", "hello")
+		awaitOperation(t, r, root.Identity.SessionID, "op-1", harness.OperationSuccess)
+		boundary := inputEntryID(t, r, root.Identity.SessionID, "op-1")
+
+		// Park both later models on the one gate: each lineage header is
+		// asserted while its own Operation is the running current one.
+		gate := make(chan struct{})
+		e.server.setHold(gate)
+		release := sync.OnceFunc(func() { close(gate) })
+		defer release() // LIFO: the gate releases before the owner close joins
+
+		forked := forkThroughRuntime(t, r, root.Identity.SessionID, boundary, "fork-op-1")
+		awaitModelArrival(t, e)
+		forkHeader := projectSession(headerThroughRuntime(t, r, forked), r.instance)
+		assertStableHeader(t, forkHeader, headerThroughRuntime(t, r, forked),
+			forked, workspace, "solo", "fork-op-1", r.instance)
+		testassert.Require(t, forkHeader.SourceSessionId != nil && *forkHeader.SourceSessionId == root.Identity.SessionID && forkHeader.ParentSessionId == nil, "fork source = %v, want %s; fork parent pointer = %v, want none", forkHeader.SourceSessionId, root.Identity.SessionID, forkHeader.ParentSessionId)
+
+		child := launchChildThroughRuntime(t, r, root.Identity.SessionID, "child-op-1")
+		awaitModelArrival(t, e)
+		childHeader := projectSession(headerThroughRuntime(t, r, child), r.instance)
+		assertStableHeader(t, childHeader, headerThroughRuntime(t, r, child),
+			child, workspace, "worker", "child-op-1", r.instance)
+		testassert.Require(t, childHeader.ParentSessionId != nil && *childHeader.ParentSessionId == root.Identity.SessionID && childHeader.SourceSessionId == nil, "child parent = %v, want %s; child source pointer = %v, want none", childHeader.ParentSessionId, root.Identity.SessionID, childHeader.SourceSessionId)
+
+		release()
+		awaitOperation(t, r, forked, "fork-op-1", harness.OperationSuccess)
+		awaitOperation(t, r, child, "child-op-1", harness.OperationSuccess)
+	})
+}
+
+// TestProjectionOperationActiveAndTerminal proves the shared Operation
+// projector for the running and settled states, including the interrupted
+// terminal's required detail.
+func TestProjectionOperationActiveAndTerminal(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		session := projectionSession(t, r, filepath.Join(e.home, "ops"), "solo").Identity.SessionID
+
+		gate := make(chan struct{})
+		e.server.setHold(gate)
+		submitThroughRuntime(t, r, session, "op-1", "work")
+		awaitModelArrival(t, e)
+
+		active := projectOperation(readOperation(t, r, session, "op-1"))
+		testassert.Require(t, active.OperationId == "op-1" && active.RequestKind == protocol.OperationRequestKindMessage && active.Status == protocol.OperationStatusRunning && active.SettledAt == nil && active.Detail == nil && active.AgentSelection.Definition.DefinitionId == "solo" && active.Model == "prov/m" && !active.AdmittedAt.IsZero(), "active projection = %+v, want the running message op-1 with no terminal members", active)
+
+		close(gate)
+		record := awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
+		settled := projectOperation(record)
+		testassert.Require(t, settled.Status == protocol.OperationStatusSuccess && settled.SettledAt != nil && settled.Detail == nil, "settled projection = %+v, want success with a settlement time and no detail", settled)
+		testassert.Require(t, settled.AdmittedAt.Equal(record.Admission.AdmittedAt), "settled admitted_at drifted from the register admission")
+
+		// The interrupted terminal requires its diagnostic detail, on a fresh
+		// Session: the terminal cleanup of the settled row does not imply the
+		// old execution's retirement, so the interruption never addresses the
+		// just-settled Session.
+		interruptedSession := projectionSession(t, r, filepath.Join(e.home, "ops"), "solo").Identity.SessionID
+		gate = make(chan struct{})
+		e.server.setHold(gate)
+		submitThroughRuntime(t, r, interruptedSession, "op-2", "again")
+		awaitModelArrival(t, e)
+		testassert.NoError(t, r.InterruptSession(context.Background(), testCaller(), interruptedSession))
+		interrupted := projectOperation(awaitOperation(t, r, interruptedSession, "op-2", harness.OperationInterruption))
+		testassert.Require(t, interrupted.Status == protocol.OperationStatusInterruption && interrupted.SettledAt != nil && interrupted.Detail != nil && *interrupted.Detail != "", "interrupted projection = %+v, want interruption with a required detail", interrupted)
+	})
+}
+
+// TestProjectionListFilters proves the one-rule filter set at the facade:
+// both members required, relative roots normalized, no match an empty list.
+func TestProjectionListFilters(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		ws1 := filepath.Join(e.home, "first")
+		ws2 := filepath.Join(e.home, "second")
+		open1 := projectionSession(t, r, ws1, "solo").Identity.SessionID
+		archived := projectionSession(t, r, ws2, "solo").Identity.SessionID
+		err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.ArchiveSession(ctx, archived)
+			return err
+		})
+		testassert.NoError(t, err)
+
+		invalid := map[string]protocol.ListSessionsParams{
+			"absent workspace":  {Lifecycle: "open"},
+			"empty lifecycle":   {Workspace: ws1},
+			"unknown lifecycle": {Workspace: ws1, Lifecycle: "paused"},
+		}
+		for name, params := range invalid {
+			{
+				_, err := r.ListSessions(context.Background(), testCaller(), params)
+				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s: listSessions = %v, want harness.ErrInvalid", name, err)
+			}
+		}
+
+		openList, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws1, Lifecycle: "open"})
+		testassert.NoError(t, err)
+		testassert.Require(t, len(openList) == 1 && openList[0].SessionId == open1, "open list = %+v, want exactly %s", openList, open1)
+		archivedList, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws2, Lifecycle: "archived"})
+		testassert.NoError(t, err)
+		testassert.Require(t, len(archivedList) == 1 && archivedList[0].SessionId == archived && archivedList[0].Lifecycle == protocol.Archived && archivedList[0].ArchivedAt != nil, "archived list = %+v, want exactly the archived %s", archivedList, archived)
+		noMatch, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws2, Lifecycle: "open"})
+		testassert.NoError(t, err)
+		testassert.Require(t, len(noMatch) == 0, "no-match list = %+v, want empty", noMatch)
+
+		// A nonempty relative root is normalized before filtering.
+		cwd, err := os.Getwd()
+		testassert.NoError(t, err)
+		relative, err := filepath.Rel(cwd, ws1)
+		testassert.NoError(t, err)
+		relativeList, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: relative, Lifecycle: "open"})
+		testassert.NoError(t, err)
+		testassert.Require(t, len(relativeList) == 1 && relativeList[0].SessionId == open1 && relativeList[0].Workspace == ws1, "relative-root list = %+v, want exactly the normalized %s row", relativeList, ws1)
+	})
+}
+
+// TestProjectionListAndReadsAroundUnavailableSessions proves a fresh list
+// omits deleted and corrupt Sessions without hiding valid siblings, while
+// direct reads return the underlying typed errors.
+func TestProjectionListAndReadsAroundUnavailableSessions(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		corruptID := "0123456789abcdef0123456789abcdef"
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		ws := filepath.Join(e.home, "mixed")
+		// The corrupt Session is a seeded cold register: the live Melta never
+		// warmed a coordinator for it, so the fresh scan revalidates and omits it.
+		lifecycleInsertRegister(t, store, harness.RegisterKey{SessionID: corruptID, Kind: harness.RegisterSession}, `{"not":"a session register"}`)
+		valid := projectionSession(t, r, ws, "solo").Identity.SessionID
+		deleted := projectionSession(t, r, ws, "solo").Identity.SessionID
+		err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.ArchiveSession(ctx, deleted)
+			return err
+		})
+		testassert.NoError(t, err)
+		{
+			_, err := r.DeleteSession(context.Background(), testCaller(), deleted)
+			testassert.NoError(t, err)
+		}
+
+		list, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
+		testassert.NoError(t, err)
+		testassert.Require(t, len(list) == 1 && list[0].SessionId == valid, "list = %+v, want exactly the valid %s", list, valid)
+
+		{
+			err := headerErrorThroughRuntime(context.Background(), r, deleted)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleted read = %v, want harness.ErrNotFound", err)
+		}
+		err = headerErrorThroughRuntime(context.Background(), r, corruptID)
+		testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "corrupt read = %v, want the harness.ErrCorrupt class", err)
+		var corruptErr *harness.CorruptionError
+		testassert.Require(t, errors.As(err, &corruptErr), "corrupt read lost its typed CorruptionError identity")
+	})
+}
+
+// TestProjectionWorkspaceNavigation proves the distinct sorted roots with
+// their base-name display names and no other projection.
+func TestProjectionWorkspaceNavigation(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		// The empty navigation result is the non-nil [] shape before any
+		// Session exists.
+		initial, err := r.ListWorkspaces(context.Background(), testCaller())
+		testassert.Require(t, err == nil && initial != nil && len(initial) == 0, "initial workspaces = (%+v, %v), want the non-nil empty list", initial, err)
+		wsA := filepath.Join(e.home, "alpha")
+		wsB := filepath.Join(e.home, "beta")
+		root := projectionSession(t, r, wsA, "solo").Identity.SessionID
+		launchChildThroughRuntime(t, r, root, "child-op-1")
+		projectionSession(t, r, wsB, "solo")
+
+		workspaces, err := r.ListWorkspaces(context.Background(), testCaller())
+		testassert.NoError(t, err)
+		want := []protocol.Workspace{
+			{Root: wsA, DisplayName: filepath.Base(wsA)},
+			{Root: wsB, DisplayName: filepath.Base(wsB)},
+		}
+		testassert.Require(t, reflect.DeepEqual(workspaces, want), "workspaces = %+v, want exactly %+v", workspaces, want)
+	})
+}
+
+// TestProjectionCallerCopyOwnership proves a returned projection is a caller
+// copy: the pre-mutation expectation is immutable and the next read is
+// unchanged.
+func TestProjectionCallerCopyOwnership(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		ws := filepath.Join(e.home, "owned")
+		session := projectionSession(t, r, ws, "solo").Identity.SessionID
+
+		header := projectSession(headerThroughRuntime(t, r, session), r.instance)
+		wantHeader := projectSession(headerThroughRuntime(t, r, session), r.instance)
+		header.AgentSelection.Definition.DefinitionId = "mutated"
+		header.Workspace = "mutated"
+		header.Lifecycle = protocol.Archived
+		header.SessionId = "mutated"
+		header.SessionRevision.DurableRevision = "0"
+		header.CreatedAt = time.Time{}
+
+		list, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
+		testassert.NoError(t, err)
+		wantList := append([]protocol.Session(nil), list...)
+		list[0].SessionId = "mutated"
+		list[0].SessionRevision.LocalRevision = "0"
+
+		workspaces, err := r.ListWorkspaces(context.Background(), testCaller())
+		testassert.NoError(t, err)
+		wantWorkspaces := append([]protocol.Workspace(nil), workspaces...)
+		if len(workspaces) == 1 {
+			workspaces[0].Root = "mutated"
+		}
+
+		reread := projectSession(headerThroughRuntime(t, r, session), r.instance)
+		testassert.Require(t, reflect.DeepEqual(reread, wantHeader), "re-read header = %+v, want %+v", reread, wantHeader)
+		relisted, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
+		testassert.NoError(t, err)
+		testassert.Require(t, reflect.DeepEqual(relisted, wantList), "re-read list = %+v, want the immutable pre-mutation %+v", relisted, wantList)
+		rews, err := r.ListWorkspaces(context.Background(), testCaller())
+		testassert.NoError(t, err)
+		testassert.Require(t, reflect.DeepEqual(rews, wantWorkspaces), "re-read workspaces = %+v, want the immutable pre-mutation %+v", rews, wantWorkspaces)
+	})
+}
+
+// TestProjectionConcurrentReadDelete proves a read racing one deletion
+// converges to a complete-body outcome: the full old header or the typed
+// not-found, never a partial projection.
+func TestProjectionConcurrentReadDelete(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		blocked := newTargetedBlockStore(store)
+		r, e := openProjectionRuntime(t, blocked)
+		defer closeProjectionRuntime(r)
+		ws := filepath.Join(e.home, "race")
+		session := projectionSession(t, r, ws, "solo").Identity.SessionID
+		err := r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+			_, err := h.ArchiveSession(ctx, session)
+			return err
+		})
+		testassert.NoError(t, err)
+
+		// The complete old outcome: a read that finishes before the deletion
+		// commit returns the full header.
+		before := projectSession(headerThroughRuntime(t, r, session), r.instance)
+		testassert.Require(t, before.SessionId == session && before.Lifecycle == protocol.Archived, "pre-delete header = %+v, want the complete archived header", before)
+
+		// The complete new outcome: a read parked behind the deletion
+		// transaction converges to the typed not-found with no header.
+		blocked.block(session)
+		// The shared wrapper's releaseBlock is not idempotent: one OnceFunc
+		// release serves both the success path and failure cleanup, deferred
+		// after the owner close so a failing test releases before the close
+		// joins the parked calls.
+		release := sync.OnceFunc(blocked.releaseBlock)
+		defer release()
+		deleteDone := make(chan error, 1)
+		go func() {
+			_, err := r.DeleteSession(context.Background(), testCaller(), session)
+			deleteDone <- err
+		}()
+		select {
+		case <-blocked.arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the deletion never reached its transaction")
+		}
+		readDone := make(chan error, 1)
+		go func() {
+			readDone <- headerErrorThroughRuntime(context.Background(), r, session)
+		}()
+		release()
+		testassert.NoError(t, <-deleteDone)
+		select {
+		case err := <-readDone:
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "read racing the delete = %v, want the typed not-found", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("the racing read never converged")
+		}
+	})
+}
+
+// TestProjectionQueuedLocalRevisionWithoutDurableAdvance proves a queued
+// buffer publication advances only the coordinator-local counter.
+func TestProjectionQueuedLocalRevisionWithoutDurableAdvance(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		session := projectionSession(t, r, filepath.Join(e.home, "queued"), "solo").Identity.SessionID
+
+		gate := make(chan struct{})
+		e.server.setHold(gate)
+		submitThroughRuntime(t, r, session, "op-1", "running")
+		awaitModelArrival(t, e)
+		before := projectSession(headerThroughRuntime(t, r, session), r.instance)
+
+		submitQueuedThroughRuntime(t, r, session, "op-2", "queued")
+
+		after := projectSession(headerThroughRuntime(t, r, session), r.instance)
+		testassert.Equal(t, after.SessionRevision.DurableRevision, before.SessionRevision.DurableRevision)
+		beforeLocal, err := strconv.ParseUint(before.SessionRevision.LocalRevision, 10, 64)
+		testassert.NoError(t, err)
+		afterLocal, err := strconv.ParseUint(after.SessionRevision.LocalRevision, 10, 64)
+		testassert.NoError(t, err)
+		testassert.Require(t, afterLocal > beforeLocal, "local revision %d did not advance past %d after the queued publication", afterLocal, beforeLocal)
+
+		close(gate)
+		awaitOperation(t, r, session, "op-2", harness.OperationSuccess)
+	})
+}
+
+// TestProjectionClosedAndCanceledCallers proves every facade read holds the
+// admission gate: closed owners reject with ErrClosed and canceled callers
+// with their own context error.
+func TestProjectionClosedAndCanceledCallers(t *testing.T) {
+	r, _ := openProjectionRuntime(t, storage.NewMemory())
+	defer closeProjectionRuntime(r)
+	testassert.NoError(t, r.Close(context.Background()))
+	closed := []func() error{
+		func() error {
+			return headerErrorThroughRuntime(context.Background(), r, "0123456789abcdef0123456789abcdef")
+		},
+		func() error {
+			_, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: "/tmp/x", Lifecycle: "open"})
+			return err
+		},
+		func() error { _, err := r.ListWorkspaces(context.Background(), testCaller()); return err },
+	}
+	for i, call := range closed {
+		{
+			err := call()
+			testassert.Require(t, errors.Is(err, ErrClosed), "closed caller %d = %v, want ErrClosed", i, err)
+		}
+	}
+
+	r2, _ := openProjectionRuntime(t, storage.NewMemory())
+	defer closeProjectionRuntime(r2)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceledCalls := []func() error{
+		func() error {
+			return headerErrorThroughRuntime(canceled, r2, "0123456789abcdef0123456789abcdef")
+		},
+		func() error {
+			_, err := r2.ListSessions(canceled, testCaller(), protocol.ListSessionsParams{Workspace: "/tmp/x", Lifecycle: "open"})
+			return err
+		},
+		func() error { _, err := r2.ListWorkspaces(canceled, testCaller()); return err },
+	}
+	for i, call := range canceledCalls {
+		{
+			err := call()
+			testassert.Require(t, errors.Is(err, context.Canceled), "canceled caller %d = %v, want context.Canceled", i, err)
+		}
+	}
+}
+
+// TestProjectionHeaderCarriesNoInternalRepresentation proves the projected
+// headers' exact field sets: no storage register, system prompt, execution
+// capture, or key material leaves through a Session or Operation header.
+func TestProjectionHeaderCarriesNoInternalRepresentation(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		r, e := openProjectionRuntime(t, store)
+		defer closeProjectionRuntime(r)
+		ws := filepath.Join(e.home, "wire")
+		session := projectionSession(t, r, ws, "solo").Identity.SessionID
+		submitThroughRuntime(t, r, session, "op-1", "work")
+		awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
+
+		header := projectSession(headerThroughRuntime(t, r, session), r.instance)
+		assertExactJSONKeys(t, header, []string{
+			"agent_selection", "agent_selection.definition", "created_at", "last_activity", "lifecycle", "session_id",
+			"session_revision", "session_revision.durable_revision", "session_revision.instance_id",
+			"session_revision.local_revision", "workspace",
+		})
+		snap := sessionViewThroughRuntime(t, r, session)
+		operationJSON := assertExactJSONKeys(t, projectOperationSummary(snap.Operations[0]), []string{
+			"admitted_at", "agent_selection", "agent_selection.definition", "model", "operation_id", "request_kind",
+			"settled_at", "status", "usage", "usage.by_model",
+		})
+		testassert.Require(t, strings.Contains(operationJSON, `"by_model":[]`), "empty usage = %s, want the non-nil [] array", operationJSON)
+		// The canonical register totals project as decimal strings.
+		usage := projectUsage(harness.UsageTotals{ByModel: []harness.ModelUsage{{
+			Model: model.ModelRef{Provider: "prov", Model: "m"},
+			Usage: harness.UsageCount{InputTokens: 11, CachedInputTokens: 3, OutputTokens: 5},
+		}}})
+		wantUsage := protocol.UsageTotals{ByModel: []protocol.ModelUsage{{
+			Model: "prov/m",
+			Usage: protocol.UsageCount{InputTokens: "11", CachedInputTokens: "3", OutputTokens: "5"},
+		}}}
+		testassert.Require(t, reflect.DeepEqual(usage, wantUsage), "usage projection = %+v, want %+v", usage, wantUsage)
+	})
+}
+
+// assertExactJSONKeys marshals v and checks its flattened object key set
+// against the expected members, then returns the marshaled body. Decoding
+// keeps exact numbers, so opaque values like 1e1000 survive the inspection.
+func assertExactJSONKeys(t *testing.T, v any, want []string) string {
+	t.Helper()
+	data, err := json.Marshal(v)
+	testassert.Require(t, err == nil, "marshal %T: %v", v, err)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var top map[string]any
+	{
+		err := decoder.Decode(&top)
+		testassert.Require(t, err == nil, "unmarshal %T: %v", v, err)
+	}
+	var got []string
+	for key, value := range top {
+		got = append(got, key)
+		if nested, ok := value.(map[string]any); ok {
+			for nestedKey := range nested {
+				got = append(got, key+"."+nestedKey)
+			}
+		}
+	}
+	sort.Strings(got)
+	wantSorted := append([]string(nil), want...)
+	sort.Strings(wantSorted)
+	testassert.Require(t, reflect.DeepEqual(got, wantSorted), "wire keys = %v, want exactly %v", got, wantSorted)
+	return string(data)
+}
+
+// TestProjectionCostEstimatesFromCapturedPricing pins the estimate's wire
+// shape end to end through the composed Melta: a usage-reporting turn is
+// priced from its captured rates into the hydration totals and its Operation
+// summary, a turn with no usage report leaves both absent, one unknown
+// producer makes the whole Session estimate absent, and a Session with no
+// producer at all carries the present known zero.
+func TestProjectionCostEstimatesFromCapturedPricing(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		ctx := context.Background()
+		e := newPrepEnv(t, store)
+		// The priced report: {prompt 10, cached 4, completion 2} over the
+		// fixture capture rates 1.5/0.5/3 is (6*1.5 + 4*0.5 + 2*3)/1e6.
+		const want = (6*1.5 + 4*0.5 + 2*3) / 1e6
+
+		empty := e.session("solo")
+		hydration, err := e.r.GetHydration(ctx, testCaller(), empty)
+		testassert.NoError(t, err)
+		testassert.Require(t, hydration.Usage.Totals.EstimatedCostUsd != nil && *hydration.Usage.Totals.EstimatedCostUsd == 0, "no-producer hydration estimate = %+v, want the known zero", hydration.Usage.Totals.EstimatedCostUsd)
+
+		e.server.setScript(func(_ context.Context, body string) []string {
+			return append(textTurnEvents("priced answer"),
+				`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":4}}}`)
+		})
+		priced := e.session("solo")
+		e.admit(priced, "op-1", "one")
+		e.awaitTerminal(priced, "op-1", harness.OperationSuccess)
+		hydration, err = e.r.GetHydration(ctx, testCaller(), priced)
+		testassert.NoError(t, err)
+		testassert.Require(t, hydration.Usage.Totals.EstimatedCostUsd != nil && math.Abs(*hydration.Usage.Totals.EstimatedCostUsd-want) < 1e-12, "priced hydration estimate = %+v, want %v", hydration.Usage.Totals.EstimatedCostUsd, want)
+		view, err := e.sessionView(ctx, priced)
+		testassert.NoError(t, err)
+		pricedSummary := projectOperationSummary(view.Operations[0])
+		testassert.Require(t, pricedSummary.Usage.EstimatedCostUsd != nil && math.Abs(*pricedSummary.Usage.EstimatedCostUsd-want) < 1e-12, "priced Operation estimate = %+v, want %v", pricedSummary.Usage, want)
+		assertExactJSONKeys(t, pricedSummary, []string{
+			"admitted_at", "agent_selection", "agent_selection.definition", "model", "operation_id", "request_kind",
+			"settled_at", "status", "usage", "usage.by_model", "usage.estimated_cost_usd",
+		})
+
+		// An unreported turn is an unknown producer: its own estimate and the
+		// Session total are absent, while the priced Operation keeps its value.
+		e.server.setScript(func(_ context.Context, body string) []string {
+			return nil // the default completed text turn reports no usage
+		})
+		e.admit(priced, "op-2", "two")
+		e.awaitTerminal(priced, "op-2", harness.OperationSuccess)
+		hydration, err = e.r.GetHydration(ctx, testCaller(), priced)
+		testassert.NoError(t, err)
+		testassert.Require(t, hydration.Usage.Totals.EstimatedCostUsd == nil, "contaminated Session estimate = %+v, want absent", hydration.Usage.Totals.EstimatedCostUsd)
+		view, err = e.sessionView(ctx, priced)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(view.Operations) == 2, "Operations = %d, want the settled pair", len(view.Operations))
+		repriced := projectOperationSummary(view.Operations[0])
+		unreported := projectOperationSummary(view.Operations[1])
+		testassert.Require(t, repriced.Usage.EstimatedCostUsd != nil && math.Abs(*repriced.Usage.EstimatedCostUsd-want) < 1e-12, "priced Operation estimate after the sibling turn = %+v, want %v", repriced.Usage, want)
+		testassert.Require(t, unreported.Usage.EstimatedCostUsd == nil, "unreported Operation estimate = %+v, want absent", unreported.Usage)
+		assertExactJSONKeys(t, unreported, []string{
+			"admitted_at", "agent_selection", "agent_selection.definition", "model", "operation_id", "request_kind",
+			"settled_at", "status", "usage", "usage.by_model",
+		})
+	})
+}
+
+// oneShotEntriesStore wraps one store: the first ReadEntries after arming
+// parks before delegating to the backend, signals its arrival, and never
+// parks again — the owner's post-deletion generation bump may revalidate the
+// survivor, so a second read must pass straight through.
+type oneShotEntriesStore struct {
+	harness.Storage
+	mu      sync.Mutex
+	release chan struct{} // armed gate: closed once by releaseGate
+	spent   bool          // the one park is taken
+	closed  bool          // the gate was released
+	arrived chan struct{}
+}
+
+func newOneShotEntriesStore(base harness.Storage) *oneShotEntriesStore {
+	return &oneShotEntriesStore{Storage: base, arrived: make(chan struct{}, 1)}
+}
+
+func (s *oneShotEntriesStore) arm() {
+	s.mu.Lock()
+	s.release = make(chan struct{})
+	s.spent = false
+	s.closed = false
+	s.mu.Unlock()
+}
+
+func (s *oneShotEntriesStore) releaseGate() {
+	s.mu.Lock()
+	release := s.release
+	closed := s.closed
+	s.closed = true
+	s.mu.Unlock()
+	if release != nil && !closed {
+		close(release)
+	}
+}
+
+func (s *oneShotEntriesStore) ReadEntries(ctx context.Context, sessionID string, after int64) ([]harness.Entry, error) {
+	s.mu.Lock()
+	release, park := s.release, !s.spent
+	s.spent = true
+	s.mu.Unlock()
+	if release != nil && park {
+		select {
+		case s.arrived <- struct{}{}:
+		default:
+		}
+		<-release
+	}
+	return s.Storage.ReadEntries(ctx, sessionID, after)
+}
+
+// TestProjectionListCandidateDeletionDuringScan proves the fresh-scan skip
+// against a real interleaving: a candidate deleted while the scan's snapshot
+// read is parked leaves exactly the complete survivor listed, and the direct
+// victim read is the typed not-found — never a propagated not-found partial
+// list.
+func TestProjectionListCandidateDeletionDuringScan(t *testing.T) {
+	eachPrepStore(t, func(t *testing.T, store harness.Storage) {
+		gated := newOneShotEntriesStore(store)
+		r, e := openProjectionRuntime(t, gated)
+		defer closeProjectionRuntime(r)
+		ws := filepath.Join(e.home, "scan")
+		// Two archived Sessions seeded after Open: the lower sorted identity
+		// is the cold survivor whose parked materialization lets the deletion
+		// land first; the higher sorted identity is the victim copy that a
+		// missed gone check would still list.
+		first := seedStaleArchivedSession(t, store, ws, 0)
+		second := seedStaleArchivedSession(t, store, ws, 0)
+		survivor, victim := first, second
+		if survivor > victim {
+			survivor, victim = victim, survivor
+		}
+		// Warm the victim before arming: the scan reaches it only after the
+		// parked survivor, so a missed gone check would return its cached
+		// header instead of omitting it.
+		testassert.NoError(t, headerErrorThroughRuntime(context.Background(), r, victim))
+
+		gated.arm()
+		defer gated.releaseGate() // failure cleanup: runs before the owner close below
+		listDone := make(chan error, 1)
+		var list []protocol.Session
+		go func() {
+			var err error
+			list, err = r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "archived"})
+			listDone <- err
+		}()
+		select {
+		case <-gated.arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the scan never reached the cold survivor's entry read")
+		}
+		// While the survivor's read is parked, the already-copied victim is
+		// deleted: the scan must observe it as absent, not fail.
+		{
+			_, err := r.DeleteSession(context.Background(), testCaller(), victim)
+			testassert.NoError(t, err)
+		}
+		gated.releaseGate()
+		select {
+		case err := <-listDone:
+			testassert.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("the scan never converged")
+		}
+		testassert.Require(t, len(list) == 1 && list[0].SessionId == survivor && list[0].Lifecycle == protocol.Archived && list[0].ArchivedAt != nil, "list = %+v, want exactly the complete survivor %s header", list, survivor)
+		{
+			err := headerErrorThroughRuntime(context.Background(), r, victim)
+			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "victim read = %v, want harness.ErrNotFound", err)
+		}
+	})
+}

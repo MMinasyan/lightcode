@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -11,54 +10,25 @@ import (
 )
 
 // The one multiplexed events stream: every authenticated GET /v1/events owns
-// one capacity-256 subscription and one frame writer that serializes
-// notification frames and 15-second keepalive comments. A slow reader blocks
-// only its own writer; when its bounded queue overflows, the observation bus
-// removes that subscription alone, and the stream's private watcher closes
-// exactly its native connection — even while a socket write blocks — so the
-// client reconnects and rehydrates from authoritative reads. A disconnect
-// releases the stream's delivery resources and never cancels committed
-// Agent or Job work; owner shutdown exits the writer so its admitted call
-// converges.
+// one bounded subscription and one frame writer that serializes notification
+// frames and 15-second keepalive comments. A slow reader blocks only its own
+// writer; when its bounded queue overflows, the observation bus removes that
+// subscription alone. A disconnect releases the stream's delivery resources
+// and never cancels committed Agent or Job work; host release closes the
+// connection so the writer exits. The stream holds no owner command-admission
+// guard across its wait.
 const (
 	sseSubscriptionCapacity = 256
 	sseHeartbeatInterval    = 15 * time.Second
 )
 
-// subscribeEvents is the owner-wide event-stream producer: one admitted call
-// authorizes the owner target, then attaches the bounded subscription. The
-// release and subscription both outlive this call and are closed by the
-// handler on every exit.
-func (r *Runtime) subscribeEvents(ctx context.Context, c caller) (*Subscription, func(), error) {
-	release, err := r.enter(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := c.authorize(ctx, nil, harnessScope); err != nil {
-		release()
-		return nil, nil, err
-	}
-	sub, err := r.obs.subscribe(sseSubscriptionCapacity)
-	if err != nil {
-		release()
-		return nil, nil, err
-	}
-	return sub, release, nil
-}
-
-// GetEvents serves the one authenticated event stream. The whole stream
-// lifetime is one admitted call, so shutdown joins it after the server's
-// connections close; the writer selects on the owner's cancellation, the
-// caller's disconnect, the subscription's closure, and the heartbeat clock.
+// GetEvents serves the one authenticated event stream.
 func (rt *protocolHandlers) GetEvents(w http.ResponseWriter, r *http.Request) {
-	sub, release, err := rt.subscribeEvents(r.Context(), protocolCaller())
+	sub, err := rt.owner.Subscribe(sseSubscriptionCapacity)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	defer release()
-	// The subscription releases on every exit: client disconnect, queue
-	// closure, owner cancellation, or write failure.
 	defer sub.Close()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -68,7 +38,7 @@ func (rt *protocolHandlers) GetEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The per-stream watcher unblocks a writer stuck in a socket write when
-	// its subscription closes — saturation or Runtime cleanup — by closing
+	// its subscription closes — saturation or owner cleanup — by closing
 	// only this stream's native connection. It writes no frame and touches
 	// no work.
 	watcherDone := make(chan struct{})
@@ -77,7 +47,7 @@ func (rt *protocolHandlers) GetEvents(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			defer close(watcherDone)
 			select {
-			case <-sub.closed:
+			case <-sub.Done():
 				_ = conn.Close()
 			case <-stop:
 			}
@@ -90,17 +60,22 @@ func (rt *protocolHandlers) GetEvents(w http.ResponseWriter, r *http.Request) {
 
 	heartbeat := time.NewTicker(sseHeartbeatInterval)
 	defer heartbeat.Stop()
-	instance := rt.protocolInstance()
 	events := sub.Events()
 	for {
 		select {
 		case event, ok := <-events:
 			if !ok {
 				// The subscription was removed — saturation or cleanup: this
-				// stream ends alone and the client reconnects.
+				// stream ends alone and the client reconnects. Closing the
+				// native connection here covers the race where the events
+				// channel closes while the writer is between frames; the
+				// watcher covers a writer blocked inside a socket write.
+				if conn, ok := r.Context().Value(sseConnectionKey{}).(net.Conn); ok && conn != nil {
+					_ = conn.Close()
+				}
 				return
 			}
-			if err := writeEventFrame(w, qualifyEvent(event, instance)); err != nil {
+			if err := writeEventFrame(w, event); err != nil {
 				return
 			}
 		case <-heartbeat.C:
@@ -111,8 +86,6 @@ func (rt *protocolHandlers) GetEvents(w http.ResponseWriter, r *http.Request) {
 				flusher.Flush()
 			}
 		case <-r.Context().Done():
-			return
-		case <-rt.work.Done():
 			return
 		}
 	}

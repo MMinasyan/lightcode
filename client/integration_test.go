@@ -18,6 +18,7 @@ import (
 	"github.com/MMinasyan/lightcode/client"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -77,14 +78,15 @@ func isolateBundledCredentials(t *testing.T) {
 // newRealRuntime opens one production-composition Runtime over isolated HOME,
 // data, and config paths, configured with one provider pointing at the given
 // base URL.
-func newRealRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string) {
+func newRealRuntime(t *testing.T, baseURL string) (*melta.Melta, *runtime.ProtocolHost, string) {
 	t.Helper()
 	t.Setenv("CLIENT_TEST_KEY", "client-test-key")
 	isolateBundledCredentials(t)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, fmt.Sprintf(clientConfigDocument, baseURL, clientAgentsDocument))
-	r, err := runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, Configuration: runtime.NewFileConfigurationSource(configPath), Credentials: runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")), Plugins: builtin.Plugins()})
+	host := runtime.NewProtocolHost()
+	r, err := melta.Open(context.Background(), melta.Options{DataDir: dataDir, Configuration: melta.NewFileConfigurationSource(configPath), Credentials: melta.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")), Extensions: builtin.Plugins(), BeforeRelease: host.BeforeRelease})
 	testassert.NoError(t, err)
 	t.Cleanup(func() {
 		{
@@ -92,14 +94,14 @@ func newRealRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string) {
 			testassert.Check(t, err == nil, "runtime.Close: %v", err)
 		}
 	})
-	return r, configPath
+	return r, host, configPath
 }
 
 // openProtocol attaches the real listener and publishes its real discovery
 // record at an isolated path.
-func openProtocol(t *testing.T, r *runtime.Runtime) (*runtime.ProtocolServer, string) {
+func openProtocol(t *testing.T, r *melta.Melta, host *runtime.ProtocolHost) (*runtime.ProtocolServer, string) {
 	t.Helper()
-	ps, err := r.OpenProtocol(context.Background())
+	ps, err := host.OpenProtocol(context.Background(), r)
 	testassert.NoError(t, err)
 	record := filepath.Join(t.TempDir(), "discovery.json")
 	testassert.NoError(t, ps.PublishDiscovery(record))
@@ -214,8 +216,8 @@ func awaitOperation(t *testing.T, c *client.Client, sessionID, operationID strin
 // reconnect and the typed refusal of a wrong credential.
 func TestRealRuntimeClient(t *testing.T) {
 	const baseURL = "http://127.0.0.1:1/v1"
-	r, configPath := newRealRuntime(t, baseURL)
-	ps, record := openProtocol(t, r)
+	r, host, configPath := newRealRuntime(t, baseURL)
+	ps, record := openProtocol(t, r, host)
 
 	t.Run("generated reads, stream, and explicit rehydration", func(t *testing.T) {
 		ctx := context.Background()
@@ -367,8 +369,8 @@ func refusalModelServer(t *testing.T) *httptest.Server {
 // assembled refusal on the assistant item.
 func TestRealRuntimeRefusalStream(t *testing.T) {
 	model := refusalModelServer(t)
-	r, _ := newRealRuntime(t, model.URL)
-	_, record := openProtocol(t, r)
+	r, host, _ := newRealRuntime(t, model.URL)
+	_, record := openProtocol(t, r, host)
 	c := connectFixture(t, record)
 	session := createSession(t, c, filepath.Join(t.TempDir(), "refusal-ws"))
 
@@ -465,8 +467,8 @@ func progressScope(t *testing.T, event protocol.Event) (protocol.Scope, error) {
 // stays live and the Operation settles successfully after release.
 func TestStreamCloseDoesNotCancelWork(t *testing.T) {
 	model := newParkedModel(t)
-	r, _ := newRealRuntime(t, model.URL)
-	_, record := openProtocol(t, r)
+	r, host, _ := newRealRuntime(t, model.URL)
+	_, record := openProtocol(t, r, host)
 	c := connectFixture(t, record)
 	session := createSession(t, c, filepath.Join(t.TempDir(), "workspace"))
 
@@ -540,8 +542,8 @@ func parseRevision(value string) uint64 {
 // hydration from one real owner, accepts a new owner's real read, then
 // delivers the old value late and proves instance-first rejection.
 func TestCallerProjectionStaleOwner(t *testing.T) {
-	oldRuntime, _ := newRealRuntime(t, "http://127.0.0.1:1/v1")
-	_, oldRecord := openProtocol(t, oldRuntime)
+	oldRuntime, oldHost, _ := newRealRuntime(t, "http://127.0.0.1:1/v1")
+	_, oldRecord := openProtocol(t, oldRuntime, oldHost)
 	oldClient := connectFixture(t, oldRecord)
 	oldSession := createSession(t, oldClient, filepath.Join(t.TempDir(), "workspace-old"))
 	archiveSession(t, oldClient, oldSession)
@@ -551,8 +553,8 @@ func TestCallerProjectionStaleOwner(t *testing.T) {
 	// received before the owner goes away.
 	testassert.NoError(t, oldRuntime.Close(context.Background()))
 
-	newRuntime, _ := newRealRuntime(t, "http://127.0.0.1:1/v1")
-	_, newRecord := openProtocol(t, newRuntime)
+	newRuntime, newHost, _ := newRealRuntime(t, "http://127.0.0.1:1/v1")
+	_, newRecord := openProtocol(t, newRuntime, newHost)
 	newClient := connectFixture(t, newRecord)
 	newSession := createSession(t, newClient, filepath.Join(t.TempDir(), "workspace-new"))
 	accepted := hydrateSession(t, newClient, newSession)
