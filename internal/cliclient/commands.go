@@ -441,11 +441,11 @@ func (c *CLI) archiveDelete(s stamp, id string, deleteAfter bool) {
 		if c.conn == s.conn {
 			c.invalidateListLocked()
 		}
-		fresh = c.stampLocked()
-		current = c.conn == s.conn && !c.closed
+		freshAfterDelete := c.stampLocked()
+		currentAfterDelete := c.conn == s.conn && !c.closed
 		c.mu.Unlock()
-		if current {
-			c.refreshList(fresh, "open", false)
+		if currentAfterDelete {
+			c.refreshList(freshAfterDelete, "open", false)
 		}
 	})
 }
