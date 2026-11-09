@@ -422,13 +422,11 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	}, nil
 }
 
-// defaultStrategy returns the host-selected default strategy binding,
-// falling back to the included one for a zero-value fixture snapshot.
+// defaultStrategy returns the captured composition's host-selected default
+// strategy binding. The one copy is captured at construction and consumed for
+// both the execution capture and strategy selection.
 func defaultStrategy(snapshot *configuration) *harness.StrategyBinding {
-	if snapshot != nil && snapshot.strategy != nil {
-		return snapshot.strategy
-	}
-	return harness.IncludedStrategyBinding()
+	return snapshot.composition.defaultStrategy
 }
 
 // requireCatalogModel admits only a selected model that resolves in the

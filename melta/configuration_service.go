@@ -138,11 +138,8 @@ func (s *configurationService) capturePreparation(ctx context.Context) (configur
 	if err != nil {
 		return configurationCapture{}, err
 	}
-	if captured.snapshot != nil && captured.snapshot.resources != nil && len(captured.snapshot.credentials) != 0 {
-		names := make([]string, 0, len(captured.snapshot.credentials))
-		for name := range captured.snapshot.credentials {
-			names = append(names, name)
-		}
+	if captured.snapshot != nil && captured.snapshot.resources != nil && len(captured.snapshot.credentialNames) != 0 {
+		names := captured.snapshot.credentialNames
 		s.holdCredentialNamesLocked(names)
 		captured.releaseNames = func() { s.releaseCredentialNames(names) }
 	}
@@ -270,8 +267,10 @@ func (s *configurationService) subprocessEnvironment(ctx context.Context) ([]str
 // declared reference name, and the pending connection key name, then folds the
 // pending key action into that same map. Every name is observed exactly once
 // in the build; provider and declared observations derive from the one
-// resulting map, and no source call runs after the owning write.
-func (s *configurationService) captureCredentials(ctx context.Context, names []string, key *connectionEffects) (map[string]CredentialValue, error) {
+// resulting map, and no source call runs after the owning write. The returned
+// names are the full requested union, independent of a source that returns
+// only some keys.
+func (s *configurationService) captureCredentials(ctx context.Context, names []string, key *connectionEffects) (map[string]CredentialValue, []string, error) {
 	seen := make(map[string]bool, len(names)+1)
 	unique := make([]string, 0, len(names)+1)
 	for _, name := range names {
@@ -288,7 +287,7 @@ func (s *configurationService) captureCredentials(ctx context.Context, names []s
 	if len(unique) != 0 {
 		fresh, err := s.credentials.Capture(ctx, unique)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for name, value := range fresh {
 			captured[name] = value
@@ -302,7 +301,7 @@ func (s *configurationService) captureCredentials(ctx context.Context, names []s
 			captured[key.keyEnv] = CredentialValue{}
 		}
 	}
-	return captured, nil
+	return captured, unique, nil
 }
 
 // credentialValues projects one captured credential map onto the catalog
@@ -578,7 +577,7 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 		return nil, configurationFailure(err)
 	}
 	secrets := resolveDeclaredSecrets(active, doc.Extensions)
-	credentials, err := s.captureCredentials(ctx, capturedCredentialNames(built.Catalog, secrets), key)
+	credentials, credentialNames, err := s.captureCredentials(ctx, capturedCredentialNames(built.Catalog, secrets), key)
 	if err != nil {
 		return nil, configurationFailure(err)
 	}
@@ -597,9 +596,9 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 	}
 	snapshot.composition = graph
 	snapshot.credentials = credentials
+	snapshot.credentialNames = credentialNames
 	snapshot.secrets = secrets
 	snapshot.declaredBindings = captureDeclaredBindings(secrets, credentials)
-	snapshot.strategy = s.strategy
 	if err := s.validateExtensions(ctx, graph, doc.Extensions); err != nil {
 		return nil, err
 	}

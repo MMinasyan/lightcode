@@ -22,10 +22,14 @@ type protocolHandlers struct {
 var _ protocol.ServerInterface = (*protocolHandlers)(nil)
 
 // GetHealth serves the authenticated, versioned readiness read of the live
-// owner: one admitted call answers with the attached server's minted
-// instance identity and the one wire protocol version.
+// owner: one admitted call answers with the owner's minted instance identity
+// and the one wire protocol version.
 func (rt *protocolHandlers) GetHealth(w http.ResponseWriter, r *http.Request) {
-	health := protocol.Health{InstanceId: rt.server.instance, ProtocolVersion: protocol.N13}
+	health, err := rt.owner.Health(r.Context(), rt.server.caller)
+	if err != nil {
+		writeProtocolError(w, err)
+		return
+	}
 	rt.writeJSON(w, http.StatusOK, &health)
 }
 

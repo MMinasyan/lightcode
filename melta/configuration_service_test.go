@@ -66,7 +66,7 @@ func (h *serviceHarness) serviceWithDefaults(owner context.Context, defaults []s
 	return newConfigurationService(owner, c, h.loader,
 		NewFileConfigurationSource(h.configPath),
 		NewEnvironmentCredentialSource(filepath.Join(h.home, ".lightcode", ".env")),
-		h.locations(), nil, newObservation())
+		h.locations(), harness.IncludedStrategyBinding(), newObservation())
 }
 
 func (h *serviceHarness) locations() Locations {

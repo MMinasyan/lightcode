@@ -99,8 +99,11 @@ type discoveryCacheModel struct {
 	Metadata        *discoveryModelMetadata `json:"metadata,omitempty"`
 }
 
-// FetchDiscovery fetches and parses a provider's OpenAI-compatible /models list.
-func FetchDiscovery(ctx context.Context, client *http.Client, provider *Provider) (DiscoveredProvider, error) {
+// FetchDiscovery fetches one provider's models list. The resolved credential,
+// when non-empty, is the one Authorization the request carries, overriding any
+// configured Authorization spelling; an empty credential preserves the
+// configured headers unchanged.
+func FetchDiscovery(ctx context.Context, client *http.Client, provider *Provider, credential string) (DiscoveredProvider, error) {
 	if provider == nil {
 		return DiscoveredProvider{}, fmt.Errorf("discovery provider is nil")
 	}
@@ -117,6 +120,9 @@ func FetchDiscovery(ctx context.Context, client *http.Client, provider *Provider
 	}
 	for key, value := range provider.Transport.Headers {
 		req.Header.Set(key, value)
+	}
+	if credential != "" {
+		req.Header.Set("Authorization", "Bearer "+credential)
 	}
 
 	resp, err := client.Do(req)

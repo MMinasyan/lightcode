@@ -65,7 +65,7 @@ func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
 			Headers:   map[string]string{"X-Test-Header": "yes"},
 		},
 	}
-	discovered, err := FetchDiscovery(context.Background(), server.Client(), discoveryProviderWithCredential(provider, "secret-token"))
+	discovered, err := FetchDiscovery(context.Background(), server.Client(), provider, "secret-token")
 	testassert.NoError(t, err)
 	testassert.Require(t, seenRequest, "test server was not called")
 	rich := discovered.Models["rich"]
@@ -97,7 +97,7 @@ func TestFetchDiscoveryReturnsBoundedFailures(t *testing.T) {
 			}))
 			defer server.Close()
 
-			_, err := FetchDiscovery(context.Background(), server.Client(), &Provider{ID: "test", Transport: Transport{BaseURL: server.URL + "/v1"}})
+			_, err := FetchDiscovery(context.Background(), server.Client(), &Provider{ID: "test", Transport: Transport{BaseURL: server.URL + "/v1"}}, "")
 			testassert.Require(t, err != nil && strings.Contains(err.Error(), tt.wantError), "FetchDiscovery error = %v, want substring %q", err, tt.wantError)
 		})
 	}
@@ -131,7 +131,7 @@ func TestFetchDiscoveryBoundsResponseBytes(t *testing.T) {
 	oversized := sizedDiscoveryBody(maxDiscoveryResponseBytes + 1)
 	fetch := func(t *testing.T, client *http.Client, baseURL string) error {
 		t.Helper()
-		_, err := FetchDiscovery(context.Background(), client, &Provider{ID: "test", Transport: Transport{BaseURL: baseURL}})
+		_, err := FetchDiscovery(context.Background(), client, &Provider{ID: "test", Transport: Transport{BaseURL: baseURL}}, "")
 		return err
 	}
 
@@ -140,7 +140,7 @@ func TestFetchDiscoveryBoundsResponseBytes(t *testing.T) {
 			_, _ = io.WriteString(w, exact)
 		}))
 		defer server.Close()
-		discovered, err := FetchDiscovery(context.Background(), server.Client(), &Provider{ID: "test", Transport: Transport{BaseURL: server.URL + "/v1"}})
+		discovered, err := FetchDiscovery(context.Background(), server.Client(), &Provider{ID: "test", Transport: Transport{BaseURL: server.URL + "/v1"}}, "")
 		testassert.NoError(t, err)
 		entry := discovered.Models["padded"]
 		testassert.Require(t, entry.ContextWindow == 8, "padded model = %#v, want the padded document's own projection", entry)

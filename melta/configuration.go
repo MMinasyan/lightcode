@@ -43,7 +43,7 @@ type configuration struct {
 	secrets              []declaredSecret
 	declaredBindings     map[declaredField]declaredBinding
 	credentials          map[string]CredentialValue
-	strategy             *harness.StrategyBinding
+	credentialNames      []string
 	userProviders        map[string]any
 	permissions          json.RawMessage
 	workspacePermissions map[string]json.RawMessage

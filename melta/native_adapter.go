@@ -68,10 +68,7 @@ func selectedCapability(scopes []*scope, id string) (*capabilityValue, bool) {
 // resolveStrategyBinding selects the execution's strategy.
 func resolveStrategyBinding(c *composition, scopes []*scope, selected harness.StrategySelection) (*harness.StrategyBinding, error) {
 	if selected.ID == "" {
-		if c != nil && c.defaultStrategy != nil {
-			return c.defaultStrategy, nil
-		}
-		return harness.IncludedStrategyBinding(), nil
+		return c.defaultStrategy, nil
 	}
 	capability, ok := c.compiled.Capability(selected.ID)
 	if !ok || capability.Kind != extension.KindStrategy {

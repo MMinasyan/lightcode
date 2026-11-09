@@ -272,7 +272,7 @@ func (s *configurationService) mutationCapture(ctx context.Context, configData [
 		return configurationCapture{}, configurationFailure(err)
 	}
 	secrets := resolveDeclaredSecrets(active, doc.Extensions)
-	credentials, err := s.captureCredentials(ctx, capturedCredentialNames(built.Catalog, secrets), nil)
+	credentials, credentialNames, err := s.captureCredentials(ctx, capturedCredentialNames(built.Catalog, secrets), nil)
 	if err != nil {
 		return configurationCapture{}, configurationFailure(err)
 	}
@@ -284,6 +284,7 @@ func (s *configurationService) mutationCapture(ctx context.Context, configData [
 	snapshot.catalogWarnings = built.Warnings
 	snapshot.secrets = secrets
 	snapshot.credentials = credentials
+	snapshot.credentialNames = credentialNames
 	snapshot.declaredBindings = captureDeclaredBindings(secrets, credentials)
 	return configurationCapture{snapshot: &snapshot}, nil
 }

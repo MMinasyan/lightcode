@@ -19,6 +19,21 @@ import (
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
+// Health is the admitted readiness read of the live owner: one owner-wide call
+// answers with the owner's process-lifetime instance identity and the wire
+// protocol version.
+func (r *Melta) Health(ctx context.Context, c Caller) (protocol.Health, error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return protocol.Health{}, err
+	}
+	defer release()
+	if err := r.authorize(c, ctx, nil, harnessScope); err != nil {
+		return protocol.Health{}, err
+	}
+	return protocol.Health{InstanceId: r.instance, ProtocolVersion: protocol.N13}, nil
+}
+
 // ListSessions projects Session headers under one required workspace and
 // lifecycle filter set, inside a single admitted call. Absent, empty, or
 // unknown filter members and a failing workspace normalization wrap the

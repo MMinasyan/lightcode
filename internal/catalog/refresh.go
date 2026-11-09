@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -56,38 +55,11 @@ func FetchDiscoveryIfDue(ctx context.Context, cacheDir string, provider *Provide
 	// existing FetchDiscovery call, so a valid-request failure after this
 	// point stays attempted and preserves TTL suppression.
 	attempted = true
-	got, err := FetchDiscovery(ctx, http.DefaultClient, discoveryProviderWithCredential(provider, credentials[provider.Transport.APIKeyEnv]))
+	got, err := FetchDiscovery(ctx, http.DefaultClient, provider, credentials[provider.Transport.APIKeyEnv])
 	if err != nil {
 		return attempted, nil, []Warning{{Kind: "discovery_failure", Provider: provider.ID, Message: err.Error()}}
 	}
 	return attempted, &got, nil
-}
-
-// discoveryProviderWithCredential returns the configured provider with its
-// transient Authorization copy set from the captured credential. The
-// configured transport is never mutated and no process environment is read.
-func discoveryProviderWithCredential(provider *Provider, apiKey string) *Provider {
-	provisional := *provider
-	provisional.Transport = provider.Transport
-	provisional.Transport.APIKeyEnv = ""
-	provisional.Transport.Headers = cloneDiscoveryHeaders(provider.Transport.Headers)
-	if apiKey != "" {
-		for name := range provisional.Transport.Headers {
-			if strings.EqualFold(name, "Authorization") {
-				delete(provisional.Transport.Headers, name)
-			}
-		}
-		provisional.Transport.Headers["Authorization"] = "Bearer " + apiKey
-	}
-	return &provisional
-}
-
-func cloneDiscoveryHeaders(in map[string]string) map[string]string {
-	out := make(map[string]string, len(in)+1)
-	for name, value := range in {
-		out[name] = value
-	}
-	return out
 }
 
 // publishDiscoveryResult is the shared per-provider publication code once the

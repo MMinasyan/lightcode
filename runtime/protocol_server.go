@@ -270,9 +270,6 @@ func (ps *ProtocolServer) publishDiscovery(path string, verify func() error) err
 	if ps.host.released {
 		return melta.ErrClosed
 	}
-	if ps.discoveryPath != "" {
-		return fmt.Errorf("discovery already published at %s: %w", ps.discoveryPath, harness.ErrInvalid)
-	}
 	if err := atomicfs.Write(path, record, 0o600); err != nil {
 		return err
 	}

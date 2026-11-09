@@ -684,7 +684,7 @@ func TestStrategyBindingIsCopiedAtOpen(t *testing.T) {
 	testassert.NoError(t, err)
 	defer func() { _ = r.Close(context.Background()) }()
 	binding.ID = "mutated"
-	testassert.Equal(t, r.config.strategy.ID, "host.strategy")
+	testassert.Equal(t, r.config.current().composition.defaultStrategy.ID, "host.strategy")
 }
 
 // contextBlockingCredentials waits for request cancellation on selected

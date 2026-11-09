@@ -348,37 +348,14 @@ func resolveConnectKey(envName string, optionalKey *string, observed CredentialV
 }
 
 // connectFetchDiscovery performs one /models fetch for the provider identity
-// under the retained 30-second timeout. The transport is the Caller's
-// original configured transport; the credential rides a transient
-// Authorization copy alone — the fetch copy's api_key_env is cleared so no
-// binding is consulted or changed, every case-insensitive Authorization
-// spelling configured on the transport is removed from the copy before the
-// canonical header is set (the captured transport itself is never mutated),
-// and no cache, attempt marker, env, or configuration write ever follows. A
-// canceled Caller keeps its unwrapped context error.
+// under the retained 30-second timeout. The transport is the Caller's original
+// configured transport; the resolved credential is the one Authorization the
+// fetch carries, and no cache, attempt marker, env, or configuration write ever
+// follows. A canceled Caller keeps its unwrapped context error.
 func connectFetchDiscovery(ctx context.Context, providerID string, transport catalog.Transport, key string) (catalog.DiscoveredProvider, error) {
-	provisional := transport
-	provisional.APIKeyEnv = ""
-	provisional.Headers = cloneTransportHeaders(transport.Headers)
-	if key != "" {
-		for name := range provisional.Headers {
-			if strings.EqualFold(name, "Authorization") {
-				delete(provisional.Headers, name)
-			}
-		}
-		provisional.Headers["Authorization"] = "Bearer " + key
-	}
-	return discoveryFetch(ctx, &catalog.Provider{ID: providerID, Transport: provisional})
-}
-
-// discoveryFetch performs one /models fetch under the retained 30-second
-// timeout and maps the outcome: a canceled Caller keeps its unwrapped
-// context error, everything else is the typed configuration failure. No
-// cache, attempt marker, env, or configuration write ever follows.
-func discoveryFetch(ctx context.Context, prov *catalog.Provider) (catalog.DiscoveredProvider, error) {
 	fetchCtx, cancel := context.WithTimeout(ctx, connectDiscoveryTimeout)
 	defer cancel()
-	discovered, err := catalog.FetchDiscovery(fetchCtx, connectHTTPClient, prov)
+	discovered, err := catalog.FetchDiscovery(fetchCtx, connectHTTPClient, &catalog.Provider{ID: providerID, Transport: transport}, key)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return catalog.DiscoveredProvider{}, err
@@ -386,16 +363,6 @@ func discoveryFetch(ctx context.Context, prov *catalog.Provider) (catalog.Discov
 		return catalog.DiscoveredProvider{}, configurationFailure(err)
 	}
 	return discovered, nil
-}
-
-// cloneTransportHeaders copies one header map, nil-safe, so the transient
-// Authorization never reaches the Caller's captured headers.
-func cloneTransportHeaders(in map[string]string) map[string]string {
-	out := make(map[string]string, len(in)+1)
-	for name, value := range in {
-		out[name] = value
-	}
-	return out
 }
 
 // projectDiscoveredCandidates maps one fetched discovery onto the sorted

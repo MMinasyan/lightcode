@@ -577,6 +577,56 @@ func TestFailedPreparationReleasesHeldCredentialNames(t *testing.T) {
 	testassert.Require(t, !slices.Contains(svc.heldCredentialNames(), name), "discarded preparation leaked held name %q: %v", name, svc.heldCredentialNames())
 }
 
+// definedOnlyCredentials is the sparse credential source: Capture returns
+// only the requested names that are actually defined.
+type definedOnlyCredentials struct {
+	CredentialSource
+}
+
+func (s definedOnlyCredentials) Capture(ctx context.Context, names []string) (map[string]CredentialValue, error) {
+	captured, err := s.CredentialSource.Capture(ctx, names)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]CredentialValue, len(captured))
+	for name, value := range captured {
+		if value.Defined {
+			out[name] = value
+		}
+	}
+	return out, nil
+}
+
+// TestSparseCredentialCaptureHoldsRequestedNames proves a preparation holds
+// every name its build requested — not only the sparse source's returned keys
+// — so a later revision that no longer references the name cannot expose it to
+// child processes while the preparation is live.
+func TestSparseCredentialCaptureHoldsRequestedNames(t *testing.T) {
+	const name = "LIGHTCODE_SPARSE_REQUESTED"
+	t.Setenv(name, "")
+	_ = os.Unsetenv(name)
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, `{"providers":{"prov":`+nominalProvMember("http://prov.test/v1", name, `{"m":{"name":"M","context_window":4096}}`)+`}}`)
+	svc := h.preparedService(context.Background())
+	svc.credentials = definedOnlyCredentials{CredentialSource: svc.credentials}
+	_, err := svc.publish(context.Background())
+	testassert.NoError(t, err)
+	defer svc.current().resources.release()
+
+	captured, err := svc.capturePreparation(context.Background())
+	testassert.NoError(t, err)
+	defer captured.releaseHeldNames()
+	testassert.Require(t, slices.Contains(svc.heldCredentialNames(), name), "sparse capture left requested name %q unheld: %v", name, svc.heldCredentialNames())
+
+	t.Setenv(name, "later-value")
+	writeServiceFile(t, h.configPath, `{}`)
+	_, err = svc.publish(context.Background())
+	testassert.NoError(t, err)
+	defer svc.current().resources.release()
+	env := subprocessEnvForTest(t, svc)
+	testassert.Require(t, !slices.Contains(env, name+"=later-value"), "a later revision exposed the held name to children: %v", env)
+}
+
 // subprocessEnvForTest resolves the owner's child-environment projection.
 func subprocessEnvForTest(t *testing.T, svc *configurationService) []string {
 	t.Helper()

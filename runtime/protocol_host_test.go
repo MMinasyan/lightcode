@@ -501,6 +501,55 @@ func TestProtocolMountedReloadCarriesOwnerInstance(t *testing.T) {
 	testassert.Require(t, reloaded.JSON200.ConfigurationRevision.Generation == "2" && reloaded.JSON200.ConfigurationRevision.InstanceId == owner.InstanceID(), "reload = %+v, want generation 2 with the owner instance %q", reloaded.JSON200.ConfigurationRevision, owner.InstanceID())
 }
 
+// TestProtocolHealthFailsClosedDuringShutdownSettlement proves health stays an
+// admitted owner call: while shutdown settlement is blocked, the readiness
+// read answers the typed closed error and discovery publication therefore
+// writes no record.
+func TestProtocolHealthFailsClosedDuringShutdownSettlement(t *testing.T) {
+	source := &blockingConfiguration{
+		ConfigurationSource: melta.NewValueConfigurationSource([]byte(`{}`)),
+		entered:             make(chan struct{}),
+		gate:                make(chan struct{}),
+	}
+	options := testOwnerOptions(t)
+	options.Configuration = source
+	owner, _, server := mountedOwner(t, context.Background(), options)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(source.gate) }) }
+	t.Cleanup(release)
+
+	source.block.Store(true)
+	reloadDone := make(chan error, 1)
+	go func() {
+		_, err := owner.Reload(context.Background(), testCaller(t, owner))
+		reloadDone <- err
+	}()
+	<-source.entered
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- owner.Close(context.Background()) }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		response := rawMounted(t, http.MethodGet, server.Endpoint()+"/v1/health", server.credential, "")
+		typed := decodeMountedError(t, response)
+		if response.StatusCode == http.StatusGone {
+			testassert.Require(t, typed.Code == protocol.ErrorCodeClosed, "health during settlement = (%d, %+v), want the typed closed error", response.StatusCode, typed)
+			break
+		}
+		testassert.Require(t, time.Now().Before(deadline), "health stayed ready during blocked shutdown settlement: (%d, %+v)", response.StatusCode, typed)
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	path := filepath.Join(t.TempDir(), "runtime.json")
+	testassert.Require(t, server.PublishDiscovery(path) != nil, "discovery was published while health reported closed")
+	_, statErr := os.Stat(path)
+	testassert.Require(t, os.IsNotExist(statErr), "a discovery record was written while health reported closed")
+
+	release()
+	_ = <-reloadDone
+	testassert.NoError(t, <-closeDone)
+}
+
 // TestProtocolHostReleaseAfterReadinessPreventsPublication proves the final
 // release check and record write share the host mutex: release beginning
 // after readiness completes but before the write leaves no record.
