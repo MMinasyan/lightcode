@@ -189,7 +189,6 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	writeAgentDefinitions(t, h.configPath, workerAgentsDocument)
 	agentsBefore := append(json.RawMessage(nil), fileRoot(t, h.configPath)["extensions"]...)
 	svc, sub := metadataService(t, h)
-	unsetenv(t, "NEW_KEY")
 	// The fixture is a genuine credential consumer: the referenced env
 	// carries an actual secret that must never reach the file, the mutation
 	// result, or any read — the create stores the env NAME only.
@@ -213,7 +212,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 		Discovery:        ptrTo(false),
 		ProtocolMetadata: &meta,
 	}
-	candidate, err := svc.mutate(context.Background(), svc.editProviderCreate(" new ", patch, models, nil))
+	candidate, err := svc.mutate(context.Background(), svc.editProviderCreate(context.Background(), " new ", patch, models, nil))
 	testassert.NoError(t, err)
 	testassert.Require(t, candidate.snapshot.generation == 2 && svc.current() == candidate.snapshot, "create = generation %d, want 2 published", candidate.snapshot.generation)
 	prov := candidate.snapshot.catalog.Providers["new"]
@@ -251,7 +250,7 @@ func TestMetadataEditCreateCustomProvider(t *testing.T) {
 	emptyHeaders := map[string]string{}
 	window2 := 1
 	{
-		_, err := svc.mutate(context.Background(), svc.editProviderCreate("noheaders",
+		_, err := svc.mutate(context.Background(), svc.editProviderCreate(context.Background(), "noheaders",
 			protocol.ProviderEdit{BaseUrl: ptrTo("https://nh.test/v1"), Headers: &emptyHeaders},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window2}}, nil))
 		testassert.NoError(t, err)
@@ -302,7 +301,7 @@ func TestMetadataEditCreateRefusals(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
-			_, err := svc.mutate(context.Background(), svc.editProviderCreate(row.id, row.patch, row.models, nil))
+			_, err := svc.mutate(context.Background(), svc.editProviderCreate(context.Background(), row.id, row.patch, row.models, nil))
 			assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, row.want)
 		})
 	}
@@ -312,7 +311,7 @@ func TestMetadataEditCreateRefusals(t *testing.T) {
 	external := strings.Replace(metadataConfigDocument, `"prov": {`, `"ghost": {"transport": {"base_url": "https://ghost.test/v1"}, "models": {"g": {"context_window": 1}}}, "prov": {`, 1)
 	writeServiceFile(t, h.configPath, external)
 	dupBefore, dupFirst, dupWarnRev := metadataBaseline(t, svc, h.configPath)
-	_, dupErr := svc.mutate(context.Background(), svc.editProviderCreate("ghost", protocol.ProviderEdit{BaseUrl: &base}, valid, nil))
+	_, dupErr := svc.mutate(context.Background(), svc.editProviderCreate(context.Background(), "ghost", protocol.ProviderEdit{BaseUrl: &base}, valid, nil))
 	assertMetadataRefused(t, svc, sub, h.configPath, dupBefore, dupFirst, dupWarnRev, dupErr, harness.ErrInvalid)
 }
 
@@ -348,7 +347,7 @@ func TestMetadataEditCreateRegistersIncompleteMetadata(t *testing.T) {
 			// create that planned any key action would fail the manager's
 			// typed refusal, so the row's success itself proves no
 			// credential action was planned.
-			candidate, err := svc.mutate(context.Background(), svc.editProviderCreate(row.id, row.patch, row.models, nil))
+			candidate, err := svc.mutate(context.Background(), svc.editProviderCreate(context.Background(), row.id, row.patch, row.models, nil))
 			testassert.Require(t, err == nil, "create %s: %v", row.id, err)
 			generation++
 			testassert.Require(t, candidate.snapshot.generation == uint64(generation), "create generation = %d, want %d", candidate.snapshot.generation, generation)
@@ -383,7 +382,6 @@ func TestMetadataEditUpdateCustomProviderPatchSemantics(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
-	unsetenv(t, "META_TEST_KEY", "NEW_TEST_KEY") // prov is not connected
 
 	// Pointer absence: an empty patch still publishes (identical bytes
 	// included) but changes no raw member.
@@ -491,7 +489,6 @@ func TestMetadataEditUpdateEnvRules(t *testing.T) {
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
-	unsetenv(t, "META_TEST_KEY", "NEW_TEST_KEY")
 	t.Setenv("META_TEST_KEY", "secret-value") // prov is connected via its env key
 
 	// The connected rebindings land: a different nonempty name and a clear
@@ -663,7 +660,6 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 	}
 
 	// The connected env-keyed custom is removable too.
-	unsetenv(t, "META_TEST_KEY")
 	t.Setenv("META_TEST_KEY", "secret-value")
 	candidate, err = svc.mutate(context.Background(), svc.editProviderDelete("prov"))
 	testassert.Require(t, err == nil && candidate.snapshot.generation == 3, "connected delete = (%v, generation %d), want a publication at 3", err, candidate.snapshot.generation)
@@ -686,24 +682,22 @@ func TestMetadataEditDeleteProvider(t *testing.T) {
 	testassert.Equal(t, string(fileRoot(t, h.configPath)["custom_flag"]), "true")
 
 	// A custom definition deleted from the latest raw layer by an external
-	// editor (without a reload) is not reconstructed: the identity is still
-	// effective, so the delete succeeds, publishes, and leaves no subject —
-	// the post-state is null, and the raw file is unchanged apart from the
-	// shared writer's own formatting.
+	// editor (without a reload) is observed by the mutation build's own
+	// capture: the delete refuses with the catalog's typed not-found and
+	// writes nothing.
 	window := 1
 	valid := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
 	{
-		_, err := svc.mutate(context.Background(), svc.editProviderCreate("temp",
+		_, err := svc.mutate(context.Background(), svc.editProviderCreate(context.Background(), "temp",
 			protocol.ProviderEdit{BaseUrl: ptrTo("https://temp.test/v1")}, valid, nil))
 		testassert.NoError(t, err)
 	}
 	drainConnectionEvent(t, svc.warnings, sub, "5")
 	external := `{"providers":{"prov":` + nominalProvMember("https://prov.test/v1", "META_TEST_KEY", `{"m":{"name":"M","context_window":4096}}`) + `},"custom_flag":true}`
 	writeServiceFile(t, h.configPath, external)
-	candidate, err = svc.mutate(context.Background(), svc.editProviderDelete("temp"))
-	testassert.Require(t, err == nil && candidate.snapshot.generation == 6, "externally-removed delete = (%v, generation %d), want a publication at 6", err, candidate.snapshot.generation)
-	drainConnectionEvent(t, svc.warnings, sub, "6")
-	testassert.Require(t, candidate.snapshot.catalog.Providers["temp"] == nil, "the externally-removed provider stayed in the candidate catalog")
+	beforeExternal, firstExternal, warnExternal := metadataBaseline(t, svc, h.configPath)
+	_, externalErr := svc.mutate(context.Background(), svc.editProviderDelete("temp"))
+	assertMetadataRefused(t, svc, sub, h.configPath, beforeExternal, firstExternal, warnExternal, externalErr, catalog.ErrUnknownProvider)
 
 	// The unknown subject fails its typed not-found without a write.
 	before, first, warnRev := metadataBaseline(t, svc, h.configPath)
@@ -802,7 +796,6 @@ func TestMetadataEditResetProviderFields(t *testing.T) {
 
 	// The builtin base_url override (from the fixture's raw user layer)
 	// resets to the bundled URL: only its own raw member changes.
-	unsetenv(t, "BUILTIN_OVERRIDE_KEY") // the builtin env override is disconnected
 	builtinBefore := metadataRawProvider(t, h.configPath, "bstatic")
 	{
 		_, err := svc.mutate(context.Background(), svc.editProviderFieldReset("bstatic", protocol.ProviderFieldBaseUrl))
@@ -1067,15 +1060,14 @@ func TestMetadataEditModelDelete(t *testing.T) {
 	}
 
 	// A user model already deleted from the latest raw layer by an external
-	// editor (without a reload) still publishes: the identity is effective,
-	// no user node remains, and the post-state carries no subject. The
-	// external write removes only "m" from the raw layer.
+	// editor (without a reload) is observed by the mutation build's own
+	// capture: the delete refuses with the catalog's typed not-found and
+	// writes nothing. The external write removes only "m" from the raw layer.
 	external := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"META_TEST_KEY","headers":{"X-Trace":"t1"}},"discovery":false,"extra_body":{"side":1,"big":9007199254740993},"models":{"wide":{"context_window":8192}}},"other":{"transport":{"base_url":"https://other.test/v1","api_key_env":"OTHER_TEST_KEY"},"discovery":false,"models":{"o":{"context_window":9007199254740993}}}},"custom_flag":true}`
 	writeServiceFile(t, h.configPath, external)
-	candidate, err = svc.mutate(context.Background(), svc.editModelDelete("prov", "m"))
-	testassert.Require(t, err == nil && candidate.snapshot.generation == 5, "externally-removed model delete = (%v, generation %d), want a publication at 5", err, candidate.snapshot.generation)
-	drainConnectionEvent(t, svc.warnings, sub, "5")
-	testassert.Require(t, candidate.snapshot.catalog.Providers["prov"].Models["m"] == nil, "the externally-removed model stayed in the candidate catalog")
+	beforeExternal, firstExternal, warnExternal := metadataBaseline(t, svc, h.configPath)
+	_, externalErr := svc.mutate(context.Background(), svc.editModelDelete("prov", "m"))
+	assertMetadataRefused(t, svc, sub, h.configPath, beforeExternal, firstExternal, warnExternal, externalErr, catalog.ErrUnknownModel)
 }
 
 // --- model field reset ---
@@ -1202,7 +1194,7 @@ func TestMetadataEditResetModelFields(t *testing.T) {
 // refresh candidates).
 func seedDiscoveredModel(t *testing.T, h *serviceHarness) {
 	t.Helper()
-	preBuilt, err := h.loader.LoadCaptured(context.Background(), map[string]any{})
+	preBuilt, err := h.loader.AssembleCaptured(context.Background(), map[string]any{})
 	testassert.NoError(t, err)
 	disco := preBuilt.Catalog.Providers["disco"]
 	testassert.Require(t, disco != nil, "bundled disco provider missing: %+v", preBuilt.Catalog.Providers)
@@ -1563,7 +1555,6 @@ func TestMetadataEditModelPatchPreservesUnsuppliedValues(t *testing.T) {
 	testassert.Require(t, entry != nil && entry.ContextWindow == 2000 && entry.MaxOutputTokens == 60 && entry.Cost != nil && entry.Cost.Input != nil && *entry.Cost.Input == 2.5 && fmt.Sprint(entry.ExtraBody["x"]) == "1" && entry.Hidden, "bundled model after one-member patch = %+v, want the earlier override members preserved", entry)
 
 	// The discovered override: the same preservation rule.
-	unsetenv(t, "DISCO_TEST_KEY") // never ready: no network anywhere below
 	seedDiscoveredModel(t, h)
 	{
 		_, err := svc.mutate(context.Background(), svc.editModelSave("disco", "disc-model", protocol.ModelEdit{
@@ -1817,7 +1808,7 @@ func TestRuntimeSpecialProviderIDsDirectOperators(t *testing.T) {
 // latest owning bytes, published generation, and warning revision.
 func runtimeMutationBaseline(t *testing.T, r *Runtime) ([]byte, uint64, uint64) {
 	t.Helper()
-	data, err := os.ReadFile(r.config.configPath)
+	data, err := os.ReadFile(r.configPathForTest())
 	testassert.NoError(t, err)
 	current := r.config.current()
 	testassert.Require(t, current != nil, "no published configuration")
@@ -1832,7 +1823,7 @@ func assertRuntimeMutationRefused(t *testing.T, r *Runtime, sub *Subscription, b
 	t.Helper()
 	testassert.Require(t, err != nil, "Runtime metadata operator succeeded, want a refusal")
 	testassert.Require(t, errors.Is(err, want), "refusal = %v, want class %v", err, want)
-	after, rerr := os.ReadFile(r.config.configPath)
+	after, rerr := os.ReadFile(r.configPathForTest())
 	testassert.Require(t, rerr == nil && string(before) == string(after), "a refused Runtime operator changed the owning file (%v)", rerr)
 	{
 		current := r.config.current()
@@ -1926,7 +1917,6 @@ func TestRuntimeMetadataCorruptRawTypesTypedFailure(t *testing.T) {
 func newOverlayFixture(t *testing.T) (*serviceHarness, *configurationService, *Subscription) {
 	t.Helper()
 	h := newMetadataHarness(t)
-	unsetenv(t, "DISCO_TEST_KEY")
 	seedDiscoveredModel(t, h)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc, sub := metadataService(t, h)
@@ -2147,11 +2137,11 @@ func TestMetadataEditPaddedInvalidValuesNeverBecomeValid(t *testing.T) {
 	// The edit API refuses every padded invalid value with the owning file
 	// and publication untouched.
 	_, svc, sub := newOverlayFixture(t)
-	before, first, warnRev := metadataBaseline(t, svc, svc.configPath)
+	before, first, warnRev := metadataBaseline(t, svc, svc.configPathForTest())
 	for _, row := range refusals {
 		t.Run(row.name, func(t *testing.T) {
 			_, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", row.patch))
-			assertMetadataRefused(t, svc, sub, svc.configPath, before, first, warnRev, err, ErrConfiguration)
+			assertMetadataRefused(t, svc, sub, svc.configPathForTest(), before, first, warnRev, err, ErrConfiguration)
 		})
 	}
 
@@ -2208,11 +2198,10 @@ func TestMetadataEditRetiredProviderControlsFollowUnknownFieldPolicy(t *testing.
 }
 
 // TestMetadataEditExternalRemovalRefusesWithoutReconstruction pins the
-// externally-removed custom provider: while the captured catalog still
-// knows the identity, the latest raw layer no longer owns a definition — an
-// update and a model save both apply nothing and refuse through the
-// candidate check, and the raw layer is never reconstructed with a
-// providers.<id> node. A model upsert under a provider whose definition is
+// externally-removed custom provider: the mutation build's own capture no
+// longer knows the identity, so an update and a model save both refuse with
+// the catalog's typed not-found and the raw layer is never reconstructed with
+// a providers.<id> node. A model upsert under a provider whose definition is
 // present stays valid (covered by the upsert suite).
 func TestMetadataEditExternalRemovalRefusesWithoutReconstruction(t *testing.T) {
 	h := newMetadataHarness(t)
@@ -2236,11 +2225,11 @@ func TestMetadataEditExternalRemovalRefusesWithoutReconstruction(t *testing.T) {
 	_, err := svc.mutate(context.Background(), svc.editProviderUpdate("prov", protocol.ProviderEdit{
 		Name: &name, BaseUrl: &fixedURL, ApiKeyEnv: &fixedEnv,
 	}))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, catalog.ErrUnknownProvider)
 
 	modelName := "Reconstructed M"
 	_, err = svc.mutate(context.Background(), svc.editModelSave("prov", "m", protocol.ModelEdit{Name: &modelName}))
-	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, ErrConfiguration)
+	assertMetadataRefused(t, svc, sub, h.configPath, before, first, warnRev, err, catalog.ErrUnknownProvider)
 
 	// No partial patch reconstructed the removed definition.
 	var rawProviders map[string]json.RawMessage

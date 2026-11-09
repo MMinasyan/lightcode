@@ -14,7 +14,6 @@ import (
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/jobs"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -26,52 +25,66 @@ import (
 var ErrOwned = errors.New("runtime: data directory owned by another Runtime")
 
 // Options are the public construction inputs of one managed Runtime: the
-// sole data root, the main configuration path, and the complete plugin set —
-// builtin.Plugins() for the shipped registration, an ordinary custom slice
-// for a custom build. Default Agent capability selections are application
-// composition data supplied to their owning extension's constructor, never a
-// Runtime option.
+// sole data root, the application-supplied configuration and credential
+// sources, and the complete plugin set — builtin.Plugins() for the shipped
+// registration, an ordinary custom slice for a custom build. Optional
+// locations are independently selected; an omitted location performs no
+// lookup there. Nil Agent and Strategy select the included defaults, and nil
+// NewEvaluator selects the included permission evaluator.
 type Options struct {
-	DataDir    string
-	ConfigPath string
-	Plugins    []extension.Native
+	DataDir       string
+	Configuration ConfigurationSource
+	Credentials   CredentialSource
+	Locations     Locations
 
-	// Identity is the application-supplied prompt persona text. GlobalRulesDir
-	// is the explicit directory holding the global AGENTS.md. Zero values
-	// supply no identity and no global rules, never an implicit fallback.
-	Identity       string
-	GlobalRulesDir string
+	// Identity is the application-supplied prompt persona text. Its zero
+	// value supplies no identity, never an implicit fallback.
+	Identity string
+
+	Agent    *harness.AgentInputs
+	Strategy *harness.StrategyBinding
+
+	Plugins []extension.Native
+
+	NewEvaluator func(PolicyInputs) (harness.PermissionEvaluator, error)
 }
 
 // Open constructs the complete managed Runtime with concrete production
 // preparation and returns the published owner. It delegates to the private
 // lifecycle implementation, which owns every retained property: explicit
-// paths, ownership-before-I/O, config publication, recovery-before-execution,
-// one admitted-call gate, and the joined shutdown.
+// sources and locations, ownership-before-I/O, config publication,
+// recovery-before-execution, one admitted-call gate, and the joined shutdown.
 func Open(ctx context.Context, opts Options) (*Runtime, error) {
 	return open(ctx, options{
-		DataDir:        opts.DataDir,
-		ConfigPath:     opts.ConfigPath,
-		Plugins:        opts.Plugins,
-		Identity:       opts.Identity,
-		GlobalRulesDir: opts.GlobalRulesDir,
+		DataDir:       opts.DataDir,
+		Configuration: opts.Configuration,
+		Credentials:   opts.Credentials,
+		Locations:     opts.Locations,
+		Identity:      opts.Identity,
+		Agent:         opts.Agent,
+		Strategy:      opts.Strategy,
+		Plugins:       opts.Plugins,
+		NewEvaluator:  opts.NewEvaluator,
 	})
 }
 
 // options are the private construction inputs of one managed Runtime. DataDir
 // is the sole data root: runtime.lock and the storage backend's own files
-// derive from it. Dotenv and the
-// discovery cache keep their home-based paths: neither option relocates them
-// nor changes owner identity. sweepTicks optionally replaces the automatic
-// sweep scheduler's owned hourly ticker with a controlled tick stream whose
-// sends carry each pass's explicit time; the zero value keeps the production
+// derive from it. sweepTicks optionally replaces the automatic sweep
+// scheduler's owned hourly ticker with a controlled tick stream whose sends
+// carry each pass's explicit time; the zero value keeps the production
 // time.Ticker.
 type options struct {
-	DataDir, ConfigPath string
-	Plugins             []extension.Native
-	Identity            string
-	GlobalRulesDir      string
-	sweepTicks          <-chan time.Time
+	DataDir       string
+	Configuration ConfigurationSource
+	Credentials   CredentialSource
+	Locations     Locations
+	Identity      string
+	Agent         *harness.AgentInputs
+	Strategy      *harness.StrategyBinding
+	Plugins       []extension.Native
+	NewEvaluator  func(PolicyInputs) (harness.PermissionEvaluator, error)
+	sweepTicks    <-chan time.Time
 }
 
 // Runtime is the single live owner of one Harness, its durable Session
@@ -80,17 +93,17 @@ type options struct {
 // The constructor context is the managed Runtime process lifetime; its
 // cancellation requests the same joined shutdown that Close starts.
 type Runtime struct {
-	lock       *atomicfs.Lock
-	work       context.Context
-	cancelWork context.CancelFunc
-	config     *configurationService
-	obs        *observation
-	warnings   *warningStore
-	passive    *observationAdapter
-	managedEnv *config.ManagedEnv
-	harness    *harness.Harness
-	artifacts  *artifactIntervals
-	dataDir    string
+	lock        *atomicfs.Lock
+	work        context.Context
+	cancelWork  context.CancelFunc
+	config      *configurationService
+	obs         *observation
+	warnings    *warningStore
+	passive     *observationAdapter
+	agentInputs harness.AgentInputs
+	harness     *harness.Harness
+	artifacts   *artifactIntervals
+	dataDir     string
 
 	// jobs and closeStore are the directly constructed baseline services:
 	// the jobs service (also the Harness job-stop seam) and the included
@@ -114,13 +127,13 @@ type Runtime struct {
 }
 
 // open constructs the complete owner and publishes nothing until it has
-// finished. It requires nonempty paths, normalizes both
-// paths once with filepath.Abs, and validates the context before any
+// finished. It requires nonempty construction inputs, normalizes the data
+// directory once with filepath.Abs, and validates the context before any
 // initialization. Startup acquires the process-lifetime lock at
-// <DataDir>/runtime.lock, loads the managed dotenv, validates the active
-// composition and initial configuration, directly constructs the included SQLite
-// store and jobs service, then prepare and publish the initial resource set
-// with the standard tools bound before running restart recovery, and
+// <DataDir>/runtime.lock, validates the active composition and initial
+// configuration from the supplied sources, directly constructs the included
+// SQLite store and jobs service, then prepare and publish the initial resource
+// set with the standard tools bound before running restart recovery, and
 // construct the Harness with the bound preparation and the jobs stop seam.
 // Other factories receive no canonical Storage.
 // The automatic sweep's owned ticker loop is then registered as Runtime work
@@ -141,20 +154,30 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	if options.DataDir == "" {
 		return nil, errors.New("runtime: options.DataDir must be non-empty")
 	}
-	if options.ConfigPath == "" {
-		return nil, errors.New("runtime: options.ConfigPath must be non-empty")
+	if options.Configuration == nil {
+		return nil, errors.New("runtime: options.Configuration must be non-nil")
+	}
+	if options.Credentials == nil {
+		return nil, errors.New("runtime: options.Credentials must be non-nil")
+	}
+	inputs := DefaultAgentInputs()
+	if options.Agent != nil {
+		if err := harness.ValidateAgentInputs(*options.Agent); err != nil {
+			return nil, fmt.Errorf("runtime: options.Agent: %v: %w", err, harness.ErrInvalid)
+		}
+		inputs = options.Agent.Owned()
+	}
+	strategy := harness.IncludedStrategyBinding()
+	if options.Strategy != nil {
+		if options.Strategy.ID == "" || options.Strategy.Strategy == nil {
+			return nil, fmt.Errorf("runtime: options.Strategy requires an ID and an implementation: %w", harness.ErrInvalid)
+		}
+		owned := *options.Strategy
+		strategy = &owned
 	}
 	dataDir, err := filepath.Abs(options.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("normalize data directory: %w", err)
-	}
-	configPath, err := filepath.Abs(options.ConfigPath)
-	if err != nil {
-		return nil, fmt.Errorf("normalize config path: %w", err)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("resolve home dir: %w", err)
 	}
 	c := registeredComposition(options.Plugins)
 
@@ -167,11 +190,6 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	}
 	work, cancelWork := context.WithCancel(ctx)
 
-	managedEnv, err := config.LoadDotEnv()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "lightcode: .env: %v\n", err)
-	}
-
 	obs := newObservation()
 	// The warning store and the passive publication adapter initialize
 	// before any plugin scope opens: the Runtime installs the adapter's
@@ -182,10 +200,9 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	warnings := newWarningStore()
 	adapter := newObservationAdapter(obs, warnings)
 	c.reportWarning = adapter.reportPluginWarning
-	loader := catalog.NewLoader(home, nil)
-	configService := newConfigurationService(work, c, loader, configPath, obs)
+	loader := catalog.NewLoader(options.Locations.DiscoveryCacheDir, nil)
+	configService := newConfigurationService(work, c, loader, options.Configuration, options.Credentials, options.Locations, strategy, obs)
 	configService.attachWarnings(warnings)
-	configService.attachEnv(managedEnv)
 	// The private per-Session artifact interval registry initializes before
 	// the first resource set: every committed opener, standalone data call,
 	// restore, committed deletion and sweep candidate coordinates on it, and
@@ -246,7 +263,6 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		return unwind(err)
 	}
 	configService.buildMu.Lock()
-	configService.captureMu.Lock()
 	configService.commit(initial)
 	if err := harness.Recover(work, store); err != nil {
 		return unwind(err)
@@ -256,19 +272,13 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 	// the Harness: every committed opener, restore, committed deletion and
 	// sweep candidate coordinates on it, and no caller can observe an
 	// unarmed registry because the owner is unpublished.
-	// The call-time subprocess environment producer exists only when the
-	// retained manager exists; without it no manager is constructed on
-	// demand and every cooperative command fails. The configuration owner
-	// supplies the one coherent projection of the managed environment, the
-	// current revision's names and the owner-wide held-name union.
-	var subprocessEnv func() []string
-	if managedEnv != nil {
-		subprocessEnv = configService.subprocessEnvironment
-	}
+	// The call-time subprocess environment producer is the one coherent
+	// projection of the current revision's names and the owner-wide held-name
+	// union; the credential source filters the process environment.
 	h, err := harness.New(work, harness.Dependencies{
 		Storage: store,
 		Jobs:    jobsService,
-		Prepare: newPreparation(configService, home, options.Identity, options.GlobalRulesDir, background, adapter, artifacts, subprocessEnv).bind(),
+		Prepare: newPreparation(configService, options.Locations, options.Identity, background, adapter, artifacts, configService.subprocessEnvironment, options.NewEvaluator).bind(),
 		Observe: adapter.observe,
 	})
 	if err != nil {
@@ -289,7 +299,7 @@ func open(ctx context.Context, options options) (*Runtime, error) {
 		obs:          obs,
 		warnings:     warnings,
 		passive:      adapter,
-		managedEnv:   managedEnv,
+		agentInputs:  inputs,
 		harness:      h,
 		artifacts:    artifacts,
 		dataDir:      dataDir,

@@ -247,7 +247,7 @@ func TestRuntimeShutdownJoinsRealJobsWorkGroup(t *testing.T) {
 	// root: while the owner holds the lock, its open fails with ErrOwned before
 	// any store or factory.
 	lockHeld := func() bool {
-		_, err := open(context.Background(), options{DataDir: e.dataDir, ConfigPath: e.configPath})
+		_, err := open(context.Background(), e.options())
 		return errors.Is(err, ErrOwned)
 	}
 	probe := &realJobsProbe{

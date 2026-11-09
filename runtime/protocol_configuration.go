@@ -63,7 +63,7 @@ func (r *Runtime) listModels(ctx context.Context, params protocol.ListModelsPara
 		// The refs enumerate this same immutable catalog's verified provider
 		// and model maps, so the lookup cannot fail; nothing is swallowed.
 		prov, entry, _ := captured.snapshot.catalog.LookupOrIncomplete(ref)
-		if !catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials)) {
+		if !catalog.ProviderConnected(prov, capturedEnvIsSet(captured.snapshot.credentials)) {
 			continue
 		}
 		models = append(models, projectModelListEntry(prov, entry))
@@ -237,7 +237,7 @@ func (r *Runtime) addProvider(ctx context.Context, providerID string, patch prot
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
-	captured, err := r.config.mutate(ctx, r.config.editProviderCreate(providerID, patch, models, key))
+	captured, err := r.config.mutate(ctx, r.config.editProviderCreate(ctx, providerID, patch, models, key))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
@@ -381,7 +381,7 @@ func capturedProvider(captured *configuration, providerID string) (*catalog.Prov
 // capturedEnvIsSet is the one captured credential predicate: a provider
 // connection decision reads the nonemptiness of the value sampled with its
 // own capture, never a live environment getter.
-func capturedEnvIsSet(credentials map[string]config.EnvValue) func(string) bool {
+func capturedEnvIsSet(credentials map[string]CredentialValue) func(string) bool {
 	return func(name string) bool {
 		return credentials[name].Value != ""
 	}
@@ -408,8 +408,8 @@ func projectProviders(captured configurationCapture) []protocol.Provider {
 // labels, never values: no key value, permission suggestion, or generated
 // name suggestion appears.
 func projectProvider(captured configurationCapture, prov *catalog.Provider) protocol.Provider {
-	connected := catalog.ProviderConnected(prov, capturedEnvIsSet(captured.credentials))
-	keySource := classifyKeySource(prov.Transport.APIKeyEnv, captured.credentials)
+	connected := catalog.ProviderConnected(prov, capturedEnvIsSet(captured.snapshot.credentials))
+	keySource := classifyKeySource(prov.Transport.APIKeyEnv, captured.snapshot.credentials)
 	return protocol.Provider{
 		ApiKeyEnv:        prov.Transport.APIKeyEnv,
 		BaseUrl:          prov.Transport.BaseURL,
@@ -648,7 +648,7 @@ func stripCredentialHeaders(headers map[string]string) map[string]string {
 // external regardless of emptiness — a defined-but-empty external variable
 // supplies no credential but stays external — and managed membership comes
 // from the managed set; neither is reread live.
-func classifyKeySource(apiKeyEnv string, credentials map[string]config.EnvValue) string {
+func classifyKeySource(apiKeyEnv string, credentials map[string]CredentialValue) string {
 	managed := func(name string) bool { return credentials[name].Managed }
 	external := func(name string) bool {
 		value := credentials[name]
@@ -671,10 +671,10 @@ func usableModelCount(prov *catalog.Provider) int {
 // generateAPIKeyEnvName applies the retained name-generation rule: the base
 // name LIGHTCODE_<UPPER_SNAKE_ID>_API_KEY (or the PROVIDER fallback for an
 // unusable ID), suffixed 2+ while occupied. A name is occupied when the
-// captured catalog references it or the environment defines it — managed
-// orphans and externally defined empty variables included — so allocation
-// never reuses or overwrites an existing binding.
-func (s *configurationService) generateAPIKeyEnvName(providerID string, cat *catalog.Catalog) string {
+// captured catalog references it or the credential source defines it —
+// managed orphans and externally defined empty variables included — so
+// allocation never reuses or overwrites an existing binding.
+func (s *configurationService) generateAPIKeyEnvName(ctx context.Context, providerID string, cat *catalog.Catalog) (string, error) {
 	base := "LIGHTCODE_" + upperSnake(providerID) + "_API_KEY"
 	if base == "LIGHTCODE__API_KEY" {
 		base = "LIGHTCODE_PROVIDER_API_KEY"
@@ -687,8 +687,14 @@ func (s *configurationService) generateAPIKeyEnvName(providerID string, cat *cat
 	}
 	candidate := base
 	for suffix := 2; ; suffix++ {
-		if !referenced[candidate] && !s.env.Capture([]string{candidate})[candidate].Defined {
-			return candidate
+		if !referenced[candidate] {
+			observed, err := s.credentials.Capture(ctx, []string{candidate})
+			if err != nil {
+				return "", err
+			}
+			if !observed[candidate].Defined {
+				return candidate, nil
+			}
 		}
 		candidate = fmt.Sprintf("%s_%d", base, suffix)
 	}

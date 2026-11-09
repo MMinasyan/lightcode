@@ -103,22 +103,6 @@ func writeDotEnv(t *testing.T, home, content string) {
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(content), 0o600))
 }
 
-// unsetenv cleans one process-environment key before and after the test:
-// LoadDotEnv's real os.Setenv leaks past t.Setenv's restore, so a subtest
-// must start from a clean key rather than inheriting a prior subtest's
-// managed key as a pre-exported one.
-func unsetenv(t *testing.T, keys ...string) {
-	t.Helper()
-	t.Cleanup(func() {
-		for _, key := range keys {
-			_ = os.Unsetenv(key)
-		}
-	})
-	for _, key := range keys {
-		_ = os.Unsetenv(key)
-	}
-}
-
 func findProvider(views []protocol.Provider, id string) protocol.Provider {
 	for _, view := range views {
 		if view.Id == id {
@@ -136,7 +120,6 @@ func findProvider(views []protocol.Provider, id string) protocol.Provider {
 // both header maps.
 func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value") // pre-exported shell key, never managed
 		e := newOwnerEnv(t)
 		// A valid injected key followed by an oversized line: the scanner
@@ -216,7 +199,6 @@ func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *te
 // surviving sibling's connection untouched. One variable, no per-provider
 // leases.
 func TestRuntimeSharedCredentialReference(t *testing.T) {
-	unsetenv(t, "SHARED_CRED_TEST_KEY", "RESHARED_TEST_KEY")
 	store := storage.NewMemory()
 	e := newOwnerEnv(t)
 	writeDotEnv(t, e.home, "SHARED_CRED_TEST_KEY=shared-secret-value\n")
@@ -248,8 +230,8 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 		detail, err := r.getProvider(ctx, "shbeta")
 		testassert.Require(t, err == nil && detail.Provider.Connected && detail.Provider.ApiKeyEnv == "SHARED_CRED_TEST_KEY", "shbeta after the sibling update = (%v, %+v), want the shared reference untouched", err, detail.Provider)
 	}
-	if os.Getenv("SHARED_CRED_TEST_KEY") != "shared-secret-value" || !r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY") {
-		t.Fatalf("shared variable after the sibling update = (%q, %v), want the exact value and ownership", os.Getenv("SHARED_CRED_TEST_KEY"), r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY"))
+	if envValueForTest(r, "SHARED_CRED_TEST_KEY") != "shared-secret-value" || !testManaged(r, "SHARED_CRED_TEST_KEY") {
+		t.Fatalf("shared variable after the sibling update = (%q, %v), want the exact value and ownership", envValueForTest(r, "SHARED_CRED_TEST_KEY"), testManaged(r, "SHARED_CRED_TEST_KEY"))
 	}
 
 	// The connected rebinding away from the shared name does not unset
@@ -261,8 +243,8 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	drainConnectionEvent(t, r.warnings, sub, "3")
-	if os.Getenv("SHARED_CRED_TEST_KEY") != "shared-secret-value" {
-		t.Fatalf("the rebinding unset the shared credential: %q", os.Getenv("SHARED_CRED_TEST_KEY"))
+	if envValueForTest(r, "SHARED_CRED_TEST_KEY") != "shared-secret-value" {
+		t.Fatalf("the rebinding unset the shared credential: %q", envValueForTest(r, "SHARED_CRED_TEST_KEY"))
 	}
 	{
 		detail, err := r.getProvider(ctx, "shbeta")
@@ -276,8 +258,8 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 	mutation, err := r.deleteProvider(ctx, "shbeta")
 	testassert.Require(t, err == nil && mutation.Result == nil, "shared-reference delete = (%v, %+v), want the null post-state", err, mutation)
 	drainConnectionEvent(t, r.warnings, sub, "4")
-	if os.Getenv("SHARED_CRED_TEST_KEY") != "shared-secret-value" || !r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY") {
-		t.Fatalf("the deletion removed the shared variable = (%q, %v)", os.Getenv("SHARED_CRED_TEST_KEY"), r.managedEnv.IsManaged("SHARED_CRED_TEST_KEY"))
+	if envValueForTest(r, "SHARED_CRED_TEST_KEY") != "shared-secret-value" || !testManaged(r, "SHARED_CRED_TEST_KEY") {
+		t.Fatalf("the deletion removed the shared variable = (%q, %v)", envValueForTest(r, "SHARED_CRED_TEST_KEY"), testManaged(r, "SHARED_CRED_TEST_KEY"))
 	}
 	{
 		detail, err := r.getProvider(ctx, "shgamma")
@@ -423,7 +405,6 @@ const definedEmptyProvidersDocument = `{
 // picker; the nearest siblings stay absent=none and managed-empty=managed.
 func TestConfigurationDefinedEmptyExternalKeySource(t *testing.T) {
 	store := storage.NewMemory()
-	unsetenv(t, "EMPTY_EXT_TEST_KEY", "ABSENT_TEST_KEY", "MANAGED_EMPTY_TEST_KEY")
 	t.Setenv("EMPTY_EXT_TEST_KEY", "")
 	e := newOwnerEnv(t)
 	writeDotEnv(t, e.home, "MANAGED_EMPTY_TEST_KEY=\n")
@@ -462,7 +443,6 @@ func TestConfigurationDefinedEmptyExternalKeySource(t *testing.T) {
 // flags, and disconnected providers appear in neither.
 func TestConfigurationModelPickerConnectedRules(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value")
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
@@ -530,7 +510,6 @@ func TestConfigurationModelPickerConnectedRules(t *testing.T) {
 // pointer never reaches the captured configuration.
 func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value")
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
@@ -636,7 +615,6 @@ func TestConfigurationFailedReloadLeavesClocksUnchanged(t *testing.T) {
 // unfiltered read orders the actual stored groups lexically.
 func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		unsetenv(t, "UNSET_SETUP_KEY")
 		e := newOwnerEnv(t)
 		disconnectedDoc := `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"UNSET_SETUP_KEY"},"discovery":false,"models":{"m":{"context_window":4096}}}}}`
 		definitions := `{"primary":{"model":"prov/m"}}`
@@ -661,7 +639,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		// reload: the setup warnings clear and the publication carries its
 		// warning hint — one configuration event then one runtime-scoped
 		// warning event with the advanced revision.
-		testassert.NoError(t, r.managedEnv.Set("UNSET_SETUP_KEY", "setup-secret"))
+		testassert.NoError(t, r.managedEnvForTest().Set("UNSET_SETUP_KEY", "setup-secret"))
 		{
 			_, err := r.Reload(context.Background())
 			testassert.NoError(t, err)
@@ -802,7 +780,6 @@ func probeNames[T any](probes []T, name func(T) string) []string {
 // an independent serialized baseline.
 func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value")
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
@@ -887,7 +864,6 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 // the reload build, never per read — is discovered.
 func TestConfigurationModelSourceExactThroughCapturedCatalog(t *testing.T) {
 	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
-		unsetenv(t, "SHELL_TEST_KEY", "MANAGED_TEST_KEY", "UNSET_TEST_KEY")
 		t.Setenv("SHELL_TEST_KEY", "shell-secret-value")
 		r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
@@ -911,7 +887,7 @@ func TestConfigurationModelSourceExactThroughCapturedCatalog(t *testing.T) {
 		// first build produced, then reload: the rebuild adopts the discovered
 		// model and labels it from the same accepted record.
 		transport := catalog.Transport{BaseURL: openrouter.BaseUrl, APIKeyEnv: openrouter.ApiKeyEnv, Headers: openrouter.Headers}
-		testassert.NoError(t, catalog.WriteDiscoveryCache(e.home, "openrouter", transport,
+		testassert.NoError(t, catalog.WriteDiscoveryCache(filepath.Join(e.home, ".lightcode", "cache", "discovery"), "openrouter", transport,
 			catalog.DiscoveredProvider{Models: map[string]catalog.DiscoveredModel{"found-via-cache": {Name: "Found Via Cache", ContextWindow: 4096}}},
 			time.Now().UTC()))
 		{

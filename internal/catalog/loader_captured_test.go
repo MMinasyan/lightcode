@@ -30,7 +30,7 @@ func TestLoaderLoadCapturedUsesInputWithoutReadingConfig(t *testing.T) {
 		"models":    map[string]any{"known": map[string]any{"context_window": json.Number("9007199254740993")}},
 	}}
 
-	result, err := NewLoader(home, fsys).LoadCaptured(context.Background(), userRaw)
+	result, err := loadCapturedResult(t, NewLoader(home, fsys), context.Background(), userRaw)
 	testassert.NoError(t, err)
 	testassert.Require(t, len(result.Warnings) == 0, "warnings = %#v, want none: the captured layer must not report config problems", result.Warnings)
 	{
@@ -67,7 +67,7 @@ func TestLoaderLoadCapturedCostProtectionUsesCapturedInput(t *testing.T) {
 	}}
 	loader := NewLoader(home, fsys)
 
-	result, err := loader.LoadCaptured(context.Background(), userRaw)
+	result, err := loadCapturedResult(t, loader, context.Background(), userRaw)
 	testassert.NoError(t, err)
 	testassert.Equal(t, calls, 1)
 	if _, model, err := result.Catalog.Lookup(ModelRef{Provider: "remote", Model: "m"}); err != nil {
@@ -76,7 +76,7 @@ func TestLoaderLoadCapturedCostProtectionUsesCapturedInput(t *testing.T) {
 		t.Fatalf("discovered model cost = %#v, want the captured-declared input protected and the discovered output filled", model.Cost)
 	}
 	{
-		_, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		_, err := os.Stat(filepath.Join(home, "remote.json"))
 		testassert.NoError(t, err)
 	}
 	{
@@ -86,7 +86,7 @@ func TestLoaderLoadCapturedCostProtectionUsesCapturedInput(t *testing.T) {
 
 	// The retained 24h attempted-at TTL suppresses a duplicate fetch.
 	{
-		_, err := loader.LoadCaptured(context.Background(), userRaw)
+		_, err := loadCapturedResult(t, loader, context.Background(), userRaw)
 		testassert.NoError(t, err)
 	}
 	testassert.Equal(t, calls, 1)
@@ -129,15 +129,15 @@ func TestLoaderLoadCapturedCancellationSkipsPublicationWithoutUndoingWrites(t *t
 		}`)},
 	}
 
-	result, err := NewLoader(home, fsys).LoadCaptured(ctx, nil)
+	result, err := loadCapturedResult(t, NewLoader(home, fsys), ctx, nil)
 	testassert.Require(t, errors.Is(err, context.Canceled), "LoadCaptured error = %v, want the caller's context error unwrapped", err)
 	testassert.Require(t, result.Catalog == nil && result.Warnings == nil, "canceled LoadCaptured published result %#v, want the zero BuildResult", result)
 	{
-		_, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "aa.json"))
+		_, statErr := os.Stat(filepath.Join(home, "aa.json"))
 		testassert.Require(t, statErr == nil, "the cache write that had started was undone: %v", statErr)
 	}
 	{
-		_, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "bb.json"))
+		_, statErr := os.Stat(filepath.Join(home, "bb.json"))
 		testassert.Require(t, os.IsNotExist(statErr), "the canceled fetch's publication was not skipped: %v", statErr)
 	}
 }
@@ -182,7 +182,7 @@ func TestLoaderLoadCapturedFailedFetchKeepsWarningAndAttempt(t *testing.T) {
 		"models": {"known": {"context_window": 1000}}
 	}`)}}
 
-	result, err := NewLoader(home, fsys).LoadCaptured(context.Background(), nil)
+	result, err := loadCapturedResult(t, NewLoader(home, fsys), context.Background(), nil)
 	testassert.NoError(t, err)
 	testassert.Require(t, hasWarningForProvider(result.Warnings, "discovery_failure", "remote"), "warnings = %#v, want the discovery_failure warning", result.Warnings)
 	{
@@ -190,7 +190,7 @@ func TestLoaderLoadCapturedFailedFetchKeepsWarningAndAttempt(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	{
-		_, statErr := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		_, statErr := os.Stat(filepath.Join(home, "remote.json"))
 		testassert.Require(t, statErr == nil, "the failed fetch's attempt marker was not written: %v", statErr)
 	}
 }
@@ -215,7 +215,7 @@ func TestLoaderLoadCapturedContentionWarnsAndKeepsCachedInput(t *testing.T) {
 		"discovery": true,
 		"models": {}
 	}`)}}
-	result, err := NewLoader(home, fsys).LoadCaptured(context.Background(), nil)
+	result, err := loadCapturedResult(t, NewLoader(home, fsys), context.Background(), nil)
 	testassert.NoError(t, err)
 	testassert.Require(t, hasWarningForProvider(result.Warnings, "discovery_failure", "remote"), "warnings = %#v, want the retained contention warning", result.Warnings)
 	{
@@ -248,7 +248,7 @@ func TestLoaderLoadCapturedAllowRefreshFilterRetained(t *testing.T) {
 
 	loader := NewLoader(home, fsys)
 	loader.AllowRefresh = func(_ string, _ *Provider) bool { return false }
-	result, err := loader.LoadCaptured(context.Background(), nil)
+	result, err := loadCapturedResult(t, loader, context.Background(), nil)
 	testassert.NoError(t, err)
 	testassert.Equal(t, calls, 0)
 	{
@@ -341,7 +341,7 @@ func TestLoaderLoadCapturedConnectionOverlaysOneProviderWithoutRefresh(t *testin
 		testassert.NoError(t, err)
 	}
 	{
-		_, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		_, err := os.Stat(filepath.Join(home, "remote.json"))
 		testassert.Require(t, os.IsNotExist(err), "the connection candidate wrote a cache file: %v", err)
 	}
 
@@ -353,4 +353,19 @@ func TestLoaderLoadCapturedConnectionOverlaysOneProviderWithoutRefresh(t *testin
 	if prov = result.Catalog.Providers["remote"]; prov != nil && len(prov.Models) != 0 {
 		t.Fatalf("misbound overlay contributed %v, want no models", prov.Models)
 	}
+}
+
+// loadCapturedResult is the test-side assembly plus captured-refresh pair the
+// removed ambient entry used to perform. Tests that need provider credentials
+// supply them through RefreshCaptured directly.
+func loadCapturedResult(t *testing.T, loader *Loader, ctx context.Context, userRaw map[string]any) (BuildResult, error) {
+	t.Helper()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	built, err := loader.AssembleCaptured(ctx, userRaw)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	return loader.RefreshCaptured(ctx, userRaw, built, nil)
 }

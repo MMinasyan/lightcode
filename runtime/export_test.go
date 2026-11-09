@@ -28,12 +28,8 @@ func WriteAgentDefinitionsForTest(t *testing.T, configPath, content string) {
 // runtime-to-plugin import cycle. It forwards to the public Open with the
 // supplied plugins: the same concrete preparation path, with no alternate
 // producer. It is absent from production builds.
-func OpenForTest(ctx context.Context, dataDir, configPath string, plugins []extension.Native) (*Runtime, error) {
-	return Open(ctx, Options{
-		DataDir:    dataDir,
-		ConfigPath: configPath,
-		Plugins:    plugins,
-	})
+func OpenForTest(ctx context.Context, dataDir, configPath, home string, plugins []extension.Native) (*Runtime, error) {
+	return Open(ctx, testOptions(dataDir, configPath, home, plugins...))
 }
 
 // ConfiguredInvocationForTest builds one configured Invocation whose
@@ -137,3 +133,10 @@ func SubmitForTest(ctx context.Context, r *Runtime, sessionID, operationID, text
 // in-package tests, which receive it from the external composition test's
 // init assignment.
 var ShippedAdaptationPlugin func() extension.Native
+
+// OptionsForTest builds explicit construction inputs for external test
+// packages: the file configuration at configPath, the environment credential
+// source at home/.lightcode/.env, and the application locations under home.
+func OptionsForTest(dataDir, configPath, home string, plugins []extension.Native) Options {
+	return testOptions(dataDir, configPath, home, plugins...)
+}

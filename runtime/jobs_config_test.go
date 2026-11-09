@@ -35,7 +35,7 @@ func TestComposedJobsSettingsPublication(t *testing.T) {
 
 	e := newComposeEnv(t)
 	writeToolsConfig(t, e.configPath, accept)
-	r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath})
+	r, err := Open(ctx, e.options())
 	testassert.NoError(t, err)
 	if rev, err := r.Reload(ctx); err != nil || rev != "2" {
 		_ = r.Close(ctx)

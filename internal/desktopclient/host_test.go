@@ -1039,16 +1039,16 @@ func isolateBundledCredentials(t *testing.T) {
 // pulled generated event.
 func TestDesktopHostMountedRuntime(t *testing.T) {
 	const baseURL = "http://127.0.0.1:1/v1"
-	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DESKTOP_TEST_KEY", "desktop-test-key")
 	isolateBundledCredentials(t)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, fmt.Sprintf(smokeConfigDocument, baseURL, smokeAgentsDocument))
 	owner, err := runtime.Open(context.Background(), runtime.Options{
-		DataDir:    dataDir,
-		ConfigPath: configPath,
-		Plugins:    builtin.Plugins(),
+		DataDir:       dataDir,
+		Configuration: runtime.NewFileConfigurationSource(configPath),
+		Credentials:   runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
+		Plugins:       builtin.Plugins(),
 	})
 	testassert.NoError(t, err)
 	t.Cleanup(func() {

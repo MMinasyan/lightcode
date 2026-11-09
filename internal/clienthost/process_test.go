@@ -208,9 +208,10 @@ type attemptCloser struct{}
 // is used.
 func openRuntime(dataDir, configPath string) (*runtime.Runtime, error) {
 	return runtime.Open(context.Background(), runtime.Options{
-		DataDir:    dataDir,
-		ConfigPath: configPath,
-		Plugins:    []extension.Native{attemptMarkerPlugin()},
+		DataDir:       dataDir,
+		Configuration: runtime.NewFileConfigurationSource(configPath),
+		Credentials:   runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
+		Plugins:       []extension.Native{attemptMarkerPlugin()},
 	})
 }
 
@@ -378,12 +379,10 @@ type sandbox struct {
 // stops and reaps every identified helper child.
 func newSandbox(t *testing.T) *sandbox {
 	t.Helper()
-	home := t.TempDir()
 	dataDir := t.TempDir()
 	dir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	testassert.NoError(t, os.WriteFile(configPath, []byte(`{"extensions":{"attempt":{"enabled":true}}}`), 0o600))
-	t.Setenv("HOME", home)
 	isolateBundledCredentials(t)
 	s := &sandbox{
 		t: t, dataDir: dataDir, configPath: configPath, dir: dir,

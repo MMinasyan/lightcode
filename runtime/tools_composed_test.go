@@ -53,7 +53,7 @@ func TestComposedToolsSettingsPublication(t *testing.T) {
 	ctx := context.Background()
 	e := newComposeEnv(t)
 	writeToolsConfig(t, e.configPath, toolsComposedDocument)
-	r, err := Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath})
+	r, err := Open(ctx, e.options())
 	testassert.NoError(t, err)
 	if rev, err := r.Reload(ctx); err != nil || rev != "2" {
 		_ = r.Close(ctx)
@@ -190,7 +190,7 @@ func TestStandardToolsCompiledIntoComposition(t *testing.T) {
 // call-time environment producer.
 func stubManagedEnv(t *testing.T) *config.ManagedEnv {
 	t.Helper()
-	return config.NewManagedEnvForTest(filepath.Join(t.TempDir(), ".env"))
+	return config.NewManagedEnv(filepath.Join(t.TempDir(), ".env"))
 }
 
 // envCallContext is a callToolContext whose call-time environment producer
@@ -199,7 +199,7 @@ func stubManagedEnv(t *testing.T) *config.ManagedEnv {
 func envCallContext(t *testing.T, workspace string, constraints ToolConstraints) ToolContext {
 	t.Helper()
 	tc := callToolContext(workspace, constraints)
-	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
+	tc.SubprocessEnv = testSubprocessEnv(stubManagedEnv(t))
 	return tc
 }
 
@@ -324,7 +324,7 @@ type toolsHarnessOpts struct {
 	permissions   harness.PermissionPolicy
 	background    BackgroundServices
 	invocation    Invocation
-	subprocessEnv func() []string
+	subprocessEnv func(context.Context) ([]string, error)
 	// store, when non-nil, is the durable store behind the fixture's
 	// Harness; the zero value opens a temporary SQLite store.
 	store harness.Storage
@@ -658,7 +658,7 @@ func TestComposedToolsHarnessRecovery(t *testing.T) {
 	// A fresh Runtime composition over the same data root repairs the
 	// abandoned running state before any execution can start.
 	e := newComposeEnv(t)
-	r, err := Open(ctx, Options{DataDir: th.dataDir, ConfigPath: e.configPath})
+	r, err := Open(ctx, testOptions(th.dataDir, e.configPath, e.home))
 	testassert.NoError(t, err)
 	testassert.NoError(t, r.Close(ctx))
 	key := harness.RegisterKey{SessionID: session, Kind: harness.RegisterOperation, OperationID: "op-1"}
@@ -780,7 +780,7 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 	byID := openTools(t, dataDir)
 	ws := t.TempDir()
 	tc := callToolContext(ws, ToolConstraints{})
-	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
+	tc.SubprocessEnv = testSubprocessEnv(stubManagedEnv(t))
 
 	t.Run("success carries the captured output", func(t *testing.T) {
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"printf ok"}`)
@@ -850,10 +850,10 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 		// The key connects AFTER the tools plugin opened: the call-time
 		// subprocess-environment producer, not any Open-captured copy, must
 		// scrub it from the child.
-		managed := config.NewManagedEnvForTest(filepath.Join(t.TempDir(), ".env"))
+		managed := config.NewManagedEnv(filepath.Join(t.TempDir(), ".env"))
 		testassert.NoError(t, managed.TrySet("LIGHTCODE_TOOLS_PLUGIN_MANAGED", "managed-secret"))
 		callTC := tc
-		callTC.SubprocessEnv = managed.SubprocessEnv
+		callTC.SubprocessEnv = testSubprocessEnv(managed)
 		plan := prepare(t, runCommand, callTC, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_TOOLS_PLUGIN_TEST\" \"$LIGHTCODE_TOOLS_PLUGIN_MANAGED\"; pwd"}`)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "result = %+v, want success", outcome.Result)
@@ -932,7 +932,6 @@ func TestReadOnlyRunCommandExecutesRewriteSuppressingGitContentHelpers(t *testin
 	repo := t.TempDir()
 	// Isolate HOME so user-level git configuration (signing, hooks,
 	// templates) cannot leak into or break the fixture.
-	t.Setenv("HOME", t.TempDir())
 	runGit := func(args ...string) {
 		t.Helper()
 		cmd := exec.Command("git", args...)
@@ -1372,7 +1371,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 		fake := &fakeJobs{}
 		byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 		tc := callToolContext(ws, ToolConstraints{})
-		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
+		tc.SubprocessEnv = testSubprocessEnv(stubManagedEnv(t))
 		tc.Background = &scriptBackground{startErr: errors.New("background group is closed or stopping")}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
 		testassert.Require(t, plan.Immediate == nil && plan.Execute != nil && len(plan.Permissions) != 0 && plan.Permissions[0].Permission == "command.run", "plan = %+v, want an executor plan; pairs = %+v, want command.run pairs on the background call", plan, plan.Permissions)
@@ -1385,7 +1384,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 		fake := &fakeJobs{startErr: errors.New("spawn boom")}
 		byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 		tc := callToolContext(ws, ToolConstraints{})
-		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
+		tc.SubprocessEnv = testSubprocessEnv(stubManagedEnv(t))
 		tc.Background = &scriptBackground{}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
 		outcome := plan.Execute(context.Background())
@@ -1397,7 +1396,7 @@ func TestBackgroundStartFailuresRenderOneWrapperAndAbortReservation(t *testing.T
 		fake := &fakeJobs{reserveErr: errors.New("process: manager is closed")}
 		byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 		tc := callToolContext(ws, ToolConstraints{})
-		tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
+		tc.SubprocessEnv = testSubprocessEnv(stubManagedEnv(t))
 		tc.Background = &scriptBackground{}
 		plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
 		outcome := plan.Execute(context.Background())
@@ -1415,7 +1414,7 @@ func TestReadOnlyBackgroundStartRewritesAndHonorsTimeout(t *testing.T) {
 	byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 	ws := t.TempDir()
 	tc := callToolContext(ws, ToolConstraints{Readonly: true})
-	tc.SubprocessEnv = stubManagedEnv(t).SubprocessEnv
+	tc.SubprocessEnv = testSubprocessEnv(stubManagedEnv(t))
 	tc.Background = &scriptBackground{}
 
 	wantCommand, err := tool.ReadOnlyCommand("git status")
@@ -1456,7 +1455,7 @@ func TestRunCommandConcurrentManagedWritesSpawnChildren(t *testing.T) {
 	byID := newStandardTools(jobsDir, jobsInst)
 	ws := t.TempDir()
 	tc := callToolContext(ws, ToolConstraints{})
-	tc.SubprocessEnv = managed.SubprocessEnv
+	tc.SubprocessEnv = testSubprocessEnv(managed)
 	tc.Background = &scriptBackground{}
 
 	// One synchronous managed write proves the writer path works before any
@@ -1560,7 +1559,7 @@ func TestBackgroundJobEnvironmentScrubsManagedKey(t *testing.T) {
 	managed := stubManagedEnv(t)
 	ws := t.TempDir()
 	tc := callToolContext(ws, ToolConstraints{})
-	tc.SubprocessEnv = managed.SubprocessEnv
+	tc.SubprocessEnv = testSubprocessEnv(managed)
 	tc.Background = &scriptBackground{}
 	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_BG_UNLISTED\" \"$LIGHTCODE_BG_MANAGED\"; sleep 30","background":true}`)
 	// Both clocks move after Prepare and before the child starts: the
@@ -1643,7 +1642,7 @@ func TestBackgroundStartRealProcessDeliversTruncatedSteeringCompletion(t *testin
 		advertise:     []string{"run_command"},
 		background:    bg,
 		invocation:    invocation,
-		subprocessEnv: stubManagedEnv(t).SubprocessEnv,
+		subprocessEnv: testSubprocessEnv(stubManagedEnv(t)),
 	})
 	session := th.createSession()
 	th.submit(session, "op-1", "run the background command")
@@ -1875,11 +1874,11 @@ func TestRunCommandNilSubprocessEnvNoStart(t *testing.T) {
 	ws := t.TempDir()
 	for _, testCase := range []struct {
 		name     string
-		producer func() []string
+		producer func(context.Context) ([]string, error)
 		want     string
 	}{
 		{name: "nil callback", producer: nil, want: "no subprocess environment producer"},
-		{name: "nil snapshot", producer: func() []string { return nil }, want: "returned no environment"},
+		{name: "nil snapshot", producer: func(context.Context) ([]string, error) { return nil, nil }, want: "returned no environment"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			marker := filepath.Join(ws, strings.ReplaceAll(testCase.name, " ", "-")+"-marker")
@@ -1926,7 +1925,7 @@ func TestRunCommandEnvResolvedAtStartNotPrepare(t *testing.T) {
 	runCommand := openTools(t, t.TempDir())["run_command"]
 	ws := t.TempDir()
 	tc := callToolContext(ws, ToolConstraints{})
-	tc.SubprocessEnv = managed.SubprocessEnv
+	tc.SubprocessEnv = testSubprocessEnv(managed)
 	plan := prepare(t, runCommand, tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_TIMING_EXTERNAL\" \"$LIGHTCODE_SCRUB_LATE\""}`)
 	// Both clocks move after Prepare: the external sibling changes and the
 	// key connects. A Prepare-time capture would freeze the early sibling and
@@ -1946,7 +1945,7 @@ func TestBackgroundNilEnvSnapshotAbortsBeforeStart(t *testing.T) {
 	fake := &fakeJobs{}
 	byID, _ := openToolsComposed(t, t.TempDir(), fake, nil)
 	tc := callToolContext(ws, ToolConstraints{})
-	tc.SubprocessEnv = func() []string { return nil } // a nil snapshot is never an ambient fallback
+	tc.SubprocessEnv = func(context.Context) ([]string, error) { return nil, nil } // a nil snapshot is never an ambient fallback
 	tc.Background = &scriptBackground{}
 	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"true","background":true}`)
 	outcome := plan.Execute(context.Background())

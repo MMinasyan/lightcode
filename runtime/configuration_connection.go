@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -80,7 +79,7 @@ func (r *Runtime) connectProvider(ctx context.Context, providerID string, option
 	// carries no credential (a supplied key refuses), and every keyed
 	// provider — usable or not — resolves its binding. A usable provider
 	// still runs no discovery and no key probe.
-	key, persist, err := resolveConnectKey(envName, optionalKey, captured.credentials[envName])
+	key, persist, err := resolveConnectKey(envName, optionalKey, captured.snapshot.credentials[envName])
 	if err != nil {
 		return protocol.ProviderMutation{}, configurationFailure(err)
 	}
@@ -162,7 +161,11 @@ func (r *Runtime) discoverProvider(ctx context.Context, req protocol.DiscoveryRe
 	if req.ApiKey != nil && *req.ApiKey != "" {
 		key = *req.ApiKey
 	} else if envName := strings.TrimSpace(req.ApiKeyEnv); envName != "" {
-		key = r.managedEnv.Capture([]string{envName})[envName].Value
+		captured, err := r.config.credentials.Capture(ctx, []string{envName})
+		if err != nil {
+			return nil, err
+		}
+		key = captured[envName].Value
 	}
 	discovered, err := connectFetchDiscovery(ctx, "custom", catalog.Transport{BaseURL: baseURL, Headers: headers}, key)
 	if err != nil {
@@ -191,7 +194,7 @@ func (r *Runtime) discoverProviderModels(ctx context.Context, providerID string)
 	}
 	key := ""
 	if env := prov.Transport.APIKeyEnv; env != "" {
-		key = captured.credentials[env].Value
+		key = captured.snapshot.credentials[env].Value
 	}
 	discovered, err := connectFetchDiscovery(ctx, prov.ID, prov.Transport, key)
 	if err != nil {
@@ -249,7 +252,7 @@ func (s *configurationService) editProviderDisconnect(providerID string, plan *c
 				return 0, invalidEdit("provider %q is keyless; remove it instead", providerID)
 			}
 			plan.providerID = providerID
-			observed := captured.credentials[envName]
+			observed := captured.snapshot.credentials[envName]
 			if observed.Managed {
 				plan.keyAction, plan.keyEnv = keyActionRemove, envName
 			} else if observed.Value != "" {
@@ -304,7 +307,7 @@ func checkConnectionCandidate(live *configuration, plan *connectionEffects, cand
 // managed or external defined value is used as-is, a defined-but-empty
 // external value fails uniformly, and an absent key fails the required
 // credential.
-func resolveConnectKey(envName string, optionalKey *string, observed config.EnvValue) (key string, persist bool, err error) {
+func resolveConnectKey(envName string, optionalKey *string, observed CredentialValue) (key string, persist bool, err error) {
 	if envName == "" {
 		if optionalKey != nil && *optionalKey != "" {
 			return "", false, fmt.Errorf("provider is keyless; a supplied key has no named variable to persist to")

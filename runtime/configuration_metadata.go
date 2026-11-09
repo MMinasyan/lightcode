@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -288,7 +289,7 @@ func requireCandidateModel(c *configuration, providerID, modelID string) error {
 // created provider survived the shared catalog validation, and the edit's
 // connection data carries the one managed-key write that follows the owning
 // file.
-func (s *configurationService) editProviderCreate(providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit, key *string) configurationEdit {
+func (s *configurationService) editProviderCreate(ctx context.Context, providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit, key *string) configurationEdit {
 	// The create identity is trim-normalized once at the constructor entry:
 	// the apply and the candidate check resolve the same canonicalized ID
 	// (the Runtime operator's separate by-value parameter still canonicalizes
@@ -351,10 +352,16 @@ func (s *configurationService) editProviderCreate(providerID string, patch proto
 			}
 			if key != nil && *key != "" {
 				if keyEnv == "" {
-					keyEnv = s.generateAPIKeyEnvName(providerID, captured.snapshot.catalog)
+					keyEnv, err = s.generateAPIKeyEnvName(ctx, providerID, captured.snapshot.catalog)
+					if err != nil {
+						return 0, configurationFailure(err)
+					}
 				}
-				observed := s.env.Capture([]string{keyEnv})[keyEnv]
-				if _, persist, err := resolveConnectKey(keyEnv, key, observed); err != nil {
+				observed, err := s.credentials.Capture(ctx, []string{keyEnv})
+				if err != nil {
+					return 0, configurationFailure(err)
+				}
+				if _, persist, err := resolveConnectKey(keyEnv, key, observed[keyEnv]); err != nil {
 					return 0, configurationFailure(err)
 				} else if persist {
 					plan.keyAction = keyActionSet

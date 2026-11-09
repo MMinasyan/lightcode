@@ -1013,7 +1013,7 @@ func TestCodeSnapshotsLegacySessionDataStaysInert(t *testing.T) {
 		workspace := filepath.Join(e.home, "legacy-inert-ws")
 		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
 		legacyID := "deadbeef"
-		legacyDir := seedLegacySessionFixture(t, r.config.loader.Home(), workspace, legacyID)
+		legacyDir := seedLegacySessionFixture(t, r.config.loader.CacheDir(), workspace, legacyID)
 		before := snapshotTree(t, legacyDir)
 		testassert.Require(t, len(before) > 4, "legacy sentinel tree = %v, want meta, canaries, and snapshot entries", before)
 

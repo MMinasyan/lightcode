@@ -18,7 +18,7 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 	envPath := filepath.Join(dir, ".env")
 
 	newMgr := func() *ManagedEnv {
-		return NewManagedEnvForTest(envPath)
+		return NewManagedEnv(envPath)
 	}
 
 	keys := []string{"LIGHTCODE_TEST_A", "LIGHTCODE_TEST_B", "LIGHTCODE_TEST_C"}
@@ -53,9 +53,8 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 		}
 	}
 
-	// A managed key is removed.
+	// A file-owned key is removed.
 	remover := newMgr()
-	remover.managed[keys[0]] = struct{}{}
 	testassert.NoError(t, remover.Remove(keys[0]))
 	present, _, _ = ReadDotEnvKeys(envPath)
 	{
@@ -63,13 +62,9 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 		testassert.Require(t, !ok, "removed key %s still present", keys[0])
 	}
 
-	// An unmanaged removal (fresh manager does not own the key) is a no-op.
+	// An absent removal is a no-op success.
 	before, _, _ := ReadDotEnvKeys(envPath)
-	testassert.NoError(t, newMgr().Remove(keys[1]))
+	testassert.NoError(t, newMgr().Remove("LIGHTCODE_TEST_ABSENT"))
 	after, _, _ := ReadDotEnvKeys(envPath)
-	testassert.Require(t, len(before) == len(after), "unmanaged removal changed the file: %v -> %v", before, after)
-	{
-		_, ok := after[keys[1]]
-		testassert.Require(t, ok, "unmanaged key %s wrongly removed", keys[1])
-	}
+	testassert.Require(t, len(before) == len(after), "absent removal changed the file: %v -> %v", before, after)
 }

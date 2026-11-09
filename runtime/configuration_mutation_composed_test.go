@@ -40,6 +40,7 @@ func composedMutationSettings() protocol.Settings {
 // in-package suite keeps its copy because internal/plugins/* cannot be
 // imported from package runtime's own tests.
 type mutationEnv struct {
+	home       string
 	dataDir    string
 	configPath string
 }
@@ -47,10 +48,9 @@ type mutationEnv struct {
 func newMutationEnv(t *testing.T) mutationEnv {
 	t.Helper()
 	home, dataDir, configDir := t.TempDir(), t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
 	configPath := filepath.Join(configDir, "config.json")
 	testassert.NoError(t, os.WriteFile(configPath, []byte(`{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}},"extensions":{"agents":{"enabled":true},"adaptation":{"enabled":true}}}`), 0o600))
-	return mutationEnv{dataDir: dataDir, configPath: configPath}
+	return mutationEnv{home: home, dataDir: dataDir, configPath: configPath}
 }
 
 // TestComposedSettingsMutationThroughRealValidators proves the settings PUT
@@ -61,7 +61,7 @@ func newMutationEnv(t *testing.T) mutationEnv {
 func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 	ctx := context.Background()
 	e := newMutationEnv(t)
-	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
+	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, e.home, builtin.Plugins())
 	testassert.NoError(t, err)
 	sub, err := r.Subscribe(8)
 	testassert.NoError(t, err)
@@ -128,7 +128,7 @@ func TestComposedSettingsMutationThroughRealValidators(t *testing.T) {
 func TestComposedAgentModelMutationThroughRealRoster(t *testing.T) {
 	ctx := context.Background()
 	e := newMutationEnv(t)
-	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, builtin.Plugins())
+	r, err := runtime.OpenForTest(ctx, e.dataDir, e.configPath, e.home, builtin.Plugins())
 	testassert.NoError(t, err)
 	agentsPath := e.configPath
 	before, err := os.ReadFile(agentsPath)

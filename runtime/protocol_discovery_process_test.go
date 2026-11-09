@@ -28,7 +28,7 @@ import (
 // plays both the owning incumbent and the losing contender against the real
 // ownership lock, the real SQLite derivation, the real loopback listener, and
 // the real one-record publisher. Every child isolates HOME, DataDir and
-// ConfigPath under test temporary roots; the parent reads the credential only
+// construction inputs under test temporary roots; the parent reads the credential only
 // from the isolated 0600 discovery record, and no child ever prints it.
 
 const (
@@ -234,11 +234,11 @@ func newDiscoveryRoot(t *testing.T) (*ownerEnv, string) {
 // so concurrent children never rewrite them.
 func newDiscoveryChildEnv(t *testing.T, home, dataDir string) *ownerEnv {
 	t.Helper()
-	t.Setenv("HOME", home)
 	isolateBundledCredentials(t)
 	e := &ownerEnv{
 		t: t, home: home, dataDir: dataDir,
 		configPath: filepath.Join(dataDir, "config.json"),
+		envPath:    filepath.Join(home, ".lightcode", ".env"),
 		events:     &traceLog{},
 		server:     newProductionModelServer(t, "", ""),
 	}

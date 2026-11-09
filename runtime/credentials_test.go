@@ -179,7 +179,7 @@ func TestOperationCredentialsUsePreparedOpeningCapture(t *testing.T) {
 	defer svc.current().resources.release()
 
 	artifacts := newArtifactIntervals()
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), artifacts, nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), artifacts, nil, nil)
 	sessionID := testSessionID
 	prepared, err := p.bind()(context.Background(), harness.PreparationRequest{
 		Session: harness.PreparationSession{
@@ -242,7 +242,7 @@ func TestOperationCredentialNamesShareOnePreparationCapture(t *testing.T) {
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
 
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), newArtifactIntervals(), nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), newArtifactIntervals(), nil, nil)
 	sessionID := testSessionID
 	prepared, err := p.bind()(context.Background(), harness.PreparationRequest{
 		Session: harness.PreparationSession{
@@ -331,7 +331,7 @@ func TestDeclaredCredentialLazyWorkspaceUsesCandidateCapture(t *testing.T) {
 	defer svc.current().resources.release()
 	t.Setenv(name, "later-value")
 
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil, nil)
 	prepared, err := p.bind()(context.Background(), harness.PreparationRequest{
 		Session: harness.PreparationSession{
 			Identity:       harness.SessionIdentity{SessionID: testSessionID, Workspace: h.dataDir},
@@ -365,14 +365,16 @@ func TestExternalSharedCredentialRotationKeepsProviderObservation(t *testing.T) 
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
 	t.Setenv(name, "shared-later")
+	_, err = svc.publish(context.Background())
+	testassert.NoError(t, err)
 
 	captured, err := svc.capture(context.Background())
 	testassert.NoError(t, err)
-	testassert.Equal(t, captured.credentials[name].Value, "shared-later")
+	testassert.Equal(t, captured.snapshot.credentials[name].Value, "shared-later")
 	binding := captured.snapshot.declaredBindings[declaredField{extensionID: "credshared", field: "/operation"}]
-	testassert.Equal(t, binding.value, "shared-candidate")
+	testassert.Equal(t, binding.value, "shared-later")
 	activationBinding := captured.snapshot.declaredBindings[declaredField{extensionID: "credshared", field: "/activation"}]
-	testassert.Equal(t, activationBinding.value, "shared-candidate")
+	testassert.Equal(t, activationBinding.value, "shared-later")
 	operations := captured.operationSecrets()
 	testassert.Equal(t, operations["credshared"]["/operation"], "shared-later")
 	settings := projectSettings(captured.snapshot.sessions, captured.snapshot.tools, captured.snapshot.jobs, captured.snapshot.compaction, captured.snapshot.extensions)
@@ -388,7 +390,7 @@ func TestManagedKeyEditRefreshesSharedDeclaredBinding(t *testing.T) {
 	const name = "LIGHTCODE_SHARED_MANAGED"
 	h := newServiceHarness(t)
 	t.Cleanup(func() { _ = os.Unsetenv(name) })
-	managed := config.NewManagedEnvForTest(filepath.Join(h.home, ".lightcode", ".env"))
+	managed := config.NewManagedEnv(filepath.Join(h.home, ".lightcode", ".env"))
 	testassert.NoError(t, managed.TrySet(name, "old-value"))
 	native := credentialHostNative(t, "credmanaged", []extension.SecretRef{
 		{Field: "/activation", Lifetime: extension.SecretActivation},
@@ -398,7 +400,6 @@ func TestManagedKeyEditRefreshesSharedDeclaredBinding(t *testing.T) {
 	})
 	writeServiceFile(t, h.configPath, `{"providers":{"prov":`+nominalProvMember("http://prov.test/v1", name, `{"m":{"name":"M","context_window":4096}}`)+`},"extensions":{"credmanaged":{"enabled":true,"activation":"`+name+`","operation":"`+name+`"}}}`)
 	svc := h.preparedService(context.Background(), native)
-	svc.attachEnv(managed)
 	_, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	first := svc.current().resources
@@ -413,10 +414,10 @@ func TestManagedKeyEditRefreshesSharedDeclaredBinding(t *testing.T) {
 	testassert.Require(t, second != first, "a managed-key edit reused the stale resource set")
 	binding := mutation.snapshot.declaredBindings[declaredField{extensionID: "credmanaged", field: "/operation"}]
 	testassert.Equal(t, binding.value, "new-value")
-	testassert.Equal(t, managed.Capture([]string{name})[name].Value, "new-value")
+	testassert.Equal(t, captureValueForTest(t, managed, name), "new-value")
 	captured, err := svc.capture(context.Background())
 	testassert.NoError(t, err)
-	testassert.Equal(t, captured.credentials[name].Value, "new-value")
+	testassert.Equal(t, captured.snapshot.credentials[name].Value, "new-value")
 	defer svc.current().resources.release()
 }
 
@@ -436,8 +437,12 @@ func TestCredentialLifecycleCaptureCoversOperationAndInvocation(t *testing.T) {
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
 	t.Setenv(name, "later-value")
+	{
+		_, err := svc.publish(context.Background())
+		testassert.NoError(t, err)
+	}
 
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil, nil)
 	prepared, err := p.bind()(context.Background(), harness.PreparationRequest{
 		Session: harness.PreparationSession{
 			Identity:       harness.SessionIdentity{SessionID: testSessionID, Workspace: h.dataDir},
@@ -475,8 +480,12 @@ func TestCredentialLifecycleFailedPrefixCleanupKeepsCapture(t *testing.T) {
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
 	t.Setenv(name, "later-value")
+	{
+		_, err := svc.publish(context.Background())
+		testassert.NoError(t, err)
+	}
 
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil, nil)
 	prepared, err := p.bind()(context.Background(), harness.PreparationRequest{
 		Session: harness.PreparationSession{
 			Identity:       harness.SessionIdentity{SessionID: testSessionID, Workspace: h.dataDir},
@@ -584,8 +593,12 @@ func TestCredentialEffectfulHookUsesOperationCapture(t *testing.T) {
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
 	t.Setenv(name, "later-value")
+	{
+		_, err := svc.publish(context.Background())
+		testassert.NoError(t, err)
+	}
 
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil, nil)
 	prepared, err := p.bind()(context.Background(), harness.PreparationRequest{
 		Session: harness.PreparationSession{
 			Identity: harness.SessionIdentity{SessionID: testSessionID, Workspace: h.dataDir},
@@ -655,8 +668,12 @@ func TestCredentialStrategyCapturesAtItsOperationOpen(t *testing.T) {
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
 	t.Setenv(name, "later-value")
+	{
+		_, err := svc.publish(context.Background())
+		testassert.NoError(t, err)
+	}
 
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil, nil)
 	prepared, err := p.bind()(context.Background(), harness.PreparationRequest{
 		Session: harness.PreparationSession{
 			Identity: harness.SessionIdentity{SessionID: testSessionID, Workspace: h.dataDir},
@@ -757,7 +774,7 @@ func TestCredentialNestedProviderUsesItsOwnDeclaredField(t *testing.T) {
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
 
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil, nil)
 	prepared, err := p.bind()(context.Background(), harness.PreparationRequest{
 		Session: harness.PreparationSession{
 			Identity: harness.SessionIdentity{SessionID: testSessionID, Workspace: h.dataDir},
@@ -796,7 +813,7 @@ func TestCustomProviderCreateRefreshesSharedDeclaredBinding(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			h := newServiceHarness(t)
 			t.Cleanup(func() { _ = os.Unsetenv(testCase.envName) })
-			managed := config.NewManagedEnvForTest(filepath.Join(h.home, ".lightcode", ".env"))
+			managed := config.NewManagedEnv(filepath.Join(h.home, ".lightcode", ".env"))
 			if testCase.seedManaged {
 				testassert.NoError(t, managed.TrySet(testCase.envName, "old-managed"))
 			}
@@ -811,7 +828,6 @@ func TestCustomProviderCreateRefreshesSharedDeclaredBinding(t *testing.T) {
 			})
 			writeServiceFile(t, h.configPath, credentialServiceConfig(`{"credcreate":{"enabled":true,"activation":"`+testCase.envName+`","operation":"`+testCase.envName+`"}}`))
 			svc := h.preparedService(context.Background(), native)
-			svc.attachEnv(managed)
 			_, err := svc.publish(context.Background())
 			testassert.NoError(t, err)
 			firstResources := svc.current().resources
@@ -821,7 +837,7 @@ func TestCustomProviderCreateRefreshesSharedDeclaredBinding(t *testing.T) {
 			baseURL := "https://created.test/v1"
 			window := 4096
 			key := keyValue
-			mutation, err := svc.mutate(context.Background(), svc.editProviderCreate("newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &testCase.envName}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key))
+			mutation, err := svc.mutate(context.Background(), svc.editProviderCreate(context.Background(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &testCase.envName}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key))
 			testassert.NoError(t, err)
 			testassert.Require(t, svc.current().resources != firstResources, "custom create reused the stale resource set")
 			testassert.Equal(t, opens.Load(), int64(2))
@@ -831,11 +847,11 @@ func TestCustomProviderCreateRefreshesSharedDeclaredBinding(t *testing.T) {
 			testassert.Require(t, provider != nil && provider.Models["m"] != nil && provider.Models["m"].ContextWindow == window, "created provider = %+v, want the ready model", provider)
 			captured, err := svc.capture(context.Background())
 			testassert.NoError(t, err)
-			observed := captured.credentials[testCase.envName]
+			observed := captured.snapshot.credentials[testCase.envName]
 			testassert.Require(t, observed.Defined && observed.Managed && observed.Value == keyValue, "provider credential = %+v, want the supplied managed key", observed)
-			testassert.Require(t, catalog.ProviderConnected(provider, capturedEnvIsSet(captured.credentials)), "created provider = %+v, want the ready authenticated provider", provider)
+			testassert.Require(t, catalog.ProviderConnected(provider, capturedEnvIsSet(captured.snapshot.credentials)), "created provider = %+v, want the ready authenticated provider", provider)
 			testassert.Equal(t, captured.operationSecrets()["credcreate"]["/operation"], keyValue)
-			testassert.Equal(t, managed.Capture([]string{testCase.envName})[testCase.envName].Value, keyValue)
+			testassert.Equal(t, captureValueForTest(t, managed, testCase.envName), keyValue)
 			defer svc.current().resources.release()
 		})
 	}
@@ -870,10 +886,10 @@ func TestDefinedEmptyExternalSharedKeyRefusesSuppliedConnect(t *testing.T) {
 	generation := r.config.current().generation
 	captured, err := r.config.capture(context.Background())
 	testassert.NoError(t, err)
-	observed := captured.credentials[name]
+	observed := captured.snapshot.credentials[name]
 	testassert.Require(t, observed.Defined && !observed.Managed && observed.Value == "", "shared external observation = %+v, want the unchanged defined-empty external record", observed)
-	testassert.Equal(t, classifyKeySource(name, captured.credentials), config.KeySourceExternal)
-	testassert.Require(t, !capturedEnvIsSet(captured.credentials)(name), "defined-empty external shared key reported as set")
+	testassert.Equal(t, classifyKeySource(name, captured.snapshot.credentials), config.KeySourceExternal)
+	testassert.Require(t, !capturedEnvIsSet(captured.snapshot.credentials)(name), "defined-empty external shared key reported as set")
 
 	key := "supplied-key-must-refuse"
 	if _, err := r.connectProvider(context.Background(), "prov", &key); err == nil || !strings.Contains(err.Error(), "set externally") {
@@ -882,7 +898,7 @@ func TestDefinedEmptyExternalSharedKeyRefusesSuppliedConnect(t *testing.T) {
 	after, err := os.ReadFile(e.configPath)
 	testassert.NoError(t, err)
 	testassert.Require(t, string(after) == string(before), "refused connect rewrote the config document")
-	testassert.Require(t, !r.managedEnv.IsManaged(name), "refused connect managed the external shared key")
+	testassert.Require(t, !testManaged(r, name), "refused connect managed the external shared key")
 	testassert.Require(t, r.config.current().generation == generation, "refused connect consumed a configuration generation")
 }
 
@@ -902,7 +918,7 @@ func TestPreparationUsesCurrentCredentialObservationAfterStartup(t *testing.T) {
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
 
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), newArtifactIntervals(), nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), newArtifactIntervals(), nil, nil)
 	request := func(session string) harness.PreparationRequest {
 		return harness.PreparationRequest{
 			Session: harness.PreparationSession{
@@ -919,6 +935,8 @@ func TestPreparationUsesCurrentCredentialObservationAfterStartup(t *testing.T) {
 	defer oldPrepared.Release()
 
 	t.Setenv(name, "shared-later")
+	_, err = svc.publish(context.Background())
+	testassert.NoError(t, err)
 	newPrepared, err := p.bind()(context.Background(), request("session-new"))
 	testassert.NoError(t, err)
 	defer newPrepared.Release()
@@ -945,7 +963,7 @@ func TestPreparationUsesCurrentCredentialObservationAfterStartup(t *testing.T) {
 	run(oldPrepared, "session-old", "op-old", "inv-old", "shared-candidate")
 	probe.mu.Lock()
 	defer probe.mu.Unlock()
-	testassert.Equal(t, probe.values["shared-later"], "shared-candidate|shared-later")
+	testassert.Equal(t, probe.values["shared-later"], "shared-later|shared-later")
 	testassert.Equal(t, probe.values["shared-candidate"], "shared-candidate|shared-candidate")
 }
 
@@ -1068,37 +1086,33 @@ func TestProjectedShellUsesTheOwnerEnvironmentProjection(t *testing.T) {
 	t.Setenv("SHELL", "/bin/projected")
 	t.Setenv("EXTENSION_SECRET", "secret")
 	t.Setenv("KEEP", "value")
-	svc := newConfigurationService(context.Background(), &composition{}, nil, "", newObservation())
-	testassert.Require(t, svc.subprocessEnvironment() == nil, "nil manager produced an environment")
-	if got := projectedShell(svc.subprocessEnvironment); got != "unknown" {
-		t.Fatalf("projectedShell(nil manager) = %q, want unknown", got)
-	}
-	svc.env = config.NewManagedEnvForTest(filepath.Join(t.TempDir(), ".env"))
+	h := newServiceHarness(t)
+	svc := h.service(context.Background())
 
 	svc.published.Store(&configuration{catalog: &catalog.Catalog{}})
-	if got := projectedShell(svc.subprocessEnvironment); got != "/bin/projected" {
+	if got := projectedShell(context.Background(), svc.subprocessEnvironment); got != "/bin/projected" {
 		t.Fatalf("projectedShell(owner projection) = %q, want the projected shell", got)
 	}
 	svc.published.Store(&configuration{catalog: &catalog.Catalog{Providers: map[string]*catalog.Provider{
 		"p": {Transport: catalog.Transport{APIKeyEnv: "SHELL"}},
 	}}})
-	if got := projectedShell(svc.subprocessEnvironment); got != "unknown" {
+	if got := projectedShell(context.Background(), svc.subprocessEnvironment); got != "unknown" {
 		t.Fatalf("projectedShell(provider name) = %q, want unknown", got)
 	}
 	svc.published.Store(&configuration{catalog: &catalog.Catalog{}, secrets: []declaredSecret{{name: "EXTENSION_SECRET"}}})
-	projected := svc.subprocessEnvironment()
+	projected := subprocessEnvForTest(t, svc)
 	testassert.Require(t, !slices.Contains(projected, "EXTENSION_SECRET=secret") && slices.Contains(projected, "SHELL=/bin/projected") && slices.Contains(projected, "KEEP=value"), "owner projection = %v, want the declared name removed and siblings kept", projected)
 	svc.published.Store(&configuration{catalog: &catalog.Catalog{}})
 	svc.holdCredentialNames([]string{"SHELL"})
-	if got := projectedShell(svc.subprocessEnvironment); got != "unknown" {
+	if got := projectedShell(context.Background(), svc.subprocessEnvironment); got != "unknown" {
 		t.Fatalf("projectedShell(held name) = %q, want unknown", got)
 	}
 	svc.releaseCredentialNames([]string{"SHELL"})
-	if got := projectedShell(svc.subprocessEnvironment); got != "/bin/projected" {
+	if got := projectedShell(context.Background(), svc.subprocessEnvironment); got != "/bin/projected" {
 		t.Fatalf("projectedShell(released held name) = %q, want the projected shell", got)
 	}
 	t.Setenv("SHELL", "")
-	if got := projectedShell(svc.subprocessEnvironment); got != "unknown" {
+	if got := projectedShell(context.Background(), svc.subprocessEnvironment); got != "unknown" {
 		t.Fatalf("projectedShell(empty shell) = %q, want unknown", got)
 	}
 }
@@ -1289,10 +1303,10 @@ func TestDeclaredCredentialCapturesStayPerOperation(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// A changed value under the same name leaves the candidate activation
-	// binding unchanged while the next preparation's Operation observation
-	// reads the current environment.
+	// A changed value under the same name is observed at the next build.
 	t.Setenv(first, "changed-secret")
+	_, err = r.Reload(context.Background())
+	testassert.NoError(t, err)
 	secondSession := create()
 	submitThroughRuntime(t, r, secondSession.Identity.SessionID, "op-second", "hello")
 	awaitOperation(t, r, secondSession.Identity.SessionID, "op-second", harness.OperationSuccess)
@@ -1302,7 +1316,7 @@ func TestDeclaredCredentialCapturesStayPerOperation(t *testing.T) {
 	// old name and value.
 	writeServiceFile(t, e.configPath, credentialConfigDocument(e.server.URL, second, second))
 	revision, err := r.Reload(context.Background())
-	testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
+	testassert.Require(t, err == nil && revision == "3", "Reload = (%q, %v), want 3", revision, err)
 	testassert.Require(t, r.config.current().resources != firstResources, "the rotated declared binding reused the pre-reload resource set")
 	thirdSession := create()
 	submitThroughRuntime(t, r, thirdSession.Identity.SessionID, "op-third", "hello")
@@ -1313,11 +1327,10 @@ func TestDeclaredCredentialCapturesStayPerOperation(t *testing.T) {
 	probe.mu.Lock()
 	defer probe.mu.Unlock()
 	// The first Operation's activation and Operation captures predate both the
-	// value change and the rename. The second Operation's activation keeps the
-	// candidate binding while its preparation observation takes the changed
-	// value; the third captures the reloaded name.
+	// value change and the rename. The second Operation's revision captures the
+	// changed value; the third captures the reloaded name.
 	testassert.Equal(t, probe.values["first"], "first-secret|first-secret")
-	testassert.Equal(t, probe.values["changed"], "first-secret|changed-secret")
+	testassert.Equal(t, probe.values["changed"], "changed-secret|changed-secret")
 	testassert.Equal(t, probe.values["third"], "second-secret|second-secret")
 	// The first Operation's prepared exclusion still names the old variable
 	// after the reload renamed it, and the live revision adds the new one.
@@ -1416,4 +1429,12 @@ func (t *credentialGateTool) Execute(ctx context.Context, tc extension.ToolConte
 	t.probe.values[request.Key] = credentialString(activation) + "|" + credentialString(operation)
 	t.probe.mu.Unlock()
 	return credentialOutcome(prepared.CallID, "probed")
+}
+
+// captureValueForTest returns one managed file value.
+func captureValueForTest(t *testing.T, managed *config.ManagedEnv, name string) string {
+	t.Helper()
+	captured, err := managed.Capture([]string{name})
+	testassert.NoError(t, err)
+	return captured[name].Value
 }

@@ -21,7 +21,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -189,11 +188,10 @@ func awaitBackgroundCompletionBody(t *testing.T, server *productionModelServer) 
 	}
 }
 
-// TestSubprocessEnvironmentSerializesCaptureAndPublication proves the owner
-// projection holds one capture ownership across the held and current reads:
-// a capture registering OLD and a publication to NEW cannot land between
-// them.
-func TestSubprocessEnvironmentSerializesCaptureAndPublication(t *testing.T) {
+// TestSubprocessEnvironmentUsesCurrentRevision proves the child-environment
+// projection reads the current provider names from the published revision and
+// excludes them without a source call or a reader-visible lock.
+func TestSubprocessEnvironmentUsesCurrentRevision(t *testing.T) {
 	const oldName = "LIGHTCODE_COHERENCE_OLD"
 	const newName = "LIGHTCODE_COHERENCE_NEW"
 	t.Setenv(oldName, "old-value")
@@ -201,57 +199,17 @@ func TestSubprocessEnvironmentSerializesCaptureAndPublication(t *testing.T) {
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, `{"providers":{"prov":`+nominalProvMember("http://prov.test/v1", oldName, `{"m":{"name":"M","context_window":4096}}`)+`}}`)
 	svc := h.preparedService(context.Background())
-	svc.attachEnv(config.NewManagedEnvForTest(filepath.Join(h.home, ".lightcode", ".env")))
 	_, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
-	testassert.Require(t, !slices.Contains(svc.subprocessEnvironment(), oldName+"=old-value"), "initial owner projection kept the current provider name")
+	testassert.Require(t, !slices.Contains(subprocessEnvForTest(t, svc), oldName+"=old-value"), "initial owner projection kept the current provider name")
 
-	svc.heldMu.Lock()
-	var releaseHeld sync.Once
-	t.Cleanup(func() { releaseHeld.Do(func() { svc.heldMu.Unlock() }) })
-	projection := make(chan []string, 1)
-	go func() { projection <- svc.subprocessEnvironment() }()
-	entered := time.Now().Add(10 * time.Second)
-	for {
-		if svc.captureMu.TryLock() {
-			svc.captureMu.Unlock()
-			testassert.Require(t, time.Now().Before(entered), "owner projection never acquired capture ownership")
-			time.Sleep(time.Millisecond)
-			continue
-		}
-		break
-	}
-
-	captureDone := make(chan configurationCapture, 1)
-	go func() {
-		captured, captureErr := svc.capturePreparation(context.Background())
-		testassert.NoError(t, captureErr)
-		captureDone <- captured
-	}()
 	writeServiceFile(t, h.configPath, `{"providers":{"prov":`+nominalProvMember("http://prov.test/v1", newName, `{"m":{"name":"M","context_window":4096}}`)+`}}`)
-	publishDone := make(chan struct{})
-	go func() {
-		_, publishErr := svc.publish(context.Background())
-		testassert.NoError(t, publishErr)
-		close(publishDone)
-	}()
-	select {
-	case <-captureDone:
-		t.Fatal("capture completed while the owner projection held capture ownership")
-	case <-publishDone:
-		t.Fatal("publication completed while the owner projection held capture ownership")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	releaseHeld.Do(func() { svc.heldMu.Unlock() })
-	env := <-projection
-	testassert.Require(t, !slices.Contains(env, oldName+"=old-value"), "owner projection read a torn OLD environment: %v", env)
-	captured := <-captureDone
-	testassert.NoError(t, captured.snapshot.resources.release())
-	captured.releaseHeldNames()
-	<-publishDone
-	testassert.Require(t, svc.current().catalog.Providers["prov"].Transport.APIKeyEnv == newName, "publication did not install the new provider name")
+	_, err = svc.publish(context.Background())
+	testassert.NoError(t, err)
+	env := subprocessEnvForTest(t, svc)
+	testassert.Require(t, !slices.Contains(env, newName+"=new-value"), "owner projection kept the current provider name: %v", env)
+	testassert.Require(t, slices.Contains(env, oldName+"=old-value"), "owner projection dropped the released sibling: %v", env)
 }
 
 // TestBlockedCleanupDoesNotHoldProviderNames proves a cleanup resource
@@ -406,12 +364,11 @@ func TestCandidateResourceHoldsNamesBeforeOpen(t *testing.T) {
 		},
 	}
 	svc := h.preparedService(context.Background(), native)
-	svc.attachEnv(config.NewManagedEnvForTest(filepath.Join(h.home, ".lightcode", ".env")))
 	writeServiceFile(t, h.configPath, credentialServiceConfig(`{"credlife":{"enabled":true}}`))
 	_, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	defer svc.current().resources.release()
-	testassert.Require(t, slices.Contains(svc.subprocessEnvironment(), name+"=candidate-open-value"), "initial projection did not expose the ordinary name")
+	testassert.Require(t, slices.Contains(subprocessEnvForTest(t, svc), name+"=candidate-open-value"), "initial projection did not expose the ordinary name")
 
 	parkOpen.Store(true)
 	failSibling.Store(true)
@@ -427,18 +384,18 @@ func TestCandidateResourceHoldsNamesBeforeOpen(t *testing.T) {
 		t.Fatal("candidate author Open never entered")
 	}
 	testassert.Equal(t, parkedValue, "candidate-open-value")
-	testassert.Require(t, !slices.Contains(svc.subprocessEnvironment(), name+"=candidate-open-value"), "name was not held while the candidate author Open was parked")
+	testassert.Require(t, !slices.Contains(subprocessEnvForTest(t, svc), name+"=candidate-open-value"), "name was not held while the candidate author Open was parked")
 	releaseOpen()
 	select {
 	case <-cleanupEntered:
 	case <-time.After(10 * time.Second):
 		t.Fatal("candidate prefix cleanup never entered")
 	}
-	testassert.Require(t, !slices.Contains(svc.subprocessEnvironment(), name+"=candidate-open-value"), "name was not held during candidate prefix cleanup")
+	testassert.Require(t, !slices.Contains(subprocessEnvForTest(t, svc), name+"=candidate-open-value"), "name was not held during candidate prefix cleanup")
 	releaseCleanup()
 	parkCleanup.Store(false)
 	testassert.Require(t, <-buildDone != nil, "candidate with a failing sibling succeeded")
-	testassert.Require(t, slices.Contains(svc.subprocessEnvironment(), name+"=candidate-open-value"), "name stayed held after an unpublished candidate unwound")
+	testassert.Require(t, slices.Contains(subprocessEnvForTest(t, svc), name+"=candidate-open-value"), "name stayed held after an unpublished candidate unwound")
 }
 
 func cleanupProviderConfig(endpoint, keyEnv, declaredName string) string {
@@ -614,8 +571,16 @@ func TestFailedPreparationReleasesHeldCredentialNames(t *testing.T) {
 	defer svc.current().resources.release()
 	testassert.Require(t, !slices.Contains(svc.heldCredentialNames(), name), "published provider name was held without a reserving capture")
 
-	p := newPreparation(svc, h.home, "", "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil)
+	p := newPreparation(svc, h.locations(), "", nil, newObservationAdapter(newObservation(), newWarningStore()), nil, nil, nil)
 	_, err = p.bind()(context.Background(), harness.PreparationRequest{Session: harness.PreparationSession{Identity: harness.SessionIdentity{SessionID: testSessionID, Workspace: h.dataDir}}})
 	testassert.Require(t, err != nil, "discarded preparation without a selection succeeded")
 	testassert.Require(t, !slices.Contains(svc.heldCredentialNames(), name), "discarded preparation leaked held name %q: %v", name, svc.heldCredentialNames())
+}
+
+// subprocessEnvForTest resolves the owner's child-environment projection.
+func subprocessEnvForTest(t *testing.T, svc *configurationService) []string {
+	t.Helper()
+	env, err := svc.subprocessEnvironment(context.Background())
+	testassert.NoError(t, err)
+	return env
 }

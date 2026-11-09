@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -35,22 +36,41 @@ type composeEnv struct {
 	home       string
 	dataDir    string
 	configPath string
+	envPath    string
 }
 
 func newComposeEnv(t *testing.T) *composeEnv {
 	t.Helper()
 	home, dataDir, configDir := t.TempDir(), t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
+	ensureDotEnv(t, home)
 	isolateBundledCredentials(t)
 	configPath := filepath.Join(configDir, "config.json")
 	testassert.NoError(t, os.WriteFile(configPath, []byte(composedConfigDocument), 0o600))
-	return &composeEnv{t: t, home: home, dataDir: dataDir, configPath: configPath}
+	return &composeEnv{t: t, home: home, dataDir: dataDir, configPath: configPath, envPath: filepath.Join(home, ".lightcode", ".env")}
 }
 
 // openComposed constructs the Runtime over the included store.
+func (e *composeEnv) locations() Locations {
+	return Locations{
+		GlobalRulesDir:     filepath.Join(e.home, ".lightcode"),
+		DiscoveryCacheDir:  filepath.Join(e.home, ".lightcode", "cache", "discovery"),
+		WorkspacePolicyDir: filepath.Join(e.home, ".lightcode", "projects"),
+	}
+}
+
+func (e *composeEnv) options(plugins ...extension.Native) Options {
+	return Options{
+		DataDir:       e.dataDir,
+		Configuration: NewFileConfigurationSource(e.configPath),
+		Credentials:   NewEnvironmentCredentialSource(e.envPath),
+		Locations:     e.locations(),
+		Plugins:       plugins,
+	}
+}
+
 func (e *composeEnv) openComposed(ctx context.Context) (*Runtime, error) {
 	e.t.Helper()
-	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath})
+	return Open(ctx, e.options())
 }
 
 // treeFiles maps every file under root, relative slash path to bytes.

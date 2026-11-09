@@ -536,7 +536,7 @@ func (t runCommandTool) Prepare(_ context.Context, tc ToolContext, call model.To
 			// The environment resolves immediately at this process start,
 			// never at Prepare: a key connected after the call was prepared
 			// is still scrubbed, and a shell sibling stays visible.
-			env, envErr := commandEnvironment(tc)
+			env, envErr := commandEnvironment(ctx, tc)
 			if envErr != nil {
 				return commandEnvironmentFailure(call.ID, envErr)
 			}
@@ -553,11 +553,14 @@ var errNoSubprocessEnv = errors.New("run_command: no subprocess environment prod
 // the ToolContext's call-time producer. A missing callback — or a producer
 // reporting no environment — is an ordinary error the caller renders with no
 // process start; there is no ambient-environment fallback.
-func commandEnvironment(tc ToolContext) ([]string, error) {
+func commandEnvironment(ctx context.Context, tc ToolContext) ([]string, error) {
 	if tc.SubprocessEnv == nil {
 		return nil, errNoSubprocessEnv
 	}
-	env := tc.SubprocessEnv()
+	env, err := tc.SubprocessEnv(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if env == nil {
 		return nil, errors.New("run_command: subprocess environment producer returned no environment")
 	}
@@ -587,11 +590,11 @@ func (t runCommandTool) backgroundOutcome(_ context.Context, callID, command str
 	if err != nil {
 		return backgroundStartOutcome(callID, err)
 	}
-	err = tc.Background.StartJob(jobID, func(_ context.Context, deliver func(string) error) error {
+	err = tc.Background.StartJob(jobID, func(ctx context.Context, deliver func(string) error) error {
 		// The environment resolves at the admitted start handoff — never at
 		// Prepare — and the exact slice is the job process's environment; a
 		// nil snapshot fails the start instead of inheriting ambient secrets.
-		env, envErr := commandEnvironment(tc)
+		env, envErr := commandEnvironment(ctx, tc)
 		if envErr != nil {
 			return envErr
 		}

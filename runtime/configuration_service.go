@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/protocol"
@@ -22,21 +22,11 @@ import (
 // stays unwrapped.
 var ErrConfiguration = errors.New("runtime: configuration failure")
 
-// The first-run document enables the supplied optional extensions without
-// choosing a model. Existing configuration files are never rewritten here.
-const (
-	mainConfigSkeleton = `{
-  "providers": {},
-  "extensions": {"agents": {"enabled": true}, "adaptation": {"enabled": true}}
-}
-`
-)
-
 // configurationService is the private Runtime configuration service. It
-// owns plugin registrations, captures the main document once per build and
-// composes only enabled installed plugins. Provider assembly uses
-// Loader.LoadCaptured; active Agent definitions and extension settings are
-// validated before factories run and the candidate can publish.
+// owns plugin registrations, reads the supplied document once per build and
+// composes only enabled installed plugins. Provider assembly uses the
+// catalog loader's captured entries; active Agent definitions and extension
+// settings are validated before factories run and the candidate can publish.
 //
 // One service-local build mutex serializes initial load and reload from input
 // reads through publication. The current snapshot is one atomic pointer that
@@ -47,10 +37,13 @@ const (
 // publication carries its passive configuration event inside the same
 // observation section as its atomic Store.
 type configurationService struct {
-	loader     *catalog.Loader
-	configPath string
-	natives    []extension.Native
-	nativeIDs  map[string]bool
+	loader        *catalog.Loader
+	configuration ConfigurationSource
+	credentials   CredentialSource
+	locations     Locations
+	strategy      *harness.StrategyBinding
+	natives       []extension.Native
+	nativeIDs     map[string]bool
 
 	owner       context.Context
 	obs         *observation
@@ -64,21 +57,10 @@ type configurationService struct {
 	// (isolated service tests) drops only that passive presentation.
 	warnings *warningStore
 
-	// env is the Runtime's retained managed-environment manager, attached
-	// like the warning store; nil (isolated service tests) makes every key
-	// action the manager's own typed failure — no manager is constructed on
-	// demand.
-	env *config.ManagedEnv
-
 	// buildMu serializes initial load, reload, and every mutation's input
-	// read through candidate construction. captureMu is the separate
-	// publication/capture owner: readers sample the ready pointer and the
-	// credential names it references under it, and a writer takes it before
-	// any mutable credential effect and holds it through publication. A slow
-	// build therefore never blocks reads, and no reader can observe a
-	// managed effect before the generation that owns it.
+	// read through candidate construction. Readers load the ready snapshot
+	// pointer without it; credentials are published inside that snapshot.
 	buildMu   sync.Mutex
-	captureMu sync.Mutex
 	published atomic.Pointer[configuration]
 
 	// heldMu owns the owner-wide private reference counts for credential
@@ -89,14 +71,13 @@ type configurationService struct {
 }
 
 // configurationCapture joins one published immutable configuration revision
-// with the owner-coherent credential observations its catalog references.
-// The named snapshot field keeps the captured revision explicit at every
-// consumer: no promoted access can read a field without naming the snapshot,
-// and the credential map is infrastructure data that never reaches a
-// protocol DTO, durable capture, error, or log.
+// with the credential observations its catalog references. The named snapshot
+// field keeps the captured revision explicit at every consumer: no promoted
+// access can read a field without naming the snapshot, and the credential map
+// is infrastructure data that never reaches a protocol DTO, durable capture,
+// error, or log.
 type configurationCapture struct {
-	snapshot    *configuration
-	credentials map[string]config.EnvValue
+	snapshot *configuration
 
 	// releaseNames drops this reserving capture's private name reference
 	// counts after its resource cleanup finishes. It is nil for non-reserving
@@ -105,23 +86,25 @@ type configurationCapture struct {
 }
 
 // newConfigurationService binds the service to the composition's owned
-// declarations, the Loader rooted at the home the Runtime resolved once, the
-// Runtime owner context, and the Runtime's passive observation. Neither DataDir nor ConfigPath
-// relocates the home-based discovery cache or its locks and TTL records, and
-// the service reads no dotenv: that belongs to Runtime startup, not to any
-// build or reload.
-func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configPath string, obs *observation) *configurationService {
+// declarations, the supplied configuration, credential and location sources,
+// the Runtime owner context, and the Runtime's passive observation. No build
+// reads a home directory, process environment, or path not named by these
+// inputs.
+func newConfigurationService(owner context.Context, c *composition, loader *catalog.Loader, configuration ConfigurationSource, credentials CredentialSource, locations Locations, strategy *harness.StrategyBinding, obs *observation) *configurationService {
 	nativeIDs := make(map[string]bool, len(c.natives))
 	for _, native := range c.natives {
 		nativeIDs[native.Declaration.ID] = true
 	}
 	return &configurationService{
-		loader:     loader,
-		configPath: configPath,
-		natives:    c.natives,
-		nativeIDs:  nativeIDs,
-		owner:      owner,
-		obs:        obs,
+		loader:        loader,
+		configuration: configuration,
+		credentials:   credentials,
+		locations:     locations,
+		strategy:      strategy,
+		natives:       c.natives,
+		nativeIDs:     nativeIDs,
+		owner:         owner,
+		obs:           obs,
 	}
 }
 
@@ -131,48 +114,56 @@ func (s *configurationService) current() *configuration {
 	return s.published.Load()
 }
 
-// capture takes publication/capture ownership, checks cancellation and owner
-// lifetime, loads the ready pointer once, and samples the credential names
-// that pointer's catalog references through the environment owner. The mutex
-// is released before any projection, preparation, plugin, or network work, so
-// callers hold one owned observation and never a lock. A nil pointer (no
-// publication yet) yields the zero capture, matching current()'s contract.
+// capture takes one owned capture: cancellation, the ready snapshot pointer,
+// and optional resource retention. Readers never take the build mutex and
+// never sample a credential source; the published snapshot carries the
+// configuration and its credential observations as one pair.
 func (s *configurationService) capture(ctx context.Context) (configurationCapture, error) {
 	return s.captureFor(ctx, false)
 }
 
 func (s *configurationService) captureFor(ctx context.Context, reserve bool) (configurationCapture, error) {
-	s.captureMu.Lock()
-	defer s.captureMu.Unlock()
 	return s.captureBody(ctx, reserve)
 }
 
-// capturePreparation is the explicit preparation admission capture: the same
-// common capture body under captureMu, followed by its owner-wide name hold
-// before the mutex releases. No consumer can observe an accepted preparation
-// whose names are not yet registered.
+// capturePreparation is the explicit preparation admission capture: the
+// published-pointer load and its owner-wide name hold happen under heldMu, so
+// the child-environment union never observes an accepted preparation whose
+// names are not yet registered. No source call or publication runs here.
 func (s *configurationService) capturePreparation(ctx context.Context) (configurationCapture, error) {
-	s.captureMu.Lock()
-	defer s.captureMu.Unlock()
-	captured, err := s.captureBody(ctx, true)
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+	captured, err := s.captureBodyLocked(ctx, true)
 	if err != nil {
 		return configurationCapture{}, err
 	}
-	if captured.snapshot != nil && captured.snapshot.resources != nil {
-		names := make([]string, 0, len(captured.credentials))
-		for name := range captured.credentials {
+	if captured.snapshot != nil && captured.snapshot.resources != nil && len(captured.snapshot.credentials) != 0 {
+		names := make([]string, 0, len(captured.snapshot.credentials))
+		for name := range captured.snapshot.credentials {
 			names = append(names, name)
 		}
-		s.holdCredentialNames(names)
+		s.holdCredentialNamesLocked(names)
 		captured.releaseNames = func() { s.releaseCredentialNames(names) }
 	}
 	return captured, nil
 }
 
-// captureBody is the common reservation body under captureMu: cancellation,
-// one ready pointer, optional resource retention and the one credential
-// observation. Generic resource captures do not become admission name holds.
+// captureBody is the common reservation body: cancellation, one ready pointer
+// and optional resource retention. A reserving load and its retain run under
+// heldMu, the same short mutex the publication Store takes, so a retain can
+// never follow a Store that released the old set. Generic resource captures do
+// not become admission name holds.
 func (s *configurationService) captureBody(ctx context.Context, reserve bool) (configurationCapture, error) {
+	if !reserve {
+		return s.captureBodyLocked(ctx, false)
+	}
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+	return s.captureBodyLocked(ctx, true)
+}
+
+// captureBodyLocked is captureBody under the caller-held heldMu when reserving.
+func (s *configurationService) captureBodyLocked(ctx context.Context, reserve bool) (configurationCapture, error) {
 	if err := s.canceled(ctx); err != nil {
 		return configurationCapture{}, err
 	}
@@ -183,7 +174,7 @@ func (s *configurationService) captureBody(ctx context.Context, reserve bool) (c
 	if reserve && snapshot.resources != nil {
 		snapshot.resources.retain()
 	}
-	return configurationCapture{snapshot: snapshot, credentials: s.captureCredentials(snapshot)}, nil
+	return configurationCapture{snapshot: snapshot}, nil
 }
 
 func (c configurationCapture) releaseHeldNames() {
@@ -201,6 +192,10 @@ func (s *configurationService) holdCredentialNames(names []string) {
 	}
 	s.heldMu.Lock()
 	defer s.heldMu.Unlock()
+	s.holdCredentialNamesLocked(names)
+}
+
+func (s *configurationService) holdCredentialNamesLocked(names []string) {
 	if s.heldNames == nil {
 		s.heldNames = make(map[string]int)
 	}
@@ -245,28 +240,17 @@ func (s *configurationService) heldCredentialNames() []string {
 }
 
 // subprocessEnvironment is the one production child-environment projection:
-// it takes the managed-environment snapshot, the current revision's provider
-// and declared names, and the owner-wide held-name union under one
-// publication/capture ownership. A capture or publication therefore cannot
-// land between the held and current reads. No lock survives this call. A nil
-// manager yields no environment, preserving fail-closed command behavior; a
-// nil ready snapshot contributes no current names.
-func (s *configurationService) subprocessEnvironment() []string {
-	if s.env == nil {
-		return nil
-	}
-	s.captureMu.Lock()
-	defer s.captureMu.Unlock()
-	env := s.env.SubprocessEnv()
-	if env == nil {
-		return nil
-	}
+// under heldMu it collects the owner-wide held-name union, the current
+// revision's provider and declared names, then releases the lock and asks the
+// credential source for the process environment without those names. No lock
+// survives the source call. An error fails the spawn through the command
+// path.
+func (s *configurationService) subprocessEnvironment(ctx context.Context) ([]string, error) {
 	var names []string
 	s.heldMu.Lock()
 	for name := range s.heldNames {
 		names = append(names, name)
 	}
-	s.heldMu.Unlock()
 	current := s.published.Load()
 	if current != nil {
 		for _, prov := range current.catalog.Providers {
@@ -276,61 +260,112 @@ func (s *configurationService) subprocessEnvironment() []string {
 		}
 		names = append(names, current.declaredSecretNames()...)
 	}
-	return config.EnvWithoutKeys(env, names)
+	s.heldMu.Unlock()
+	return s.credentials.SubprocessEnv(ctx, names)
 }
 
-// captureCredentials samples the union of every nonempty api_key_env the
-// captured catalog references and every declared reference name in one
-// environment-owner observation. The returned EnvValue records are the
-// owner's actual observations, unchanged; declared candidate bindings govern
-// extension activation/Operation resources and never rewrite provider
-// Value/Defined/Managed. Capture owns the dedupe; a nil manager samples the
-// environment alone (no managed ownership).
-func (s *configurationService) captureCredentials(snapshot *configuration) map[string]config.EnvValue {
-	names := make([]string, 0, len(snapshot.catalog.Providers)+len(snapshot.secrets))
-	for _, prov := range snapshot.catalog.Providers {
-		if prov != nil && prov.Transport.APIKeyEnv != "" {
-			names = append(names, prov.Transport.APIKeyEnv)
+// captureCredentials performs one credential observation for a build over the
+// union of every nonempty api_key_env the candidate catalog references and
+// every declared reference name, then folds the candidate's pending connection
+// key action into that same map. A mutation supplies the observation already
+// taken over the latest document as base; names first introduced by the
+// candidate are captured here and merged, so each name is observed exactly
+// once in the build. Provider and declared observations derive from the one
+// resulting map, and no source call runs after the owning write.
+func (s *configurationService) captureCredentials(ctx context.Context, names []string, key *connectionEffects, base map[string]CredentialValue) (map[string]CredentialValue, error) {
+	seen := make(map[string]bool, len(names)+1)
+	unique := make([]string, 0, len(names)+1)
+	for _, name := range names {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		unique = append(unique, name)
+	}
+	if key != nil && key.keyEnv != "" && !seen[key.keyEnv] {
+		unique = append(unique, key.keyEnv)
+	}
+	var missing []string
+	if base != nil {
+		for _, name := range unique {
+			if _, ok := base[name]; !ok {
+				missing = append(missing, name)
+			}
+		}
+	} else {
+		missing = unique
+	}
+	captured := make(map[string]CredentialValue, len(unique))
+	if len(missing) != 0 {
+		fresh, err := s.credentials.Capture(ctx, missing)
+		if err != nil {
+			return nil, err
+		}
+		for name, value := range fresh {
+			captured[name] = value
 		}
 	}
-	for _, secret := range snapshot.secrets {
-		names = append(names, secret.name)
+	if base != nil {
+		for name := range seen {
+			if value, ok := base[name]; ok {
+				captured[name] = value
+			}
+		}
 	}
-	return s.env.Capture(names)
+	if key != nil && key.keyEnv != "" {
+		switch key.keyAction {
+		case keyActionSet:
+			captured[key.keyEnv] = CredentialValue{Value: key.keyValue, Defined: true, Managed: true}
+		case keyActionRemove:
+			captured[key.keyEnv] = CredentialValue{}
+		}
+	}
+	return captured, nil
 }
 
-// captureDeclaredBindings takes one private candidate observation of the
-// active declared field names and values. A pending connection key action is
-// applied to the matching binding so a build that only later writes the
-// managed key does not publish a stale declared binding. The result is used
-// for resource-set adoption and every component activation value; it is never
-// durable.
-func (s *configurationService) captureDeclaredBindings(secrets []declaredSecret, key *connectionEffects) map[declaredField]declaredBinding {
+// credentialValues projects one captured credential map onto the catalog
+// loader's value-only view. Discovery readiness and authorization consume only
+// the non-empty value; ownership stays in the published revision.
+func credentialValues(captured map[string]CredentialValue) map[string]string {
+	out := make(map[string]string, len(captured))
+	for name, value := range captured {
+		if value.Value != "" {
+			out[name] = value.Value
+		}
+	}
+	return out
+}
+
+// capturedCredentialNames returns the candidate catalog's provider credential
+// names and every active declared name, the one capture input set.
+func capturedCredentialNames(cat *catalog.Catalog, secrets []declaredSecret) []string {
+	var names []string
+	if cat != nil {
+		names = make([]string, 0, len(cat.Providers)+len(secrets))
+		for _, prov := range cat.Providers {
+			if prov != nil && prov.Transport.APIKeyEnv != "" {
+				names = append(names, prov.Transport.APIKeyEnv)
+			}
+		}
+	}
+	for _, secret := range secrets {
+		names = append(names, secret.name)
+	}
+	return names
+}
+
+// captureDeclaredBindings derives the active declared field bindings from the
+// same build capture. A pending connection key action is applied to the
+// matching binding so a build that only later writes the managed key does not
+// publish a stale declared binding. The result is used for resource-set
+// adoption and every component activation value; it is never durable.
+func captureDeclaredBindings(secrets []declaredSecret, captured map[string]CredentialValue) map[declaredField]declaredBinding {
 	if len(secrets) == 0 {
 		return nil
 	}
-	names := make([]string, 0, len(secrets))
-	seen := make(map[string]bool, len(secrets))
-	for _, secret := range secrets {
-		if seen[secret.name] {
-			continue
-		}
-		seen[secret.name] = true
-		names = append(names, secret.name)
-	}
-	captured := s.env.Capture(names)
 	out := make(map[declaredField]declaredBinding, len(secrets))
 	for _, secret := range secrets {
-		value := captured[secret.name].Value
-		if key != nil && key.keyEnv == secret.name {
-			switch key.keyAction {
-			case keyActionSet:
-				value = key.keyValue
-			case keyActionRemove:
-				value = ""
-			}
-		}
-		out[declaredField{extensionID: secret.extensionID, field: secret.field}] = declaredBinding{name: secret.name, value: value}
+		out[declaredField{extensionID: secret.extensionID, field: secret.field}] = declaredBinding{name: secret.name, value: captured[secret.name].Value}
 	}
 	return out
 }
@@ -348,7 +383,7 @@ func (c configurationCapture) operationSecrets() map[string]map[string]string {
 		if secret.lifetime != extension.SecretOperation {
 			continue
 		}
-		value := c.credentials[secret.name].Value
+		value := c.snapshot.credentials[secret.name].Value
 		if value == "" {
 			continue
 		}
@@ -373,18 +408,12 @@ func (s *configurationService) attachWarnings(warnings *warningStore) {
 	s.warnings = warnings
 }
 
-// attachEnv wires the Runtime's retained managed-environment manager: the
-// one connection key actions write through.
-func (s *configurationService) attachEnv(env *config.ManagedEnv) {
-	s.env = env
-}
-
 // publish runs one serialized initial-load or reload build and publishes the
 // complete candidate with its next generation as a single atomic Store,
 // carrying the configuration event in the same observation section as that
-// Store. Publication/capture ownership is taken only after the candidate
-// validated, so the build never blocks reads of the ready revision; the
-// commit releases both mutexes before the enqueue.
+// Store. No publication mutex is held during the build; readers load the ready
+// pointer without waiting, and the commit releases the build mutex before the
+// enqueue.
 func (s *configurationService) publish(ctx context.Context) (configurationCapture, error) {
 	if err := s.canceled(ctx); err != nil {
 		return configurationCapture{}, err
@@ -420,7 +449,6 @@ func (s *configurationService) publish(ctx context.Context) (configurationCaptur
 		}
 		return configurationCapture{}, err
 	}
-	s.captureMu.Lock()
 	return s.commit(candidate), nil
 }
 
@@ -439,25 +467,22 @@ func (s *configurationService) nextGeneration() (uint64, error) {
 }
 
 // commit publishes the validated candidate as the ready snapshot with its
-// events; the caller holds the build and capture mutexes. It captures the
-// candidate catalog's credential observations after every accepted key effect
-// and uses those values for the setup warnings, so the published revision and
-// the credentials its projection consumes are one frozen pair. The global
-// warning groups follow the published candidate inside the one observation
-// section, so a later publication can never interleave an earlier candidate's
-// refresh and no nested publication exists. The section stores the candidate,
-// releases the capture then the build mutex, and enqueues the configuration
-// event plus one final runtime-scoped warning event exactly when any group
-// changed — each changed group keeps its own revision increment. No
-// observation callback reacquires capture ownership.
+// events; the caller holds the build mutex. The candidate already carries the
+// one credential capture its construction consumed, so the published revision
+// and its credential observations are one frozen pair. The global warning
+// groups follow the published candidate inside the one observation section, so
+// a later publication can never interleave an earlier candidate's refresh and
+// no nested publication exists. The section stores the candidate, releases the
+// build mutex, and enqueues the configuration event plus one final
+// runtime-scoped warning event exactly when any group changed — each changed
+// group keeps its own revision increment.
 func (s *configurationService) commit(candidate *configuration) configurationCapture {
-	credentials := s.captureCredentials(candidate)
-	captured := configurationCapture{snapshot: candidate, credentials: credentials}
+	captured := configurationCapture{snapshot: candidate}
 	previous := s.published.Load()
 	s.obs.publish(func() []Event {
 		warningChanged := false
 		if s.warnings != nil {
-			warningChanged = s.warnings.setGlobal(setupSource, setupWarnings(candidate, credentials)) || warningChanged
+			warningChanged = s.warnings.setGlobal(setupSource, setupWarnings(candidate, candidate.credentials)) || warningChanged
 			warningChanged = s.warnings.setGlobal(catalogSource, catalogWarnings(candidate.catalogWarnings)) || warningChanged
 		}
 		var events []Event
@@ -467,8 +492,9 @@ func (s *configurationService) commit(candidate *configuration) configurationCap
 			events = append(events, scopeEvent(protocol.ScopeOpened, candidate.resources.runtime.info))
 		}
 		revision := s.warnings.storeRevision()
+		s.heldMu.Lock()
 		s.published.Store(candidate)
-		s.captureMu.Unlock()
+		s.heldMu.Unlock()
 		s.buildMu.Unlock()
 		events = append(events, configurationChangedEvent(candidate.generation))
 		if warningChanged {
@@ -505,9 +531,12 @@ func (s *configurationService) canceled(ctx context.Context) error {
 	return nil
 }
 
-// build captures the main document once and passes it to candidate construction.
+// build reads the supplied configuration document once and passes it to
+// candidate construction. The source, not the owner, decides how the document
+// is stored; a missing document is a configuration failure and is never
+// created here.
 func (s *configurationService) build(ctx context.Context, generation uint64) (*configuration, error) {
-	configData, err := captureConfiguredFile(s.configPath, mainConfigSkeleton)
+	configData, err := s.configuration.Read(ctx)
 	if err != nil {
 		return nil, configurationFailure(fmt.Errorf("read main configuration: %w", err))
 	}
@@ -533,6 +562,13 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 // connection candidate is fully validated before its caller's first
 // persistence and is never rebuilt after it.
 func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData []byte, conn, key *connectionEffects) (*configuration, error) {
+	return s.buildCapturedFrom(ctx, generation, configData, conn, key, nil)
+}
+
+// buildCapturedFrom is buildCaptured with a mutation's prior credential
+// observation; names it already captured are reused and only new candidate
+// names are observed.
+func (s *configurationService) buildCapturedFrom(ctx context.Context, generation uint64, configData []byte, conn, key *connectionEffects, base map[string]CredentialValue) (*configuration, error) {
 	if candidateBarrier != nil {
 		candidateBarrier()
 	}
@@ -550,9 +586,10 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 	if err != nil {
 		return nil, configurationFailure(err)
 	}
+	graph.defaultStrategy = s.strategy
 	var built catalog.BuildResult
 	if conn == nil {
-		built, err = s.loader.LoadCaptured(ctx, doc.Providers)
+		built, err = s.loader.AssembleCaptured(ctx, doc.Providers)
 	} else {
 		built, err = s.loader.LoadCapturedConnection(ctx, doc.Providers, conn.providerID, conn.transport, conn.discovered)
 	}
@@ -562,13 +599,29 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 		}
 		return nil, configurationFailure(err)
 	}
-	snapshot, err := newConfiguration(generation, doc, built, captureWorkspacePermissions())
+	secrets := resolveDeclaredSecrets(active, doc.Extensions)
+	credentials, err := s.captureCredentials(ctx, capturedCredentialNames(built.Catalog, secrets), key, base)
+	if err != nil {
+		return nil, configurationFailure(err)
+	}
+	if conn == nil {
+		built, err = s.loader.RefreshCaptured(ctx, doc.Providers, built, credentialValues(credentials))
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			return nil, configurationFailure(err)
+		}
+	}
+	snapshot, err := newConfiguration(generation, doc, built, captureWorkspacePermissions(s.locations.WorkspacePolicyDir))
 	if err != nil {
 		return nil, configurationFailure(err)
 	}
 	snapshot.composition = graph
-	snapshot.secrets = resolveDeclaredSecrets(active, doc.Extensions)
-	snapshot.declaredBindings = s.captureDeclaredBindings(snapshot.secrets, key)
+	snapshot.credentials = credentials
+	snapshot.secrets = secrets
+	snapshot.declaredBindings = captureDeclaredBindings(secrets, credentials)
+	snapshot.strategy = s.strategy
 	if err := s.validateExtensions(ctx, graph, doc.Extensions); err != nil {
 		return nil, err
 	}
@@ -591,19 +644,18 @@ var (
 	prePublishBarrier func()
 )
 
-// captureWorkspacePermissions enumerates the home-based per-Workspace
+// captureWorkspacePermissions enumerates the selected per-Workspace
 // permission inventory during one configuration build and captures each
-// present readable permissions.json's raw bytes keyed by its directory ID. A
-// missing directory is the fresh-install absent case and a failed enumeration
-// leaves the whole Workspace policy level absent for this revision; a missing
-// or unreadable file inside the inventory is absent policy for that Workspace
-// alone. A successfully read malformed file is captured unchanged —
-// resolution determines validity from the raw bytes. No enumeration failure
-// fails publication, and nothing here reads project records, meta.json, or
-// locks.
-func captureWorkspacePermissions() map[string]json.RawMessage {
-	root, err := config.ProjectsDir()
-	if err != nil {
+// present readable permissions.json's raw bytes keyed by its directory ID. An
+// empty location is the absent Workspace policy level; a missing directory is
+// the fresh-install absent case and a failed enumeration leaves the whole
+// Workspace policy level absent for this revision; a missing or unreadable
+// file inside the inventory is absent policy for that Workspace alone. A
+// successfully read malformed file is captured unchanged — resolution
+// determines validity from the raw bytes. No enumeration failure fails
+// publication, and nothing here reads project records, meta.json, or locks.
+func captureWorkspacePermissions(root string) map[string]json.RawMessage {
+	if root == "" {
 		return nil
 	}
 	entries, err := os.ReadDir(root)
@@ -640,21 +692,6 @@ func (s *configurationService) validateExtensions(ctx context.Context, graph *co
 		return configurationFailure(err)
 	}
 	return nil
-}
-
-// captureConfiguredFile reads one configured input file's bytes once and
-// preserves the first-run skeleton: a missing file is exclusively created
-// with the same content the retained loaders write, then re-read, so a losing
-// concurrent creator observes the winner's content.
-func captureConfiguredFile(path, skeleton string) ([]byte, error) {
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		if _, err := atomicfs.CreateExclusive(path, []byte(skeleton), 0o600); err != nil {
-			return nil, err
-		}
-		data, err = os.ReadFile(path)
-	}
-	return data, err
 }
 
 // configurationFailure classifies a complete candidate failure while

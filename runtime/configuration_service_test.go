@@ -43,12 +43,12 @@ type serviceHarness struct {
 func newServiceHarness(t *testing.T) *serviceHarness {
 	t.Helper()
 	h := &serviceHarness{t: t, home: t.TempDir(), dataDir: t.TempDir()}
-	// One isolated HOME for every harness consumer: the publisher's
-	// Workspace-permission capture resolves the home-based projects
-	// directory, so no test here ever reads the real user HOME.
-	t.Setenv("HOME", h.home)
+	ensureDotEnv(t, h.home)
 	h.configPath = filepath.Join(h.dataDir, "config.json")
-	h.loader = catalog.NewLoader(h.home, staticBundledFS())
+	if _, err := os.Stat(h.configPath); os.IsNotExist(err) {
+		writeServiceFile(t, h.configPath, `{"providers":{},"extensions":{"agents":{"enabled":true},"adaptation":{"enabled":true}}}`)
+	}
+	h.loader = catalog.NewLoader(filepath.Join(h.home, ".lightcode", "cache", "discovery"), staticBundledFS())
 	return h
 }
 
@@ -63,7 +63,18 @@ func (h *serviceHarness) serviceWithDefaults(owner context.Context, defaults []s
 	if err != nil {
 		h.t.Fatalf("newComposition: %v", err)
 	}
-	return newConfigurationService(owner, c, h.loader, h.configPath, newObservation())
+	return newConfigurationService(owner, c, h.loader,
+		NewFileConfigurationSource(h.configPath),
+		NewEnvironmentCredentialSource(filepath.Join(h.home, ".lightcode", ".env")),
+		h.locations(), nil, newObservation())
+}
+
+func (h *serviceHarness) locations() Locations {
+	return Locations{
+		GlobalRulesDir:     filepath.Join(h.home, ".lightcode"),
+		DiscoveryCacheDir:  filepath.Join(h.home, ".lightcode", "cache", "discovery"),
+		WorkspacePolicyDir: filepath.Join(h.home, ".lightcode", "projects"),
+	}
 }
 
 func staticBundledFS() fstest.MapFS {
@@ -286,7 +297,7 @@ func TestResourceFactoryWithoutWarningSink(t *testing.T) {
 		return extension.Instance{Capabilities: map[string]extension.Implementation{"capability.alpha": testServiceImplementation()}}, nil
 	}
 	c := mustComposition(t, p)
-	s := newConfigurationService(context.Background(), c, h.loader, h.configPath, newObservation())
+	s := h.service(context.Background(), p)
 	s.composition, s.dataDir = c, h.dataDir
 	_, err := s.publish(context.Background())
 	testassert.NoError(t, err)
@@ -889,30 +900,28 @@ func TestConfigurationServiceChecksCancellationBeforePublication(t *testing.T) {
 	t.Run("caller canceled before waiting", func(t *testing.T) {
 		h := newServiceHarness(t)
 		svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, nil))
+		source := &countingConfigurationSource{inner: NewFileConfigurationSource(h.configPath)}
+		svc.configuration = source
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		{
 			_, err := svc.publish(ctx)
 			testassert.Require(t, errors.Is(err, context.Canceled), "publish = %v, want the caller context error", err)
 		}
-		{
-			_, err := os.Stat(h.configPath)
-			testassert.Require(t, os.IsNotExist(err), "a pre-canceled publish started input reads: %v", err)
-		}
+		testassert.Require(t, source.reads.Load() == 0, "a pre-canceled publish started input reads")
 	})
 	t.Run("owner canceled before waiting", func(t *testing.T) {
 		owner, cancelOwner := context.WithCancel(context.Background())
 		h := newServiceHarness(t)
 		svc := h.service(owner, servicePlugin("alpha", &h.opens, nil))
+		source := &countingConfigurationSource{inner: NewFileConfigurationSource(h.configPath)}
+		svc.configuration = source
 		cancelOwner()
 		{
 			_, err := svc.publish(context.Background())
 			testassert.Require(t, errors.Is(err, ErrClosed), "publish = %v, want ErrClosed for the canceled owner", err)
 		}
-		{
-			_, err := os.Stat(h.configPath)
-			testassert.Require(t, os.IsNotExist(err), "an owner-canceled publish started input reads: %v", err)
-		}
+		testassert.Require(t, source.reads.Load() == 0, "an owner-canceled publish started input reads")
 	})
 	t.Run("caller canceled after the last validator", func(t *testing.T) {
 		h := newServiceHarness(t)
@@ -939,6 +948,8 @@ func TestConfigurationServiceChecksCancellationBeforePublication(t *testing.T) {
 		caller, cancelCaller := context.WithCancel(context.Background())
 		h := newServiceHarness(t)
 		svc := h.service(owner, servicePlugin("alpha", &h.opens, nil))
+		source := &countingConfigurationSource{inner: NewFileConfigurationSource(h.configPath)}
+		svc.configuration = source
 		sub, err := svc.obs.subscribe(4)
 		testassert.NoError(t, err)
 		t.Cleanup(sub.Close)
@@ -954,10 +965,7 @@ func TestConfigurationServiceChecksCancellationBeforePublication(t *testing.T) {
 		default:
 		}
 		testassert.Require(t, svc.current() == nil, "a canceled publication stored a snapshot")
-		{
-			_, err := os.Stat(h.configPath)
-			testassert.Require(t, os.IsNotExist(err), "a both-done publish started input reads: %v", err)
-		}
+		testassert.Require(t, source.reads.Load() == 0, "a both-done publish started input reads")
 	})
 	t.Run("owner canceled after the last validator", func(t *testing.T) {
 		owner, cancelOwner := context.WithCancel(context.Background())
@@ -1116,38 +1124,27 @@ func TestConfigurationServiceGenerationOverflow(t *testing.T) {
 	testassert.Require(t, svc.current() == exhausted, "the overflow failure replaced the published snapshot")
 }
 
-// TestConfigurationServiceKeepsFirstRunSkeletons proves a fresh machine
-// build creates exactly the retained first-run skeleton contents and starts
-// successfully on their defaults, including a selected Agent whose model is
-// wholly missing.
-func TestConfigurationServiceKeepsFirstRunSkeletons(t *testing.T) {
+// TestConfigurationServiceDoesNotCreateConfiguration proves the owner never
+// creates the supplied document: a missing source is the ordinary
+// configuration failure and leaves the path absent.
+func TestConfigurationServiceDoesNotCreateConfiguration(t *testing.T) {
 	h := newServiceHarness(t)
+	testassert.NoError(t, os.Remove(h.configPath))
 	svc := h.preparedService(context.Background(), fixtureAgentPlugin())
-	first, err := svc.publish(context.Background())
-	testassert.NoError(t, err)
-	if configData, err := os.ReadFile(h.configPath); err != nil || string(configData) != mainConfigSkeleton {
-		t.Fatalf("first-run config = %q (%v), want the retained skeleton", string(configData), err)
-	}
-	if _, err := os.Stat(filepath.Join(h.dataDir, "agents.json")); !os.IsNotExist(err) {
-		t.Fatalf("first-run agents.json: %v, want absent", err)
-	}
-	testassert.Equal(t, len(first.snapshot.definitions), 5)
-
-	writeServiceFile(t, h.configPath, `{"extensions":{"agents":{"enabled":true,"definitions":{"plain":{}}}}}`)
-	second, err := svc.publish(context.Background())
-	testassert.NoError(t, err)
+	candidate, err := svc.publish(context.Background())
+	testassert.Require(t, candidate.snapshot == nil && errors.Is(err, ErrConfiguration), "missing configuration publish = (%v, %v), want ErrConfiguration without publication", candidate, err)
 	{
-		found, model := hasDefinition(second.snapshot, "plain")
-		testassert.Require(t, found && model == "", "plain definition = (%v, %q), want the roster with a wholly empty model", found, model)
+		_, statErr := os.Stat(h.configPath)
+		testassert.Require(t, os.IsNotExist(statErr), "the owner created the configuration document: %v", statErr)
 	}
 }
 
-// TestConfigurationServiceKeepsHomeBasedCachePaths proves neither an
-// alternate ConfigPath nor a separate data root relocates the discovery
-// cache: the publication and its TTL record stay under the once-resolved
-// home, the service creates no dotenv itself, and the data directory holds
-// exactly the captured input files.
-func TestConfigurationServiceKeepsHomeBasedCachePaths(t *testing.T) {
+// TestConfigurationServiceUsesSelectedLocations proves an alternate
+// configuration path and data root do not relocate the selected discovery
+// cache: the publication and its TTL record stay under the supplied location,
+// the service creates no dotenv itself, and the data directory holds exactly
+// the captured input files.
+func TestConfigurationServiceUsesSelectedLocations(t *testing.T) {
 	home := t.TempDir()
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
@@ -1164,7 +1161,7 @@ func TestConfigurationServiceKeepsHomeBasedCachePaths(t *testing.T) {
 
 	h := newServiceHarness(t)
 	h.home = home
-	h.loader = catalog.NewLoader(home, bundled)
+	h.loader = catalog.NewLoader(h.locations().DiscoveryCacheDir, bundled)
 	h.configPath = configPath
 	writeServiceFile(t, configPath, `{}`)
 	svc := h.service(context.Background(), servicePlugin("alpha", &h.opens, nil))
@@ -1413,4 +1410,19 @@ func TestConfigurationServiceProjectsHostSelectedDefaultCapabilities(t *testing.
 	for _, def := range snapshot.snapshot.definitions {
 		testassert.Require(t, def.inputs.Capabilities == nil, "%s capabilities = %q, want none without host defaults", def.name, def.inputs.Capabilities)
 	}
+}
+
+// countingConfigurationSource counts document reads around a real source.
+type countingConfigurationSource struct {
+	inner ConfigurationSource
+	reads atomic.Int64
+}
+
+func (s *countingConfigurationSource) Read(ctx context.Context) ([]byte, error) {
+	s.reads.Add(1)
+	return s.inner.Read(ctx)
+}
+
+func (s *countingConfigurationSource) Write(ctx context.Context, data []byte) error {
+	return s.inner.Write(ctx, data)
 }

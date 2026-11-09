@@ -1,8 +1,6 @@
 package catalog
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -12,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -26,7 +23,6 @@ import (
 )
 
 func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
-	t.Setenv("TEST_DISCOVERY_API_KEY", "secret-token")
 	seenRequest := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenRequest = true
@@ -69,7 +65,7 @@ func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
 			Headers:   map[string]string{"X-Test-Header": "yes"},
 		},
 	}
-	discovered, err := FetchDiscovery(context.Background(), server.Client(), provider)
+	discovered, err := FetchDiscovery(context.Background(), server.Client(), discoveryProviderWithCredential(provider, "secret-token"))
 	testassert.NoError(t, err)
 	testassert.Require(t, seenRequest, "test server was not called")
 	rich := discovered.Models["rich"]
@@ -208,7 +204,7 @@ func TestDiscoveryCacheWriteReadRoundTripLoadsAttempt(t *testing.T) {
 		},
 	}}, fetchedAt))
 	{
-		_, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "local.json"))
+		_, err := os.Stat(filepath.Join(home, "local.json"))
 		testassert.NoError(t, err)
 	}
 
@@ -231,7 +227,7 @@ func TestDiscoveryCacheWriteReadRoundTripLoadsAttempt(t *testing.T) {
 
 func TestReadDiscoveryCacheSkipsMalformedFilesWithWarning(t *testing.T) {
 	home := t.TempDir()
-	path := filepath.Join(home, ".lightcode", "cache", "discovery", "bad.json")
+	path := filepath.Join(home, "bad.json")
 	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 	testassert.NoError(t, os.WriteFile(path, []byte(`{not json`), 0o600))
 
@@ -242,7 +238,7 @@ func TestReadDiscoveryCacheSkipsMalformedFilesWithWarning(t *testing.T) {
 
 func TestReadDiscoveryCacheOldShapeWithoutMetadataKeepsUnknown(t *testing.T) {
 	home := t.TempDir()
-	path := filepath.Join(home, ".lightcode", "cache", "discovery", "local.json")
+	path := filepath.Join(home, "local.json")
 	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 	testassert.NoError(t, os.WriteFile(path, []byte(`{
 		"fetched_at": "2026-05-30T00:00:00Z",
@@ -592,7 +588,7 @@ func TestConcurrentAttemptAndDiscoveryWriteLoseNeither(t *testing.T) {
 	testassert.Require(t, len(warnings) == 0, "ReadDiscoveryCache warnings = %#v, want none", warnings)
 	gotModels := cache["p"].Models
 	testassert.Require(t, len(gotModels) == 2 && gotModels["fresh-a"].Name == "Fresh A" && gotModels["fresh-b"].Name == "Fresh B", "fresh discovery lost by concurrent attempt write: got %d models, want [fresh-a fresh-b]", len(gotModels))
-	data, err := os.ReadFile(filepath.Join(discoveryCacheDir(home), "p.json"))
+	data, err := os.ReadFile(filepath.Join(home, "p.json"))
 	testassert.NoError(t, err)
 	var raw discoveryCacheFile
 	testassert.NoError(t, json.Unmarshal(data, &raw))
@@ -716,7 +712,7 @@ func TestConcurrentDiscoveryWritesDoNotTearFile(t *testing.T) {
 		}()
 		wg.Wait()
 
-		data, err := os.ReadFile(filepath.Join(discoveryCacheDir(home), "p.json"))
+		data, err := os.ReadFile(filepath.Join(home, "p.json"))
 		testassert.Require(t, err == nil, "round %d: read cache file: %v", round, err)
 		var raw discoveryCacheFile
 		{
@@ -753,7 +749,7 @@ func TestTryDiscoveryWriterRows(t *testing.T) {
 		testassert.Require(t, !got, "TryWriteDiscoveryAttempt acquired while the lock was held")
 		testassert.NoError(t, err)
 		{
-			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			_, statErr := os.Stat(filepath.Join(home, "p.json"))
 			testassert.Require(t, os.IsNotExist(statErr), "contended attempt write created the cache file: %v", statErr)
 		}
 	})
@@ -777,7 +773,7 @@ func TestTryDiscoveryWriterRows(t *testing.T) {
 		testassert.Require(t, !got, "TryWriteDiscoveryCache acquired while the lock was held")
 		testassert.NoError(t, err)
 		{
-			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			_, statErr := os.Stat(filepath.Join(home, "p.json"))
 			testassert.Require(t, os.IsNotExist(statErr), "contended cache write created the cache file: %v", statErr)
 		}
 	})
@@ -806,12 +802,12 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		}))
 		defer server.Close()
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: server.URL + "/v1"}}
-		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, nil, time.Now().UTC())
 		testassert.Require(t, attempted, "FetchDiscoveryIfDue did not mark the network attempt")
 		testassert.Require(t, discovered != nil && len(discovered.Models) == 1, "discovered = %#v, want one model", discovered)
 		testassert.Require(t, len(warnings) == 0, "warnings = %#v, want none", warnings)
 		{
-			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			_, statErr := os.Stat(filepath.Join(home, "p.json"))
 			testassert.Require(t, os.IsNotExist(statErr), "fetch-only core wrote the cache: %v", statErr)
 		}
 	})
@@ -821,12 +817,12 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		// TTL suppression.
 		home := t.TempDir()
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
-		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, nil, time.Now().UTC())
 		testassert.Require(t, attempted, "FetchDiscoveryIfDue did not mark the network attempt on a valid-request failure")
 		testassert.Require(t, discovered == nil, "discovered = %#v, want nil on failure", discovered)
 		testassert.Require(t, len(warnings) == 1 && warnings[0].Kind == "discovery_failure", "warnings = %#v, want one discovery_failure", warnings)
 		{
-			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			_, statErr := os.Stat(filepath.Join(home, "p.json"))
 			testassert.Require(t, os.IsNotExist(statErr), "fetch-only core wrote the attempt on failure: %v", statErr)
 		}
 	})
@@ -837,12 +833,12 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		// is created through either wrapper.
 		home := t.TempDir()
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "not an absolute url"}}
-		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, nil, time.Now().UTC())
 		testassert.Require(t, !attempted, "FetchDiscoveryIfDue marked an attempt for a pre-network URL validation failure")
 		testassert.Require(t, discovered == nil, "discovered = %#v, want nil for an invalid request", discovered)
 		testassert.Require(t, len(warnings) == 1 && warnings[0].Kind == "discovery_failure", "warnings = %#v, want one discovery_failure", warnings)
 		{
-			_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
+			_, statErr := os.Stat(filepath.Join(home, "p.json"))
 			testassert.Require(t, os.IsNotExist(statErr), "invalid-request core created an attempt/cache marker: %v", statErr)
 		}
 	})
@@ -850,7 +846,7 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		home := t.TempDir()
 		testassert.NoError(t, WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC()))
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
-		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, nil, time.Now().UTC())
 		testassert.Require(t, !attempted && discovered == nil && len(warnings) == 0, "FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a recent attempt", attempted, discovered, warnings)
 	})
 	t.Run("missing_key_suppresses", func(t *testing.T) {
@@ -858,189 +854,13 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		t.Setenv("LIGHTCODE_FETCH_DUE_KEY", "")
 		_ = os.Unsetenv("LIGHTCODE_FETCH_DUE_KEY")
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1", APIKeyEnv: "LIGHTCODE_FETCH_DUE_KEY"}}
-		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, nil, time.Now().UTC())
 		testassert.Require(t, !attempted && discovered == nil && len(warnings) == 0, "FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) without a key", attempted, discovered, warnings)
 	})
 	t.Run("disabled_provider_suppresses", func(t *testing.T) {
 		home := t.TempDir()
 		provider := &Provider{ID: "p", Discovery: false, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
-		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, time.Now().UTC())
+		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, nil, time.Now().UTC())
 		testassert.Require(t, !attempted && discovered == nil && len(warnings) == 0, "FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a disabled provider", attempted, discovered, warnings)
 	})
-}
-
-// TestRefreshProviderDiscoveryTryContention proves the Try refresh wrapper
-// returns a warning and publishes nothing when a foreign process holds the
-// provider's discovery lock: no attempt, no cache, no catalog merge.
-func TestRefreshProviderDiscoveryTryContention(t *testing.T) {
-	home := t.TempDir()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"m","name":"M","context_window":4096}]}`))
-	}))
-	defer server.Close()
-	cat := &Catalog{Providers: map[string]*Provider{
-		"p": {ID: "p", Builtin: true, Discovery: true, Models: map[string]*Model{}, Transport: Transport{BaseURL: server.URL + "/v1"}},
-	}}
-	holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "p"))
-	testassert.Require(t, err == nil && ok, "seed TryAcquire: (%v, %v)", ok, err)
-	defer holder.Release()
-
-	changed, warnings := RefreshProviderDiscoveryTryWithConfigPath(context.Background(), home, "", cat, "p")
-	testassert.Require(t, !changed, "Try refresh reported a change under foreign lock contention")
-	testassert.Require(t, len(warnings) != 0 && strings.Contains(warnings[0].Message, "lock"), "warnings = %#v, want a discovery lock contention warning", warnings)
-	{
-		_, statErr := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
-		testassert.Require(t, os.IsNotExist(statErr), "contended Try refresh wrote the cache: %v", statErr)
-	}
-	testassert.Require(t, len(cat.Providers["p"].Models) == 0, "contended Try refresh merged models into the catalog: %#v", cat.Providers["p"].Models)
-}
-
-// discoveryBlockHolderEnv selects the child half of
-// TestRefreshProviderDiscoveryBlocksUntilRelease and names the discovery lock
-// path the child holds.
-const discoveryBlockHolderEnv = "LIGHTCODE_CATALOG_DISCOVERY_BLOCK_HOLDER"
-
-// TestRefreshProviderDiscoveryBlocksUntilRelease proves the blocking refresh
-// wrapper stays blocked for startup callers: with a foreign process holding
-// the provider's discovery lock, it stays parked and completes once the holder
-// releases. It is the positive control beside the one-attempt Try wrapper. The
-// holder is a self-exec child of this test binary, so the contention is a real
-// cross-process flock, not a same-process open.
-func TestRefreshProviderDiscoveryBlocksUntilRelease(t *testing.T) {
-	if lockPath := os.Getenv(discoveryBlockHolderEnv); lockPath != "" {
-		l, err := atomicfs.Acquire(lockPath)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		fmt.Println("ready")
-		_, _ = io.Copy(io.Discard, os.Stdin)
-		if err := l.Release(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(3)
-		}
-		os.Exit(0)
-	}
-
-	home := t.TempDir()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":"m","name":"M","context_window":4096}]}`))
-	}))
-	defer server.Close()
-	cat := &Catalog{Providers: map[string]*Provider{
-		"p": {ID: "p", Builtin: true, Discovery: true, Models: map[string]*Model{}, Transport: Transport{BaseURL: server.URL + "/v1"}},
-	}}
-	lockPath := discoveryLockPath(home, "p")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRefreshProviderDiscoveryBlocksUntilRelease$")
-	cmd.Env = append(os.Environ(), discoveryBlockHolderEnv+"="+lockPath)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		cancel()
-		t.Fatalf("child stdin pipe: %v", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		t.Fatalf("child stdout pipe: %v", err)
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		cancel()
-		t.Fatalf("start child: %v", err)
-	}
-	ready := make(chan struct{})
-	scannerDone := make(chan struct{})
-	go func() {
-		defer close(scannerDone)
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			if scanner.Text() == "ready" {
-				close(ready)
-				return
-			}
-		}
-	}()
-	reap := func() error {
-		_ = stdin.Close()
-		err := cmd.Wait()
-		<-scannerDone
-		return err
-	}
-	fail := func() string {
-		cancel()
-		_ = reap()
-		return stderr.String()
-	}
-	t.Cleanup(func() { cancel(); _ = reap() })
-	select {
-	case <-ready:
-	case <-ctx.Done():
-		t.Fatalf("child never held the discovery lock within %v: %v\n%s", 30*time.Second, ctx.Err(), fail())
-	}
-
-	started := make(chan struct{})
-	done := make(chan struct {
-		changed  bool
-		warnings []Warning
-	}, 1)
-	go func() {
-		close(started)
-		changed, warnings := RefreshProviderDiscoveryWithConfigPath(context.Background(), home, "", cat, "p")
-		done <- struct {
-			changed  bool
-			warnings []Warning
-		}{changed, warnings}
-	}()
-	<-started
-	select {
-	case <-done:
-		t.Fatal("blocking refresh returned while the foreign process held the discovery lock; the startup wrapper must stay blocked")
-	case <-time.After(100 * time.Millisecond):
-	}
-	if err := reap(); err != nil {
-		t.Fatalf("child after release: %v\n%s", err, stderr.String())
-	}
-	select {
-	case res := <-done:
-		testassert.Require(t, res.changed && len(res.warnings) == 0, "blocking refresh after release = (%v, %#v), want (true, none)", res.changed, res.warnings)
-	case <-time.After(5 * time.Second):
-		t.Fatal("blocking refresh did not complete after the holder released")
-	}
-	testassert.Require(t, len(cat.Providers["p"].Models) == 1, "merged models = %#v, want the fetched model", cat.Providers["p"].Models)
-}
-
-// TestRefreshWrappersDoNotMarkInvalidURLAttempt proves a pre-network URL
-// validation failure through either refresh wrapper creates no attempt or
-// cache marker: both the blocking and the one-attempt Try wrapper return the
-// existing discovery_failure warning with attempted=false, so no
-// discovery/<id>.json file is ever created for a request that never reached
-// the network.
-func TestRefreshWrappersDoNotMarkInvalidURLAttempt(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		run  func(home string, cat *Catalog) (bool, []Warning)
-	}{
-		{"blocking", func(home string, cat *Catalog) (bool, []Warning) {
-			return RefreshProviderDiscoveryWithConfigPath(context.Background(), home, "", cat, "p")
-		}},
-		{"try", func(home string, cat *Catalog) (bool, []Warning) {
-			return RefreshProviderDiscoveryTryWithConfigPath(context.Background(), home, "", cat, "p")
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
-			cat := &Catalog{Providers: map[string]*Provider{
-				"p": {ID: "p", Discovery: true, Transport: Transport{BaseURL: "not an absolute url"}},
-			}}
-			changed, warnings := tc.run(home, cat)
-			testassert.Require(t, !changed, "invalid-URL refresh reported a change")
-			testassert.Require(t, len(warnings) == 1 && warnings[0].Kind == "discovery_failure", "warnings = %#v, want one discovery_failure", warnings)
-			{
-				_, err := os.Stat(filepath.Join(discoveryCacheDir(home), "p.json"))
-				testassert.Require(t, os.IsNotExist(err), "invalid-URL %s wrapper created an attempt/cache marker: %v", tc.name, err)
-			}
-		})
-	}
 }

@@ -1137,7 +1137,7 @@ func TestPreparationHooksAreOrderedAndValidated(t *testing.T) {
 					testassert.Require(t, slices.Equal(toolNames(got.Tools), []string{"echo", "read"}), "capture tools = %v, want the eligible catalog subset", got.Tools)
 					testassert.Require(t, got.Tools[0].Description == "" && got.Tools[0].Parameters[0] == '{', "capture tool = %+v, want the definition's untouched metadata", got.Tools[0])
 					testassert.Require(t, got.Pricing != nil && got.Pricing.Input != nil && *got.Pricing.Input == 1.5 && got.Compact.Model == prepModelRef, "capture pricing/compact = %+v, want the catalog-owned values", got)
-					testassert.Require(t, got.Strategy.ID == productionStrategy.ID && got.ConfigurationRevision == "1", "capture strategy/revision = %+v/%q, want the core-owned values", got.Strategy, got.ConfigurationRevision)
+					testassert.Require(t, got.Strategy.ID == harness.IncludedStrategyID && got.ConfigurationRevision == "1", "capture strategy/revision = %+v/%q, want the core-owned values", got.Strategy, got.ConfigurationRevision)
 					testassert.Require(t, got.SystemPrompt != "mutated prompt" && strings.HasSuffix(got.SystemPrompt, "|second"), "capture prompt = %.120s, want the assembled baseline with the accepted contribution only", got.SystemPrompt)
 					testassert.NoError(t, e.converge())
 				})

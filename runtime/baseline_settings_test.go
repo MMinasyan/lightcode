@@ -42,7 +42,7 @@ func baselineSettingsPrep(t *testing.T, agentsDoc, endpoint string) (configurati
 	svc := sh.preparedService(owner, compact, fixtureAgentPlugin(compact))
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return captured, newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
+	return captured, newPreparation(svc, sh.locations(), "", nil, nil, nil, nil, nil)
 }
 
 // TestBaselineSettingsDriveToolsJobsAndCompaction proves the top-level
@@ -90,7 +90,7 @@ func TestBaselineSettingsDriveToolsJobsAndCompaction(t *testing.T) {
 		AdmittedEntry: harness.EntryRef{SessionID: testSessionID, EntryID: testEntryID},
 		Invocation:    invocation,
 		Background:    scriptBackground{},
-		SubprocessEnv: func() []string { return []string{} },
+		SubprocessEnv: func(context.Context) ([]string, error) { return []string{}, nil },
 	}, backgroundCall)
 	testassert.Require(t, plan.Immediate == nil && plan.Execute != nil, "background plan = %+v, want one executor", plan)
 	outcome := plan.Execute(context.Background())
@@ -173,7 +173,7 @@ func TestCompactionSettingsResetRestoresFallbackDefaults(t *testing.T) {
 	svc := sh.preparedService(owner, compact, fixtureAgentPlugin(compact))
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	prep := newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
+	prep := newPreparation(svc, sh.locations(), "", nil, nil, nil, nil, nil)
 
 	prepare := func(t *testing.T, captured configurationCapture) harness.ExecutionCapture {
 		t.Helper()
@@ -215,7 +215,7 @@ func newBaselineSettingsService(t *testing.T, configDoc string) (*serviceHarness
 	svc := sh.preparedService(owner, compact, fixtureAgentPlugin(compact))
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return sh, svc, newPreparation(svc, sh.home, "", "", nil, nil, nil, nil), captured
+	return sh, svc, newPreparation(svc, sh.locations(), "", nil, nil, nil, nil, nil), captured
 }
 
 // prepareCompactCapture runs one concrete preparation over a selection built
@@ -242,7 +242,7 @@ func startBackgroundForTest(t *testing.T, invocation Invocation) jobs.StartReque
 		AdmittedEntry: harness.EntryRef{SessionID: testSessionID, EntryID: testEntryID},
 		Invocation:    invocation,
 		Background:    scriptBackground{},
-		SubprocessEnv: func() []string { return []string{} },
+		SubprocessEnv: func(context.Context) ([]string, error) { return []string{}, nil },
 	}, call)
 	testassert.Require(t, plan.Immediate == nil && plan.Execute != nil, "background plan = %+v, want one executor", plan)
 	outcome := plan.Execute(context.Background())

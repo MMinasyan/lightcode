@@ -42,6 +42,8 @@ type configuration struct {
 	extensions           map[string]json.RawMessage
 	secrets              []declaredSecret
 	declaredBindings     map[declaredField]declaredBinding
+	credentials          map[string]CredentialValue
+	strategy             *harness.StrategyBinding
 	userProviders        map[string]any
 	permissions          json.RawMessage
 	workspacePermissions map[string]json.RawMessage
@@ -230,16 +232,26 @@ func projectSettingsObject(raw json.RawMessage) json.RawMessage {
 	return append(json.RawMessage(nil), raw...)
 }
 
-// permissionPolicy resolves this revision's automatic policy for one
+// policyInputs resolves this revision's captured permission inputs for one
 // Workspace from the captured global permissions member and the captured
 // Workspace permission bytes keyed by directory ID; neither input is reread.
-// An absent Workspace capture is an absent Workspace policy level, and any
-// malformed block follows the built-in fallback posture inside
-// ResolvePermissionPolicy.
-func (c *configuration) permissionPolicy(workspace string) harness.PermissionPolicy {
+// An absent Workspace capture is an absent Workspace policy level.
+func (c *configuration) policyInputs(workspace string) PolicyInputs {
 	var workspaceRaw json.RawMessage
 	if id, err := config.WorkspacePermissionDirID(workspace); err == nil {
 		workspaceRaw = c.workspacePermissions[id]
 	}
-	return harness.ResolvePermissionPolicy(c.permissions, workspaceRaw)
+	return PolicyInputs{
+		Workspace:       workspace,
+		Global:          append(json.RawMessage(nil), c.permissions...),
+		WorkspacePolicy: append(json.RawMessage(nil), workspaceRaw...),
+	}
+}
+
+// permissionPolicy resolves this revision's automatic policy for one
+// Workspace from its captured inputs. Any malformed block follows the
+// built-in fallback posture inside ResolvePermissionPolicy.
+func (c *configuration) permissionPolicy(workspace string) harness.PermissionPolicy {
+	inputs := c.policyInputs(workspace)
+	return harness.ResolvePermissionPolicy(inputs.Global, inputs.WorkspacePolicy)
 }

@@ -168,6 +168,10 @@ type composition struct {
 	// Runtime scope binds as its own provided capabilities.
 	standardValues map[string]Tool
 
+	// defaultStrategy is the host-selected default strategy binding used when
+	// no strategy ID is selected.
+	defaultStrategy *harness.StrategyBinding
+
 	// reportWarning is the owner's neutral plugin-warning sink.
 	reportWarning func(pluginID, kind, message string)
 

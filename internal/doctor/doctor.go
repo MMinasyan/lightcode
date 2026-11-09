@@ -100,7 +100,7 @@ func Run(p Params) (Report, bool) {
 	catalogChecks(result.Warnings, len(result.Catalog.Providers), add)
 
 	// Providers. The connection resolver mirrors the agent's effective
-	// environment after LoadDotEnv: shell presence (even an empty export)
+	// environment observed by the credential source: shell presence (even an empty export)
 	// shadows .env, and a credential resolves only when the effective
 	// value is non-empty — a template-style `KEY=` line defines the name
 	// but connects nothing.
@@ -247,9 +247,9 @@ func providerChecks(cat *catalog.Catalog, dotenvKeys map[string]bool, lookupEnv 
 	anyConnected := false
 	// Agent-parity key-source adapters: external means a non-empty shell
 	// value (an empty export classifies none, as the agent's Getenv check
-	// does); managed means the name is defined in .env and not shadowed by
-	// the shell — LoadDotEnv marks even empty .env values managed, but
-	// skips keys the shell already set.
+	// does); managed means the name is defined in the managed file and not shadowed
+	// by the shell — an empty .env value is managed, while a shell-set name
+	// stays external.
 	external := func(name string) bool { shellVal, _ := lookupEnv(name); return shellVal != "" }
 	managed := func(name string) bool {
 		if _, shellPresent := lookupEnv(name); shellPresent {

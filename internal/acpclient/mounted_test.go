@@ -72,13 +72,12 @@ func isolateBundledCredentials(t *testing.T) {
 // HOME, data, and config paths.
 func newMountedRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string, string) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
 	t.Setenv("ACP_MOUNTED_KEY", "mounted-test-key")
 	isolateBundledCredentials(t)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, fmt.Sprintf(mountedConfigDocument, baseURL, mountedAgentsDocument))
-	r, err := runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: builtin.Plugins()})
+	r, err := runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, Configuration: runtime.NewFileConfigurationSource(configPath), Credentials: runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")), Plugins: builtin.Plugins()})
 	testassert.NoError(t, err)
 	t.Cleanup(func() {
 		{

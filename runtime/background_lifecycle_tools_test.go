@@ -159,7 +159,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	// The managed key connects through a real manager AFTER the tools
 	// plugin opened: the call-time subprocess-environment producer, not any
 	// Open-captured copy, must scrub it from the spawned job.
-	managed := config.NewManagedEnvForTest(filepath.Join(t.TempDir(), ".env"))
+	managed := config.NewManagedEnv(filepath.Join(t.TempDir(), ".env"))
 	// The read loop's bounded rendezvous: every retry gets a fresh call ID,
 	// and the final assertion reads this last one — valid only after the
 	// loop observed the real output.
@@ -216,7 +216,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 		advertise:     []string{"run_command", "process"},
 		background:    background,
 		invocation:    invocation,
-		subprocessEnv: managed.SubprocessEnv,
+		subprocessEnv: testSubprocessEnv(managed),
 		store:         store,
 	})
 	// The connect happens after the plugin scope opened, before any command

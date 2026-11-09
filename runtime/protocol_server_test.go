@@ -688,7 +688,7 @@ func TestProtocolServerCredentialFlowRawWireSecretFree(t *testing.T) {
 		stderr := captureSweepStderr(t)
 		e := newOwnerEnv(t)
 		writeAgentDefinitions(t, e.configPath, projectionAgentsDocument)
-		// One malformed line makes the startup LoadDotEnv diagnostic run, so
+		// One malformed line makes the credential capture diagnostic run, so
 		// the captured stderr sink is genuinely exercised before the scan.
 		writeDotEnv(t, e.home, "MALFORMED LINE\n")
 		e.fixtureStore(store)
@@ -881,11 +881,11 @@ func TestProtocolServerDiscoverySuppliedKey(t *testing.T) {
 		case <-time.After(2 * time.Second):
 		}
 		{
-			_, serr := os.Stat(filepath.Join(r.config.loader.Home(), ".lightcode", "cache", "discovery", "custom.json"))
+			_, serr := os.Stat(filepath.Join(r.config.loader.CacheDir(), "custom.json"))
 			testassert.Require(t, os.IsNotExist(serr), "the discovery reads wrote a cache file: %v", serr)
 		}
-		if os.Getenv("MOUNTED_DISCOVERY_KEY") != external || r.managedEnv.IsManaged("MOUNTED_DISCOVERY_KEY") {
-			t.Fatalf("external reference state = (%q, %v), want the exact value intact and unmanaged", os.Getenv("MOUNTED_DISCOVERY_KEY"), r.managedEnv.IsManaged("MOUNTED_DISCOVERY_KEY"))
+		if envValueForTest(r, "MOUNTED_DISCOVERY_KEY") != external || testManaged(r, "MOUNTED_DISCOVERY_KEY") {
+			t.Fatalf("external reference state = (%q, %v), want the exact value intact and unmanaged", envValueForTest(r, "MOUNTED_DISCOVERY_KEY"), testManaged(r, "MOUNTED_DISCOVERY_KEY"))
 		}
 	})
 }
@@ -1221,8 +1221,8 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 		body, _ := json.Marshal(created.JSON200)
 		t.Fatalf("generated-binding create = %s (%v), want the actual binding in api_key_env", body, err)
 	}
-	if os.Getenv("LIGHTCODE_GENERATED_API_KEY") != key {
-		t.Fatalf("managed key state = %q, want the exact supplied value", os.Getenv("LIGHTCODE_GENERATED_API_KEY"))
+	if envValueForTest(r, "LIGHTCODE_GENERATED_API_KEY") != key {
+		t.Fatalf("managed key state = %q, want the exact supplied value", envValueForTest(r, "LIGHTCODE_GENERATED_API_KEY"))
 	}
 	body, _ := json.Marshal(created.JSON200)
 	testassert.Require(t, !strings.Contains(string(body), key), "the create response carries key bytes: %s", body)
@@ -1242,7 +1242,7 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 		body, _ := json.Marshal(refused.JSON200)
 		t.Fatalf("external-binding create = %s (status %d), want the typed configuration refusal", body, refused.HTTPResponse.StatusCode)
 	}
-	testassert.Require(t, !r.managedEnv.IsManaged("PATH"), "the refused create managed the external variable")
+	testassert.Require(t, !testManaged(r, "PATH"), "the refused create managed the external variable")
 	{
 		detail, derr := client.GetProviderDetailWithResponse(ctx, &protocol.GetProviderDetailParams{ProviderId: "external"})
 		testassert.Require(t, derr == nil && detail.JSONDefault != nil && detail.JSONDefault.Code == protocol.ErrorCodeNotFound, "the refused create registered the provider: (%v, %+v)", derr, detail.JSONDefault)
@@ -1292,7 +1292,7 @@ func TestProtocolServerProviderPostStateAndKeyRules(t *testing.T) {
 		body, _ := json.Marshal(externalConnect.JSON200)
 		t.Fatalf("external connect with a supplied key = %s (status %d, %+v), want the typed configuration refusal", body, externalConnect.HTTPResponse.StatusCode, externalConnect.JSONDefault)
 	}
-	testassert.Require(t, !r.managedEnv.IsManaged("PATH"), "a refused connect managed the external variable")
+	testassert.Require(t, !testManaged(r, "PATH"), "a refused connect managed the external variable")
 	afterConfig, rerr := os.ReadFile(configPath)
 	testassert.Require(t, rerr == nil && string(afterConfig) == string(refusalBaseline), "a refused connect changed the owning config (%v)", rerr)
 	currentView, err := client.GetConfigurationWithResponse(ctx)

@@ -98,7 +98,7 @@ func compactPrepWith(t *testing.T, agentsDoc, configDoc, endpoint string) (confi
 	svc := sh.preparedService(owner, compact, fixtureAgentPlugin(compact))
 	captured, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
-	return captured, newPreparation(svc, sh.home, "", "", nil, nil, nil, nil)
+	return captured, newPreparation(svc, sh.locations(), "", nil, nil, nil, nil, nil)
 }
 
 func compactToolsPlugin() extension.Native {
@@ -135,7 +135,7 @@ func compactPrepSelection(t *testing.T, captured configurationCapture, agentName
 		scopes:      []*scope{sc},
 		selected:    selected,
 		invocation:  Invocation{snapshot: captured.snapshot},
-		credentials: captured.credentials,
+		credentials: captured.snapshot.credentials,
 	}
 }
 

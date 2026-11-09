@@ -9,7 +9,6 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -278,7 +277,7 @@ const (
 // must resolve to a usable (positive-window) model of a connected provider.
 // The connection samples come from the candidate's own capture, never a live
 // environment read.
-func setupWarnings(c *configuration, credentials map[string]config.EnvValue) []protocol.Warning {
+func setupWarnings(c *configuration, credentials map[string]CredentialValue) []protocol.Warning {
 	connected := func(prov *catalog.Provider) bool {
 		return catalog.ProviderConnected(prov, capturedEnvIsSet(credentials))
 	}

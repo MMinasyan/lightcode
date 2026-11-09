@@ -9,13 +9,23 @@ import (
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
-func defaultAgentSelection() harness.AgentSelection {
+// DefaultAgentInputs returns the included Agent execution inputs: full
+// assembly mode, the seven standard tools, and no instructions, capability
+// selection, constraint, strategy ID, or model.
+func DefaultAgentInputs() harness.AgentInputs {
 	declarations := standardToolDeclarations()
 	tools := make([]string, 0, len(declarations))
 	for _, declaration := range declarations {
 		tools = append(tools, declaration.id)
 	}
-	return harness.AgentSelection{Inputs: &harness.AgentInputs{AssemblyMode: "full", Tools: tools}}
+	return harness.AgentInputs{AssemblyMode: "full", Tools: tools}
+}
+
+// defaultAgentSelection is the omitted Session-creation selection over the
+// host-supplied inputs.
+func (r *Runtime) defaultAgentSelection() harness.AgentSelection {
+	inputs := r.agentInputs.Owned()
+	return harness.AgentSelection{Inputs: &inputs}
 }
 
 func selectionFromProtocol(value protocol.AgentSelection) (harness.AgentSelection, error) {

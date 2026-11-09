@@ -19,6 +19,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/internal/config"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
@@ -49,6 +50,7 @@ type ownerEnv struct {
 	home           string
 	dataDir        string
 	configPath     string
+	envPath        string
 	events         *traceLog
 	server         *productionModelServer
 	scopeDataDir   atomic.Value
@@ -62,11 +64,12 @@ func newOwnerEnv(t *testing.T) *ownerEnv {
 
 func newOwnerEnvIn(t *testing.T, home, dataDir string) *ownerEnv {
 	t.Helper()
-	t.Setenv("HOME", home)
 	isolateBundledCredentials(t)
+	ensureDotEnv(t, home)
 	e := &ownerEnv{
 		t: t, home: home, dataDir: dataDir,
 		configPath: filepath.Join(dataDir, "config.json"),
+		envPath:    filepath.Join(home, ".lightcode", ".env"),
 		events:     &traceLog{},
 		server:     newProductionModelServer(t, "", ""),
 	}
@@ -103,6 +106,24 @@ func isolateBundledCredentials(t *testing.T) {
 		if provider.Transport.APIKeyEnv != "" {
 			t.Setenv(provider.Transport.APIKeyEnv, "")
 		}
+	}
+}
+
+// testOptions builds explicit construction inputs over one test home: the
+// file configuration at configPath, an environment credential source at the
+// application dotenv path, and the selected application locations.
+func testOptions(dataDir, configPath, home string, plugins ...extension.Native) Options {
+	dataRoot := filepath.Join(home, ".lightcode")
+	return Options{
+		DataDir:       dataDir,
+		Configuration: NewFileConfigurationSource(configPath),
+		Credentials:   NewEnvironmentCredentialSource(filepath.Join(dataRoot, ".env")),
+		Locations: Locations{
+			GlobalRulesDir:     dataRoot,
+			DiscoveryCacheDir:  filepath.Join(dataRoot, "cache", "discovery"),
+			WorkspacePolicyDir: filepath.Join(dataRoot, "projects"),
+		},
+		Plugins: plugins,
 	}
 }
 
@@ -163,7 +184,17 @@ func (e *ownerEnv) options(natives ...extension.Native) options {
 			natives = append(natives, fixtureAgentPlugin(natives...))
 		}
 	}
-	return options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: natives}
+	return options{
+		DataDir:       e.dataDir,
+		Configuration: NewFileConfigurationSource(e.configPath),
+		Credentials:   NewEnvironmentCredentialSource(e.envPath),
+		Locations: Locations{
+			GlobalRulesDir:     filepath.Join(e.home, ".lightcode"),
+			DiscoveryCacheDir:  filepath.Join(e.home, ".lightcode", "cache", "discovery"),
+			WorkspacePolicyDir: filepath.Join(e.home, ".lightcode", "projects"),
+		},
+		Plugins: natives,
+	}
 }
 
 func (e *ownerEnv) open(ctx context.Context, plugins ...extension.Native) (*Runtime, error) {
@@ -511,8 +542,9 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 			name string
 			opts options
 		}{
-			{"empty data directory", options{ConfigPath: e.configPath}},
-			{"empty config path", options{DataDir: e.dataDir}},
+			{"empty data directory", options{Configuration: NewFileConfigurationSource(e.configPath), Credentials: NewEnvironmentCredentialSource(e.envPath)}},
+			{"missing configuration source", options{DataDir: e.dataDir, Credentials: NewEnvironmentCredentialSource(e.envPath)}},
+			{"missing credential source", options{DataDir: e.dataDir, Configuration: NewFileConfigurationSource(e.configPath)}},
 		}
 		for _, tc := range cases {
 			r, err := open(context.Background(), tc.opts)
@@ -539,9 +571,10 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		relData, err := filepath.Rel(cwd, e.dataDir)
 		testassert.NoError(t, err)
 		r, err := open(context.Background(), options{
-			DataDir:    relData,
-			ConfigPath: filepath.Join(relData, "config.json"),
-			Plugins:    []extension.Native{e.sqliteDerivationPlugin()},
+			DataDir:       relData,
+			Configuration: NewFileConfigurationSource(filepath.Join(relData, "config.json")),
+			Credentials:   NewEnvironmentCredentialSource(e.envPath),
+			Plugins:       []extension.Native{e.sqliteDerivationPlugin()},
 		})
 		testassert.NoError(t, err)
 		{
@@ -573,10 +606,6 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		{
 			_, err := os.Stat(filepath.Join(configDir, "agents.json"))
 			testassert.Require(t, os.IsNotExist(err), "agents.json exists or cannot be checked: %v", err)
-		}
-		{
-			_, err := os.Stat(filepath.Join(e.home, ".lightcode", ".env"))
-			testassert.NoError(t, err)
 		}
 		testassert.NoError(t, r.Close(context.Background()))
 	})
@@ -1610,4 +1639,73 @@ func TestRuntimeRecoverySettlesQuiescentChildLossWithoutParentCompletion(t *test
 		}
 		testassert.NoError(t, again.Close(ctx))
 	})
+}
+
+// managedEnvForTest exposes the attached environment credential source's
+// manager to in-package fixtures.
+func (r *Runtime) managedEnvForTest() *config.ManagedEnv {
+	if source, ok := r.config.credentials.(*environmentCredentials); ok {
+		return source.env
+	}
+	return nil
+}
+
+// configPathForTest exposes the file configuration source path.
+func (r *Runtime) configPathForTest() string {
+	if source, ok := r.config.configuration.(*fileConfiguration); ok {
+		return source.path
+	}
+	return ""
+}
+
+// testSubprocessEnv adapts one real managed file to the tool producer shape.
+func testSubprocessEnv(managed *config.ManagedEnv) func(context.Context) ([]string, error) {
+	return func(context.Context) ([]string, error) { return managed.SubprocessEnv(nil), nil }
+}
+
+// configPathForTest exposes the service's file configuration path.
+func (s *configurationService) configPathForTest() string {
+	if source, ok := s.configuration.(*fileConfiguration); ok {
+		return source.path
+	}
+	return ""
+}
+
+// testManaged reports whether one name is owned by the attached managed file.
+func testManaged(r *Runtime, name string) bool {
+	env := r.managedEnvForTest()
+	if env == nil {
+		return false
+	}
+	captured, err := env.Capture([]string{name})
+	return err == nil && captured[name].Managed
+}
+
+// ensureDotEnv creates one empty managed dotenv file for fixtures whose
+// baseline assertions read the source file before any managed write.
+func ensureDotEnv(t *testing.T, home string) {
+	t.Helper()
+	path := filepath.Join(home, ".lightcode", ".env")
+	if _, err := os.Stat(path); err == nil {
+		return
+	}
+	testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	testassert.NoError(t, os.WriteFile(path, nil, 0o600))
+}
+
+// envValueForTest returns the effective credential value: a shell value wins,
+// otherwise the managed file's value.
+func envValueForTest(r *Runtime, name string) string {
+	if value, defined := os.LookupEnv(name); defined {
+		return value
+	}
+	env := r.managedEnvForTest()
+	if env == nil {
+		return ""
+	}
+	captured, err := env.Capture([]string{name})
+	if err != nil {
+		return ""
+	}
+	return captured[name].Value
 }

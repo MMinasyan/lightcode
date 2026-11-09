@@ -154,13 +154,13 @@ type ToolContext struct {
 	// Execute and the admitted Jobs start handoff alike — and returns the
 	// exact environment slice that process runs with: the live ambient
 	// environment with the Runtime's live credential exclusion applied (the
-	// current managed-key set and provider credential names, together with
-	// the preparation-time captured names). It is that live exclusion
-	// service only, never a promise to reread the selected execution policy:
-	// the model, prompt, tools, permissions and configuration revision stay
-	// the admission's frozen capture. A nil callback fails the cooperative
-	// command; there is no ambient fallback.
-	SubprocessEnv func() []string
+	// current revision's provider names, together with the preparation-time
+	// captured names). It is that live exclusion service only, never a
+	// promise to reread the selected execution policy: the model, prompt,
+	// tools, permissions and configuration revision stay the admission's
+	// frozen capture. A nil callback or an error fails the cooperative
+	// command before any process starts; there is no ambient fallback.
+	SubprocessEnv func(context.Context) ([]string, error)
 }
 
 // Tool is one concrete tool capability: pure terminating argument

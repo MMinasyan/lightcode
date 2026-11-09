@@ -1,19 +1,26 @@
 package catalog
 
-import "fmt"
+import (
+	"fmt"
+	"path/filepath"
+)
 
 // BuildOffline assembles the effective catalog without any filesystem write
 // or network access: bundled providers come from the embedded FS, the
-// discovery cache is read as-is (no refresh), and userRaw is caller-supplied
-// — callers must obtain it without auto-creating the config file. Cache-read
-// warnings are concatenated into the result's Warnings the way Loader.Load
-// surfaces them, so a corrupt cache is visible to read-only callers.
+// application discovery cache under the supplied home root is read as-is (no
+// refresh), and userRaw is caller-supplied — callers must obtain it without
+// auto-creating the config file. Cache-read warnings are concatenated into the
+// result's Warnings, so a corrupt cache is visible to read-only callers.
 func BuildOffline(home string, userRaw map[string]any) (BuildResult, error) {
 	bundled, err := readBundledProviders(bundledFS)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("read bundled catalog: %w", err)
 	}
-	records, cacheWarnings := ReadDiscoveryCache(home)
+	cacheDir := ""
+	if home != "" {
+		cacheDir = filepath.Join(home, ".lightcode", "cache", "discovery")
+	}
+	records, cacheWarnings := ReadDiscoveryCache(cacheDir)
 	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Records: records})
 	result.Warnings = append(cacheWarnings, result.Warnings...)
 	return result, nil

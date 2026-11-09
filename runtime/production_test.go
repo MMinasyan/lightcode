@@ -262,7 +262,6 @@ type productionEnv struct {
 func newProductionEnv(t *testing.T, store harness.Storage) *productionEnv {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
 	isolateBundledCredentials(t)
 	server := newProductionModelServer(t, "prod_write", productionWriteArgs)
 	t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
@@ -271,6 +270,25 @@ func newProductionEnv(t *testing.T, store harness.Storage) *productionEnv {
 	writeServiceFile(t, configPath, productionConfigDocument(server.URL, "T1"))
 	writeAgentDefinitions(t, configPath, productionAgentsDocument)
 	return &productionEnv{t: t, home: home, dataDir: dataDir, configPath: configPath, server: server, store: store}
+}
+
+func (e *productionEnv) locations() Locations {
+	return Locations{
+		GlobalRulesDir:     filepath.Join(e.home, ".lightcode"),
+		DiscoveryCacheDir:  filepath.Join(e.home, ".lightcode", "cache", "discovery"),
+		WorkspacePolicyDir: filepath.Join(e.home, ".lightcode", "projects"),
+	}
+}
+
+func (e *productionEnv) options(plugins []extension.Native) Options {
+	return Options{
+		DataDir:       e.dataDir,
+		Configuration: NewFileConfigurationSource(e.configPath),
+		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".lightcode", ".env")),
+		Locations:     e.locations(),
+		Identity:      e.identity,
+		Plugins:       plugins,
+	}
 }
 
 func (e *productionEnv) open(ctx context.Context, hook *recordHook, park *parkingHook) (*Runtime, error) {
@@ -288,7 +306,7 @@ func (e *productionEnv) openPlugins(ctx context.Context, natives ...extension.Na
 		Extensions map[string]json.RawMessage `json:"extensions"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: natives, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
+		return Open(ctx, e.options(natives))
 	}
 	hasAgents := false
 	for _, native := range natives {
@@ -301,7 +319,7 @@ func (e *productionEnv) openPlugins(ctx context.Context, natives ...extension.Na
 	if !hasAgents && sectionEnabled(doc.Extensions["agents"]) {
 		natives = append(natives, fixtureAgentPlugin(natives...))
 	}
-	return Open(ctx, Options{DataDir: e.dataDir, ConfigPath: e.configPath, Plugins: natives, Identity: e.identity, GlobalRulesDir: e.globalRulesDir})
+	return Open(ctx, e.options(natives))
 }
 
 // openWithPlugins composes the suite's base plugin set plus extras — the
@@ -627,6 +645,8 @@ func TestProductionKeyResolution(t *testing.T) {
 		// A required credential that resolves empty rejects admission with
 		// the retained provider/env-name diagnostic; no Operation exists.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
+		_, err = r.Reload(ctx)
+		testassert.NoError(t, err)
 		err = submitExpectFailure(r, session.Identity.SessionID, "op-missing", "please write")
 		testassert.Require(t, errors.Is(err, config.ErrMissingEnvVar) && errors.Is(err, harness.ErrInvalid) && strings.Contains(err.Error(), "PRODUCTION_TEST_KEY") && strings.Contains(err.Error(), `for provider "prov"`), "missing credential submit = %v, want the retained diagnostic wrapping both identities; missing credential diagnostic = %v, want the env name and provider identity", err, err)
 		{
@@ -639,6 +659,8 @@ func TestProductionKeyResolution(t *testing.T) {
 		// both the parked first request and the follow-up carry the captured
 		// key, and the turn completes.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
+		_, err = r.Reload(ctx)
+		testassert.NoError(t, err)
 		e.server.armGate()
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please write")
 		e.server.awaitRequests(1)
@@ -658,10 +680,9 @@ func TestProductionKeyResolution(t *testing.T) {
 }
 
 // TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair parks an
-// accepted managed-key write mid-file and starts a real admission: the
-// admission waits at configuration capture, then runs on the writer's
-// published pair — the published generation and the real model transport's
-// new key.
+// accepted managed-key write mid-file and admits real work: an admission
+// during the parked write uses the previous published pair without waiting,
+// and the next admission uses the writer's new pair.
 func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing.T) {
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		// The fixture credential is managed-empty: no shell export, one empty
@@ -673,11 +694,11 @@ func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing
 		r, err := e.open(ctx, e.hookedHook(), &parkingHook{})
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
-		testassert.Require(t, r.managedEnv != nil && r.managedEnv.IsManaged("PRODUCTION_TEST_KEY"), "the fixture credential is not managed")
+		testassert.Require(t, r.managedEnvForTest() != nil && testManaged(r, "PRODUCTION_TEST_KEY"), "the fixture credential is not managed")
 		session, err := r.createSession(ctx, e.workspace("race-ws"), "worker")
 		testassert.NoError(t, err)
 
-		probe := installOwningSyncProbe(t, r.managedEnv.Path())
+		probe := installOwningSyncProbe(t, r.managedEnvForTest().Path())
 		defer probe.restore()
 		probe.park = true
 		release := sync.OnceFunc(probe.releaseProbe)
@@ -694,20 +715,15 @@ func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing
 		}()
 		probe.awaitWriteStarted(t)
 
-		// The admission must establish its wait at configuration capture
-		// while the writer holds the publication/capture ownership.
-		submitDone := make(chan error, 1)
-		go func() { submitDone <- submitExpectFailure(r, session.Identity.SessionID, "op-race", "please write") }()
-		awaitConfigurationCaptureWait(t)
+		// The admission does not wait for the parked writer: it runs on the
+		// previous pair, whose managed-empty key fails credential resolution.
+		previousErr := submitExpectFailure(r, session.Identity.SessionID, "op-race-previous", "please write")
+		testassert.Require(t, errors.Is(previousErr, config.ErrMissingEnvVar), "admission during the parked write = %v, want the previous pair's missing-credential diagnostic", previousErr)
+
 		release()
 		connect := <-connectDone
 		testassert.Require(t, connect.err == nil, "connect: %v", connect.err)
-		select {
-		case err := <-submitDone:
-			testassert.NoError(t, err)
-		case <-time.After(10 * time.Second):
-			t.Fatal("the admission never resumed after the write published")
-		}
+		submitThroughRuntime(t, r, session.Identity.SessionID, "op-race", "please write")
 		e.server.awaitRequests(1)
 		testassert.Equal(t, e.server.authAt(0), "Bearer "+key)
 		record := awaitOperation(t, r, session.Identity.SessionID, "op-race", harness.OperationSuccess)
@@ -975,11 +991,7 @@ func TestProductionHostDefaultCapabilitiesSelectContribution(t *testing.T) {
 		useFixtureStore(t, e.store)
 		tools := productionToolsPlugin()
 		hooks := hookPlugin(e.hookedHook())
-		r, err := Open(ctx, Options{
-			DataDir:    e.dataDir,
-			ConfigPath: e.configPath,
-			Plugins:    []extension.Native{tools, hooks, agentsTestNativeWithDefaults([]string{"hook.first"}, tools, hooks)},
-		})
+		r, err := Open(ctx, e.options([]extension.Native{tools, hooks, agentsTestNativeWithDefaults([]string{"hook.first"}, tools, hooks)}))
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("default-cap-ws"), "defaulted")
@@ -1005,11 +1017,7 @@ func TestProductionDefaultCapabilityForDisabledContribution(t *testing.T) {
 		hooks := hookPlugin(e.hookedHook())
 		park := parkPlugin(&parkingHook{})
 		// The fixture enables hooks only; park stays installed but inactive.
-		r, err := Open(ctx, Options{
-			DataDir:    e.dataDir,
-			ConfigPath: e.configPath,
-			Plugins:    []extension.Native{tools, hooks, park, agentsTestNativeWithDefaults([]string{"park.second"}, tools, hooks, park)},
-		})
+		r, err := Open(ctx, e.options([]extension.Native{tools, hooks, park, agentsTestNativeWithDefaults([]string{"park.second"}, tools, hooks, park)}))
 		testassert.NoError(t, err)
 		defer r.Close(ctx)
 		session, err := r.createSession(ctx, e.workspace("disabled-default-ws"), "defaulted")

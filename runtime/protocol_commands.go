@@ -17,7 +17,7 @@ import (
 // error; the committed creation is never rolled back and no synthetic
 // revision is invented.
 func (r *Runtime) createSessionHeader(ctx context.Context, workspace string, requested *protocol.AgentSelection) (protocol.Session, error) {
-	selection := defaultAgentSelection()
+	selection := r.defaultAgentSelection()
 	if requested != nil {
 		var err error
 		selection, err = selectionFromProtocol(*requested)

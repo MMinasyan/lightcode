@@ -323,7 +323,6 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		// Isolated HOME and data roots, pointed at the scenario's server with
 		// the chained agent's document.
 		home := t.TempDir()
-		t.Setenv("HOME", home)
 		isolateBundledCredentials(t)
 		t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
 		dataDir := t.TempDir()
@@ -346,7 +345,7 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 				hookPlugin(hook),
 				argumentHookPlugin("arg.rewrite", argHook.BeforeTool), ShippedAdaptationPlugin(),
 			}
-			return Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: append(plugins, fixtureAgentPlugin(plugins...))})
+			return Open(ctx, testOptions(dataDir, configPath, home, append(plugins, fixtureAgentPlugin(plugins...))...))
 		}
 		owner, ownerCancel := context.WithCancel(ctx)
 		defer ownerCancel()

@@ -558,7 +558,6 @@ func TestProtocolComposedFlow(t *testing.T) {
 	run := func(t *testing.T, plugins []extension.Native) {
 		ctx := context.Background()
 		home := t.TempDir()
-		t.Setenv("HOME", home)
 		isolateBundledCredentials(t)
 		t.Setenv("COMPOSED_TEST_KEY", composedFlowKey)
 		composedReserveEnv(t, composedConnectKeyEnv)
@@ -570,7 +569,7 @@ func TestProtocolComposedFlow(t *testing.T) {
 		composedWriteFile(t, configPath, composedFlowConfigDocument(model.URL))
 		runtime.WriteAgentDefinitionsForTest(t, configPath, composedFlowAgentsDocument)
 
-		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: plugins})
+		r, err := runtime.Open(ctx, runtime.OptionsForTest(dataDir, configPath, home, plugins))
 		testassert.NoError(t, err)
 		ps, err := r.OpenProtocol(ctx)
 		testassert.NoError(t, err)
@@ -1307,7 +1306,6 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 	run := func(t *testing.T, background bool) {
 		ctx := context.Background()
 		home := t.TempDir()
-		t.Setenv("HOME", home)
 		isolateBundledCredentials(t)
 		t.Setenv(heldOldKeyEnv, heldOldKeyValue)
 		t.Setenv(heldNewKeyEnv, heldNewKeyValue)
@@ -1320,7 +1318,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 		composedWriteFile(t, configPath, heldConfigDocument(model.URL, heldOldKeyEnv, false))
 		runtime.WriteAgentDefinitionsForTest(t, configPath, heldAgentsMain)
 
-		r, err := runtime.Open(ctx, runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []extension.Native{composedAgentsNative()}})
+		r, err := runtime.Open(ctx, runtime.OptionsForTest(dataDir, configPath, home, []extension.Native{composedAgentsNative()}))
 		testassert.NoError(t, err)
 		store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
 		testassert.NoError(t, err)

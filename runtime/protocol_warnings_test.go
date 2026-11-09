@@ -135,6 +135,8 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		before, err := r.getWarnings(ctx)
 		testassert.NoError(t, err)
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
+		_, err = r.Reload(ctx)
+		testassert.NoError(t, err)
 		failedSession, err := r.createSession(ctx, e.workspace("prompt-ws-3"), "worker")
 		testassert.NoError(t, err)
 		{
@@ -142,6 +144,8 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 			testassert.Require(t, err != nil, "the missing-credential submit succeeded, want the failed preparation")
 		}
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
+		_, err = r.Reload(ctx)
+		testassert.NoError(t, err)
 
 		// A failed hook (invalid consequence rejected before publication)
 		// changes nothing.
@@ -443,7 +447,10 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		owner, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin(compactToolsPlugin()))
-		svc := newConfigurationService(owner, comp, sh.loader, sh.configPath, r.obs)
+		svc := newConfigurationService(owner, comp, sh.loader,
+			NewFileConfigurationSource(sh.configPath),
+			NewEnvironmentCredentialSource(filepath.Join(sh.home, ".lightcode", ".env")),
+			sh.locations(), nil, r.obs)
 		svc.composition, svc.dataDir = comp, sh.dataDir
 		svc.attachWarnings(r.warnings)
 		{
@@ -453,7 +460,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		defer svc.current().resources.release()
 		adapter := newObservationAdapter(r.obs, r.warnings)
 		adapter.h = r.harness
-		p := newPreparation(svc, sh.home, "", "", nil, adapter, nil, nil)
+		p := newPreparation(svc, sh.locations(), "", nil, adapter, nil, nil, nil)
 
 		request := compactPrepRequest()
 		request.Session.Identity.SessionID = sessionID

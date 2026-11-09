@@ -340,7 +340,6 @@ func openNativeFIFO(t *testing.T, path string) *os.File {
 }
 
 func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	isolateBundledCredentials(t)
 	t.Setenv("DESKTOP_TEST_KEY", "isolated-key")
 	dataDir, workspace := t.TempDir(), t.TempDir()
@@ -364,7 +363,7 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	var owner *runtime.Runtime
 	openOwner := func() string {
 		var err error
-		owner, err = runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: builtin.Plugins()})
+		owner, err = runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, Configuration: runtime.NewFileConfigurationSource(configPath), Credentials: runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")), Plugins: builtin.Plugins()})
 		testassert.NoError(t, err)
 		server, err := owner.OpenProtocol(context.Background())
 		testassert.NoError(t, err)

@@ -79,13 +79,12 @@ func isolateBundledCredentials(t *testing.T) {
 // base URL.
 func newRealRuntime(t *testing.T, baseURL string) (*runtime.Runtime, string) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CLIENT_TEST_KEY", "client-test-key")
 	isolateBundledCredentials(t)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, fmt.Sprintf(clientConfigDocument, baseURL, clientAgentsDocument))
-	r, err := runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: builtin.Plugins()})
+	r, err := runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, Configuration: runtime.NewFileConfigurationSource(configPath), Credentials: runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")), Plugins: builtin.Plugins()})
 	testassert.NoError(t, err)
 	t.Cleanup(func() {
 		{

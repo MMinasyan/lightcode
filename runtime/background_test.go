@@ -65,7 +65,6 @@ func TestBackgroundBridgeArmingAcrossPublication(t *testing.T) {
 	store := storage.NewMemory()
 	server := newProductionModelServer(t, "bg_probe", "{}")
 	home := t.TempDir()
-	t.Setenv("HOME", home)
 	isolateBundledCredentials(t)
 	t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
 	dataDir := t.TempDir()
@@ -79,9 +78,7 @@ func TestBackgroundBridgeArmingAcrossPublication(t *testing.T) {
 
 	probe := &backgroundProbe{}
 	useFixtureStore(t, store)
-	r, err := Open(ctx, Options{DataDir: dataDir, ConfigPath: configPath, Plugins: []extension.Native{
-		backgroundProbePlugin(probe), fixtureAgentPlugin(backgroundProbePlugin(probe)),
-	}})
+	r, err := Open(ctx, testOptions(dataDir, configPath, home, backgroundProbePlugin(probe), fixtureAgentPlugin(backgroundProbePlugin(probe))))
 	testassert.NoError(t, err)
 	// The unarmed-to-armed window ends before publication: construction
 	// and publication observe nothing.

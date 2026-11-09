@@ -23,11 +23,12 @@ func installedExtensions() ([]string, []string) {
 }
 
 // runRuntime runs the shared managed Runtime owner in the foreground for the
-// lifetime of the signal context. It opens the owner over the normalized
-// paths with the shipped plugin set, attaches the protocol and publishes the
-// discovery record once, then waits for the shutdown signal and joins the
-// managed cleanup. Contention exits quietly without initialization; every
-// startup, publication and cleanup error keeps its identity for exit 1.
+// lifetime of the signal context. It supplies the current application paths
+// and the first-run configuration document, opens the owner, attaches the
+// protocol and publishes the discovery record once, then waits for the
+// shutdown signal and joins the managed cleanup. Contention exits quietly
+// without initialization; every startup, publication and cleanup error keeps
+// its identity for exit 1.
 func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 	absDataDir, err := filepath.Abs(dataDir)
 	if err != nil {
@@ -41,12 +42,25 @@ func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 	if err != nil {
 		return err
 	}
+	dataRoot := filepath.Join(home, ".lightcode")
+	locations := runtime.Locations{
+		GlobalRulesDir:     dataRoot,
+		DiscoveryCacheDir:  filepath.Join(dataRoot, "cache", "discovery"),
+		WorkspacePolicyDir: filepath.Join(dataRoot, "projects"),
+	}
+	if os.Getenv("LIGHTCODE_DEBUG_WIRE") == "1" {
+		locations.WireDebugDir = filepath.Join(dataRoot, "debug", "wire")
+	}
+	if err := runtime.InitializeFirstRunConfiguration(absConfigPath); err != nil {
+		return err
+	}
 	owner, err := runtime.Open(ctx, runtime.Options{
-		DataDir:        absDataDir,
-		ConfigPath:     absConfigPath,
-		Plugins:        builtin.Plugins(),
-		Identity:       runtimeIdentity,
-		GlobalRulesDir: filepath.Join(home, ".lightcode"),
+		DataDir:       absDataDir,
+		Configuration: runtime.NewFileConfigurationSource(absConfigPath),
+		Credentials:   runtime.NewEnvironmentCredentialSource(filepath.Join(dataRoot, ".env")),
+		Locations:     locations,
+		Plugins:       builtin.Plugins(),
+		Identity:      runtimeIdentity,
 	})
 	if errors.Is(err, runtime.ErrOwned) {
 		// Another process owns the data directory; this contender

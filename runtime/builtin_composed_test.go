@@ -31,7 +31,6 @@ func init() { runtime.ShippedAdaptationPlugin = adaptation.Native }
 func TestBuiltinRegistrationComposes(t *testing.T) {
 	ctx := context.Background()
 	home, dataDir, configDir := t.TempDir(), t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
 	entries, err := os.ReadDir(filepath.Join("..", "internal", "catalog", "builtin"))
 	testassert.NoError(t, err)
 	for _, entry := range entries {
@@ -57,7 +56,7 @@ func TestBuiltinRegistrationComposes(t *testing.T) {
 	configPath := filepath.Join(configDir, "config.json")
 	testassert.NoError(t, os.WriteFile(configPath, []byte(`{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":""},"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`), 0o600))
 
-	r, err := runtime.OpenForTest(ctx, dataDir, configPath, builtin.Plugins())
+	r, err := runtime.OpenForTest(ctx, dataDir, configPath, home, builtin.Plugins())
 	testassert.NoError(t, err)
 	{
 		revision, err := r.Reload(ctx)

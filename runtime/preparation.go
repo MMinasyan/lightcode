@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -20,10 +19,6 @@ import (
 	"github.com/MMinasyan/lightcode/prompt"
 	"github.com/MMinasyan/lightcode/protocol"
 )
-
-// debugWireEnv is the retained wire-debug opt-in: when set to "1", raw
-// request bodies and SSE chunks dump under the home-based private directory.
-const debugWireEnv = "LIGHTCODE_DEBUG_WIRE"
 
 // openInvocation turns one committed admission's execution-view selection and
 // one Harness-issued Engine-call request into that invocation's opened
@@ -50,6 +45,11 @@ type selection struct {
 	// an admitted execution.
 	lease *artifactCallLease
 
+	// permissions is the preparation-time permission evaluator, built before
+	// durable admission so a factory error or nil evaluator rejects the
+	// preparation instead of failing an admitted Operation.
+	permissions harness.PermissionEvaluator
+
 	// operationSecrets are the operation-lifetime declared credential values
 	// captured at preparation and retained through the prepared opener. Every
 	// tool and hook view of that execution carries them; no value reaches a
@@ -63,7 +63,7 @@ type selection struct {
 	// resolves its transport secrets from it, the operation fields derive
 	// their values from it, and no value leaves the prepared opener or the
 	// durable capture.
-	credentials map[string]config.EnvValue
+	credentials map[string]CredentialValue
 
 	// warnings is the per-preparation private presentation collector: the
 	// concrete preparation assigns the assembled prompt warnings into it and
@@ -128,16 +128,16 @@ func protocolWarnings(sessionID string, warnings []model.ProtocolWarning) []prot
 // the preparation guard.
 type preparation struct {
 	config *configurationService
-	home   string
 
-	// identity and globalRulesDir are the host-supplied prompt inputs: the
-	// application persona text and the explicit global rules directory. Their
-	// zero values supply no identity and no global rules, never an implicit
-	// fallback.
-	identity       string
-	globalRulesDir string
-	background     *backgroundBridge
-	passive        *observationAdapter
+	// identity and locations are the host-supplied prompt and diagnostic
+	// inputs: the application persona text and the explicit global rules and
+	// wire-debug locations. Their zero values supply no identity, no global
+	// rules and no wire diagnostics, never an implicit fallback.
+	identity     string
+	locations    Locations
+	background   *backgroundBridge
+	passive      *observationAdapter
+	newEvaluator func(PolicyInputs) (harness.PermissionEvaluator, error)
 
 	// artifacts is the Runtime's private per-Session artifact interval
 	// registry. Every committed opener acquires its Session's token here
@@ -146,33 +146,30 @@ type preparation struct {
 	// without artifact ownership.
 	artifacts *artifactIntervals
 
-	// subprocessEnv is the Runtime's live subprocess-environment producer —
-	// the managed-environment snapshot with the current provider credential
-	// names excluded — supplied only when the retained manager exists; nil
-	// leaves every prepared command without an environment producer and the
-	// cooperative command fails. It is invoked at each process start, never
-	// at preparation.
-	subprocessEnv func() []string
+	// subprocessEnv is the Runtime's live subprocess-environment producer.
+	// It is invoked at each process start, never at preparation; an error
+	// fails the spawn before start.
+	subprocessEnv func(context.Context) ([]string, error)
 }
 
 // newPreparation wires the binder to the published configuration, the
-// once-resolved home, the host-supplied prompt identity and global rules
-// directory, the background services bridge armed after harness.New
-// returns, the Runtime's passive publication adapter (nil in isolated
-// preparation tests, dropping only passive presentation), the Runtime's
-// private artifact interval registry (nil without a Runtime), and the
-// Runtime's live managed-environment producer (nil without a retained
-// manager). One concrete preparation path serves every admission.
-func newPreparation(config *configurationService, home, identity, globalRulesDir string, background *backgroundBridge, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func() []string) *preparation {
+// selected locations, the host-supplied prompt identity, the background
+// services bridge armed after harness.New returns, the Runtime's passive
+// publication adapter (nil in isolated preparation tests, dropping only
+// passive presentation), the Runtime's private artifact interval registry
+// (nil without a Runtime), the Runtime's live child-environment producer, and
+// the optional evaluator factory. One concrete preparation path serves every
+// admission.
+func newPreparation(config *configurationService, locations Locations, identity string, background *backgroundBridge, passive *observationAdapter, artifacts *artifactIntervals, subprocessEnv func(context.Context) ([]string, error), newEvaluator func(PolicyInputs) (harness.PermissionEvaluator, error)) *preparation {
 	return &preparation{
-		config:         config,
-		home:           home,
-		identity:       identity,
-		globalRulesDir: globalRulesDir,
-		background:     background,
-		passive:        passive,
-		artifacts:      artifacts,
-		subprocessEnv:  subprocessEnv,
+		config:        config,
+		identity:      identity,
+		locations:     locations,
+		background:    background,
+		passive:       passive,
+		artifacts:     artifacts,
+		subprocessEnv: subprocessEnv,
+		newEvaluator:  newEvaluator,
 	}
 }
 
@@ -253,6 +250,10 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 			return harness.PreparedExecution{}, err
 		}
 		workspace := req.Session.Identity.Workspace
+		evaluator, err := p.permissionEvaluator(snapshot, workspace)
+		if err != nil {
+			return harness.PreparedExecution{}, err
+		}
 		runtimeScope, workspaces := snapshot.resources.runtime, snapshot.resources.workspaces
 		workspaceInfo := ScopeInfo{Kind: ScopeWorkspace, DataDir: runtimeScope.info.DataDir, Workspace: workspace, Revision: snapshot.resources.revisionString()}
 		workspaceInfo.sections = snapshot.extensions
@@ -264,7 +265,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		selected := make([]string, 0, len(inputs.Capabilities)+len(inputs.Tools))
 		selected = append(selected, inputs.Capabilities...)
 		selected = append(selected, inputs.Tools...)
-		sel := selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope}, selected: selected, invocation: Invocation{snapshot: snapshot}, credentials: captured.credentials, operationSecrets: captured.operationSecrets()}
+		sel := selection{inputs: inputs, definition: definition, scopes: []*scope{runtimeScope, workspaceScope}, selected: selected, invocation: Invocation{snapshot: snapshot}, credentials: captured.snapshot.credentials, permissions: evaluator, operationSecrets: captured.operationSecrets()}
 
 		callCtx, release, err := workspaceScope.enter(ctx)
 		if err != nil {
@@ -287,7 +288,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		prepared = harness.PreparedExecution{
 			Capture: capture,
 			Open: func(openCtx context.Context, admission harness.OperationAdmission) (harness.Execution, error) {
-				return p.open(openCtx, admission, workspace, runtimeScope, workspaceScope, inputs, definition, snapshot, sel.operationSecrets, warnings, opener, &releaseArtifacts)
+				return p.open(openCtx, admission, workspace, runtimeScope, workspaceScope, inputs, definition, snapshot, sel.permissions, sel.operationSecrets, warnings, opener, &releaseArtifacts)
 			},
 		}
 		prepared.Release = func() error {
@@ -300,6 +301,23 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		}
 		return prepared, nil
 	}
+}
+
+// permissionEvaluator builds the preparation-time evaluator from the
+// captured policy inputs. A nil factory selects the included resolver; a
+// factory error, nil evaluator or empty evaluator is an invalid preparation.
+func (p *preparation) permissionEvaluator(snapshot *configuration, workspace string) (harness.PermissionEvaluator, error) {
+	if p.newEvaluator == nil {
+		return snapshot.permissionPolicy(workspace), nil
+	}
+	built, err := p.newEvaluator(snapshot.policyInputs(workspace))
+	if err != nil {
+		return nil, fmt.Errorf("prepare permission evaluator: %w", err)
+	}
+	if built == nil {
+		return nil, fmt.Errorf("prepare permission evaluator: nil evaluator: %w", harness.ErrInvalid)
+	}
+	return built, nil
 }
 
 // open turns the committed admission into the execution: it first acquires
@@ -319,7 +337,7 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 // after the opening succeeds does the collected prompt presentation publish,
 // so a failed fork or admission never creates warnings for an unpublished
 // Session and a successful opener publishes before any progress.
-func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, runtimeScope, workspaceScope *scope, inputs harness.AgentInputs, definition *harness.DefinitionRef, snapshot *configuration, operationSecrets map[string]map[string]string, warnings *preparationWarnings, opener openInvocation, artifactRelease *func()) (harness.Execution, error) {
+func (p *preparation) open(ctx context.Context, admission harness.OperationAdmission, workspace string, runtimeScope, workspaceScope *scope, inputs harness.AgentInputs, definition *harness.DefinitionRef, snapshot *configuration, evaluator harness.PermissionEvaluator, operationSecrets map[string]map[string]string, warnings *preparationWarnings, opener openInvocation, artifactRelease *func()) (harness.Execution, error) {
 	releaseArtifacts, err := p.artifacts.acquireExecution(ctx, sessionArtifactDir(runtimeScope.info.DataDir, admission.SessionID))
 	if err != nil {
 		return harness.Execution{}, err
@@ -387,14 +405,14 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	*artifactRelease = releaseArtifacts
 	strategyBinding, err := resolveStrategyBinding(snapshot.composition, []*scope{runtimeScope, workspaceScope, operation}, inputs.Strategy)
 	if err != nil {
-		err = errors.Join(err, operation.close())
 		releaseOperation()
+		err = errors.Join(err, operation.close())
 		releaseArtifacts()
 		return harness.Execution{}, err
 	}
 	return harness.Execution{
 		OpenInvocation: openInvocation,
-		Permissions:    snapshot.permissionPolicy(workspace),
+		Permissions:    evaluator,
 		Strategy:       strategyBinding,
 		Close: func() error {
 			releaseOperation()
@@ -404,8 +422,14 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	}, nil
 }
 
-// productionStrategy is the included context strategy binding.
-var productionStrategy = harness.IncludedStrategyBinding()
+// defaultStrategy returns the host-selected default strategy binding,
+// falling back to the included one for a zero-value fixture snapshot.
+func defaultStrategy(snapshot *configuration) *harness.StrategyBinding {
+	if snapshot != nil && snapshot.strategy != nil {
+		return snapshot.strategy
+	}
+	return harness.IncludedStrategyBinding()
+}
 
 // requireCatalogModel admits only a selected model that resolves in the
 // captured catalog, and rejects a wholly
@@ -493,10 +517,10 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 	// current capture excludes is absent from the prompt and every
 	// preparation/request hook input, and an absent projection or value
 	// renders the existing "unknown".
-	shell := projectedShell(subprocessEnv)
+	shell := projectedShell(ctx, subprocessEnv)
 	result, catalog, err := composeSurface(ctx, surfaceRequest{
 		hostIdentity:   p.identity,
-		globalRulesDir: p.globalRulesDir,
+		globalRulesDir: p.locations.GlobalRulesDir,
 		workspace:      req.Session.Identity.Workspace,
 		sessionStart:   req.Session.Identity.CreatedAt, // a Fork's zero start samples the compose time once
 		promptSize:     prompt.Mode(sel.inputs.AssemblyMode),
@@ -543,8 +567,8 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 			Pricing:      capturedPricing(compactCost),
 		},
 		Strategy: harness.StrategyCapture{
-			ID:                    productionStrategy.ID,
-			RequiresContextWindow: productionStrategy.RequiresContextWindow,
+			ID:                    defaultStrategy(snapshot).ID,
+			RequiresContextWindow: defaultStrategy(snapshot).RequiresContextWindow,
 		},
 		Implementations: implementationProvenance(snapshot.composition, sel),
 	}
@@ -560,12 +584,12 @@ func (p *preparation) concretePrepare(ctx context.Context, req harness.Preparati
 // projectedShell reads SHELL from the same child-environment projection the
 // command path consumes. An absent producer, absent snapshot, absent value or
 // empty value renders the existing "unknown".
-func projectedShell(env func() []string) string {
+func projectedShell(ctx context.Context, env func(context.Context) ([]string, error)) string {
 	if env == nil {
 		return "unknown"
 	}
-	snapshot := env()
-	if snapshot == nil {
+	snapshot, err := env(ctx)
+	if err != nil || snapshot == nil {
 		return "unknown"
 	}
 	for _, entry := range snapshot {
@@ -642,7 +666,7 @@ func (p *preparation) resolveTransport(provider *catalog.Provider, entry *catalo
 		Headers:        provider.Transport.Headers,
 		WireSystemRole: string(entry.SystemRole), // the catalog build injects the effective role; Encode maps empty to "system" as backstop
 		StreamedUsage:  entry.UsageInStream,
-		WireDebugDir:   wireDebugDir(p.home),
+		WireDebugDir:   wireDebugDir(p.locations.WireDebugDir),
 	}
 	providerExtras, err := extraBody(provider.ExtraBody)
 	if err != nil {
@@ -692,19 +716,17 @@ func extraBody(in map[string]any) (model.Extra, error) {
 	return out, nil
 }
 
-// wireDebugDir applies the retained opt-in: with the environment variable set
-// to "1", raw wire artifacts dump under the home-based private directory,
-// created once per preparation; a failed creation disables diagnostics, never
-// execution.
-func wireDebugDir(home string) string {
-	if os.Getenv(debugWireEnv) != "1" {
+// wireDebugDir applies the selected location: an empty location disables
+// diagnostics; otherwise raw wire artifacts dump under it, created once per
+// preparation; a failed creation disables diagnostics, never execution.
+func wireDebugDir(location string) string {
+	if location == "" {
 		return ""
 	}
-	dir := filepath.Join(home, ".lightcode", "debug", "wire")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(location, 0o700); err != nil {
 		return ""
 	}
-	return dir
+	return location
 }
 
 // concreteOpener returns the production invocation factory: per Engine call
@@ -727,7 +749,7 @@ func wireDebugDir(home string) string {
 // producer and nil snapshot fail-closed shapes unchanged. The shared
 // advertisement gate rejects unknown names before dispatch; retry
 // classification and scope disposal belong to the shared machinery.
-func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, session harness.SessionIdentity, workspace string, catalog []model.ToolDefinition, subprocessEnv func() []string) openInvocation {
+func (p *preparation) concreteOpener(transport, compactTransport *model.Transport, session harness.SessionIdentity, workspace string, catalog []model.ToolDefinition, subprocessEnv func(context.Context) ([]string, error)) openInvocation {
 	return func(_ context.Context, admission harness.OperationAdmission, sel selection, request harness.InvocationRequest) (harness.InvocationExecution, error) {
 		table := make(map[string]Tool, len(catalog))
 		for _, definition := range catalog {

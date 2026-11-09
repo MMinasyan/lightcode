@@ -122,16 +122,16 @@ func TestMountedGeneratedTypeScriptClient(t *testing.T) {
 		t.Skipf("node is not on PATH: %v", err)
 	}
 
-	t.Setenv("HOME", t.TempDir())
 	t.Setenv("MOUNTED_PROTOCOL_KEY", "mounted-protocol-key")
 	isolateMountedBundledCredentials(t)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeMountedFile(t, configPath, mountedOwnerConfig)
 	owner, err := runtime.Open(context.Background(), runtime.Options{
-		DataDir:    dataDir,
-		ConfigPath: configPath,
-		Plugins:    append(builtin.Plugins(), mountedReporterPlugin()),
+		DataDir:       dataDir,
+		Configuration: runtime.NewFileConfigurationSource(configPath),
+		Credentials:   runtime.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
+		Plugins:       append(builtin.Plugins(), mountedReporterPlugin()),
 	})
 	testassert.NoError(t, err)
 	defer func() {
