@@ -29,7 +29,7 @@ func TestClassifyKeySourceOrder(t *testing.T) {
 	}
 }
 
-// Agent-context adapter: LoadDotEnv has Setenv'd every managed key, so the
+// Agent-context adapter: the credential source captures every managed key, so the
 // agent passes external = set-in-env AND NOT managed. A key that is both in
 // the env and managed must classify managed, not external.
 func TestClassifyKeySourceAgentContext(t *testing.T) {
@@ -43,7 +43,7 @@ func TestClassifyKeySourceAgentContext(t *testing.T) {
 	testassert.Equal(t, ClassifyKeySource("UNSET_KEY", external, managed), KeySourceNone)
 }
 
-// Doctor-context adapter: LoadDotEnv never ran, so doctor mirrors its
+// Doctor-context adapter: the owner credential source never ran, so doctor mirrors its
 // effective env — external means a non-empty shell value; managed means the
 // name is defined in .env (any value) and not shadowed by the shell, which
 // skips even empty exports. A shell-exported key beats .env; a .env-only

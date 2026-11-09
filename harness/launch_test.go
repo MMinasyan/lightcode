@@ -30,6 +30,7 @@ func launchRequest() LaunchChildRequest {
 		AgentSelection:  testSelection("child-agent"),
 		Content:         admissionContent("child task"),
 		OperationID:     "child-op-1",
+		ExtensionID:     "test.extension",
 		MaxConcurrent:   2,
 		OutputLimit:     1024,
 	}
@@ -263,6 +264,7 @@ func TestLaunchChildSessionRejectsInvalidRequests(t *testing.T) {
 		{"output limit above 1048576", func(r *LaunchChildRequest) { r.OutputLimit = 1048577 }},
 		{"non-hex parent", func(r *LaunchChildRequest) { r.ParentSessionID = "parent" }},
 		{"empty operation id", func(r *LaunchChildRequest) { r.OperationID = "" }},
+		{"missing extension attribution", func(r *LaunchChildRequest) { r.ExtensionID = "" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -706,7 +708,7 @@ func TestLaunchChildSessionStartsChild(t *testing.T) {
 	testassert.Require(t, reflect.DeepEqual(capture, want), "durable child capture = %+v, want the sentinel capture %+v", capture, want)
 	graph, err := validateFixture(t, store, res.ChildSessionID)
 	testassert.NoError(t, err)
-	testassert.Require(t, len(graph.Entries) == 1 && graph.Entries[0].Input != nil && graph.Entries[0].Input.Origin == InputOriginPlugin && graph.Entries[0].Input.Content[0].Text == "child task", "child entries = %+v, want the plugin-origin input", graph.Entries)
+	testassert.Require(t, len(graph.Entries) == 1 && graph.Entries[0].Input != nil && graph.Entries[0].Input.Origin == InputOriginPlugin && graph.Entries[0].Input.ExtensionID == "test.extension" && graph.Entries[0].Input.Content[0].Text == "child task", "child entries = %+v, want the plugin-origin input with its calling extension", graph.Entries)
 
 	c.mu.Lock()
 	members := len(c.group.members)

@@ -1133,7 +1133,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			defer f.close()
 			probe.atEntry = f.cancel
 
-			res, err := f.h.Fork(ctx, harness.ForkRequest{
+			res, err := f.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: source,
 				BoundaryEntryID: boundary,
 				OperationID:     "fork-1",
@@ -1165,7 +1165,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			defer cancelCaller()
 			probe.atEntry = cancelCaller
 
-			res, err := f.h.Fork(caller, harness.ForkRequest{
+			res, err := f.h.Fork(caller, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: source,
 				BoundaryEntryID: boundary,
 				OperationID:     "fork-2",
@@ -1216,7 +1216,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			defer cancelCaller()
 			probe.atEntry = func() { <-caller.Done() } // publication gated until the caller deadline expires
 
-			res, err := f.h.Fork(caller, harness.ForkRequest{
+			res, err := f.h.Fork(caller, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: source,
 				BoundaryEntryID: boundary,
 				OperationID:     "fork-3",
@@ -1270,7 +1270,7 @@ func TestPublicPublicationContextLifetime(t *testing.T) {
 			defer cancelCaller()
 			probe.afterCommit = cancelCaller
 
-			res, err := f.h.Fork(caller, harness.ForkRequest{
+			res, err := f.h.Fork(caller, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: source,
 				BoundaryEntryID: boundary,
 				OperationID:     "fork-2",
@@ -5225,6 +5225,44 @@ func forkEntryOf(t *testing.T, store harness.Storage, sessionID string, kind har
 	return harness.Entry{}
 }
 
+// awaitForkIdle waits until one Session's current Operation clears, so a
+// following fork observes the required idle source.
+func awaitForkIdle(t *testing.T, h *harness.Harness, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		header, err := h.ReadSessionHeader(context.Background(), sessionID)
+		testassert.NoError(t, err)
+		if header.CurrentOperationID == "" {
+			return
+		}
+		testassert.Require(t, !time.Now().After(deadline), "session %q never became idle", sessionID)
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// inputFactsOf returns one Session's committed input values in sequence
+// order through the public validated history read.
+func inputFactsOf(t *testing.T, h *harness.Harness, sessionID string) []harness.InputEntry {
+	t.Helper()
+	view, err := h.ReadHistoryView(context.Background(), sessionID)
+	testassert.NoError(t, err)
+	var ids []string
+	for _, header := range view.HistoryHeaders() {
+		if header.Kind == harness.EntryInput {
+			ids = append(ids, header.EntryID)
+		}
+	}
+	facts := view.HistoryFacts(ids)
+	inputs := make([]harness.InputEntry, 0, len(facts))
+	for _, fact := range facts {
+		if fact.Input != nil {
+			inputs = append(inputs, *fact.Input)
+		}
+	}
+	return inputs
+}
+
 // assertForkSourceUnchanged verifies that a fork left one source Session's
 // complete durable state byte-identical at the same revisions.
 func assertForkSourceUnchanged(t *testing.T, store harness.Storage, sessionID string, before sessionSnapshot) {
@@ -5317,15 +5355,16 @@ func (s *corruptReadStore) ReadRegister(ctx context.Context, key harness.Registe
 }
 
 // TestPublicForkCopiesPrefixAndAdmits proves the fork row's positive core
-// through public operations: an idle source forks at a user-origin input
+// through public operations: an idle source forks at a committed input
 // boundary; the destination inherits the source Workspace and current Agent
 // type with informational source/boundary lineage and zero usage; only the
 // strict-before-boundary input, assistant, tool_result, and signal entries
 // are copied, under new operationless identities with cleared usage, the
 // rewritten result/assistant references, and the copied signal's source
 // Operation left as informational history; settlements and the boundary
-// itself are excluded; the fresh admission is a user-origin input owning a
-// running message Operation; the source stays byte-identical; and the
+// itself are excluded; the fresh admission carries the caller's replacement
+// origin and provenance and owns a running message Operation; the source
+// stays byte-identical; and the
 // destination execution starts after the commit and projects the copied
 // prefix before the fork input.
 func TestPublicForkPrepareOwnsSelection(t *testing.T) {
@@ -5355,7 +5394,7 @@ func TestPublicForkPrepareOwnsSelection(t *testing.T) {
 				}
 				return f.defaultPrep, nil
 			}
-			forked, err := f.h.Fork(context.Background(), harness.ForkRequest{SourceSessionID: source, BoundaryEntryID: boundary, OperationID: "fork-op", Content: []model.ContentPart{{Kind: model.PartText, Text: "fork"}}})
+			forked, err := f.h.Fork(context.Background(), harness.ForkRequest{Origin: harness.InputOriginUser, SourceSessionID: source, BoundaryEntryID: boundary, OperationID: "fork-op", Content: []model.ContentPart{{Kind: model.PartText, Text: "fork"}}})
 			testassert.NoError(t, err)
 			testassert.Require(t, reflect.DeepEqual(forked.Session.State.AgentSelection, selection) && reflect.DeepEqual(forked.Operation.Admission.AgentSelection, selection), "fork callback changed selection: %+v", forked)
 			header, err := f.h.ReadSessionHeader(context.Background(), source)
@@ -5439,7 +5478,7 @@ func TestPublicForkCopiesPrefixAndAdmits(t *testing.T) {
 		forkScript.gate = make(chan struct{})
 		f2 := newPublicFixture(t, store, forkScript, nil)
 		defer f2.close()
-		res, err := f2.h.Fork(ctx, harness.ForkRequest{
+		res, err := f2.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 			SourceSessionID: source,
 			BoundaryEntryID: boundary,
 			OperationID:     "fork-1",
@@ -5567,7 +5606,7 @@ func TestPublicForkArchivedSource(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
-		res, err := f2.h.Fork(ctx, harness.ForkRequest{
+		res, err := f2.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 			SourceSessionID: source,
 			BoundaryEntryID: boundary,
 			OperationID:     "fork-1",
@@ -5592,9 +5631,10 @@ func TestPublicForkArchivedSource(t *testing.T) {
 }
 
 // TestPublicForkBoundaryValidation proves the boundary/precondition axis: a
-// running source, a missing boundary, a non-input boundary, a non-user
-// boundary origin, and malformed identities are all rejected with nothing
-// published.
+// running source, a missing boundary, a non-input boundary, and malformed
+// identities are all rejected with nothing published, while every committed
+// source origin is an eligible boundary crossed with every replacement
+// origin.
 func TestPublicForkBoundaryValidation(t *testing.T) {
 	eachStore(t, func(t *testing.T, store harness.Storage) {
 		ctx := context.Background()
@@ -5610,7 +5650,7 @@ func TestPublicForkBoundaryValidation(t *testing.T) {
 		}
 		<-script.arrived // parked: the source is running
 		{
-			_, err := f.h.Fork(ctx, harness.ForkRequest{
+			_, err := f.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: source,
 				BoundaryEntryID: newRawSessionID(t),
 				OperationID:     "fork-1",
@@ -5619,15 +5659,15 @@ func TestPublicForkBoundaryValidation(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork of a running source = err %v, want ErrInvalid", err)
 		}
 		{
-			_, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: "short", BoundaryEntryID: newRawSessionID(t), OperationID: "fork-1"})
+			_, err := f.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser, SourceSessionID: "short", BoundaryEntryID: newRawSessionID(t), OperationID: "fork-1"})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork with a malformed source identity = err %v, want ErrInvalid", err)
 		}
 		{
-			_, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: source, BoundaryEntryID: "short", OperationID: "fork-1"})
+			_, err := f.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser, SourceSessionID: source, BoundaryEntryID: "short", OperationID: "fork-1"})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork with a malformed boundary identity = err %v, want ErrInvalid", err)
 		}
 		{
-			_, err := f.h.Fork(ctx, harness.ForkRequest{SourceSessionID: source, BoundaryEntryID: newRawSessionID(t), OperationID: ""})
+			_, err := f.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser, SourceSessionID: source, BoundaryEntryID: newRawSessionID(t), OperationID: ""})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fork without an operation identity = err %v, want ErrInvalid", err)
 		}
 		script.releaseGate()
@@ -5636,29 +5676,10 @@ func TestPublicForkBoundaryValidation(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 
-		// an idle source with one runtime-origin input: non-user boundaries are invalid
-		runtimeScript := newScriptModel()
-		f2 := newPublicFixture(t, store, runtimeScript, nil)
-		defer f2.close()
-		{
-			_, err := f2.h.Submit(ctx, harness.SubmitRequest{
-				SessionID:   source,
-				OperationID: "op-2",
-				Origin:      harness.InputOriginRuntime,
-				Content:     []model.ContentPart{{Kind: model.PartText, Text: "runtime input"}},
-				Mode:        harness.MessageModeRegular,
-			})
-			testassert.NoError(t, err)
-		}
-		<-runtimeScript.arrived
-		{
-			err := converge(t, f2)
-			testassert.NoError(t, err)
-		}
-
+		// A missing or non-input entry is never a boundary, independent of
+		// origin.
 		f3 := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f3.close()
-		runtimeBoundary := forkEntryOf(t, store, source, harness.EntryInput, "op-2").ID
 		assistantBoundary := forkEntryOf(t, store, source, harness.EntryAssistant, "op-1").ID
 		for _, tt := range []struct {
 			name     string
@@ -5666,10 +5687,9 @@ func TestPublicForkBoundaryValidation(t *testing.T) {
 		}{
 			{"missing boundary", newRawSessionID(t)},
 			{"non-input boundary", assistantBoundary},
-			{"runtime-origin boundary", runtimeBoundary},
 		} {
 			{
-				_, err := f3.h.Fork(ctx, harness.ForkRequest{
+				_, err := f3.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 					SourceSessionID: source,
 					BoundaryEntryID: tt.boundary,
 					OperationID:     "fork-1",
@@ -5679,6 +5699,84 @@ func TestPublicForkBoundaryValidation(t *testing.T) {
 			}
 		}
 		assertSessionIDs(t, store, source) // nothing was published by any rejection
+
+		// Source origin is attribution only: a committed canonical input of
+		// user, runtime, or plugin origin is the same eligible boundary, and
+		// the replacement input's origin/provenance is independently supplied
+		// by the caller.
+		origins := []harness.InputOrigin{harness.InputOriginUser, harness.InputOriginRuntime, harness.InputOriginPlugin}
+		provenance := func(origin harness.InputOrigin) string {
+			if origin == harness.InputOriginPlugin {
+				return "matrix." + string(origin) + ".extension"
+			}
+			return ""
+		}
+		for _, sourceOrigin := range origins {
+			for _, replacementOrigin := range origins {
+				t.Run(string(sourceOrigin)+" source, "+string(replacementOrigin)+" replacement", func(t *testing.T) {
+					matrixScript := newScriptModel()
+					fixture := newPublicFixture(t, store, matrixScript, nil)
+					defer fixture.close()
+					matrixSource := createSession(t, fixture.h)
+					prefixOperation := "op-prefix-" + string(sourceOrigin) + "-" + string(replacementOrigin)
+					boundaryOperation := "op-boundary-" + string(sourceOrigin) + "-" + string(replacementOrigin)
+					forkOperation := "fork-" + string(sourceOrigin) + "-" + string(replacementOrigin)
+					for _, operation := range []string{prefixOperation, boundaryOperation} {
+						{
+							_, err := fixture.h.Submit(ctx, harness.SubmitRequest{
+								SessionID:   matrixSource,
+								OperationID: operation,
+								Origin:      sourceOrigin,
+								ExtensionID: provenance(sourceOrigin),
+								Content:     []model.ContentPart{{Kind: model.PartText, Text: "boundary"}},
+								Mode:        harness.MessageModeRegular,
+							})
+							testassert.NoError(t, err)
+						}
+						awaitTerminal(t, fixture.h, matrixSource, operation)
+					}
+					sourceFacts := inputFactsOf(t, fixture.h, matrixSource)
+					boundary := forkEntryOf(t, store, matrixSource, harness.EntryInput, boundaryOperation).ID
+					forked, err := fixture.h.Fork(ctx, harness.ForkRequest{
+						SourceSessionID: matrixSource,
+						BoundaryEntryID: boundary,
+						OperationID:     forkOperation,
+						Origin:          replacementOrigin,
+						ExtensionID:     provenance(replacementOrigin),
+						Content:         []model.ContentPart{{Kind: model.PartText, Text: "replacement"}},
+					})
+					testassert.NoError(t, err)
+					testassert.Require(t, forked.Session.Identity.SourceSessionID == matrixSource && forked.Session.Identity.SourceBoundaryEntryID == boundary, "destination lineage = %+v, want source %q boundary %q", forked.Session.Identity, matrixSource, boundary)
+					awaitTerminal(t, fixture.h, forked.Session.Identity.SessionID, forkOperation)
+					{
+						after := inputFactsOf(t, fixture.h, matrixSource)
+						testassert.Require(t, reflect.DeepEqual(after, sourceFacts), "fork changed the source input: %+v -> %+v", sourceFacts, after)
+					}
+					destination := inputFactsOf(t, fixture.h, forked.Session.Identity.SessionID)
+					testassert.Require(t, len(destination) == 2, "destination inputs = %+v, want the copied prefix and the replacement", destination)
+					testassert.Require(t, destination[0].OperationID == "" && destination[0].Origin == sourceOrigin && destination[0].ExtensionID == provenance(sourceOrigin), "copied input = %+v, want operationless %s provenance", destination[0], sourceOrigin)
+					testassert.Require(t, destination[1].OperationID == forkOperation && destination[1].Origin == replacementOrigin && destination[1].ExtensionID == provenance(replacementOrigin), "replacement input = %+v, want %s %s provenance", destination[1], forkOperation, replacementOrigin)
+
+					// The independently copied, operationless prefix input of
+					// any origin is itself an eligible fork boundary.
+					awaitForkIdle(t, fixture.h, forked.Session.Identity.SessionID)
+					copiedForkOperation := "fork-copied-" + string(sourceOrigin) + "-" + string(replacementOrigin)
+					copiedFork, err := fixture.h.Fork(ctx, harness.ForkRequest{
+						SourceSessionID: forked.Session.Identity.SessionID,
+						BoundaryEntryID: destination[0].EntryID,
+						OperationID:     copiedForkOperation,
+						Origin:          replacementOrigin,
+						ExtensionID:     provenance(replacementOrigin),
+						Content:         []model.ContentPart{{Kind: model.PartText, Text: "copied replacement"}},
+					})
+					testassert.NoError(t, err)
+					testassert.Require(t, copiedFork.Session.Identity.SourceSessionID == forked.Session.Identity.SessionID && copiedFork.Session.Identity.SourceBoundaryEntryID == destination[0].EntryID, "copied-boundary lineage = %+v, want the destination's copied input", copiedFork.Session.Identity)
+					awaitTerminal(t, fixture.h, copiedFork.Session.Identity.SessionID, copiedForkOperation)
+					copiedDestination := inputFactsOf(t, fixture.h, copiedFork.Session.Identity.SessionID)
+					testassert.Require(t, len(copiedDestination) == 1 && copiedDestination[0].OperationID == copiedForkOperation && copiedDestination[0].Origin == replacementOrigin && copiedDestination[0].ExtensionID == provenance(replacementOrigin), "copied-boundary destination inputs = %+v, want only the replacement %s provenance", copiedDestination, replacementOrigin)
+				})
+			}
+		}
 	})
 }
 
@@ -5696,7 +5794,7 @@ func TestPublicForkExistingLookup(t *testing.T) {
 		ctx := context.Background()
 		source := seedIdleSource(t, store, "op-1")
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
-		forkReq := harness.ForkRequest{
+		forkReq := harness.ForkRequest{Origin: harness.InputOriginUser,
 			SourceSessionID: source,
 			BoundaryEntryID: boundary,
 			OperationID:     "fork-a",
@@ -5764,7 +5862,7 @@ func TestPublicForkExistingLookup(t *testing.T) {
 			f6 := newPublicFixture(t, store, newScriptModel(), nil)
 			defer f6.close()
 			{
-				_, err := f6.h.Fork(ctx, harness.ForkRequest{
+				_, err := f6.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 					SourceSessionID: other,
 					BoundaryEntryID: otherBoundary,
 					OperationID:     "fork-b",
@@ -5777,7 +5875,7 @@ func TestPublicForkExistingLookup(t *testing.T) {
 		t.Run("corrupt located owner returns corruption", func(t *testing.T) {
 			f7 := newPublicFixture(t, store, newScriptModel(), nil)
 			defer f7.close()
-			res, err := f7.h.Fork(ctx, harness.ForkRequest{
+			res, err := f7.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: other,
 				BoundaryEntryID: otherBoundary,
 				OperationID:     "fork-c",
@@ -5810,7 +5908,7 @@ func TestPublicForkExistingLookup(t *testing.T) {
 				testassert.NoError(t, err)
 			}
 			{
-				_, err := f8.h.Fork(ctx, harness.ForkRequest{
+				_, err := f8.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 					SourceSessionID: other,
 					BoundaryEntryID: otherBoundary,
 					OperationID:     "fork-c",
@@ -5876,7 +5974,7 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 				decoyCh <- seedForkDecoy(t, store, source, boundary, "race-1", true) // the concurrent winner commits during preparation
 				return racePrepared(race), nil
 			}
-			res, err := race.h.Fork(ctx, harness.ForkRequest{
+			res, err := race.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: source,
 				BoundaryEntryID: boundary,
 				OperationID:     "race-1",
@@ -5904,7 +6002,7 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 				return racePrepared(race), nil
 			}
 			{
-				_, err := race.h.Fork(ctx, harness.ForkRequest{
+				_, err := race.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 					SourceSessionID: source,
 					BoundaryEntryID: boundary,
 					OperationID:     "race-2",
@@ -5929,7 +6027,7 @@ func TestPublicForkFirstWriterRace(t *testing.T) {
 				return racePrepared(race), nil
 			}
 			{
-				_, err := race.h.Fork(ctx, harness.ForkRequest{
+				_, err := race.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 					SourceSessionID: source,
 					BoundaryEntryID: boundary,
 					OperationID:     "race-3",
@@ -5970,7 +6068,7 @@ func TestPublicForkSourceRevisionRace(t *testing.T) {
 			return racePrepared(race), nil
 		}
 		{
-			_, err := race.h.Fork(ctx, harness.ForkRequest{
+			_, err := race.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: source,
 				BoundaryEntryID: boundary,
 				OperationID:     "race-1",
@@ -6015,7 +6113,7 @@ func TestPublicForkIndependentSourceDeletion(t *testing.T) {
 
 		f2 := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f2.close()
-		res, err := f2.h.Fork(ctx, harness.ForkRequest{
+		res, err := f2.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 			SourceSessionID: source,
 			BoundaryEntryID: boundary,
 			OperationID:     "fork-1",
@@ -6068,7 +6166,7 @@ func TestPublicForkIndependentSourceDeletion(t *testing.T) {
 		f4 := newPublicFixture(t, store, newScriptModel(), nil)
 		defer f4.close()
 		{
-			_, err := f4.h.Fork(ctx, harness.ForkRequest{
+			_, err := f4.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: source,
 				BoundaryEntryID: boundary,
 				OperationID:     "fork-3",
@@ -6093,7 +6191,7 @@ func TestPublicForkRollbackOnTransactionFailure(t *testing.T) {
 		race := newPublicFixture(t, probe, newScriptModel(), nil)
 		defer race.close()
 		{
-			_, err := race.h.Fork(ctx, harness.ForkRequest{
+			_, err := race.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: source,
 				BoundaryEntryID: boundary,
 				OperationID:     "fork-1",
@@ -6235,7 +6333,7 @@ func TestPublicExecutionResourceLifetime(t *testing.T) {
 		// Fork shares the same lifetime: the destination execution opens
 		// after the fork commit and closes after its own terminal.
 		boundary := forkEntryOf(t, store, source, harness.EntryInput, "op-1").ID
-		res, err := f.h.Fork(ctx, harness.ForkRequest{
+		res, err := f.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 			SourceSessionID: source,
 			BoundaryEntryID: boundary,
 			OperationID:     "fork-op",
@@ -6523,7 +6621,7 @@ func TestPublicForkAcrossCompaction(t *testing.T) {
 		}
 		testassert.Require(t, sourceWire.OperationID == "c-1" && sourceSummary == "[Previous conversation summary]\n\nsummary one\n\n[End of summary. Continue from here.]" && sourceUsage != nil, "source compaction entry = %+v, want the c-1-owned committed summary with usage", sourceWire)
 
-		res, err := f.h.Fork(ctx, harness.ForkRequest{
+		res, err := f.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 			SourceSessionID: source,
 			BoundaryEntryID: boundary,
 			OperationID:     "fork-1",

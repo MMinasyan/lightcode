@@ -1,0 +1,415 @@
+package melta
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+
+	"github.com/MMinasyan/lightcode/harness"
+	"github.com/MMinasyan/lightcode/model"
+	"github.com/MMinasyan/lightcode/protocol"
+)
+
+// CreateSession is the protocol-shaped root Session creation: one
+// admitted call runs the shared creation core and then projects the header
+// from the narrow post-transition metadata read, so the revision pair is the
+// coordinator's own publication. A failed fresh read propagates its typed
+// error; the committed creation is never rolled back and no synthetic
+// revision is invented.
+func (r *Melta) CreateSession(ctx context.Context, c Caller, workspace string, requested *protocol.AgentSelection) (protocol.Session, error) {
+	selection := r.defaultAgentSelection()
+	if requested != nil {
+		var err error
+		selection, err = selectionFromProtocol(*requested)
+		if err != nil {
+			return protocol.Session{}, err
+		}
+	}
+	if workspace == "" {
+		return protocol.Session{}, fmt.Errorf("workspace must be non-empty: %w", harness.ErrInvalid)
+	}
+	normalized, err := filepath.Abs(workspace)
+	if err != nil {
+		return protocol.Session{}, fmt.Errorf("normalize Workspace: %w", harness.ErrInvalid)
+	}
+	var header protocol.Session
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeWorkspace, Workspace: normalized}); err != nil {
+			return err
+		}
+		record, err := r.createSessionRecord(ctx, h, normalized, selection)
+		if err != nil {
+			return err
+		}
+		header, err = sessionHeaderAfter(ctx, h, record.Identity.SessionID, r.instance)
+		return err
+	}); err != nil {
+		return protocol.Session{}, err
+	}
+	return header, nil
+}
+
+// SubmitSession is the protocol-shaped Session message submission: the wire
+// body is converted once, trusted Caller attribution supplies the origin and
+// extension provenance (the wire carries neither), the mode is a plain cast
+// so the existing Harness validator decides the closed set, and the outcome
+// projects the Harness-returned record. A Session target outside the Caller's
+// scope is denied before the Harness sees it. A buffered item's result keeps
+// Operation nil even after a later drain admits work under that identity.
+func (r *Melta) SubmitSession(ctx context.Context, c Caller, sessionID string, req protocol.SubmitRequest) (protocol.SubmitResult, error) {
+	content, err := convertContentParts(req.Content)
+	if err != nil {
+		return protocol.SubmitResult{}, err
+	}
+	var result protocol.SubmitResult
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeSession, SessionID: sessionID}); err != nil {
+			return err
+		}
+		out, err := h.Submit(ctx, harness.SubmitRequest{
+			SessionID:   sessionID,
+			OperationID: req.OperationId,
+			Origin:      c.origin,
+			ExtensionID: c.extensionID,
+			Content:     content,
+			Mode:        harness.MessageMode(req.Mode),
+		})
+		if err != nil {
+			return err
+		}
+		result = projectSubmitResult(out)
+		return nil
+	}); err != nil {
+		return protocol.SubmitResult{}, err
+	}
+	return result, nil
+}
+
+// projectSubmitResult maps the Harness outcome: the disposition enum is the
+// same closed set, and only an admitted or existing Operation is projected.
+func projectSubmitResult(out harness.SubmitResult) protocol.SubmitResult {
+	result := protocol.SubmitResult{Disposition: protocol.SubmitResultDisposition(out.Disposition)}
+	if out.Operation != nil {
+		operation := projectOperation(*out.Operation)
+		result.Operation = &operation
+	}
+	return result
+}
+
+// CompactSession is the protocol-shaped manual compaction over one idle
+// Session: the contiguous admission discipline stays entirely with the
+// Harness, and the returned Operation is its committed record.
+func (r *Melta) CompactSession(ctx context.Context, c Caller, sessionID string, req protocol.CompactRequest) (protocol.Operation, error) {
+	var operation protocol.Operation
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeSession, SessionID: sessionID}); err != nil {
+			return err
+		}
+		record, err := h.Compact(ctx, harness.CompactRequest{SessionID: sessionID, OperationID: req.OperationId})
+		if err != nil {
+			return err
+		}
+		operation = projectOperation(record)
+		return nil
+	}); err != nil {
+		return protocol.Operation{}, err
+	}
+	return operation, nil
+}
+
+// ForkSession is the protocol-shaped Fork command. One admitted call resolves
+// the raw boundary entry — from an already-committed destination of this
+// request when one exists, otherwise from the live narrow history capture —
+// then delegates to Harness.Fork with that raw identity, so first-writer/
+// conflict and the normal new-fork transaction stay Harness authority. The
+// Caller's replacement attribution is trusted grant data, never wire fields,
+// and a Session target outside its scope is denied. The destination header
+// comes from the narrow post-transition metadata read.
+func (r *Melta) ForkSession(ctx context.Context, c Caller, sessionID string, req protocol.ForkRequest) (protocol.ForkResult, error) {
+	content, err := convertContentParts(req.Content)
+	if err != nil {
+		return protocol.ForkResult{}, err
+	}
+	var result protocol.ForkResult
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeSession, SessionID: sessionID}); err != nil {
+			return err
+		}
+		boundaryEntryID, err := forkBoundaryEntry(ctx, h, sessionID, req)
+		if err != nil {
+			return err
+		}
+		out, err := h.Fork(ctx, harness.ForkRequest{
+			SourceSessionID: sessionID,
+			BoundaryEntryID: boundaryEntryID,
+			OperationID:     req.OperationId,
+			Origin:          c.origin,
+			ExtensionID:     c.extensionID,
+			Content:         content,
+		})
+		if err != nil {
+			return err
+		}
+		header, err := sessionHeaderAfter(ctx, h, out.Session.Identity.SessionID, r.instance)
+		if err != nil {
+			return err
+		}
+		result = protocol.ForkResult{Session: header, Operation: projectOperation(out.Operation)}
+		return nil
+	}); err != nil {
+		return protocol.ForkResult{}, err
+	}
+	return result, nil
+}
+
+// forkBoundaryEntry resolves the raw boundary entry identity for one fork
+// request inside the Caller's single admission. The live source history
+// capture resolves the projected boundary first and, on success, is returned
+// immediately — a valid source never falls back to a destination scan, so an
+// invalid boundary item fails exactly like the pure resolver. Only a
+// typed-unavailable source (deleted or corrupt) scans an already-committed
+// destination of this Caller Operation ID whose durable lineage names this
+// source Session, whose lineage boundary projects to the requested boundary
+// item, and whose located Operation is a message Operation; that raw lineage
+// boundary is returned and the Harness still decides first-writer/conflict,
+// so an idempotent retry still resolves after the source Session is deleted
+// or cold-corrupt. The scan reads only the public validated
+// ListSessions/ReadOperation producers, never storage or an index, and an
+// absent or corrupt destination is skipped without reinterpretation. With no
+// valid matching lineage the original source error returns unchanged. Other
+// source errors propagate unchanged. Ceiling: the unavailable-source scan is
+// O(Sessions) and may validate a cold coordinator; no dedup or index state is
+// added, and every normal new fork is revalidated by the Harness transaction.
+func forkBoundaryEntry(ctx context.Context, h *harness.Harness, sourceID string, req protocol.ForkRequest) (string, error) {
+	view, err := h.ReadHistoryView(ctx, sourceID)
+	if err == nil {
+		return resolveBoundaryEntry(sourceID, view.HistoryHeaders(), req.BoundaryItemId)
+	}
+	if !errors.Is(err, harness.ErrNotFound) && !errors.Is(err, harness.ErrCorrupt) {
+		return "", err
+	}
+	sourceErr := err
+	rows, err := h.ListSessions(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, row := range rows {
+		boundary := row.Identity.SourceBoundaryEntryID
+		if row.Identity.SourceSessionID != sourceID || boundary == "" {
+			continue
+		}
+		if projectItemID(sourceID, boundary) != req.BoundaryItemId {
+			continue
+		}
+		operation, err := h.ReadOperation(ctx, row.Identity.SessionID, req.OperationId)
+		if errors.Is(err, harness.ErrNotFound) || errors.Is(err, harness.ErrCorrupt) {
+			continue // not a valid matching destination
+		}
+		if err != nil {
+			return "", err
+		}
+		if operation.Admission.RequestKind != harness.RequestKindMessage {
+			continue
+		}
+		return boundary, nil
+	}
+	return "", sourceErr
+}
+
+// SetSessionAgentType is the protocol-shaped Agent-type change: the Harness
+// keeps its nonempty-only selection (an unknown type fails at the next
+// preparation, not here), and the returned header is the narrow
+// post-transition metadata read.
+func (r *Melta) SetSessionAgentType(ctx context.Context, c Caller, sessionID string, req protocol.SetSessionAgentTypeRequest) (protocol.Session, error) {
+	var header protocol.Session
+	selection, err := selectionFromProtocol(req.AgentSelection)
+	if err != nil {
+		return header, err
+	}
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeSession, SessionID: sessionID}); err != nil {
+			return err
+		}
+		if _, err := h.ChangeAgentType(ctx, sessionID, selection); err != nil {
+			return err
+		}
+		var err error
+		header, err = sessionHeaderAfter(ctx, h, sessionID, r.instance)
+		return err
+	}); err != nil {
+		return protocol.Session{}, err
+	}
+	return header, nil
+}
+
+func (r *Melta) SetSessionModel(ctx context.Context, c Caller, sessionID, modelRef string) (protocol.Session, error) {
+	var ref model.ModelRef
+	if modelRef != "" {
+		var err error
+		ref, err = model.Parse(modelRef)
+		if err != nil {
+			return protocol.Session{}, fmt.Errorf("model: %v: %w", err, harness.ErrInvalid)
+		}
+	}
+	var header protocol.Session
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeSession, SessionID: sessionID}); err != nil {
+			return err
+		}
+		if _, err := h.SetSessionModel(ctx, sessionID, ref); err != nil {
+			return err
+		}
+		var err error
+		header, err = sessionHeaderAfter(ctx, h, sessionID, r.instance)
+		return err
+	}); err != nil {
+		return protocol.Session{}, err
+	}
+	return header, nil
+}
+
+// ArchiveSession is the protocol-shaped archive: the Harness-owned
+// idle/live-background gates stay in force, and the archived header is the
+// narrow post-transition metadata read.
+func (r *Melta) ArchiveSession(ctx context.Context, c Caller, sessionID string) (protocol.Session, error) {
+	var header protocol.Session
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeSession, SessionID: sessionID}); err != nil {
+			return err
+		}
+		if _, err := h.ArchiveSession(ctx, sessionID); err != nil {
+			return err
+		}
+		var err error
+		header, err = sessionHeaderAfter(ctx, h, sessionID, r.instance)
+		return err
+	}); err != nil {
+		return protocol.Session{}, err
+	}
+	return header, nil
+}
+
+// ReopenSession is the protocol-shaped reopen: an already open Session is the
+// Harness no-write success, and the header is the narrow post-transition
+// metadata read.
+func (r *Melta) ReopenSession(ctx context.Context, c Caller, sessionID string) (protocol.Session, error) {
+	var header protocol.Session
+	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeSession, SessionID: sessionID}); err != nil {
+			return err
+		}
+		if _, err := h.ReopenSession(ctx, sessionID); err != nil {
+			return err
+		}
+		var err error
+		header, err = sessionHeaderAfter(ctx, h, sessionID, r.instance)
+		return err
+	}); err != nil {
+		return protocol.Session{}, err
+	}
+	return header, nil
+}
+
+// InterruptSession delegates to the Harness interrupt and returns with it:
+// the control is issued immediately and this call never waits for the
+// Operation's later terminal commit.
+func (r *Melta) InterruptSession(ctx context.Context, c Caller, sessionID string) error {
+	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeSession, SessionID: sessionID}); err != nil {
+			return err
+		}
+		return h.Interrupt(ctx, sessionID)
+	})
+}
+
+// StopSession delegates to the full background convergence wait owned by
+// Harness.Stop; the root active Operation and pending buffers are not touched
+// by this facade.
+func (r *Melta) StopSession(ctx context.Context, c Caller, sessionID string) error {
+	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := r.authorize(c, ctx, h, CallerScope{Kind: CallerScopeSession, SessionID: sessionID}); err != nil {
+			return err
+		}
+		return h.Stop(ctx, sessionID)
+	})
+}
+
+// sessionHeaderAfter projects one Session header from a fresh narrow
+// metadata read taken inside the Caller's admission after a committed
+// transition. A failing fresh read returns its typed error; no synthetic
+// revision is invented.
+func sessionHeaderAfter(ctx context.Context, h *harness.Harness, sessionID string, instance string) (protocol.Session, error) {
+	header, err := h.ReadSessionHeader(ctx, sessionID)
+	if err != nil {
+		return protocol.Session{}, err
+	}
+	return projectSession(header, instance), nil
+}
+
+// convertContentParts maps one generated content union list to canonical
+// model parts through the generated accessors. It performs union decoding
+// only: the Harness accepting boundary validates and clones every part
+// through model.NewContentPart before any admission or effect, for both
+// Submit and Fork. Unknown discriminator and union decode failures wrap the
+// shared harness.ErrInvalid sentinel.
+func convertContentParts(parts []protocol.ContentPart) ([]model.ContentPart, error) {
+	out := make([]model.ContentPart, 0, len(parts))
+	for i, wire := range parts {
+		part, err := convertContentPart(wire)
+		if err != nil {
+			return nil, fmt.Errorf("content[%d]: %w", i, err)
+		}
+		out = append(out, part)
+	}
+	return out, nil
+}
+
+// convertContentPart maps one generated union member to its canonical kind
+// with exactly that kind's field; extras ride the identical raw-valued map
+// conversion, so numbers and opaque extras are preserved. It adds no
+// model-semantic validation: the Harness boundary owns that rule.
+func convertContentPart(wire protocol.ContentPart) (model.ContentPart, error) {
+	invalid := func(format string, args ...any) (model.ContentPart, error) {
+		return model.ContentPart{}, fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), harness.ErrInvalid)
+	}
+	kind, err := wire.Discriminator()
+	if err != nil {
+		return invalid("decode content part: %v", err)
+	}
+	var part model.ContentPart
+	switch kind {
+	case "text":
+		value, err := wire.AsTextPart()
+		if err != nil {
+			return invalid("decode text part: %v", err)
+		}
+		part = model.ContentPart{Kind: model.PartText, Text: value.Text, Extra: modelExtra(value.Extra)}
+	case "image_url":
+		value, err := wire.AsImageURLPart()
+		if err != nil {
+			return invalid("decode image_url part: %v", err)
+		}
+		part = model.ContentPart{Kind: model.PartImageURL, URL: value.Url, Extra: modelExtra(value.Extra)}
+	case "opaque":
+		value, err := wire.AsOpaquePart()
+		if err != nil {
+			return invalid("decode opaque part: %v", err)
+		}
+		part = model.ContentPart{Kind: model.PartOpaque, OpaqueWireType: value.OpaqueWireType, Extra: modelExtra(value.Extra)}
+	default:
+		return invalid("content part kind %q is not one of text, image_url or opaque", kind)
+	}
+	return part, nil
+}
+
+// modelExtra converts one generated raw-valued object to the canonical extra
+// set by the identical direct map conversion; the Harness accepting boundary
+// clones it through model.NewContentPart, so no reference to the wire value
+// escapes.
+func modelExtra(extra *protocol.JSONObject) model.Extra {
+	if extra == nil {
+		return nil
+	}
+	return model.Extra(*extra)
+}

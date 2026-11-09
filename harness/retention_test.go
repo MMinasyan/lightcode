@@ -233,7 +233,7 @@ func TestLatchedCellSurvivesItsGraphRelease(t *testing.T) {
 	// cell without a load.
 	foreignCorruptRegister(t, store, source)
 	{
-		_, err := h.Fork(ctx, ForkRequest{
+		_, err := h.Fork(ctx, ForkRequest{Origin: InputOriginUser,
 			SourceSessionID: source,
 			BoundaryEntryID: hexID(1),
 			OperationID:     "op-fork-latched",

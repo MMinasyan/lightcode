@@ -1,6 +1,6 @@
 <script>
   import { openDialog } from './dialogs';
-  // Temporary replacement-Fork editor for one root user-origin item. The exact
+  // Temporary replacement-Fork editor for one root input. The exact
   // edited content text is forwarded, so malformed payloads stay the server's
   // decision; rewind exists only for an owned operation_id, and an unknown
   // rewind offers no Retry.

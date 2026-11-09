@@ -814,13 +814,15 @@ func (h *Harness) StartJob(ctx context.Context, sessionID, jobID string, spawn f
 
 // LaunchChildRequest is the input of one child launch: the open root parent
 // Session, the requested Agent type and message, the caller-generated
-// globally unique Operation identity, the parent's child concurrency cap, and
-// the completion output limit in UTF-8 bytes.
+// globally unique Operation identity, the calling extension's attribution,
+// the parent's child concurrency cap, and the completion output limit in
+// UTF-8 bytes.
 type LaunchChildRequest struct {
 	ParentSessionID string
 	AgentSelection  AgentSelection
 	Content         []model.ContentPart
 	OperationID     string // caller-generated, globally unique
+	ExtensionID     string // the calling extension's attribution
 	MaxConcurrent   int    // 1..20
 	OutputLimit     int    // 1024..1048576 UTF-8 bytes
 }
@@ -860,7 +862,7 @@ func (h *Harness) LaunchChildSession(ctx context.Context, req LaunchChildRequest
 	if err := validateHexID(req.ParentSessionID, "parent session id"); err != nil {
 		return LaunchChildResult{}, invalidInput("parent session id: %v", err)
 	}
-	content, err := validateSubmitInput(req.OperationID, InputOriginPlugin, req.Content)
+	content, err := validateSubmitInput(req.OperationID, InputOriginPlugin, req.ExtensionID, req.Content)
 	if err != nil {
 		return LaunchChildResult{}, err
 	}
@@ -993,6 +995,7 @@ func (h *Harness) launchTransaction(tx Transaction, view SessionRecord, req Laun
 		OperationID: req.OperationID,
 		Kind:        RequestKindMessage,
 		Origin:      InputOriginPlugin,
+		ExtensionID: req.ExtensionID,
 		Content:     content,
 	})
 	if perr != nil {

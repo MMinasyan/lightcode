@@ -18,6 +18,7 @@ import (
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -26,62 +27,79 @@ import (
 // events stream can unblock its writer by closing exactly its connection.
 type sseConnectionKey struct{}
 
-// ProtocolServer is the one attached isolated protocol listener of a Runtime:
-// it owns the loopback listener, the native HTTP server, the minted instance
-// identity and bearer credential, and the remembered discovery path once one
-// is published. It exposes no credential-returning API and grants no
-// lifetime authority: the owning Runtime's Close is the only shutdown
-// command, and it closes this server, joins its serving goroutine, and
-// withdraws the remembered discovery record.
-type ProtocolServer struct {
-	owner      *Runtime
-	listener   net.Listener
-	server     *http.Server
-	instance   string // 32 lowercase hex: the Runtime's process-lifetime identity
-	credential string // 64 lowercase hex: the bearer credential
-	endpoint   string // "http://127.0.0.1:<port>", the host-facing address
-	serveDone  chan struct{}
+// ProtocolHost owns one host's listener attachment and supplies the
+// BeforeRelease callback to the MELTA owner that must run after admitted work
+// and scopes settle and before storage or the ownership lock is released.
+type ProtocolHost struct {
+	mu       sync.Mutex
+	server   *ProtocolServer
+	released bool
+}
 
-	// pubMu coordinates the one publication attempt: a remembered path
-	// blocks every repeat, a failed pre-write attempt releases the claim,
-	// and a successful publication never repeats.
-	pubMu         sync.Mutex
-	discoveryPath string
+// NewProtocolHost constructs one empty host. BeforeRelease is supplied to
+// melta.Options and OpenProtocol attaches the one listener afterwards.
+func NewProtocolHost() *ProtocolHost { return &ProtocolHost{} }
+
+// BeforeRelease closes the attached listener and every active connection and
+// withdraws the remembered discovery record once. It runs at the owner's
+// release boundary; a second call is a no-op.
+func (h *ProtocolHost) BeforeRelease() error {
+	h.mu.Lock()
+	if h.released {
+		h.mu.Unlock()
+		return nil
+	}
+	h.released = true
+	server := h.server
+	h.mu.Unlock()
+	if server == nil {
+		return nil
+	}
+	return server.release()
 }
 
 // OpenProtocol binds one isolated loopback listener and mounts the generated
-// protocol server against the Runtime's private producers. It owns one
-// admitted call, binds outside the Runtime mutex, and rechecks closure and
-// attachment under that mutex: a shutdown race or an existing attachment
-// closes the rejected listener and fails without touching network state.
-// Once attached, the serving goroutine always starts and shutdown joins it.
-// A second attachment while one exists fails invalid.
-func (r *Runtime) OpenProtocol(ctx context.Context) (*ProtocolServer, error) {
-	release, err := r.enter(ctx)
+// protocol server over the public owner. It binds outside the host mutex and
+// rechecks the attachment and release state under that mutex: a closing host
+// or an existing attachment closes the rejected listener and fails without
+// touching network state. Once attached, the serving goroutine always starts
+// and the host release joins it.
+func (h *ProtocolHost) OpenProtocol(ctx context.Context, owner *melta.Melta) (*ProtocolServer, error) {
+	if ctx == nil {
+		return nil, errors.New("runtime: protocol construction requires a non-nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if owner == nil {
+		return nil, errors.New("runtime: protocol construction requires a non-nil owner")
+	}
+	caller, err := owner.Caller(melta.CallerContext{Origin: harness.InputOriginUser, Scope: melta.CallerScope{Kind: melta.CallerScopeHarness}})
 	if err != nil {
 		return nil, err
 	}
-	defer release()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
-	instance, credential, err := mintProtocolIdentity()
+	credential, err := mintCredential()
 	if err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
 	ps := &ProtocolServer{
-		owner:      r,
+		host:       h,
+		owner:      owner,
+		caller:     caller,
 		listener:   listener,
-		instance:   instance,
+		instance:   owner.InstanceID(),
 		credential: credential,
 		endpoint:   "http://" + listener.Addr().String(),
 		serveDone:  make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	router := authenticatedMux{mux: mux, authorize: ps.authorize}
-	handler := protocol.HandlerWithOptions(&protocolHandlers{Runtime: r}, protocol.StdHTTPServerOptions{
+	handler := protocol.HandlerWithOptions(&protocolHandlers{owner: owner, server: ps}, protocol.StdHTTPServerOptions{
 		BaseRouter: router,
 		// A malformed or missing request parameter is the one binding-failure
 		// class, answered by the same typed error body as every handler.
@@ -102,19 +120,19 @@ func (r *Runtime) OpenProtocol(ctx context.Context) (*ProtocolServer, error) {
 			return context.WithValue(ctx, sseConnectionKey{}, c)
 		},
 	}
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
+	h.mu.Lock()
+	if h.released {
+		h.mu.Unlock()
 		_ = listener.Close()
-		return nil, ErrClosed
+		return nil, melta.ErrClosed
 	}
-	if r.protocol != nil {
-		r.mu.Unlock()
+	if h.server != nil {
+		h.mu.Unlock()
 		_ = listener.Close()
 		return nil, fmt.Errorf("a protocol server is already attached: %w", harness.ErrInvalid)
 	}
-	r.protocol = ps
-	r.mu.Unlock()
+	h.server = ps
+	h.mu.Unlock()
 	go func() {
 		defer close(ps.serveDone)
 		_ = ps.server.Serve(ps.listener)
@@ -122,32 +140,41 @@ func (r *Runtime) OpenProtocol(ctx context.Context) (*ProtocolServer, error) {
 	return ps, nil
 }
 
+// ProtocolServer is the one attached isolated protocol listener of a host:
+// it owns the loopback listener, the native HTTP server, the owner-minted
+// instance identity and bearer credential, and the remembered discovery path
+// once one is published. It exposes no credential-returning API; the host's
+// release closes this server, joins its serving goroutine, and withdraws the
+// remembered discovery record.
+type ProtocolServer struct {
+	host       *ProtocolHost
+	owner      *melta.Melta
+	caller     melta.Caller
+	listener   net.Listener
+	server     *http.Server
+	instance   string // 32 lowercase hex: the owner's process-lifetime identity
+	credential string // 64 lowercase hex: the bearer credential
+	endpoint   string // "http://127.0.0.1:<port>", the host-facing address
+	serveDone  chan struct{}
+
+	// pubMu coordinates the one publication attempt: a remembered path
+	// blocks every repeat, a failed pre-write attempt releases the claim,
+	// and a successful publication never repeats.
+	pubMu         sync.Mutex
+	discoveryPath string
+}
+
 // Endpoint returns the host-facing address of the attached listener.
 func (ps *ProtocolServer) Endpoint() string { return ps.endpoint }
 
-// mintProtocolIdentity mints the Runtime's process-lifetime identity — 16
-// random bytes as 32 lowercase hex — and its bearer credential — 32 random
-// bytes as 64 lowercase hex.
-func mintProtocolIdentity() (instance, credential string, err error) {
-	var instanceRaw [16]byte
-	if _, err := rand.Read(instanceRaw[:]); err != nil {
-		return "", "", fmt.Errorf("mint protocol instance identity: %w", err)
+// mintCredential mints the server's bearer credential: 32 random bytes as 64
+// lowercase hex.
+func mintCredential() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("mint protocol credential: %w", err)
 	}
-	var credentialRaw [32]byte
-	if _, err := rand.Read(credentialRaw[:]); err != nil {
-		return "", "", fmt.Errorf("mint protocol credential: %w", err)
-	}
-	return hex.EncodeToString(instanceRaw[:]), hex.EncodeToString(credentialRaw[:]), nil
-}
-
-// protocolInstance returns the attached server's minted instance identity, or
-// empty when no server is attached. Handlers only run while their server is
-// attached, so the value is stable for their whole response.
-func (r *Runtime) protocolInstance() string {
-	if ps := r.protocol; ps != nil {
-		return ps.instance
-	}
-	return ""
+	return hex.EncodeToString(raw[:]), nil
 }
 
 // authenticatedMux adapts the generated route registration onto the real
@@ -183,7 +210,7 @@ func (ps *ProtocolServer) authorize(handler http.HandlerFunc) http.HandlerFunc {
 		header := r.Header.Get("Authorization")
 		if !strings.HasPrefix(header, prefix) ||
 			subtle.ConstantTimeCompare([]byte(header[len(prefix):]), []byte(ps.credential)) != 1 {
-			writeProtocolError(w, errUnauthorized)
+			writeProtocolAuthError(w)
 			return
 		}
 		handler(w, r)
@@ -197,10 +224,10 @@ func (ps *ProtocolServer) notFound(w http.ResponseWriter, _ *http.Request) {
 	writeProtocolError(w, fmt.Errorf("no protocol operation matches the request method and path: %w", harness.ErrNotFound))
 }
 
-// discoveryRecord is the owner-held readiness record published at the
-// caller's isolated path: the loopback endpoint, the Runtime's minted
-// instance identity, the wire protocol version, and the bearer credential.
-// The credential never leaves through any HTTP response.
+// discoveryRecord is the server-held readiness record published at the
+// caller's isolated path: the loopback endpoint, the owner's minted instance
+// identity, the wire protocol version, and the bearer credential. The
+// credential never leaves through any HTTP response.
 type discoveryRecord struct {
 	Endpoint        string `json:"endpoint"`
 	InstanceId      string `json:"instance_id"`
@@ -208,38 +235,40 @@ type discoveryRecord struct {
 	Credential      string `json:"credential"`
 }
 
-// PublishDiscovery is the one owner-held, ready-server publisher: it holds
-// the owning Runtime's admitted call, verifies authenticated readiness over
-// the live loopback listener, atomically writes its own mode-0600 record at
-// the caller's path once, and retains that path for shutdown withdrawal. One
-// local coordination admits a single publication: a remembered path blocks
-// every repeat, while a failed pre-write attempt releases the claim so the
-// caller may retry. The destination parent must already exist — atomic
-// publication is a replace, never a directory resurrection. Once the write
-// begins, the path is remembered even when a Close races, so shutdown
-// always joins the admitted write and withdraws its record.
+// PublishDiscovery is the one ready-server publisher: readiness is verified
+// before the final publication lock; the final release check and the record
+// write then run under the host's one attachment/closing mutex, so release
+// starting after readiness but before the write leaves no record. One local
+// coordination admits a single publication: a remembered path blocks every
+// repeat, while a failed pre-write attempt releases the claim so the caller
+// may retry. The destination parent must already exist — atomic publication
+// is a replace, never a directory resurrection.
 func (ps *ProtocolServer) PublishDiscovery(path string) error {
-	release, err := ps.owner.enter(context.Background())
-	if err != nil {
-		return err
-	}
-	defer release()
+	return ps.publishDiscovery(path, ps.verifyReady)
+}
+
+func (ps *ProtocolServer) publishDiscovery(path string, verify func() error) error {
 	ps.pubMu.Lock()
 	defer ps.pubMu.Unlock()
 	if ps.discoveryPath != "" {
 		return fmt.Errorf("discovery already published at %s: %w", ps.discoveryPath, harness.ErrInvalid)
 	}
-	if err := ps.verifyReady(); err != nil {
+	if err := verify(); err != nil {
 		return err
 	}
 	record, err := json.Marshal(discoveryRecord{
 		Endpoint:        ps.endpoint,
 		InstanceId:      ps.instance,
-		ProtocolVersion: string(protocol.N12),
+		ProtocolVersion: string(protocol.N13),
 		Credential:      ps.credential,
 	})
 	if err != nil {
 		return err
+	}
+	ps.host.mu.Lock()
+	defer ps.host.mu.Unlock()
+	if ps.host.released {
+		return melta.ErrClosed
 	}
 	if err := atomicfs.Write(path, record, 0o600); err != nil {
 		return err
@@ -250,11 +279,11 @@ func (ps *ProtocolServer) PublishDiscovery(path string) error {
 
 // verifyReady proves the attached server answers one authenticated health
 // request with its own identity and the wire version, over the live loopback
-// listener. The request rides the owning Runtime's work context, so a
-// closing owner cancels a pre-write verification and prevents publication
-// without an extra limit.
+// listener.
 func (ps *ProtocolServer) verifyReady() error {
-	req, err := http.NewRequestWithContext(ps.owner.work, http.MethodGet, ps.endpoint+"/v1/health", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ps.endpoint+"/v1/health", nil)
 	if err != nil {
 		return err
 	}
@@ -275,33 +304,30 @@ func (ps *ProtocolServer) verifyReady() error {
 	if err := decodeOneDocument(body, &health); err != nil {
 		return fmt.Errorf("decode health response: %w", err)
 	}
-	if health.InstanceId != ps.instance || health.ProtocolVersion != protocol.N12 {
+	if health.InstanceId != ps.instance || health.ProtocolVersion != protocol.N13 {
 		return fmt.Errorf("health response identity %q/%q does not match this server", health.InstanceId, health.ProtocolVersion)
 	}
 	return nil
 }
 
-// closeNetwork closes the server's listener and every active connection and
-// joins the serving goroutine. It is the one network action of Runtime
-// shutdown, run outside the Runtime mutex before admitted calls converge.
-func (ps *ProtocolServer) closeNetwork() error {
-	err := ps.server.Close()
+// release closes the server's listener and every active connection, joins the
+// serving goroutine, and withdraws the remembered discovery record. It is the
+// one network action of host withdrawal, run after the owner's admitted work
+// and scopes settle and before storage or the ownership lock release.
+func (ps *ProtocolServer) release() error {
+	var errs []error
+	if err := ps.server.Close(); err != nil {
+		errs = append(errs, err)
+	}
 	<-ps.serveDone
-	return err
-}
-
-// withdrawDiscovery removes the remembered discovery record. A record the
-// filesystem already removed is withdrawn; every other removal failure
-// reports to the shutdown error.
-func (ps *ProtocolServer) withdrawDiscovery() error {
 	ps.pubMu.Lock()
 	path := ps.discoveryPath
+	ps.discoveryPath = ""
 	ps.pubMu.Unlock()
-	if path == "" {
-		return nil
+	if path != "" {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("withdraw discovery record %s: %w", path, err))
+		}
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("withdraw discovery record %s: %w", path, err)
-	}
-	return nil
+	return errors.Join(errs...)
 }

@@ -171,7 +171,7 @@ func TestPublicToolArgumentHookTurn(t *testing.T) {
 		forkScript := newScriptModel(publicFail("fork turn settled"))
 		f2 := newPublicFixture(t, store, forkScript, nil)
 		defer f2.close()
-		res, err := f2.h.Fork(ctx, harness.ForkRequest{SourceSessionID: session, BoundaryEntryID: boundary.ID, OperationID: "fork-1", Content: []model.ContentPart{{Kind: model.PartText, Text: "fork input"}}})
+		res, err := f2.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser, SourceSessionID: session, BoundaryEntryID: boundary.ID, OperationID: "fork-1", Content: []model.ContentPart{{Kind: model.PartText, Text: "fork input"}}})
 		testassert.NoError(t, err)
 		<-forkScript.arrived
 		forkScript.releaseGate()
@@ -324,7 +324,7 @@ func TestPublicForkRemapsRequestEvidenceAndExcludesHookEffects(t *testing.T) {
 		forkScript.gate = make(chan struct{})
 		f2 := newPublicFixture(t, store, forkScript, nil)
 		defer f2.close()
-		res, err := f2.h.Fork(ctx, harness.ForkRequest{
+		res, err := f2.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 			SourceSessionID: session,
 			BoundaryEntryID: boundary.ID,
 			OperationID:     "fork-1",

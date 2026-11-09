@@ -1557,6 +1557,18 @@ func TestCodecRejectsInvalidValues(t *testing.T) {
 			_, err := encodeInputEntry(v)
 			return err
 		}},
+		{"plugin input without extension", func() error {
+			v := validInputEntry(testOpID)
+			v.Origin = InputOriginPlugin
+			_, err := encodeInputEntry(v)
+			return err
+		}},
+		{"user input with extension", func() error {
+			v := validInputEntry(testOpID)
+			v.ExtensionID = "ext"
+			_, err := encodeInputEntry(v)
+			return err
+		}},
 		{"assistant empty partial", func() error {
 			v := validAssistantEntry(testOpID)
 			v.Status = model.OutputErrored
@@ -1953,7 +1965,7 @@ func TestAdoptedFormsAcrossInsertAndFork(t *testing.T) {
 		h := newTestHarness(t, store, nil)
 		var commit forkCommit
 		err := store.Transact(context.Background(), func(tx Transaction) error {
-			return h.forkTransaction(tx, hexID(9), fixture.session, ForkRequest{
+			return h.forkTransaction(tx, hexID(9), fixture.session, ForkRequest{Origin: InputOriginUser,
 				SourceSessionID: testSessionID,
 				BoundaryEntryID: hexID(4),
 				OperationID:     "fork-op-1",

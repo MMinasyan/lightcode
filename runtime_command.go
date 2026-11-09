@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/runtime"
 )
 
@@ -22,12 +23,14 @@ func installedExtensions() ([]string, []string) {
 	return ids, builtin.DefaultCapabilityIDs()
 }
 
-// runRuntime runs the shared managed Runtime owner in the foreground for the
-// lifetime of the signal context. It opens the owner over the normalized
-// paths with the shipped plugin set, attaches the protocol and publishes the
-// discovery record once, then waits for the shutdown signal and joins the
-// managed cleanup. Contention exits quietly without initialization; every
-// startup, publication and cleanup error keeps its identity for exit 1.
+// runRuntime runs the shared managed MELTA owner and its thin protocol host in
+// the foreground for the lifetime of the signal context. It supplies the
+// current application paths and the first-run configuration document, opens
+// the owner with the host withdrawal callback, attaches the protocol and
+// publishes the discovery record once, then waits for the shutdown signal and
+// joins the managed cleanup. Contention exits quietly
+// without initialization; every startup, publication and cleanup error keeps
+// its identity for exit 1.
 func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 	absDataDir, err := filepath.Abs(dataDir)
 	if err != nil {
@@ -41,14 +44,29 @@ func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 	if err != nil {
 		return err
 	}
-	owner, err := runtime.Open(ctx, runtime.Options{
-		DataDir:        absDataDir,
-		ConfigPath:     absConfigPath,
-		Plugins:        builtin.Plugins(),
-		Identity:       runtimeIdentity,
-		GlobalRulesDir: filepath.Join(home, ".lightcode"),
+	dataRoot := filepath.Join(home, ".lightcode")
+	locations := melta.Locations{
+		GlobalRulesDir:     dataRoot,
+		DiscoveryCacheDir:  filepath.Join(dataRoot, "cache", "discovery"),
+		WorkspacePolicyDir: filepath.Join(dataRoot, "projects"),
+	}
+	if os.Getenv("LIGHTCODE_DEBUG_WIRE") == "1" {
+		locations.WireDebugDir = filepath.Join(dataRoot, "debug", "wire")
+	}
+	if err := runtime.InitializeFirstRunConfiguration(absConfigPath); err != nil {
+		return err
+	}
+	host := runtime.NewProtocolHost()
+	owner, err := melta.Open(ctx, melta.Options{
+		DataDir:       absDataDir,
+		Configuration: melta.NewFileConfigurationSource(absConfigPath),
+		Credentials:   melta.NewEnvironmentCredentialSource(filepath.Join(dataRoot, ".env")),
+		Locations:     locations,
+		Extensions:    builtin.Plugins(),
+		Identity:      runtimeIdentity,
+		BeforeRelease: host.BeforeRelease,
 	})
-	if errors.Is(err, runtime.ErrOwned) {
+	if errors.Is(err, melta.ErrOwned) {
 		// Another process owns the data directory; this contender
 		// initializes nothing and exits without a diagnostic.
 		return nil
@@ -61,7 +79,7 @@ func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 		// signal context never bounds it — and its result joins the return.
 		err = errors.Join(err, owner.Close(context.Background()))
 	}()
-	server, err := owner.OpenProtocol(ctx)
+	server, err := host.OpenProtocol(ctx, owner)
 	if err != nil {
 		return err
 	}

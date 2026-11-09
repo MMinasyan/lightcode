@@ -142,12 +142,14 @@ func encodeInputEntry(v inputEntry) (json.RawMessage, error) {
 		EntryID     string            `json:"entry_id"`
 		OperationID string            `json:"operation_id,omitempty"`
 		Origin      string            `json:"origin"`
+		ExtensionID string            `json:"extension_id,omitempty"`
 		Content     []json.RawMessage `json:"content"`
 	}{
 		SessionID:   v.SessionID,
 		EntryID:     v.EntryID,
 		OperationID: v.OperationID,
 		Origin:      string(v.Origin),
+		ExtensionID: v.ExtensionID,
 		Content:     content,
 	})
 	if err != nil {
@@ -166,7 +168,7 @@ func decodeInputEntry(env Entry) (inputEntry, error) {
 	if err != nil {
 		return inputEntry{}, err
 	}
-	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "origin", "content"); err != nil {
+	if err := rejectUnknownMembers(obj, "session_id", "entry_id", "operation_id", "origin", "extension_id", "content"); err != nil {
 		return inputEntry{}, err
 	}
 	sessionID, err := stringMember(obj, "session_id", true)
@@ -185,6 +187,10 @@ func decodeInputEntry(env Entry) (inputEntry, error) {
 	if err != nil {
 		return inputEntry{}, err
 	}
+	extensionID, err := optionalNonEmptyString(obj, "extension_id")
+	if err != nil {
+		return inputEntry{}, err
+	}
 	contentRaw, err := arrayMember(obj, "content", true)
 	if err != nil {
 		return inputEntry{}, err
@@ -198,7 +204,7 @@ func decodeInputEntry(env Entry) (inputEntry, error) {
 	if operationID != env.OperationID {
 		return inputEntry{}, fmt.Errorf("payload operation id %q does not agree with the envelope", operationID)
 	}
-	v := inputEntry{SessionID: sessionID, EntryID: entryID, OperationID: operationID, Origin: InputOrigin(origin)}
+	v := inputEntry{SessionID: sessionID, EntryID: entryID, OperationID: operationID, Origin: InputOrigin(origin), ExtensionID: extensionID}
 	for i, raw := range contentRaw {
 		part, err := decodeContentPart(raw)
 		if err != nil {
@@ -225,10 +231,8 @@ func validateInputEntry(v inputEntry) error {
 			return err
 		}
 	}
-	switch v.Origin {
-	case InputOriginUser, InputOriginRuntime, InputOriginPlugin:
-	default:
-		return fmt.Errorf("input origin %q is not one of user, runtime or plugin", v.Origin)
+	if err := validateInputProvenance(v.Origin, v.ExtensionID); err != nil {
+		return err
 	}
 	for i, part := range v.Content {
 		if err := model.ValidateContentPart(part); err != nil {

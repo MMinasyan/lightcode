@@ -209,30 +209,59 @@ func TestForkBoundaryMenusUserOwnedCopiedRuntimeAndPlugin(t *testing.T) {
 	c.command("/fork")
 	settleTasks(t, c)
 	c.mu.Lock()
-	testassert.Require(t, len(c.menu.items) == 2, "non-user input became a fork boundary")
+	testassert.Require(t, len(c.menu.items) == 4, "fork menu = %v, want every committed input independent of origin", c.menu.items)
+	for i, origin := range []protocol.InputOrigin{"user", "user", "runtime", "plugin"} {
+		testassert.Require(t, c.menu.items[i].Extra.(protocol.InputItem).Origin == origin, "fork item %d origin = %q, want %q", i, c.menu.items[i].Extra.(protocol.InputItem).Origin, origin)
+	}
 	c.mu.Unlock()
 	press(c, terminal.KeyMsg{Special: terminal.KeyDown})
-	c.mu.Lock()
-	t.Logf("after down menu=%v selected=%d", c.menu != nil, func() int {
-		if c.menu == nil {
-			return -1
-		}
-		return c.menu.selected
-	}())
-	c.mu.Unlock()
 	press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
-	c.mu.Lock()
-	t.Logf("after enter menu=%v", c.menu != nil)
-	c.mu.Unlock()
 	c.mu.Lock()
 	testassert.Require(t, c.menu == nil && c.forkBoundary.OperationId == nil && !c.forkRewind, "copied input invented a source restore boundary")
 	c.forkBoundary = nil
 	c.mu.Unlock()
-	c.command("/revert")
-	settleTasks(t, c)
+
+	// A runtime or plugin input is an ordinary fork entry, and its owned
+	// attribution still offers the rewind choice.
+	for _, index := range []int{2, 3} {
+		c.command("/fork")
+		settleTasks(t, c)
+		for i := 0; i < index; i++ {
+			press(c, terminal.KeyMsg{Special: terminal.KeyDown})
+		}
+		press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
+		c.mu.Lock()
+		selected := *c.forkBoundary
+		testassert.Require(t, c.menu != nil && c.menu.kind == "fork-choice" && selected.Origin == protocol.InputOrigin([]string{"user", "user", "runtime", "plugin"}[index]), "fork choice for item %d = (%+v, %v), want the owned input's fork choice", index, c.menu, selected)
+		c.menu = nil
+		c.forkBoundary = nil
+		c.mu.Unlock()
+	}
+
+	for _, row := range []struct {
+		index     int
+		operation string
+	}{{1, "owned-2"}, {2, "owned-3"}} {
+		c.command("/revert")
+		settleTasks(t, c)
+		c.mu.Lock()
+		testassert.Require(t, len(c.menu.items) == 3, "rewind menu = %v, want the three owned inputs independent of origin", c.menu.items)
+		for i, origin := range []protocol.InputOrigin{"user", "runtime", "plugin"} {
+			testassert.Require(t, c.menu.items[i].Extra.(protocol.InputItem).Origin == origin, "rewind item %d origin = %q, want %q", i, c.menu.items[i].Extra.(protocol.InputItem).Origin, origin)
+		}
+		c.mu.Unlock()
+		for i := 0; i < row.index; i++ {
+			press(c, terminal.KeyMsg{Special: terminal.KeyDown})
+		}
+		press(c, terminal.KeyMsg{Special: terminal.KeyEnter})
+		restore := receive(t, transport.requests)
+		testassert.Require(t, strings.HasSuffix(restore.req.URL.Path, "/revert-code") && strings.Contains(string(restore.body), row.operation), "rewind item %d request = %s %s, want the actual %s boundary", row.index, restore.req.URL.Path, restore.body, row.operation)
+		restore.respond(map[string]any{"restored": []any{}, "skipped": []any{}})
+		settleTasks(t, c)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	testassert.Require(t, len(c.menu.items) == 1 && c.menu.items[0].Extra.(protocol.InputItem).OperationId != nil && r == c.root, "copied/non-user rewind sibling admitted")
+	testassert.Require(t, r == c.root, "menu replaced the selected reader")
 }
 
 func TestRejectedSubmissionKeepsDraftAndDoesNotBecomeEmptySuccess(t *testing.T) {

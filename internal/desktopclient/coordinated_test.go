@@ -26,6 +26,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 	"golang.org/x/sys/unix"
@@ -340,7 +341,6 @@ func openNativeFIFO(t *testing.T, path string) *os.File {
 }
 
 func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
 	isolateBundledCredentials(t)
 	t.Setenv("DESKTOP_TEST_KEY", "isolated-key")
 	dataDir, workspace := t.TempDir(), t.TempDir()
@@ -361,12 +361,13 @@ func TestCoordinatedHostsNativeWorkDepartureAndOwnerRepair(t *testing.T) {
 	}()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, fmt.Sprintf(`{"providers":{"prov":{"transport":{"base_url":%q,"api_key_env":"DESKTOP_TEST_KEY"},"discovery":false,"models":{"root":{"context_window":65536,"max_output_tokens":512},"child":{"context_window":65536,"max_output_tokens":512}}}},"extensions":{"agents":{"enabled":true,"definitions":{"primary":{"model":"prov/root","system_prompt":"simple","tools":["run_command","task"]},"secondary":{"model":"prov/child","system_prompt":"simple","tools":[]}}},"adaptation":{"enabled":true}}}`, modelServer.URL+"/v1"))
-	var owner *runtime.Runtime
+	var owner *melta.Melta
 	openOwner := func() string {
 		var err error
-		owner, err = runtime.Open(context.Background(), runtime.Options{DataDir: dataDir, ConfigPath: configPath, Plugins: builtin.Plugins()})
+		host := runtime.NewProtocolHost()
+		owner, err = melta.Open(context.Background(), melta.Options{DataDir: dataDir, Configuration: melta.NewFileConfigurationSource(configPath), Credentials: melta.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")), Extensions: builtin.Plugins(), BeforeRelease: host.BeforeRelease})
 		testassert.NoError(t, err)
-		server, err := owner.OpenProtocol(context.Background())
+		server, err := host.OpenProtocol(context.Background(), owner)
 		testassert.NoError(t, err)
 		testassert.NoError(t, server.PublishDiscovery(filepath.Join(dataDir, "runtime.json")))
 		return server.Endpoint()

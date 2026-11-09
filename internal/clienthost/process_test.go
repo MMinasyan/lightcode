@@ -35,6 +35,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/clienthost"
 	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -105,15 +106,15 @@ func runChild() {
 // otherwise publishes and serves until the stop marker.
 func runOwnerChild(dataDir, configPath string) {
 	awaitGate()
-	r, err := openRuntime(dataDir, configPath)
-	if errors.Is(err, runtime.ErrOwned) {
+	r, ownerHost, err := openRuntime(dataDir, configPath)
+	if errors.Is(err, melta.ErrOwned) {
 		writeLostMarker()
 		os.Exit(0)
 	}
 	if err != nil {
 		childAbort("runtime open: %v", err)
 	}
-	ps, err := r.OpenProtocol(context.Background())
+	ps, err := ownerHost.OpenProtocol(context.Background(), r)
 	if err != nil {
 		childAbort("OpenProtocol: %v", err)
 	}
@@ -121,19 +122,19 @@ func runOwnerChild(dataDir, configPath string) {
 		childAbort("PublishDiscovery: %v", err)
 	}
 	writeMarker(*childReady, ps.Endpoint())
-	awaitStopAndClose(r)
+	awaitStopAndClose(r, ownerHost)
 }
 
 // runHoldChild owns the lock without publishing until its gate opens, so a
 // contender started before publication loses the lock deterministically.
 func runHoldChild(dataDir, configPath string) {
-	r, err := openRuntime(dataDir, configPath)
+	r, ownerHost, err := openRuntime(dataDir, configPath)
 	if err != nil {
 		childAbort("runtime open: %v", err)
 	}
 	writeMarker(*childAcquired, "acquired")
 	awaitGate()
-	ps, err := r.OpenProtocol(context.Background())
+	ps, err := ownerHost.OpenProtocol(context.Background(), r)
 	if err != nil {
 		childAbort("OpenProtocol: %v", err)
 	}
@@ -141,7 +142,7 @@ func runHoldChild(dataDir, configPath string) {
 		childAbort("PublishDiscovery: %v", err)
 	}
 	writeMarker(*childReady, ps.Endpoint())
-	awaitStopAndClose(r)
+	awaitStopAndClose(r, ownerHost)
 }
 
 // runShapedChild publishes the real record first, then answers readiness
@@ -149,11 +150,11 @@ func runHoldChild(dataDir, configPath string) {
 // credential, and rewrites only the record's endpoint. The real owner and
 // its original endpoint stay live for survival checks.
 func runShapedChild(dataDir, configPath, version string, park bool) {
-	r, err := openRuntime(dataDir, configPath)
+	r, ownerHost, err := openRuntime(dataDir, configPath)
 	if err != nil {
 		childAbort("runtime open: %v", err)
 	}
-	ps, err := r.OpenProtocol(context.Background())
+	ps, err := ownerHost.OpenProtocol(context.Background(), r)
 	if err != nil {
 		childAbort("OpenProtocol: %v", err)
 	}
@@ -164,7 +165,7 @@ func runShapedChild(dataDir, configPath, version string, park bool) {
 	shapedEndpoint, originalEndpoint := shapeHealth(recordPath, version, park)
 	writeMarker(*childEndpoint, originalEndpoint)
 	writeMarker(*childReady, shapedEndpoint)
-	awaitStopAndClose(r)
+	awaitStopAndClose(r, ownerHost)
 }
 
 // attemptMarkerPlugin is one inert Runtime-scoped plugin: its factory runs
@@ -206,12 +207,16 @@ type attemptCloser struct{}
 // openRuntime opens one real Runtime through the public constructor with the
 // per-attempt factory marker. No controlled preparation or private constructor
 // is used.
-func openRuntime(dataDir, configPath string) (*runtime.Runtime, error) {
-	return runtime.Open(context.Background(), runtime.Options{
-		DataDir:    dataDir,
-		ConfigPath: configPath,
-		Plugins:    []extension.Native{attemptMarkerPlugin()},
+func openRuntime(dataDir, configPath string) (*melta.Melta, *runtime.ProtocolHost, error) {
+	host := runtime.NewProtocolHost()
+	owner, err := melta.Open(context.Background(), melta.Options{
+		DataDir:       dataDir,
+		Configuration: melta.NewFileConfigurationSource(configPath),
+		Credentials:   melta.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
+		Extensions:    []extension.Native{attemptMarkerPlugin()},
+		BeforeRelease: host.BeforeRelease,
 	})
+	return owner, host, err
 }
 
 // shapeHealth starts one test-only health server over the record's published
@@ -341,7 +346,7 @@ func awaitGate() {
 
 // awaitStopAndClose waits for the stop marker, then performs the managed
 // Runtime Close before the process exits.
-func awaitStopAndClose(r *runtime.Runtime) {
+func awaitStopAndClose(r *melta.Melta, _ *runtime.ProtocolHost) {
 	if *childStop == "" {
 		childAbort("publishing helper role requires a stop marker")
 	}
@@ -378,12 +383,10 @@ type sandbox struct {
 // stops and reaps every identified helper child.
 func newSandbox(t *testing.T) *sandbox {
 	t.Helper()
-	home := t.TempDir()
 	dataDir := t.TempDir()
 	dir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	testassert.NoError(t, os.WriteFile(configPath, []byte(`{"extensions":{"attempt":{"enabled":true}}}`), 0o600))
-	t.Setenv("HOME", home)
 	isolateBundledCredentials(t)
 	s := &sandbox{
 		t: t, dataDir: dataDir, configPath: configPath, dir: dir,
@@ -644,7 +647,7 @@ func TestClientHostConcurrentStartup(t *testing.T) {
 		t.Fatalf("client instance %q, record %q", clients[0].InstanceID(), record.InstanceID)
 	}
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N12, "authenticated health = %s/%s, want the record's instance and wire version", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N13, "authenticated health = %s/%s, want the record's instance and wire version", health.InstanceId, health.ProtocolVersion)
 
 	winners := 0
 	for _, l := range []*launched{first, second} {
@@ -699,7 +702,7 @@ func TestClientHostIncompatibleIncumbent(t *testing.T) {
 		testassert.Require(t, bytes.Equal(after, before), "the incompatible record changed across the probe")
 	}
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N12, "the incumbent's real health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N13, "the incumbent's real health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	incumbent.stopAndJoin(t)
 }
 
@@ -769,7 +772,7 @@ func TestClientHostCancellationDoesNotKillOwner(t *testing.T) {
 	record := readRecord(t, filepath.Join(s.dataDir, "runtime.json"))
 	testassert.Equal(t, record.Endpoint, endpoint)
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N12, "the surviving owner health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N13, "the surviving owner health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	pid := attemptPID(t, attempts[0])
 	testassert.Require(t, aliveProcessByPID(pid), "the canceled Connect killed owner process %d", pid)
 	{
@@ -802,7 +805,7 @@ func TestClientHostHealthTimeoutPreservesHolder(t *testing.T) {
 	testassert.Require(t, errors.Is(err, context.DeadlineExceeded), "Connect against a parked health holder = %v, want the caller deadline", err)
 
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N12, "the preserved holder health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N13, "the preserved holder health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	{
 		after := readFile(t, recordPath)
 		testassert.Require(t, bytes.Equal(after, before), "the parked record changed across the failed probes")

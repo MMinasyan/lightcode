@@ -440,7 +440,8 @@ func TestAdmissionSessionPreconditions(t *testing.T) {
 }
 
 // TestAdmissionInputValidation proves the input axis of admission: a
-// non-empty opaque operation identity and a closed input origin.
+// non-empty opaque operation identity, a closed input origin, and extension
+// provenance present exactly for plugin input.
 func TestAdmissionInputValidation(t *testing.T) {
 	store := freshSessionStore(t)
 	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
@@ -448,17 +449,68 @@ func TestAdmissionInputValidation(t *testing.T) {
 		name        string
 		operationID string
 		origin      InputOrigin
+		extensionID string
 		content     []model.ContentPart
 	}{
-		{"empty operation id", "", InputOriginUser, admissionContent("x")},
-		{"unknown origin", testOpID, InputOrigin("agent"), admissionContent("x")},
-		{"invalid content part", testOpID, InputOriginUser, []model.ContentPart{{Kind: model.PartKind("bogus")}}},
+		{"empty operation id", "", InputOriginUser, "", admissionContent("x")},
+		{"unknown origin", testOpID, InputOrigin("agent"), "", admissionContent("x")},
+		{"plugin without extension", testOpID, InputOriginPlugin, "", admissionContent("x")},
+		{"user with extension", testOpID, InputOriginUser, "ext", admissionContent("x")},
+		{"runtime with extension", testOpID, InputOriginRuntime, "ext", admissionContent("x")},
+		{"invalid content part", testOpID, InputOriginUser, "", []model.ContentPart{{Kind: model.PartKind("bogus")}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: tc.operationID, Origin: tc.origin, Content: tc.content, Mode: MessageModeRegular})
+			_, err := h.Submit(context.Background(), SubmitRequest{SessionID: testSessionID, OperationID: tc.operationID, Origin: tc.origin, ExtensionID: tc.extensionID, Content: tc.content, Mode: MessageModeRegular})
 			testassert.Require(t, errors.Is(err, ErrInvalid), "invalid input = %v, want ErrInvalid", err)
 		})
 	}
+}
+
+// entryIDsOfKind returns one captured history's entry identities of the
+// requested kind in sequence order.
+func entryIDsOfKind(view HistoryReadView, kind EntryKind) []string {
+	var ids []string
+	for _, header := range view.HistoryHeaders() {
+		if header.Kind == kind {
+			ids = append(ids, header.EntryID)
+		}
+	}
+	return ids
+}
+
+// TestAdmissionProvenancePersistsAndBuffers proves plugin attribution is
+// retained by both input forms: the committed canonical entry and the
+// process-local buffered item expose the same origin/extension pair.
+func TestAdmissionProvenancePersistsAndBuffers(t *testing.T) {
+	store := freshSessionStore(t)
+	h := newTestHarness(t, store, newPrepareStub(validPrepared()).prepare)
+	{
+		_, err := h.Submit(context.Background(), SubmitRequest{
+			SessionID: testSessionID, OperationID: testOpID, Origin: InputOriginPlugin, ExtensionID: "operation.ext",
+			Content: admissionContent("committed"), Mode: MessageModeRegular,
+		})
+		testassert.NoError(t, err)
+	}
+	view, err := h.ReadSessionView(context.Background(), testSessionID)
+	testassert.NoError(t, err)
+	var committed []InputEntry
+	for _, fact := range view.History.HistoryFacts(entryIDsOfKind(view.History, EntryInput)) {
+		if fact.Input != nil {
+			committed = append(committed, *fact.Input)
+		}
+	}
+	testassert.Require(t, len(committed) == 1 && committed[0].Origin == InputOriginPlugin && committed[0].ExtensionID == "operation.ext", "committed input = %+v, want plugin/operation.ext", committed)
+	{
+		res, err := h.Submit(context.Background(), SubmitRequest{
+			SessionID: testSessionID, OperationID: "op-buffered", Origin: InputOriginPlugin, ExtensionID: "buffered.ext",
+			Content: admissionContent("buffered"), Mode: MessageModeRegular,
+		})
+		testassert.NoError(t, err)
+		testassert.Equal(t, res.Disposition, DispositionSteering)
+	}
+	view, err = h.ReadSessionView(context.Background(), testSessionID)
+	testassert.NoError(t, err)
+	testassert.Require(t, len(view.Steering) == 1 && view.Steering[0].Origin == InputOriginPlugin && view.Steering[0].ExtensionID == "buffered.ext", "buffered input = %+v, want plugin/buffered.ext", view.Steering)
 }
 
 // TestAdmissionPublishesRunningOperation proves the admission row's positive

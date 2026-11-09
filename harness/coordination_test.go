@@ -338,7 +338,7 @@ func TestSteeringAdmitsHeadsInFIFOOrder(t *testing.T) {
 	}
 	{
 		_, err := h.Submit(context.Background(), SubmitRequest{
-			SessionID: session, OperationID: "op-4", Origin: InputOriginPlugin,
+			SessionID: session, OperationID: "op-4", Origin: InputOriginPlugin, ExtensionID: "test.extension",
 			Content: admissionContent("q1"), Mode: MessageModeQueued,
 		})
 		testassert.NoError(t, err)

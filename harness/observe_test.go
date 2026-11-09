@@ -618,7 +618,7 @@ func TestObserveDurableAdvances(t *testing.T) {
 		sourceFacts := readSessionFacts(t, h, testSessionID)
 		testassert.Require(t, len(sourceFacts) != 0 && sourceFacts[0].Kind == EntryInput, "source facts = %+v", sourceFacts)
 		col := observeHarness(h)
-		res, err := h.Fork(context.Background(), ForkRequest{
+		res, err := h.Fork(context.Background(), ForkRequest{Origin: InputOriginUser,
 			SourceSessionID: testSessionID,
 			BoundaryEntryID: sourceFacts[0].EntryID,
 			OperationID:     "fork-op-1",

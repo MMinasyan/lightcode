@@ -3,6 +3,7 @@ package runtime
 import (
 	"net/http"
 
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -10,53 +11,49 @@ import (
 // private transport receiver: the exported method names and signatures are
 // the generated transport contract, not a public backend forwarding API —
 // each method is one body decode over the generated request type, one call
-// into the Runtime's private producers, and one qualified response. The
-// receiver embeds *Runtime so authentication, admission, and producer calls
-// stay identical; the compile-time assertion pins the complete interface, so
-// a generated signature change breaks this build, not a client at runtime.
+// into the public owner command with the authenticated caller, and one
+// response. The compile-time assertion pins the complete interface,
+// so a generated signature change breaks this build, not a client at runtime.
 type protocolHandlers struct {
-	*Runtime
+	owner  *melta.Melta
+	server *ProtocolServer
 }
 
 var _ protocol.ServerInterface = (*protocolHandlers)(nil)
 
 // GetHealth serves the authenticated, versioned readiness read of the live
-// owner: one admitted call answers with the attached server's minted
-// instance identity and the one wire protocol version.
+// owner: one admitted call answers with the owner's minted instance identity
+// and the one wire protocol version.
 func (rt *protocolHandlers) GetHealth(w http.ResponseWriter, r *http.Request) {
-	release, err := rt.enter(r.Context())
+	health, err := rt.owner.Health(r.Context(), rt.server.caller)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	defer release()
-	health := protocol.Health{InstanceId: rt.protocolInstance(), ProtocolVersion: protocol.N12}
-	rt.writeQualifiedJSON(w, http.StatusOK, &health)
+	rt.writeJSON(w, http.StatusOK, &health)
 }
 
 // ReloadConfiguration serves the one publication operation: the admitted
 // Reload result wraps as the revision-only response, a publication and not
 // an edit, so no result member exists.
 func (rt *protocolHandlers) ReloadConfiguration(w http.ResponseWriter, r *http.Request) {
-	revision, err := rt.Reload(r.Context())
+	revision, err := rt.owner.Reload(r.Context(), rt.server.caller)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	response := protocol.RevisionResponse{
-		ConfigurationRevision: protocol.ConfigurationRevision{Generation: revision},
-	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &response)
+	response := protocol.RevisionResponse{ConfigurationRevision: revision}
+	rt.writeJSON(w, http.StatusOK, &response)
 }
 
 // GetConfiguration serves the revisioned configuration view.
 func (rt *protocolHandlers) GetConfiguration(w http.ResponseWriter, r *http.Request) {
-	view, err := rt.getConfiguration(r.Context())
+	view, err := rt.owner.GetConfiguration(r.Context(), rt.server.caller)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &view)
+	rt.writeJSON(w, http.StatusOK, &view)
 }
 
 // UpdateConfigurationSettings serves the settings/extension-edit writer.
@@ -66,32 +63,32 @@ func (rt *protocolHandlers) UpdateConfigurationSettings(w http.ResponseWriter, r
 		writeProtocolError(w, err)
 		return
 	}
-	mutation, err := rt.updateSettings(r.Context(), body)
+	mutation, err := rt.owner.UpdateSettings(r.Context(), rt.server.caller, body)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
 // ListModels serves the flat model picker under its one boolean selection.
 func (rt *protocolHandlers) ListModels(w http.ResponseWriter, r *http.Request, params protocol.ListModelsParams) {
-	list, err := rt.listModels(r.Context(), params)
+	list, err := rt.owner.ListModels(r.Context(), rt.server.caller, params)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &list)
+	rt.writeJSON(w, http.StatusOK, &list)
 }
 
 // ListProviders serves every provider view.
 func (rt *protocolHandlers) ListProviders(w http.ResponseWriter, r *http.Request) {
-	list, err := rt.listProviders(r.Context())
+	list, err := rt.owner.ListProviders(r.Context(), rt.server.caller)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &list)
+	rt.writeJSON(w, http.StatusOK, &list)
 }
 
 // CreateProvider serves the custom-provider add: its write-only key never
@@ -102,22 +99,22 @@ func (rt *protocolHandlers) CreateProvider(w http.ResponseWriter, r *http.Reques
 		writeProtocolError(w, err)
 		return
 	}
-	mutation, err := rt.addProvider(r.Context(), body.Id, body.Provider, body.Models, body.ApiKey)
+	mutation, err := rt.owner.AddProvider(r.Context(), rt.server.caller, body.Id, body.Provider, body.Models, body.ApiKey)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
 // GetProviderDetail serves one provider's complete view.
 func (rt *protocolHandlers) GetProviderDetail(w http.ResponseWriter, r *http.Request, params protocol.GetProviderDetailParams) {
-	detail, err := rt.getProvider(r.Context(), params.ProviderId)
+	detail, err := rt.owner.GetProvider(r.Context(), rt.server.caller, params.ProviderId)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &detail)
+	rt.writeJSON(w, http.StatusOK, &detail)
 }
 
 // UpdateProviderDetail serves the provider patch edit.
@@ -127,24 +124,24 @@ func (rt *protocolHandlers) UpdateProviderDetail(w http.ResponseWriter, r *http.
 		writeProtocolError(w, err)
 		return
 	}
-	mutation, err := rt.updateProvider(r.Context(), params.ProviderId, body.Provider)
+	mutation, err := rt.owner.UpdateProvider(r.Context(), rt.server.caller, params.ProviderId, body.Provider)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
 // DeleteProviderDetail serves the provider's user-node removal; the mutation
 // envelope carries the surviving effective post-state, or null when no
 // subject remains.
 func (rt *protocolHandlers) DeleteProviderDetail(w http.ResponseWriter, r *http.Request, params protocol.DeleteProviderDetailParams) {
-	mutation, err := rt.deleteProvider(r.Context(), params.ProviderId)
+	mutation, err := rt.owner.DeleteProvider(r.Context(), rt.server.caller, params.ProviderId)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
 // DiscoverProviderCandidates serves the unpersisted provider discovery read.
@@ -154,12 +151,12 @@ func (rt *protocolHandlers) DiscoverProviderCandidates(w http.ResponseWriter, r 
 		writeProtocolError(w, err)
 		return
 	}
-	candidates, err := rt.discoverProvider(r.Context(), body)
+	candidates, err := rt.owner.DiscoverProvider(r.Context(), rt.server.caller, body)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &candidates)
+	rt.writeJSON(w, http.StatusOK, &candidates)
 }
 
 // ConnectProvider serves the managed-key connection.
@@ -169,32 +166,32 @@ func (rt *protocolHandlers) ConnectProvider(w http.ResponseWriter, r *http.Reque
 		writeProtocolError(w, err)
 		return
 	}
-	mutation, err := rt.connectProvider(r.Context(), params.ProviderId, body.ApiKey)
+	mutation, err := rt.owner.ConnectProvider(r.Context(), rt.server.caller, params.ProviderId, body.ApiKey)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
 // DisconnectProvider serves the managed-key disconnection.
 func (rt *protocolHandlers) DisconnectProvider(w http.ResponseWriter, r *http.Request, params protocol.DisconnectProviderParams) {
-	mutation, err := rt.disconnectProvider(r.Context(), params.ProviderId)
+	mutation, err := rt.owner.DisconnectProvider(r.Context(), rt.server.caller, params.ProviderId)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
 // ListProviderModels serves one provider's complete model views.
 func (rt *protocolHandlers) ListProviderModels(w http.ResponseWriter, r *http.Request, params protocol.ListProviderModelsParams) {
-	list, err := rt.listProviderModels(r.Context(), params.ProviderId)
+	list, err := rt.owner.ListProviderModels(r.Context(), rt.server.caller, params.ProviderId)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &list)
+	rt.writeJSON(w, http.StatusOK, &list)
 }
 
 // UpdateProviderModel serves the model patch edit; both identifiers are
@@ -205,75 +202,75 @@ func (rt *protocolHandlers) UpdateProviderModel(w http.ResponseWriter, r *http.R
 		writeProtocolError(w, err)
 		return
 	}
-	mutation, err := rt.saveModel(r.Context(), params.ProviderId, params.ModelId, body.Model)
+	mutation, err := rt.owner.SaveModel(r.Context(), rt.server.caller, params.ProviderId, params.ModelId, body.Model)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
 // DeleteProviderModel serves the user-model removal.
 func (rt *protocolHandlers) DeleteProviderModel(w http.ResponseWriter, r *http.Request, params protocol.DeleteProviderModelParams) {
-	mutation, err := rt.deleteModel(r.Context(), params.ProviderId, params.ModelId)
+	mutation, err := rt.owner.DeleteModel(r.Context(), rt.server.caller, params.ProviderId, params.ModelId)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
 // DiscoverProviderModelCandidates serves the provider's model discovery read,
 // excluding its already-included usable models.
 func (rt *protocolHandlers) DiscoverProviderModelCandidates(w http.ResponseWriter, r *http.Request, params protocol.DiscoverProviderModelCandidatesParams) {
-	candidates, err := rt.discoverProviderModels(r.Context(), params.ProviderId)
+	candidates, err := rt.owner.DiscoverProviderModels(r.Context(), rt.server.caller, params.ProviderId)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &candidates)
+	rt.writeJSON(w, http.StatusOK, &candidates)
 }
 
 // ResetProviderField serves the one provider user-layer field reset; the
 // field is a closed path enum and the provider identity is a query value.
 func (rt *protocolHandlers) ResetProviderField(w http.ResponseWriter, r *http.Request, field protocol.ProviderField, params protocol.ResetProviderFieldParams) {
-	mutation, err := rt.resetProviderField(r.Context(), params.ProviderId, field)
+	mutation, err := rt.owner.ResetProviderField(r.Context(), rt.server.caller, params.ProviderId, field)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
 // ResetProviderModelField serves the one model user-layer field reset.
 func (rt *protocolHandlers) ResetProviderModelField(w http.ResponseWriter, r *http.Request, field protocol.ModelField, params protocol.ResetProviderModelFieldParams) {
-	mutation, err := rt.resetModelField(r.Context(), params.ProviderId, params.ModelId, field)
+	mutation, err := rt.owner.ResetModelField(r.Context(), rt.server.caller, params.ProviderId, params.ModelId, field)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &mutation)
+	rt.writeJSON(w, http.StatusOK, &mutation)
 }
 
-// GetWarnings serves the unfiltered Runtime-owned warning read.
+// GetWarnings serves the unfiltered owner warning read.
 func (rt *protocolHandlers) GetWarnings(w http.ResponseWriter, r *http.Request) {
-	snapshot, err := rt.getWarnings(r.Context())
+	snapshot, err := rt.owner.GetWarnings(r.Context(), rt.server.caller)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &snapshot)
+	rt.writeJSON(w, http.StatusOK, &snapshot)
 }
 
 // ListSessions serves the filtered Session list; both filter members are
 // required query values.
 func (rt *protocolHandlers) ListSessions(w http.ResponseWriter, r *http.Request, params protocol.ListSessionsParams) {
-	sessions, err := rt.listSessions(r.Context(), params)
+	sessions, err := rt.owner.ListSessions(r.Context(), rt.server.caller, params)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &sessions)
+	rt.writeJSON(w, http.StatusOK, &sessions)
 }
 
 // CreateSession serves the root Session creation with the created header.
@@ -283,12 +280,12 @@ func (rt *protocolHandlers) CreateSession(w http.ResponseWriter, r *http.Request
 		writeProtocolError(w, err)
 		return
 	}
-	header, err := rt.createSessionHeader(r.Context(), body.Workspace, body.AgentSelection)
+	header, err := rt.owner.CreateSession(r.Context(), rt.server.caller, body.Workspace, body.AgentSelection)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusCreated, &header)
+	rt.writeJSON(w, http.StatusCreated, &header)
 }
 
 func (rt *protocolHandlers) SetSessionModel(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
@@ -297,44 +294,44 @@ func (rt *protocolHandlers) SetSessionModel(w http.ResponseWriter, r *http.Reque
 		writeProtocolError(w, err)
 		return
 	}
-	header, err := rt.setSessionModel(r.Context(), id, body)
+	header, err := rt.owner.SetSessionModel(r.Context(), rt.server.caller, id, body.Model)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &header)
+	rt.writeJSON(w, http.StatusOK, &header)
 }
 
 // DeleteSession serves the archived-Session deletion with its structured
 // post-commit cleanup result.
 func (rt *protocolHandlers) DeleteSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	result, err := rt.deleteSession(r.Context(), id)
+	result, err := rt.owner.DeleteSession(r.Context(), rt.server.caller, id)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &result)
+	rt.writeJSON(w, http.StatusOK, &result)
 }
 
 // ArchiveSession serves the archive control; the returned header is the
 // narrow post-transition metadata read.
 func (rt *protocolHandlers) ArchiveSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	header, err := rt.archiveSession(r.Context(), id)
+	header, err := rt.owner.ArchiveSession(r.Context(), rt.server.caller, id)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &header)
+	rt.writeJSON(w, http.StatusOK, &header)
 }
 
 // ReopenSession serves the reopen control.
 func (rt *protocolHandlers) ReopenSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	header, err := rt.reopenSession(r.Context(), id)
+	header, err := rt.owner.ReopenSession(r.Context(), rt.server.caller, id)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &header)
+	rt.writeJSON(w, http.StatusOK, &header)
 }
 
 // SubmitSession serves the message submission with its stable Operation
@@ -346,12 +343,12 @@ func (rt *protocolHandlers) SubmitSession(w http.ResponseWriter, r *http.Request
 		writeProtocolError(w, err)
 		return
 	}
-	result, err := rt.submitSession(r.Context(), id, body)
+	result, err := rt.owner.SubmitSession(r.Context(), rt.server.caller, id, body)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &result)
+	rt.writeJSON(w, http.StatusOK, &result)
 }
 
 // CompactSession serves the manual compaction command.
@@ -361,12 +358,12 @@ func (rt *protocolHandlers) CompactSession(w http.ResponseWriter, r *http.Reques
 		writeProtocolError(w, err)
 		return
 	}
-	operation, err := rt.compactSession(r.Context(), id, body)
+	operation, err := rt.owner.CompactSession(r.Context(), rt.server.caller, id, body)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &operation)
+	rt.writeJSON(w, http.StatusOK, &operation)
 }
 
 // InterruptSession serves the interrupt control: the control is issued
@@ -374,7 +371,7 @@ func (rt *protocolHandlers) CompactSession(w http.ResponseWriter, r *http.Reques
 // commit. The POST is argument-free: the authenticated addressed Session and
 // the existing control transition decide the outcome, with no request body.
 func (rt *protocolHandlers) InterruptSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	if err := rt.interruptSession(r.Context(), id); err != nil {
+	if err := rt.owner.InterruptSession(r.Context(), rt.server.caller, id); err != nil {
 		writeProtocolError(w, err)
 		return
 	}
@@ -384,7 +381,7 @@ func (rt *protocolHandlers) InterruptSession(w http.ResponseWriter, r *http.Requ
 // StopSession serves the stop control; its no-content result follows the
 // background convergence wait. The POST is argument-free, like interrupt.
 func (rt *protocolHandlers) StopSession(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	if err := rt.stopSession(r.Context(), id); err != nil {
+	if err := rt.owner.StopSession(r.Context(), rt.server.caller, id); err != nil {
 		writeProtocolError(w, err)
 		return
 	}
@@ -398,12 +395,12 @@ func (rt *protocolHandlers) ForkSession(w http.ResponseWriter, r *http.Request, 
 		writeProtocolError(w, err)
 		return
 	}
-	result, err := rt.forkSession(r.Context(), id, body)
+	result, err := rt.owner.ForkSession(r.Context(), rt.server.caller, id, body)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &result)
+	rt.writeJSON(w, http.StatusOK, &result)
 }
 
 // SetSessionAgentType serves the Agent-type change; only subsequent
@@ -414,43 +411,43 @@ func (rt *protocolHandlers) SetSessionAgentType(w http.ResponseWriter, r *http.R
 		writeProtocolError(w, err)
 		return
 	}
-	header, err := rt.setSessionAgentType(r.Context(), id, body)
+	header, err := rt.owner.SetSessionAgentType(r.Context(), rt.server.caller, id, body)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &header)
+	rt.writeJSON(w, http.StatusOK, &header)
 }
 
 // GetSessionHydration serves the one coherent Session projection captured at
 // one revision.
 func (rt *protocolHandlers) GetSessionHydration(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	hydration, err := rt.buildHydration(r.Context(), id)
+	hydration, err := rt.owner.GetHydration(r.Context(), rt.server.caller, id)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &hydration)
+	rt.writeJSON(w, http.StatusOK, &hydration)
 }
 
 // GetSessionHistory serves one anchored page of conversation items.
 func (rt *protocolHandlers) GetSessionHistory(w http.ResponseWriter, r *http.Request, id protocol.SessionID, params protocol.GetSessionHistoryParams) {
-	page, err := rt.getHistory(r.Context(), id, params.Cursor)
+	page, err := rt.owner.GetHistory(r.Context(), rt.server.caller, id, params.Cursor)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &page)
+	rt.writeJSON(w, http.StatusOK, &page)
 }
 
 // GetSessionCodeSnapshots serves the per-Operation snapshot groups.
 func (rt *protocolHandlers) GetSessionCodeSnapshots(w http.ResponseWriter, r *http.Request, id protocol.SessionID) {
-	groups, err := rt.listSessionCodeSnapshots(r.Context(), id)
+	groups, err := rt.owner.ListSessionCodeSnapshots(r.Context(), rt.server.caller, id)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &groups)
+	rt.writeJSON(w, http.StatusOK, &groups)
 }
 
 // RevertSessionCode serves the deferred code restore. A traversal failure
@@ -463,7 +460,7 @@ func (rt *protocolHandlers) RevertSessionCode(w http.ResponseWriter, r *http.Req
 		writeProtocolError(w, err)
 		return
 	}
-	result, err := rt.revertSessionCode(r.Context(), id, body.BoundaryOperationId)
+	result, err := rt.owner.RevertSessionCode(r.Context(), rt.server.caller, id, body.BoundaryOperationId)
 	rt.writeCodeRevertResponse(w, result, err)
 }
 
@@ -478,21 +475,21 @@ func (rt *protocolHandlers) writeCodeRevertResponse(w http.ResponseWriter, resul
 	}
 	if err != nil {
 		_, status := classifyProtocolError(err)
-		rt.writeQualifiedJSON(w, status, &result)
+		rt.writeJSON(w, status, &result)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &result)
+	rt.writeJSON(w, http.StatusOK, &result)
 }
 
 // ListWorkspaces serves the distinct Session-derived Workspace navigation
 // roots.
 func (rt *protocolHandlers) ListWorkspaces(w http.ResponseWriter, r *http.Request) {
-	workspaces, err := rt.listWorkspaces(r.Context())
+	workspaces, err := rt.owner.ListWorkspaces(r.Context(), rt.server.caller)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &workspaces)
+	rt.writeJSON(w, http.StatusOK, &workspaces)
 }
 
 // ReadWorkspaceFile serves the bounded contained file view; the read is a
@@ -503,10 +500,10 @@ func (rt *protocolHandlers) ReadWorkspaceFile(w http.ResponseWriter, r *http.Req
 		writeProtocolError(w, err)
 		return
 	}
-	result, err := rt.readWorkspaceFile(r.Context(), body)
+	result, err := rt.owner.ReadWorkspaceFile(r.Context(), rt.server.caller, body)
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
-	rt.writeQualifiedJSON(w, http.StatusOK, &result)
+	rt.writeJSON(w, http.StatusOK, &result)
 }

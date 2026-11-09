@@ -2688,7 +2688,7 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 		h := newTestHarness(t, store, nil)
 		var commit forkCommit
 		err := store.Transact(context.Background(), func(tx Transaction) error {
-			return h.forkTransaction(tx, destID, fixture.session, ForkRequest{
+			return h.forkTransaction(tx, destID, fixture.session, ForkRequest{Origin: InputOriginUser,
 				SourceSessionID: testSessionID,
 				BoundaryEntryID: boundaryID,
 				OperationID:     forkOpID,
@@ -2760,7 +2760,7 @@ func TestForkCopyCompactionEntries(t *testing.T) {
 		h := newTestHarness(t, store, nil)
 		var commit forkCommit
 		err := store.Transact(context.Background(), func(tx Transaction) error {
-			return h.forkTransaction(tx, destID, fixture.session, ForkRequest{
+			return h.forkTransaction(tx, destID, fixture.session, ForkRequest{Origin: InputOriginUser,
 				SourceSessionID: testSessionID,
 				BoundaryEntryID: boundaryID,
 				OperationID:     forkOpID,

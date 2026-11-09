@@ -23,6 +23,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 	"github.com/MMinasyan/lightcode/runtime"
 )
@@ -40,7 +41,7 @@ const (
 // recordContent builds one private discovery document pointing at the
 // fixture endpoint.
 func recordContent(endpoint string) string {
-	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"12","credential":%q}`,
+	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"13","credential":%q}`,
 		endpoint, testInstance, testCredential)
 }
 
@@ -69,7 +70,7 @@ func newFixture(t *testing.T, health, events http.HandlerFunc, extra ...map[stri
 func jsonHealth() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"12"}`, testInstance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"13"}`, testInstance)
 	}
 }
 
@@ -1039,16 +1040,18 @@ func isolateBundledCredentials(t *testing.T) {
 // pulled generated event.
 func TestDesktopHostMountedRuntime(t *testing.T) {
 	const baseURL = "http://127.0.0.1:1/v1"
-	t.Setenv("HOME", t.TempDir())
 	t.Setenv("DESKTOP_TEST_KEY", "desktop-test-key")
 	isolateBundledCredentials(t)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, fmt.Sprintf(smokeConfigDocument, baseURL, smokeAgentsDocument))
-	owner, err := runtime.Open(context.Background(), runtime.Options{
-		DataDir:    dataDir,
-		ConfigPath: configPath,
-		Plugins:    builtin.Plugins(),
+	ownerHost := runtime.NewProtocolHost()
+	owner, err := melta.Open(context.Background(), melta.Options{
+		DataDir:       dataDir,
+		Configuration: melta.NewFileConfigurationSource(configPath),
+		Credentials:   melta.NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
+		Extensions:    builtin.Plugins(),
+		BeforeRelease: ownerHost.BeforeRelease,
 	})
 	testassert.NoError(t, err)
 	t.Cleanup(func() {
@@ -1057,7 +1060,7 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 			testassert.Check(t, err == nil, "runtime.Close: %v", err)
 		}
 	})
-	server, err := owner.OpenProtocol(context.Background())
+	server, err := ownerHost.OpenProtocol(context.Background(), owner)
 	testassert.NoError(t, err)
 	testassert.NoError(t, server.PublishDiscovery(filepath.Join(dataDir, "runtime.json")))
 
@@ -1074,7 +1077,7 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 	testassert.Equal(t, response.Status, http.StatusOK)
 	var health protocol.Health
 	testassert.NoError(t, json.Unmarshal([]byte(response.Body), &health))
-	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N12, "health = %+v, want the connected owner", health)
+	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N13, "health = %+v, want the connected owner", health)
 
 	create, err := host.Call(info.Generation, "CreateSession", `{"body":{"workspace":"/ws/smoke","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"integrated"}}}}`)
 	testassert.NoError(t, err)

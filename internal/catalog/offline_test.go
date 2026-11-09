@@ -164,7 +164,7 @@ func TestDiscoveryTransportReadyDoesNotRequireModels(t *testing.T) {
 	}
 }
 
-// Doctor-context resolution: LoadDotEnv never ran, so a .env-only key is not
+// Doctor-context resolution: the owner credential source never ran, so a .env-only key is not
 // in the process env — it resolves because the ReadDotEnvKeys map (name ->
 // value is non-empty) is part of the injected lookup; the shell, even an
 // empty export, shadows it.

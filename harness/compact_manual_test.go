@@ -240,7 +240,7 @@ func TestCompactAdmissionForkKindArm(t *testing.T) {
 	store := forkLineageCompactGraph().storage(t)
 	stub := newPrepareStub(validPrepared())
 	h := newTestHarness(t, store, stub.prepare)
-	_, err := h.Fork(context.Background(), ForkRequest{
+	_, err := h.Fork(context.Background(), ForkRequest{Origin: InputOriginUser,
 		SourceSessionID: testSessionID,
 		BoundaryEntryID: hexID(1),
 		OperationID:     "cx-1",

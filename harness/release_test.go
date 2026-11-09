@@ -316,7 +316,7 @@ func TestPreparationReservationReleasesOnDiscards(t *testing.T) {
 			}
 			return nil
 		}
-		_, err := h.Fork(context.Background(), ForkRequest{
+		_, err := h.Fork(context.Background(), ForkRequest{Origin: InputOriginUser,
 			SourceSessionID: testSessionID,
 			BoundaryEntryID: boundary,
 			OperationID:     "fork-down",

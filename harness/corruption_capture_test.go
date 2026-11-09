@@ -321,7 +321,7 @@ func TestCorruptMarkBetweenLookupAndCapture(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Require(t, reread.State.Status == OperationSuccess, "a mutation of the returned record reached the coordinator: %+v", reread)
 
-	reader, forkDone := runMarkWindow(t, ctx, h, stub, c, ForkRequest{
+	reader, forkDone := runMarkWindow(t, ctx, h, stub, c, ForkRequest{Origin: InputOriginUser,
 		SourceSessionID: testSessionID,
 		BoundaryEntryID: hexID(1),
 		OperationID:     "op-fork-1",
@@ -372,7 +372,7 @@ func TestCaptureAvailabilityFamily(t *testing.T) {
 
 		// The same real transition installs the marker on the warm source.
 		forkDone := make(chan error, 1)
-		go forkMarker(ctx, h, ForkRequest{
+		go forkMarker(ctx, h, ForkRequest{Origin: InputOriginUser,
 			SourceSessionID: testSessionID,
 			BoundaryEntryID: hexID(1),
 			OperationID:     "op-fork-sibling",
@@ -407,7 +407,7 @@ func TestCaptureAvailabilityFamily(t *testing.T) {
 		h, _, _, _, _ := warmCorruptFixture(t)
 
 		forkDone := make(chan error, 1)
-		go forkMarker(ctx, h, ForkRequest{
+		go forkMarker(ctx, h, ForkRequest{Origin: InputOriginUser,
 			SourceSessionID: testSessionID,
 			BoundaryEntryID: hexID(1),
 			OperationID:     "op-fork-family",

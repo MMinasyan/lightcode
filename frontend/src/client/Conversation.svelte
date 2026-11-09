@@ -108,7 +108,7 @@
     {#if item.kind === 'input'}
       <div class="message user">
         <div class="body plain">{itemContent(item)}</div>
-        {#if forksEnabled && item.origin === 'user'}
+        {#if forksEnabled}
           <button class="fork" on:click={() => dispatch('fork', item)} aria-label={`Fork from input ${item.item_id}`}>Fork</button>
         {/if}
       </div>

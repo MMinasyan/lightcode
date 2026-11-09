@@ -580,6 +580,18 @@
     {
      "name": "code-unavailable",
      "json": "{\"code\":\"unavailable\",\"message\":\"extension cleanup unavailable\"}"
+    },
+    {
+     "name": "code-denied",
+     "json": "{\"code\":\"denied\",\"message\":\"outside the caller scope\"}"
+    },
+    {
+     "name": "code-cancelled",
+     "json": "{\"code\":\"cancelled\",\"message\":\"caller cancelled\"}"
+    },
+    {
+     "name": "code-incompatible",
+     "json": "{\"code\":\"incompatible\",\"message\":\"unsupported schema\"}"
     }
    ],
    "reject": [
@@ -693,7 +705,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"12\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"13\"}"
     }
    ],
    "reject": [
@@ -703,16 +715,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"12\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"13\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"12\"}"
+     "json": "{\"protocol_version\":\"13\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"12\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"13\",\"extra\":true}"
     }
    ]
   },
@@ -777,7 +789,7 @@
     },
     {
      "name": "plugin-origin",
-     "json": "{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"plugin\",\"content\":[{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"}]}"
+     "json": "{\"item_id\":\"input-item\",\"kind\":\"input\",\"committed_at\":\"2026-01-02T03:04:05Z\",\"operation_id\":\"op-1\",\"origin\":\"plugin\",\"extension_id\":\"calling.extension\",\"content\":[{\"kind\":\"image_url\",\"url\":\"https://example.invalid/image.png\"}]}"
     }
    ],
    "reject": [
@@ -1048,6 +1060,10 @@
     {
      "name": "minimal",
      "json": "{\"operation_id\":\"fixture\",\"origin\":\"user\",\"content\":[]}"
+    },
+    {
+     "name": "plugin-provenance",
+     "json": "{\"operation_id\":\"fixture\",\"origin\":\"plugin\",\"extension_id\":\"calling.extension\",\"content\":[]}"
     }
    ],
    "reject": []

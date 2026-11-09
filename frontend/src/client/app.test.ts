@@ -4058,13 +4058,19 @@ describe('usage details and global warnings', () => {
 });
 
 describe('replacement Fork and ordered rewind', () => {
-  it('exposes Fork only on root user-origin inputs, with rewind only for an owned input', async () => {
+  it('exposes Fork on every root input, with rewind only for an owned input', async () => {
     const connection = forkConnection();
     const { target } = await mountApp(connection);
-    expect(target.querySelectorAll('.fork')).toHaveLength(2);
-    expect(target.querySelector('[aria-label="Fork from input i-runtime"]')).toBeNull();
-    expect(target.querySelector('[aria-label="Fork from input i-plugin"]')).toBeNull();
-    (target.querySelector('[aria-label="Fork from input i-owned"]') as HTMLElement).click();
+    expect(target.querySelectorAll('.fork')).toHaveLength(4);
+    for (const id of ['i-owned', 'i-copied', 'i-runtime', 'i-plugin']) {
+      expect(target.querySelector(`[aria-label="Fork from input ${id}"]`)).not.toBeNull();
+    }
+    (target.querySelector('[aria-label="Fork from input i-runtime"]') as HTMLElement).click();
+    await settle();
+    expect(target.querySelector('[aria-label="Rewind code before Fork"]')).not.toBeNull();
+    (target.querySelector('[aria-label="Close fork dialog"]') as HTMLElement).click();
+    await settle();
+    (target.querySelector('[aria-label="Fork from input i-plugin"]') as HTMLElement).click();
     await settle();
     expect(target.querySelector('[aria-label="Rewind code before Fork"]')).not.toBeNull();
     (target.querySelector('[aria-label="Close fork dialog"]') as HTMLElement).click();

@@ -11,21 +11,23 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/catalog"
+	"github.com/MMinasyan/lightcode/melta"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
 // This file owns the one transport boundary of the mounted protocol server:
 // request decoding, request-shape validation, response writing, error
-// classification, and response revision qualification. Everything reuses the
+// classification, and response writing. Everything reuses the
 // generated protocol types' own JSON tags, pointer/omitempty shape, and
 // generated enum validators; no handwritten request DTO or validation
 // dependency exists, and no credential, request body, or header value is ever
 // rendered into an error or a log.
 
-// errUnauthorized is the one authentication failure class: the credential
-// never rides the message, and no presented header value is echoed.
-var errUnauthorized = errors.New("missing or invalid bearer credential")
+// unauthorizedMessage is the transport's one authentication refusal text: the
+// credential never rides the message, and no presented header value is
+// echoed. HTTP authentication is a transport gate, not a command-producer
+// class.
+const unauthorizedMessage = "missing or invalid bearer credential"
 
 // decodeRequestBody reads one uncapped request body as exactly one JSON
 // document and decodes it natively into the generated request type:
@@ -165,7 +167,6 @@ func validateStructMembers(raw []byte, v reflect.Value, path string) error {
 		return invalidRequest("%s must be a JSON object: %v", path, err)
 	}
 	t := v.Type()
-	settingsType := reflect.TypeOf(protocol.Settings{})
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		if !field.IsExported() || field.Tag.Get("json") == "" || field.Tag.Get("json") == "-" {
@@ -183,14 +184,6 @@ func validateStructMembers(raw []byte, v reflect.Value, path string) error {
 		}
 		if isJSONNull(member) {
 			return invalidRequest("%s member %q must not be null", path, name)
-		}
-		// The three generated settings section aliases are raw messages, but
-		// their schema type is an object. The boundary enforces only that
-		// shape; every consumed member stays the candidate's validation.
-		if t == settingsType && field.Type == rawMessageType {
-			if err := requireSettingsObject(name, member); err != nil {
-				return invalidRequest("%s member %q: %v", path, name, err)
-			}
 		}
 		if err := validateDecodedValue(member, v.Field(i), path+"."+name); err != nil {
 			return err
@@ -239,33 +232,49 @@ func validateContentPart(raw []byte, part protocol.ContentPart, path string) err
 	return validateDecodedValue(raw, reflect.ValueOf(variant), path)
 }
 
-// classifyProtocolError maps one error to its schema error code and HTTP
-// status by errors.Is/As over the existing typed classes, never rendered
-// text. Caller-input invalidity outranks the complete-candidate configuration
-// failure that may wrap it; the closed class is the Runtime's own closure
-// sentinel alone, and every unclassified error — plain caller cancellation
-// and deadline errors included — is internal.
-func classifyProtocolError(err error) (protocol.ErrorCode, int) {
-	switch {
-	case errors.Is(err, errUnauthorized):
-		return protocol.ErrorCodeUnauthorized, http.StatusUnauthorized
-	case errors.Is(err, harness.ErrInvalid):
-		return protocol.ErrorCodeInvalid, http.StatusBadRequest
-	case errors.Is(err, harness.ErrNotFound), errors.Is(err, catalog.ErrUnknownProvider), errors.Is(err, catalog.ErrUnknownModel):
-		return protocol.ErrorCodeNotFound, http.StatusNotFound
-	case errors.Is(err, harness.ErrConflict):
-		return protocol.ErrorCodeConflict, http.StatusConflict
-	case errors.Is(err, ErrClosed):
-		return protocol.ErrorCodeClosed, http.StatusGone
-	case errors.Is(err, harness.ErrCorrupt):
-		return protocol.ErrorCodeCorrupt, http.StatusUnprocessableEntity
-	case errors.Is(err, ErrConfiguration):
-		return protocol.ErrorCodeConfiguration, http.StatusUnprocessableEntity
-	case errors.Is(err, harness.ErrStorage):
-		return protocol.ErrorCodeStorage, http.StatusInternalServerError
+// protocolErrorStatus is the one public class-to-status table.
+func protocolErrorStatus(code protocol.ErrorCode) int {
+	switch code {
+	case protocol.ErrorCodeInvalid:
+		return http.StatusBadRequest
+	case protocol.ErrorCodeUnauthorized:
+		return http.StatusUnauthorized
+	case protocol.ErrorCodeDenied:
+		return http.StatusForbidden
+	case protocol.ErrorCodeNotFound:
+		return http.StatusNotFound
+	case protocol.ErrorCodeConflict, protocol.ErrorCodeIncompatible:
+		return http.StatusConflict
+	case protocol.ErrorCodeClosed:
+		return http.StatusGone
+	case protocol.ErrorCodeCancelled:
+		return http.StatusRequestTimeout
+	case protocol.ErrorCodeConfiguration, protocol.ErrorCodeCorrupt:
+		return http.StatusUnprocessableEntity
+	case protocol.ErrorCodeUnavailable:
+		return http.StatusServiceUnavailable
 	default:
-		return protocol.ErrorCodeInternal, http.StatusInternalServerError
+		return http.StatusInternalServerError
 	}
+}
+
+// classifyProtocolError maps one error to its schema error code and HTTP
+// status through the one public class table: classification has already
+// happened at the producer, and no transport case reinterprets a private
+// error.
+func classifyProtocolError(err error) (protocol.ErrorCode, int) {
+	code := melta.ErrorCode(err)
+	return code, protocolErrorStatus(code)
+}
+
+// writeProtocolAuthError writes the transport gate's one authentication
+// refusal. It is not a command-producer class, so it does not pass through the
+// public-class mapper.
+func writeProtocolAuthError(w http.ResponseWriter) {
+	body, _ := json.Marshal(protocol.Error{Code: protocol.ErrorCodeUnauthorized, Message: unauthorizedMessage}) // plain string members; the marshal cannot fail
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write(body)
 }
 
 // writeProtocolError writes one schema-defined typed error body. The
@@ -286,12 +295,9 @@ func writeProtocolError(w http.ResponseWriter, err error) {
 	_, _ = w.Write(data)
 }
 
-// writeQualifiedJSON stamps the owning server's instance identity into every
-// revision of the response and writes the JSON body with its status. body
-// must be a pointer to the response value so qualification can address the
-// struct members it traverses.
-func (rt *Runtime) writeQualifiedJSON(w http.ResponseWriter, status int, body any) {
-	qualifyRevisions(reflect.ValueOf(body).Elem(), rt.protocolInstance())
+// writeJSON writes one owner-built response body with its status; revision
+// instance identities are the owner's own values and are forwarded unchanged.
+func (rt *protocolHandlers) writeJSON(w http.ResponseWriter, status int, body any) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		writeProtocolError(w, fmt.Errorf("marshal response: %w", err))
@@ -300,78 +306,4 @@ func (rt *Runtime) writeQualifiedJSON(w http.ResponseWriter, status int, body an
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(data)
-}
-
-// The one qualification traversal may match only the three generated revision
-// types; every other composite stays exactly as its producer built it.
-var (
-	sessionRevisionType       = reflect.TypeOf(protocol.SessionRevision{})
-	configurationRevisionType = reflect.TypeOf(protocol.ConfigurationRevision{})
-	warningsRevisionType      = reflect.TypeOf(protocol.WarningsRevision{})
-)
-
-// qualifyRevisions stamps the Runtime instance identity into every generated
-// session, configuration, and warnings revision reachable through struct
-// fields, pointers, and slices. Arbitrary maps, interfaces, and raw JSON —
-// including any opaque member spelled instance_id — are never traversed or
-// rewritten.
-func qualifyRevisions(rv reflect.Value, instance string) {
-	switch rv.Kind() {
-	case reflect.Struct:
-		switch rv.Type() {
-		case sessionRevisionType, configurationRevisionType, warningsRevisionType:
-			if field := rv.FieldByName("InstanceId"); field.CanSet() {
-				field.SetString(instance)
-			}
-		default:
-			for i := 0; i < rv.NumField(); i++ {
-				if rv.Type().Field(i).IsExported() {
-					qualifyRevisions(rv.Field(i), instance)
-				}
-			}
-		}
-	case reflect.Ptr:
-		if !rv.IsNil() {
-			qualifyRevisions(rv.Elem(), instance)
-		}
-	case reflect.Slice:
-		for i := 0; i < rv.Len(); i++ {
-			qualifyRevisions(rv.Index(i), instance)
-		}
-	}
-}
-
-// qualifyEvent stamps the instance identity into the revision of the three
-// revisioned event variants through their generated accessors and
-// constructors; every transient event is returned unchanged and inherits
-// the connection's identity implicitly.
-func qualifyEvent(event Event, instance string) Event {
-	kind, err := event.Discriminator()
-	if err != nil {
-		return event
-	}
-	switch kind {
-	case "configuration_changed":
-		value, err := event.AsConfigurationChangedEvent()
-		if err != nil {
-			return event
-		}
-		value.ConfigurationRevision.InstanceId = instance
-		_ = event.FromConfigurationChangedEvent(value)
-	case "session_changed":
-		value, err := event.AsSessionChangedEvent()
-		if err != nil {
-			return event
-		}
-		value.SessionRevision.InstanceId = instance
-		_ = event.FromSessionChangedEvent(value)
-	case "warning_changed":
-		value, err := event.AsWarningChangedEvent()
-		if err != nil {
-			return event
-		}
-		value.WarningsRevision.InstanceId = instance
-		_ = event.FromWarningChangedEvent(value)
-	}
-	return event
 }

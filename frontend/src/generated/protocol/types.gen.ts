@@ -5,7 +5,7 @@ export type ClientOptions = {
 };
 
 export type Error = {
-    code: 'invalid' | 'unauthorized' | 'not_found' | 'conflict' | 'corrupt' | 'closed' | 'configuration' | 'storage' | 'unavailable' | 'internal';
+    code: 'invalid' | 'unauthorized' | 'denied' | 'not_found' | 'conflict' | 'incompatible' | 'corrupt' | 'closed' | 'cancelled' | 'configuration' | 'storage' | 'unavailable' | 'internal';
     message: string;
     session_id?: string;
 };
@@ -73,7 +73,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '12';
+    protocol_version: '13';
 };
 
 /**
@@ -233,6 +233,7 @@ export type Operation = {
 export type PendingInput = {
     operation_id: string;
     origin: InputOrigin;
+    extension_id?: string;
     content: Array<ContentPart>;
 };
 
@@ -284,6 +285,7 @@ export type InputItem = {
     committed_at: string;
     operation_id?: string;
     origin: InputOrigin;
+    extension_id?: string;
     content: Array<ContentPart>;
 };
 
