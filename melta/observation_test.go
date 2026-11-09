@@ -167,7 +167,7 @@ func TestRuntimeSubscribeValidatesCapacityAndUsesTheClosedGate(t *testing.T) {
 	sub, err := r.Subscribe(4)
 	testassert.NoError(t, err)
 	{
-		_, err := r.Reload(context.Background(), testCaller())
+		_, err := r.Reload(context.Background(), testCaller(r))
 		testassert.NoError(t, err)
 	}
 	sub.Close()
@@ -190,7 +190,7 @@ func TestRuntimeObservationPublishesCommittedTransitionsInOrder(t *testing.T) {
 	sub, err := r.Subscribe(16)
 	testassert.NoError(t, err)
 	{
-		revision, err := r.Reload(context.Background(), testCaller())
+		revision, err := r.Reload(context.Background(), testCaller(r))
 		testassert.Require(t, err == nil && revision.Generation == "2", "Reload = (%q, %v), want 2", revision, err)
 	}
 	{
@@ -198,7 +198,7 @@ func TestRuntimeObservationPublishesCommittedTransitionsInOrder(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	{
-		revision, err := r.Reload(context.Background(), testCaller())
+		revision, err := r.Reload(context.Background(), testCaller(r))
 		testassert.Require(t, err == nil && revision.Generation == "3", "Reload = (%q, %v), want 3", revision, err)
 	}
 	testassert.NoError(t, r.Close(context.Background()))
@@ -237,7 +237,7 @@ func TestObservationPausedPublisherOrdersTheNextPublication(t *testing.T) {
 		defer release()
 		reloadDone := make(chan error, 1)
 		go func() {
-			_, err := r.Reload(context.Background(), testCaller())
+			_, err := r.Reload(context.Background(), testCaller(r))
 			reloadDone <- err
 		}()
 		select {
@@ -354,7 +354,7 @@ func TestObservationSaturatedSubscriberIsRemovedAndHealthyOnesContinue(t *testin
 	testassert.NoError(t, err)
 	for _, want := range []string{"2", "3", "4"} {
 		{
-			revision, err := r.Reload(context.Background(), testCaller())
+			revision, err := r.Reload(context.Background(), testCaller(r))
 			testassert.Require(t, err == nil && revision.Generation == want, "Reload = (%q, %v), want %s", revision, err, want)
 		}
 	}
@@ -376,7 +376,7 @@ func TestObservationSaturatedSubscriberIsRemovedAndHealthyOnesContinue(t *testin
 		}
 	}
 	{
-		revision, err := r.Reload(context.Background(), testCaller())
+		revision, err := r.Reload(context.Background(), testCaller(r))
 		testassert.Require(t, err == nil && revision.Generation == "5", "Reload = (%q, %v), want 5", revision, err)
 	}
 	event, ok := nextEvent(t, healthy)
@@ -422,7 +422,7 @@ func TestObservationSubscriptionCloseRacesPublication(t *testing.T) {
 		go func(i int) {
 			defer reloads.Done()
 			{
-				_, err := r.Reload(context.Background(), testCaller())
+				_, err := r.Reload(context.Background(), testCaller(r))
 				testassert.Check(t, err == nil, "Reload %d: %v", i, err)
 			}
 		}(i)
@@ -467,7 +467,7 @@ func TestRuntimeShutdownDoesNotWaitForUndrainedObservers(t *testing.T) {
 	testassert.NoError(t, err)
 	for _, want := range []string{"2", "3"} {
 		{
-			revision, err := r.Reload(context.Background(), testCaller())
+			revision, err := r.Reload(context.Background(), testCaller(r))
 			testassert.Require(t, err == nil && revision.Generation == want, "Reload = (%q, %v), want %s", revision, err, want)
 		}
 	}
@@ -518,7 +518,7 @@ func TestObservationSubscriberLossDoesNotAffectExecution(t *testing.T) {
 		testassert.NoError(t, err)
 		for _, want := range []string{"2", "3"} {
 			{
-				revision, err := r.Reload(context.Background(), testCaller())
+				revision, err := r.Reload(context.Background(), testCaller(r))
 				testassert.Require(t, err == nil && revision.Generation == want, "Reload during execution = (%q, %v), want %s", revision, err, want)
 			}
 		}

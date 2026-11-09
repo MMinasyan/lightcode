@@ -1022,7 +1022,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
-					revision, err := r.Reload(context.Background(), testCaller())
+					revision, err := r.Reload(context.Background(), testCaller(r))
 					if err != nil {
 						t.Errorf("Reload: %v", err)
 						return
@@ -1056,7 +1056,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			defer cancel()
 			reloadDone := make(chan error, 1)
 			go func() {
-				_, err := r.Reload(ctx, testCaller())
+				_, err := r.Reload(ctx, testCaller(r))
 				reloadDone <- err
 			}()
 			<-arrive
@@ -1067,7 +1067,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 				testassert.Require(t, errors.Is(err, context.Canceled), "canceled Reload = %v, want the caller's own context error", err)
 			}
 			{
-				revision, err := r.Reload(context.Background(), testCaller())
+				revision, err := r.Reload(context.Background(), testCaller(r))
 				testassert.Require(t, err == nil && revision.Generation == "2", "Reload after the canceled build = (%q, %v), want 2: a failed build consumes no generation", revision, err)
 			}
 		})
@@ -1086,7 +1086,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			t.Cleanup(func() { candidateBarrier = nil })
 			reloadDone := make(chan error, 1)
 			go func() {
-				_, err := r.Reload(context.Background(), testCaller())
+				_, err := r.Reload(context.Background(), testCaller(r))
 				reloadDone <- err
 			}()
 			<-arrive
@@ -1148,7 +1148,7 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 				testassert.Require(t, errors.Is(err, context.Canceled), "canceled request = %v, want the caller's own error", err)
 			}
 			{
-				revision, err := r.Reload(context.Background(), testCaller())
+				revision, err := r.Reload(context.Background(), testCaller(r))
 				testassert.Require(t, err == nil && revision.Generation == "2", "Reload after a canceled request = (%q, %v), want the owner alive at revision 2", revision, err)
 			}
 			testassert.NoError(t, r.Close(context.Background()))
@@ -1165,7 +1165,7 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 			canceledWork, cancelWatcherFree := context.WithCancel(context.Background())
 			cancelWatcherFree()
 			r.work, r.cancelWork = canceledWork, func() {}
-			_, reloadErr := r.Reload(context.Background(), testCaller())
+			_, reloadErr := r.Reload(context.Background(), testCaller(r))
 			ranGuardedCall := false
 			guardedErr := r.withHarness(context.Background(), func(context.Context, *harness.Harness) error {
 				ranGuardedCall = true
@@ -1222,13 +1222,13 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 			testassert.NoError(t, err)
 			testassert.NoError(t, r.Close(context.Background()))
 			{
-				_, err := r.Reload(context.Background(), testCaller())
+				_, err := r.Reload(context.Background(), testCaller(r))
 				testassert.Require(t, errors.Is(err, ErrClosed), "Reload after Close = %v, want ErrClosed", err)
 			}
 			callerCtx, cancelCaller := context.WithCancel(context.Background())
 			cancelCaller()
 			{
-				_, err := r.Reload(callerCtx, testCaller())
+				_, err := r.Reload(callerCtx, testCaller(r))
 				testassert.Require(t, errors.Is(err, ErrClosed), "Reload after Close with a canceled caller = %v, want ErrClosed: admission rejects before the caller check", err)
 			}
 			{
@@ -1674,7 +1674,7 @@ func (r *Melta) configPathForTest() string {
 
 // testSubprocessEnv adapts one real managed file to the tool producer shape.
 func testSubprocessEnv(managed *config.ManagedEnv) func(context.Context) ([]string, error) {
-	return func(context.Context) ([]string, error) { return managed.SubprocessEnv(nil), nil }
+	return func(context.Context) ([]string, error) { return managed.SubprocessEnv(nil) }
 }
 
 // configPathForTest exposes the service's file configuration path.

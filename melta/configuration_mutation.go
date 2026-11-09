@@ -133,8 +133,9 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 	}
 	// The build's own capture over the latest document's names. Edit
 	// decisions read this observation, never the previous publication; the
-	// candidate build adds only names this edit first introduces.
-	seed, initialCredentials, err := s.mutationCapture(ctx, configData)
+	// candidate build takes its own single capture over the candidate's full
+	// name union after the edit applies.
+	seed, err := s.mutationCapture(ctx, configData)
 	if err != nil {
 		s.buildMu.Unlock()
 		return configurationCapture{}, err
@@ -176,7 +177,7 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 			conn.discovered = nil
 		}
 	}
-	candidate, err := s.buildCapturedFrom(ctx, generation, configCandidate, conn, edit.connection, initialCredentials)
+	candidate, err := s.buildCaptured(ctx, generation, configCandidate, conn, edit.connection)
 	if err != nil {
 		s.buildMu.Unlock()
 		return configurationCapture{}, err
@@ -247,15 +248,15 @@ func (s *configurationService) mutate(ctx context.Context, edit configurationEdi
 }
 
 // mutationCapture builds the mutation build's credential observation from the
-// latest document's provider and active declared names before the edit runs.
-// The returned capture carries that observation with the latest assembled
-// catalog while retaining the published execution resources for extension
-// callbacks; the candidate build folds in only names first introduced by the
-// edit.
-func (s *configurationService) mutationCapture(ctx context.Context, configData []byte) (configurationCapture, map[string]CredentialValue, error) {
+// latest document's provider and active declared names before the edit runs;
+// it feeds only the edit's decisions. The returned capture carries that
+// observation with the latest assembled catalog while retaining the published
+// execution resources for extension callbacks; the candidate build takes its
+// own single capture over the edited document's names.
+func (s *configurationService) mutationCapture(ctx context.Context, configData []byte) (configurationCapture, error) {
 	doc, err := decodeCapturedConfig(configData)
 	if err != nil {
-		return configurationCapture{}, nil, configurationFailure(err)
+		return configurationCapture{}, configurationFailure(err)
 	}
 	var active []extension.Native
 	for _, native := range s.natives {
@@ -266,14 +267,14 @@ func (s *configurationService) mutationCapture(ctx context.Context, configData [
 	built, err := s.loader.AssembleCaptured(ctx, doc.Providers)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return configurationCapture{}, nil, err
+			return configurationCapture{}, err
 		}
-		return configurationCapture{}, nil, configurationFailure(err)
+		return configurationCapture{}, configurationFailure(err)
 	}
 	secrets := resolveDeclaredSecrets(active, doc.Extensions)
-	credentials, err := s.captureCredentials(ctx, capturedCredentialNames(built.Catalog, secrets), nil, nil)
+	credentials, err := s.captureCredentials(ctx, capturedCredentialNames(built.Catalog, secrets), nil)
 	if err != nil {
-		return configurationCapture{}, nil, configurationFailure(err)
+		return configurationCapture{}, configurationFailure(err)
 	}
 	var snapshot configuration
 	if published := s.current(); published != nil {
@@ -284,7 +285,7 @@ func (s *configurationService) mutationCapture(ctx context.Context, configData [
 	snapshot.secrets = secrets
 	snapshot.credentials = credentials
 	snapshot.declaredBindings = captureDeclaredBindings(secrets, credentials)
-	return configurationCapture{snapshot: &snapshot}, credentials, nil
+	return configurationCapture{snapshot: &snapshot}, nil
 }
 
 // applyConnectionEffects runs an existing-provider connection's external
@@ -296,6 +297,7 @@ func (s *configurationService) mutationCapture(ctx context.Context, configData [
 // write that succeeded before a later key failure is honest partial state. An
 // empty discovery cache location skips the cache write without error.
 func (s *configurationService) applyConnectionEffects(ctx context.Context, conn *connectionEffects) error {
+	cacheUpdated := false
 	if conn.discovered != nil && s.locations.DiscoveryCacheDir != "" {
 		ok, err := catalog.TryWriteDiscoveryCache(s.locations.DiscoveryCacheDir, conn.providerID, conn.transport, *conn.discovered, time.Now().UTC())
 		if err != nil {
@@ -304,6 +306,13 @@ func (s *configurationService) applyConnectionEffects(ctx context.Context, conn 
 		if !ok {
 			return configurationFailure(fmt.Errorf("discovery lock is held for %q; retry", conn.providerID))
 		}
+		cacheUpdated = true
+	}
+	failure := func(err error) error {
+		if cacheUpdated {
+			return configurationFailure(fmt.Errorf("%w; the discovery cache for provider %q was updated", err, conn.providerID))
+		}
+		return configurationFailure(err)
 	}
 	switch conn.keyAction {
 	case keyActionSet:
@@ -311,11 +320,11 @@ func (s *configurationService) applyConnectionEffects(ctx context.Context, conn 
 		// detected at the write or a concurrent change under the leaf lock —
 		// no tolerance disguises either as success.
 		if err := s.credentials.Set(ctx, conn.keyEnv, conn.keyValue); err != nil {
-			return configurationFailure(fmt.Errorf("persist API key %s: %w", conn.keyEnv, err))
+			return failure(fmt.Errorf("persist API key %s: %w", conn.keyEnv, err))
 		}
 	case keyActionRemove:
 		if err := s.credentials.Remove(ctx, conn.keyEnv); err != nil {
-			return configurationFailure(fmt.Errorf("remove managed key %s: %w", conn.keyEnv, err))
+			return failure(fmt.Errorf("remove managed key %s: %w", conn.keyEnv, err))
 		}
 	}
 	return nil

@@ -477,11 +477,11 @@ func TestHistoryPagingAppendStableAnchors(t *testing.T) {
 			compactRawSuccessOperation(t, store, session, fmt.Sprintf("op-%d", i), fmt.Sprintf("question op-%d", i), fmt.Sprintf("answer op-%d", i))
 		}
 
-		page1, err := r.GetHistory(context.Background(), testCaller(), session, nil)
+		page1, err := r.GetHistory(context.Background(), testCaller(r), session, nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(page1.Items) == 50 && page1.OlderCursor != nil, "initial page = %d items (cursor %v), want exactly 50 with an older cursor", len(page1.Items), page1.OlderCursor)
 		wantPage1 := strings.Join(pageItemIDs(t, page1), ",")
-		page2, err := r.GetHistory(context.Background(), testCaller(), session, page1.OlderCursor)
+		page2, err := r.GetHistory(context.Background(), testCaller(r), session, page1.OlderCursor)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(page2.Items) == 10 && page2.OlderCursor == nil, "older page = %d items (cursor %v), want the remaining 10 with no cursor", len(page2.Items), page2.OlderCursor)
 		wantPage2 := strings.Join(pageItemIDs(t, page2), ",")
@@ -493,7 +493,7 @@ func TestHistoryPagingAppendStableAnchors(t *testing.T) {
 		submitConvergedThroughRuntime(t, r, session, "op-21", "late turn", harness.OperationSuccess)
 		awaitIdleSession(t, r, session)
 
-		page1After, err := r.GetHistory(context.Background(), testCaller(), session, nil)
+		page1After, err := r.GetHistory(context.Background(), testCaller(r), session, nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(page1After.Items) == 50 && page1After.OlderCursor != nil, "post-append initial page = %d items, want exactly 50", len(page1After.Items))
 		afterIDs := pageItemIDs(t, page1After)
@@ -508,7 +508,7 @@ func TestHistoryPagingAppendStableAnchors(t *testing.T) {
 		}
 		testassert.Require(t, page1After.SessionRevision.DurableRevision != firstRevision.DurableRevision, "post-append revision = %+v, want the advanced current revision (was %+v)", page1After.SessionRevision, firstRevision)
 
-		page2After, err := r.GetHistory(context.Background(), testCaller(), session, page1.OlderCursor)
+		page2After, err := r.GetHistory(context.Background(), testCaller(r), session, page1.OlderCursor)
 		testassert.NoError(t, err)
 		testassert.Equal(t, strings.Join(pageItemIDs(t, page2After), ","), wantPage2)
 		testassert.Require(t, page2After.SessionRevision.DurableRevision != firstRevision.DurableRevision && page2After.SessionRevision.DurableRevision == page1After.SessionRevision.DurableRevision, "older page returned the stale client revision %+v, want the current one; older page revision = %+v, want the same current revision as the fresh initial page %+v", page2After.SessionRevision, page2After.SessionRevision, page1After.SessionRevision)
@@ -521,8 +521,8 @@ func TestHistoryPagingAppendStableAnchors(t *testing.T) {
 // canceled callers share the same read set.
 func sessionReadCalls(ctx context.Context, r *Melta, sessionID string) []func() error {
 	return []func() error{
-		func() error { _, err := r.GetHistory(ctx, testCaller(), sessionID, nil); return err },
-		func() error { _, err := r.GetHydration(ctx, testCaller(), sessionID); return err },
+		func() error { _, err := r.GetHistory(ctx, testCaller(r), sessionID, nil); return err },
+		func() error { _, err := r.GetHydration(ctx, testCaller(r), sessionID); return err },
 		func() error { return headerErrorThroughRuntime(ctx, r, sessionID) },
 		func() error { return historyErrorThroughRuntime(ctx, r, sessionID) },
 	}
@@ -546,7 +546,7 @@ func TestHistoryReadsArchivedDeletedSessions(t *testing.T) {
 			return err
 		}))
 		{
-			_, err := r.DeleteSession(context.Background(), testCaller(), deleted)
+			_, err := r.DeleteSession(context.Background(), testCaller(r), deleted)
 			testassert.NoError(t, err)
 		}
 
@@ -588,7 +588,7 @@ func TestHistoryCursorRejectionsThroughRuntime(t *testing.T) {
 		}
 		for i, cursor := range rejected {
 			{
-				_, err := r.GetHistory(context.Background(), testCaller(), session, cursor)
+				_, err := r.GetHistory(context.Background(), testCaller(r), session, cursor)
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "cursor rejection %d = %v, want harness.ErrInvalid", i, err)
 			}
 		}
@@ -672,12 +672,12 @@ func TestHistoryPageAttachesResultsBeyondTheBaseRange(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the first call never started")
 		}
-		testassert.NoError(t, bg.r.InterruptSession(ctx, testCaller(), session))
+		testassert.NoError(t, bg.r.InterruptSession(ctx, testCaller(bg.r), session))
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
 		awaitIdleSession(t, bg.r, session)
 
 		// The interruption signal's item identity anchors the older page.
-		newest, err := bg.r.GetHistory(ctx, testCaller(), session, nil)
+		newest, err := bg.r.GetHistory(ctx, testCaller(bg.r), session, nil)
 		testassert.NoError(t, err)
 		signalAnchor := ""
 		for _, item := range newest.Items {
@@ -689,7 +689,7 @@ func TestHistoryPageAttachesResultsBeyondTheBaseRange(t *testing.T) {
 			t.Fatalf("newest page items = %s, want the interruption signal", itemKinds(t, newest.Items))
 		}
 
-		page, err := bg.r.GetHistory(ctx, testCaller(), session, cursorBody(t, cursorJSON(session, signalAnchor)))
+		page, err := bg.r.GetHistory(ctx, testCaller(bg.r), session, cursorBody(t, cursorJSON(session, signalAnchor)))
 		testassert.NoError(t, err)
 		if len(page.Items) != 2 { // the input and the interrupted assistant
 			t.Fatalf("anchored page = %s, want the input and the assistant before the signal", itemKinds(t, page.Items))
@@ -729,7 +729,7 @@ func TestHydrationPendingFIFOsAndActiveOperation(t *testing.T) {
 		submitQueuedThroughRuntime(t, r, session, "op-q1", "queued one")
 		submitQueuedThroughRuntime(t, r, session, "op-q2", "queued two")
 
-		hydration, err := r.GetHydration(context.Background(), testCaller(), session)
+		hydration, err := r.GetHydration(context.Background(), testCaller(r), session)
 		testassert.NoError(t, err)
 		pending := hydration.Pending
 		testassert.Require(t, len(pending.Steering) == 1 && len(pending.Queued) == 2, "pending = %+v, want one steering and two queued members", pending)
@@ -802,12 +802,12 @@ func TestHydrationRootChildCoherence(t *testing.T) {
 		// The running child hydrates as an ordinary Session: its own header,
 		// its active Operation, its conversation of one input, and its live
 		// job member.
-		childHydration, err := bg.r.GetHydration(context.Background(), testCaller(), child)
+		childHydration, err := bg.r.GetHydration(context.Background(), testCaller(bg.r), child)
 		testassert.NoError(t, err)
 		testassert.Require(t, childHydration.Session.SessionId == child && childHydration.ActiveOperation != nil && childHydration.ActiveOperation.OperationId == "child-op-1" && childHydration.ActiveOperation.Status == protocol.OperationStatusRunning && len(childHydration.Conversation.Items) == 1 && len(childHydration.Operations) == 1 && len(childHydration.Background) == 1 && childHydration.Background[0].Id == "cc000003", "child hydration = %+v active %+v, want the ordinary running child Session; child hydration = %d items %d operations, want one item and one Operation; child background = %+v, want the live job member", childHydration.Session, childHydration.ActiveOperation, len(childHydration.Conversation.Items), len(childHydration.Operations), childHydration.Background)
 
 		// The parent carries the live child member.
-		rootHydration, err := bg.r.GetHydration(context.Background(), testCaller(), root)
+		rootHydration, err := bg.r.GetHydration(context.Background(), testCaller(bg.r), root)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(rootHydration.Background) == 1 && rootHydration.Background[0].Id == child, "root background = %+v, want the live child member", rootHydration.Background)
 
@@ -817,10 +817,10 @@ func TestHydrationRootChildCoherence(t *testing.T) {
 		awaitOperation(t, bg.r, child, "child-op-1", harness.OperationSuccess)
 		awaitIdleSession(t, bg.r, child)
 		stopper.addDelivery(child, completionID, "job report")
-		testassert.NoError(t, bg.r.StopSession(context.Background(), testCaller(), child))
+		testassert.NoError(t, bg.r.StopSession(context.Background(), testCaller(bg.r), child))
 		deadline := time.Now().Add(10 * time.Second)
 		for {
-			rootHydration, err = bg.r.GetHydration(context.Background(), testCaller(), root)
+			rootHydration, err = bg.r.GetHydration(context.Background(), testCaller(bg.r), root)
 			testassert.NoError(t, err)
 			if hasRuntimeOriginInput(t, rootHydration.Conversation.Items, "child finished") {
 				break
@@ -848,9 +848,9 @@ func TestHydrationRootChildCoherence(t *testing.T) {
 		// The equality oracle at the settled stable state: every hydration
 		// member equals its own narrow producer's read of the same state.
 		childHeader := projectSession(headerThroughRuntime(t, bg.r, child), bg.r.instance)
-		childPage, err := bg.r.GetHistory(context.Background(), testCaller(), child, nil)
+		childPage, err := bg.r.GetHistory(context.Background(), testCaller(bg.r), child, nil)
 		testassert.NoError(t, err)
-		childHydration, err = bg.r.GetHydration(context.Background(), testCaller(), child)
+		childHydration, err = bg.r.GetHydration(context.Background(), testCaller(bg.r), child)
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(childHydration.Session, childHeader) && childHydration.SessionRevision == childPage.SessionRevision && reflect.DeepEqual(childHydration.Conversation.Items, childPage.Items) && reflect.DeepEqual(childHydration.Conversation.OlderCursor, childPage.OlderCursor) && len(childHydration.Pending.Steering) == 0 && len(childHydration.Pending.Queued) == 0 && childHydration.ActiveOperation == nil, "settled child hydration disagrees with the narrow producers: %+v", childHydration)
 	})
@@ -916,7 +916,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 
 		usageRow := func(t *testing.T, sessionID string) protocol.Hydration {
 			t.Helper()
-			hydration, err := r.GetHydration(ctx, testCaller(), sessionID)
+			hydration, err := r.GetHydration(ctx, testCaller(r), sessionID)
 			testassert.Require(t, err == nil, "buildHydration(%s): %v", sessionID, err)
 			return hydration
 		}
@@ -941,7 +941,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember("https://prov.test/v1", "", `{"m":{"name":"M","context_window":8192}}`)+`}}`)
 		writeAgentDefinitions(t, e.configPath, usageWindowAgents)
 		{
-			_, err := r.Reload(ctx, testCaller())
+			_, err := r.Reload(ctx, testCaller(r))
 			testassert.NoError(t, err)
 		}
 		got = usageRow(t, measured)
@@ -951,7 +951,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		// The same running Session's hydration: the separately captured
 		// configuration revision and the retained captured window ride the
 		// one snapshot producer.
-		busyHydration, err := r.GetHydration(ctx, testCaller(), busy)
+		busyHydration, err := r.GetHydration(ctx, testCaller(r), busy)
 		testassert.NoError(t, err)
 		testassert.Require(t, busyHydration.ConfigurationRevision.Generation == "2" && busyHydration.Usage.Context.ContextWindow == 4096 && busyHydration.ActiveOperation != nil && busyHydration.ActiveOperation.OperationId == "b-op-1", "reloaded busy hydration = rev %+v context %+v active %+v, want generation 2, the captured 4096 window, and the running b-op-1", busyHydration.ConfigurationRevision, busyHydration.Usage.Context, busyHydration.ActiveOperation)
 		{
@@ -963,7 +963,7 @@ func TestUsageReadsDistinctWindowsAndClocks(t *testing.T) {
 		// the estimate and totals stay independent.
 		writeServiceFile(t, e.configPath, `{"providers":{}}`)
 		{
-			_, err := r.Reload(ctx, testCaller())
+			_, err := r.Reload(ctx, testCaller(r))
 			testassert.NoError(t, err)
 		}
 		got = usageRow(t, measured)
@@ -990,7 +990,7 @@ func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 		// An idle Session resolves the selected definition in the captured
 		// catalog: one shared selection supplies the model and the window.
 		solo := projectionSession(t, r, "/tmp/selection-solo", "solo").Identity.SessionID
-		idle, err := r.GetHydration(context.Background(), testCaller(), solo)
+		idle, err := r.GetHydration(context.Background(), testCaller(r), solo)
 		testassert.NoError(t, err)
 		testassert.Require(t, idle.SelectedModel != nil && *idle.SelectedModel == "prov/m" && idle.Usage.Context.ContextWindow == 4096 && idle.Session.AgentSelection.Definition.DefinitionId == "solo", "idle selection = model %v window %d, want prov/m under 4096; got %v, want %v", idle.SelectedModel, idle.Usage.Context.ContextWindow, idle.Session.AgentSelection.Definition.DefinitionId, "solo")
 
@@ -998,7 +998,7 @@ func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 		// than a fallback model.
 		for _, tc := range []struct{ name, agentType string }{{"modelless", "modelless"}, {"unknown", "ghost"}} {
 			session := projectionSession(t, r, "/tmp/selection-"+tc.name, tc.agentType).Identity.SessionID
-			hydration, err := r.GetHydration(context.Background(), testCaller(), session)
+			hydration, err := r.GetHydration(context.Background(), testCaller(r), session)
 			testassert.Require(t, err == nil, "buildHydration(%s): %v", tc.name, err)
 			testassert.Require(t, hydration.SelectedModel == nil && hydration.Usage.Context.ContextWindow == 0, "%s selection = model %v window %d, want null and 0", tc.name, hydration.SelectedModel, hydration.Usage.Context.ContextWindow)
 		}
@@ -1006,7 +1006,7 @@ func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 		// A configured but unavailable ref stays identifiable while admission
 		// still refuses it: the window is 0, the model is not invented away.
 		gone := projectionSession(t, r, "/tmp/selection-gone", "gone").Identity.SessionID
-		goneHydration, err := r.GetHydration(context.Background(), testCaller(), gone)
+		goneHydration, err := r.GetHydration(context.Background(), testCaller(r), gone)
 		testassert.NoError(t, err)
 		testassert.Require(t, goneHydration.SelectedModel != nil && *goneHydration.SelectedModel == "prov/gone" && goneHydration.Usage.Context.ContextWindow == 0, "gone selection = model %v window %d, want the configured prov/gone identifiable at 0", goneHydration.SelectedModel, goneHydration.Usage.Context.ContextWindow)
 
@@ -1025,14 +1025,14 @@ func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 			_, err := h.ChangeAgentType(ctx, active, suppliedDefinition("alternate"))
 			return err
 		}))
-		activeHydration, err := r.GetHydration(context.Background(), testCaller(), active)
+		activeHydration, err := r.GetHydration(context.Background(), testCaller(r), active)
 		testassert.NoError(t, err)
 		testassert.Require(t, activeHydration.ActiveOperation != nil && activeHydration.ActiveOperation.Model == "prov/m" && activeHydration.Usage.Context.ContextWindow == 4096 && activeHydration.SelectedModel != nil && *activeHydration.SelectedModel == "prov/m2" && activeHydration.Session.AgentSelection.Definition.DefinitionId == "alternate" && activeHydration.SessionRevision == activeHydration.Session.SessionRevision, "active hydration = active %+v window %d, want the captured prov/m under 4096; active next selection = %v, want the changed prov/m2; got %v, want %v; got %v, want %v", activeHydration.ActiveOperation, activeHydration.Usage.Context.ContextWindow, activeHydration.SelectedModel, activeHydration.Session.AgentSelection.Definition.DefinitionId, "alternate", activeHydration.SessionRevision, activeHydration.Session.SessionRevision)
 
 		// Once idle, the shared resolution supplies the new model's window.
 		release()
 		awaitIdleSession(t, r, active)
-		settled, err := r.GetHydration(context.Background(), testCaller(), active)
+		settled, err := r.GetHydration(context.Background(), testCaller(r), active)
 		testassert.NoError(t, err)
 		testassert.Require(t, settled.SelectedModel != nil && *settled.SelectedModel == "prov/m2" && settled.Usage.Context.ContextWindow == 8192, "settled selection = model %v window %d, want prov/m2 under 8192", settled.SelectedModel, settled.Usage.Context.ContextWindow)
 
@@ -1049,16 +1049,16 @@ func TestHydrationSelectedModelFollowsNextAdmission(t *testing.T) {
 		awaitModelArrival(t, e)
 		writeAgentDefinitions(t, e.configPath, `{"solo":{"model":"prov/m","system_prompt":"simple"},"alternate":{"model":"prov/m","system_prompt":"simple"},"modelless":{"system_prompt":"simple"},"gone":{"model":"prov/gone","system_prompt":"simple"}}`)
 		{
-			_, err := r.Reload(context.Background(), testCaller())
+			_, err := r.Reload(context.Background(), testCaller(r))
 			testassert.NoError(t, err)
 		}
-		reloaded, err := r.GetHydration(context.Background(), testCaller(), active)
+		reloaded, err := r.GetHydration(context.Background(), testCaller(r), active)
 		testassert.NoError(t, err)
 		testassert.Require(t, reloaded.ActiveOperation != nil && reloaded.ActiveOperation.Model == "prov/m2" && reloaded.Usage.Context.ContextWindow == 8192 && reloaded.SelectedModel != nil && *reloaded.SelectedModel == "prov/m" && reloaded.ConfigurationRevision.Generation == "2", "reloaded active capture = active %+v window %d, want the captured prov/m2 under its captured 8192; reloaded selected model = %v, want the re-pointed prov/m; reloaded configuration revision = %+v, want generation 2", reloaded.ActiveOperation, reloaded.Usage.Context.ContextWindow, reloaded.SelectedModel, reloaded.ConfigurationRevision)
 
 		releaseSecond()
 		awaitIdleSession(t, r, active)
-		afterReload, err := r.GetHydration(context.Background(), testCaller(), active)
+		afterReload, err := r.GetHydration(context.Background(), testCaller(r), active)
 		testassert.NoError(t, err)
 		testassert.Require(t, afterReload.SelectedModel != nil && *afterReload.SelectedModel == "prov/m" && afterReload.Usage.Context.ContextWindow == 4096, "after-reload selection = model %v window %d, want prov/m under 4096", afterReload.SelectedModel, afterReload.Usage.Context.ContextWindow)
 	})
@@ -1107,19 +1107,19 @@ func TestHydrationAndPageReturnedValueOwnership(t *testing.T) {
 		// baseline must be taken only after the busy state has cleared.
 		awaitSessionNotBusy(t, r, session)
 
-		page, err := r.GetHistory(context.Background(), testCaller(), session, nil)
+		page, err := r.GetHistory(context.Background(), testCaller(r), session, nil)
 		testassert.NoError(t, err)
 		wantPage, err := json.Marshal(page)
 		testassert.NoError(t, err)
 		page.Items = append(page.Items, protocol.ConversationItem{})
 		page.Items[0] = protocol.ConversationItem{}
-		reread, err := r.GetHistory(context.Background(), testCaller(), session, nil)
+		reread, err := r.GetHistory(context.Background(), testCaller(r), session, nil)
 		testassert.NoError(t, err)
 		gotPage, err := json.Marshal(reread)
 		testassert.NoError(t, err)
 		testassert.Require(t, string(gotPage) == string(wantPage), "re-read page = %s, want the immutable %s", gotPage, wantPage)
 
-		hydration, err := r.GetHydration(context.Background(), testCaller(), session)
+		hydration, err := r.GetHydration(context.Background(), testCaller(r), session)
 		testassert.NoError(t, err)
 		wantHydration, err := json.Marshal(hydration)
 		testassert.NoError(t, err)
@@ -1128,7 +1128,7 @@ func TestHydrationAndPageReturnedValueOwnership(t *testing.T) {
 		hydration.Pending.Steering = append(hydration.Pending.Steering, protocol.PendingInput{OperationId: "mutated"})
 		hydration.Operations[0].OperationId = "mutated"
 		hydration.Background = append(hydration.Background, protocol.BackgroundMember{Id: "mutated"})
-		rereadHydration, err := r.GetHydration(context.Background(), testCaller(), session)
+		rereadHydration, err := r.GetHydration(context.Background(), testCaller(r), session)
 		testassert.NoError(t, err)
 		gotHydration, err := json.Marshal(rereadHydration)
 		testassert.NoError(t, err)

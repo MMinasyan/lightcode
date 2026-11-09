@@ -27,7 +27,7 @@ func TestLoaderAssembleCapturedUsesCapturedLayerAndCache(t *testing.T) {
 		"discovery": false,
 		"models":    map[string]any{"known": map[string]any{"context_window": json.Number("9007199254740993")}},
 	}}
-	testassert.NoError(t, WriteDiscoveryCache(cacheDir, "base", Transport{BaseURL: "http://base.test/v1"}, DiscoveredProvider{
+	testassert.NoError(t, writeDiscoveryCacheForTest(cacheDir, "base", Transport{BaseURL: "http://base.test/v1"}, DiscoveredProvider{
 		Models: map[string]DiscoveredModel{"discovered": {ContextWindow: 4096}},
 	}, time.Now().Add(-time.Hour).UTC()))
 

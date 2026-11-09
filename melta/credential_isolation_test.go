@@ -265,12 +265,12 @@ func TestBlockedCleanupDoesNotHoldProviderNames(t *testing.T) {
 	_, err = callData(t, calls, "claim_external_data")
 	testassert.NoError(t, err)
 	view.end()
-	_, err = r.ArchiveSession(ctx, testCaller(), oldSession.Identity.SessionID)
+	_, err = r.ArchiveSession(ctx, testCaller(r), oldSession.Identity.SessionID)
 	testassert.NoError(t, err)
 
 	deleteDone := make(chan error, 1)
 	go func() {
-		_, deleteErr := r.DeleteSession(ctx, testCaller(), oldSession.Identity.SessionID)
+		_, deleteErr := r.DeleteSession(ctx, testCaller(r), oldSession.Identity.SessionID)
 		deleteDone <- deleteErr
 	}()
 	select {
@@ -281,7 +281,7 @@ func TestBlockedCleanupDoesNotHoldProviderNames(t *testing.T) {
 	testassert.Require(t, !slices.Contains(r.config.heldCredentialNames(), shellName), "cleanup resource reservation held provider name %q: %v", shellName, r.config.heldCredentialNames())
 
 	writeServiceFile(t, e.configPath, cleanupProviderConfig(e.server.URL, newProvider, declaredName))
-	_, err = r.Reload(ctx, testCaller())
+	_, err = r.Reload(ctx, testCaller(r))
 	testassert.NoError(t, err)
 
 	workspace := filepath.Join(e.dataDir, "cleanup-new")
@@ -463,7 +463,7 @@ func TestHeldCredentialNamesProtectOtherSessionsAfterReload(t *testing.T) {
 	}
 
 	writeServiceFile(t, e.configPath, heldCredentialConfig(e.server.URL, `{"credhold":{"enabled":true,"activation":"`+newShell+`","operation":"`+newName+`"}}`))
-	_, err = r.Reload(context.Background(), testCaller())
+	_, err = r.Reload(context.Background(), testCaller(r))
 	testassert.NoError(t, err)
 
 	second := createHeldSession(t, r, e.workspace("held-b"), []string{"run_command"})
@@ -539,7 +539,7 @@ func TestProviderOnlyRenameUsesAdoptedResourcesAndHeldNames(t *testing.T) {
 	resources := r.config.current().resources
 
 	writeServiceFile(t, e.configPath, heldProviderConfig(e.server.URL, newProvider))
-	_, err = r.Reload(context.Background(), testCaller())
+	_, err = r.Reload(context.Background(), testCaller(r))
 	testassert.NoError(t, err)
 	testassert.Require(t, r.config.current().resources == resources, "provider-only rename did not adopt the existing resource set")
 

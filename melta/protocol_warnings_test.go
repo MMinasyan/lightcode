@@ -110,7 +110,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		}
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		awaitSessionNotBusy(t, r, sessionID)
-		first, err := r.GetWarnings(ctx, testCaller())
+		first, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		found := warningOf(first.Warnings, "runtime:prompt", "rules_not_found", sessionID)
 		testassert.Require(t, found != nil && found.Message == "No AGENTS.md found", "prompt warning after successful preparation = %+v, want the assembled rules warning for the session", found)
@@ -122,7 +122,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		submitThroughRuntime(t, r, sessionID, "op-2", "please write")
 		awaitOperation(t, r, sessionID, "op-2", harness.OperationSuccess)
 		awaitIdleSession(t, r, sessionID)
-		cleared, err := r.GetWarnings(ctx, testCaller())
+		cleared, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, warningOf(cleared.Warnings, "runtime:prompt", "rules_not_found", sessionID) == nil, "the warning-free preparation kept the session's prompt warning: %+v", cleared.Warnings)
 		{
@@ -132,10 +132,10 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 
 		// A failed preparation changes nothing: the missing credential
 		// rejects admission before any publication.
-		before, err := r.GetWarnings(ctx, testCaller())
+		before, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
-		_, err = r.Reload(ctx, testCaller())
+		_, err = r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		failedSession, err := r.createSession(ctx, e.workspace("prompt-ws-3"), "worker")
 		testassert.NoError(t, err)
@@ -144,7 +144,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 			testassert.Require(t, err != nil, "the missing-credential submit succeeded, want the failed preparation")
 		}
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
-		_, err = r.Reload(ctx, testCaller())
+		_, err = r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 
 		// A failed hook (invalid consequence rejected before publication)
@@ -160,7 +160,7 @@ func TestWarningsPromptReplaceClearAndFailedPreparationNoChange(t *testing.T) {
 		}
 		hook.set(nil, nil)
 
-		after, err := r.GetWarnings(ctx, testCaller())
+		after, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Equal(t, after.WarningsRevision.Revision, before.WarningsRevision.Revision)
 		if !slices.Equal(warningBodies(before.Warnings), warningBodies(after.Warnings)) {
@@ -258,16 +258,16 @@ func TestWarningsTwoSessionsHydrationFiltersOwnAndGlobals(t *testing.T) {
 		submitThroughRuntime(t, r, sessionB.Identity.SessionID, "op-b", "please write")
 		awaitOperation(t, r, sessionB.Identity.SessionID, "op-b", harness.OperationSuccess)
 
-		all, err := r.GetWarnings(ctx, testCaller())
+		all, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, warningOf(all.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) != nil && warningOf(all.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) != nil && warningOf(all.Warnings, "runtime:setup", "setup_no_model", "") != nil, "unfiltered read misses session A's prompt warning: %+v; unfiltered read misses session B's prompt warning: %+v; unfiltered read misses the global setup warning: %+v", all.Warnings, all.Warnings, all.Warnings)
 		catalogWarning := warningOf(all.Warnings, "runtime:catalog", "incomplete_model", "")
 		testassert.Require(t, catalogWarning != nil && strings.Contains(catalogWarning.Message, "prov/inc"), "unfiltered read misses the real catalog warning: %+v", all.Warnings)
 		testassert.Require(t, warningOf(all.Warnings, "runtime:agents", "invalid_agent_type", "") == nil, "valid definitions produced an agent warning: %+v", all.Warnings)
 
-		hydrationA, err := r.GetHydration(ctx, testCaller(), sessionA.Identity.SessionID)
+		hydrationA, err := r.GetHydration(ctx, testCaller(r), sessionA.Identity.SessionID)
 		testassert.NoError(t, err)
-		hydrationB, err := r.GetHydration(ctx, testCaller(), sessionB.Identity.SessionID)
+		hydrationB, err := r.GetHydration(ctx, testCaller(r), sessionB.Identity.SessionID)
 		testassert.NoError(t, err)
 		testassert.Require(t, warningOf(hydrationA.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) != nil && warningOf(hydrationA.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) == nil && warningOf(hydrationA.Warnings, "runtime:agents", "invalid_agent_type", "") == nil, "hydration A warnings = %+v", hydrationA.Warnings)
 		testassert.Require(t, warningOf(hydrationB.Warnings, "runtime:prompt", "rules_read_error", sessionB.Identity.SessionID) != nil && warningOf(hydrationB.Warnings, "runtime:prompt", "rules_not_found", sessionA.Identity.SessionID) == nil, "hydration B misses its own prompt warning: %+v; hydration B contains the sibling's prompt warning: %+v", hydrationB.Warnings, hydrationB.Warnings)
@@ -282,7 +282,7 @@ func TestWarningsTwoSessionsHydrationFiltersOwnAndGlobals(t *testing.T) {
 		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, next.Identity.SessionID, "op-c", "please write")
 		awaitOperation(t, r, next.Identity.SessionID, "op-c", harness.OperationSuccess)
-		later, err := r.GetHydration(ctx, testCaller(), sessionA.Identity.SessionID)
+		later, err := r.GetHydration(ctx, testCaller(r), sessionA.Identity.SessionID)
 		testassert.NoError(t, err)
 		beforeRevision, revErr := warnRevision(hydrationA.WarningsRevision.Revision)
 		afterRevision, afterErr := warnRevision(later.WarningsRevision.Revision)
@@ -291,9 +291,9 @@ func TestWarningsTwoSessionsHydrationFiltersOwnAndGlobals(t *testing.T) {
 
 		// The captured revision is coherent: repeated unfiltered reads with no
 		// store change report the same revision and list.
-		again, err := r.GetWarnings(ctx, testCaller())
+		again, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
-		stable, err := r.GetWarnings(ctx, testCaller())
+		stable, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, stable.WarningsRevision.Revision == again.WarningsRevision.Revision && slices.Equal(warningBodies(stable.Warnings), warningBodies(again.Warnings)) && stable.WarningsRevision.Revision == later.WarningsRevision.Revision, "an unchanged store changed its read: %+v vs %+v; got %v, want %v", stable, again, stable.WarningsRevision.Revision, later.WarningsRevision.Revision)
 	})
@@ -345,7 +345,7 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 		testassert.NoError(t, err)
 		testassert.Require(t, protocolScope.Workspace != nil && *protocolScope.Workspace == e.workspace("protocol-ws"), "protocol diagnostic hint scope = %+v, want the cached workspace identity", protocolHint.Scope)
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
-		first, err := r.GetWarnings(ctx, testCaller())
+		first, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		found := warningOf(first.Warnings, "runtime:protocol", "protocol_must_preserve_missing", sessionID)
 		testassert.Require(t, found != nil && found.Message != "", "protocol warning after the tool turn = %+v, want the MustPreserve diagnostic for the session", found)
@@ -357,7 +357,7 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, next.Identity.SessionID, "op-2", "please write")
 		awaitOperation(t, r, next.Identity.SessionID, "op-2", harness.OperationSuccess)
-		second, err := r.GetWarnings(ctx, testCaller())
+		second, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		// The second turn's follow-up request has one more message, so its
 		// diagnostic text differs and DOES advance; the identical first
@@ -385,14 +385,14 @@ func TestWarningsModelClosureRecordsThroughRealWork(t *testing.T) {
 		enableFixturePlugin(t, e.configPath, "prodtools")
 		enableFixturePlugin(t, e.configPath, "park")
 		{
-			_, err := r.Reload(ctx, testCaller())
+			_, err := r.Reload(ctx, testCaller(r))
 			testassert.NoError(t, err)
 		}
 		failing, err := r.createSession(ctx, e.workspace("protocol-ws"), "worker")
 		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, failing.Identity.SessionID, "op-3", "please write")
 		awaitOperation(t, r, failing.Identity.SessionID, "op-3", harness.OperationFailure)
-		third, err := r.GetWarnings(ctx, testCaller())
+		third, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, warningOf(third.Warnings, "runtime:protocol", "protocol_must_preserve_missing", failing.Identity.SessionID) != nil && third.WarningsRevision.Revision != revisionAfterSecond, "the post-encode transport failure dropped its diagnostics: %+v; warning revision unchanged after the failed attempt's report: %q", third.Warnings, third.WarningsRevision.Revision)
 	})
@@ -529,11 +529,11 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		// The committed deletion removes the subject's groups; a late attempt
 		// for the deleted subject cannot reintroduce them.
 		{
-			_, err := r.ArchiveSession(ctx, testCaller(), sessionID)
+			_, err := r.ArchiveSession(ctx, testCaller(r), sessionID)
 			testassert.NoError(t, err)
 		}
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), sessionID)
+			_, err := r.DeleteSession(ctx, testCaller(r), sessionID)
 			testassert.NoError(t, err)
 		}
 		beforeLate, _ := r.warnings.snapshot()
@@ -738,13 +738,13 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 		snap := sessionViewThroughRuntime(t, r, sourceID)
 		boundaryItem := projectItemID(sourceID, commandUserInputEntry(t, snap, "op-src"))
 
-		beforeFork, err := r.GetWarnings(ctx, testCaller())
+		beforeFork, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		forkFailure := errors.New("test fork transaction failure")
 		wrapped.armFailAfterRelease(forkFailure)
 		forkDone := make(chan error, 1)
 		go func() {
-			_, err := r.ForkSession(ctx, testCaller(), sourceID, protocol.ForkRequest{
+			_, err := r.ForkSession(ctx, testCaller(r), sourceID, protocol.ForkRequest{
 				BoundaryItemId: boundaryItem,
 				OperationId:    "op-orphan-fork",
 				Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
@@ -761,7 +761,7 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 			err := <-forkDone
 			testassert.Require(t, errors.Is(err, forkFailure), "failed fork = %v, want the injected transaction failure", err)
 		}
-		afterFork, err := r.GetWarnings(ctx, testCaller())
+		afterFork, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Equal(t, afterFork.WarningsRevision.Revision, beforeFork.WarningsRevision.Revision)
 		if !slices.Equal(warningBodies(beforeFork.Warnings), warningBodies(afterFork.Warnings)) {
@@ -773,7 +773,7 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 		// unpublished.
 		victim, err := r.createSession(ctx, e.workspace("orphan-admit"), "worker")
 		testassert.NoError(t, err)
-		beforeAdmit, err := r.GetWarnings(ctx, testCaller())
+		beforeAdmit, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		admissionFailure := errors.New("test admission transaction failure")
 		wrapped.armFailAfterRelease(admissionFailure)
@@ -791,7 +791,7 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 			err := <-admitDone
 			testassert.Require(t, errors.Is(err, admissionFailure), "failed admission = %v, want the injected transaction failure", err)
 		}
-		afterAdmit, err := r.GetWarnings(ctx, testCaller())
+		afterAdmit, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Equal(t, afterAdmit.WarningsRevision.Revision, beforeAdmit.WarningsRevision.Revision)
 		if !slices.Equal(warningBodies(beforeAdmit.Warnings), warningBodies(afterAdmit.Warnings)) {
@@ -804,7 +804,7 @@ func TestWarningsFailedForkAndAdmissionCreateNoOrphanGroup(t *testing.T) {
 		testassert.NoError(t, err)
 		submitThroughRuntime(t, r, good.Identity.SessionID, "op-good", "please write")
 		awaitOperation(t, r, good.Identity.SessionID, "op-good", harness.OperationSuccess)
-		afterSuccess, err := r.GetWarnings(ctx, testCaller())
+		afterSuccess, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, afterSuccess.WarningsRevision.Revision != afterAdmit.WarningsRevision.Revision && warningOf(afterSuccess.Warnings, "runtime:prompt", "rules_not_found", good.Identity.SessionID) != nil, "a successful admission did not publish its prompt group: revision stayed %s; the successful admission's prompt group is missing: %+v", afterSuccess.WarningsRevision.Revision, afterSuccess.Warnings)
 	})
@@ -835,13 +835,13 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 		// Archive retains the group; hydration of the archived subject still
 		// carries it.
 		{
-			_, err := r.ArchiveSession(ctx, testCaller(), victimID)
+			_, err := r.ArchiveSession(ctx, testCaller(r), victimID)
 			testassert.NoError(t, err)
 		}
-		archived, err := r.GetWarnings(ctx, testCaller())
+		archived, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, sessionWarningPresent(archived.Warnings, victimID), "archive dropped the Session's warning group: %+v", archived.Warnings)
-		hydration, err := r.GetHydration(ctx, testCaller(), victimID)
+		hydration, err := r.GetHydration(ctx, testCaller(r), victimID)
 		testassert.NoError(t, err)
 		testassert.Require(t, sessionWarningPresent(hydration.Warnings, victimID), "the archived subject's hydration dropped its group: %+v", hydration.Warnings)
 
@@ -853,14 +853,14 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 		// The committed deletion removes the group in one observation section
 		// and publishes exactly one runtime-scoped hint.
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), victimID)
+			_, err := r.DeleteSession(ctx, testCaller(r), victimID)
 			testassert.NoError(t, err)
 		}
-		afterDelete, err := r.GetWarnings(ctx, testCaller())
+		afterDelete, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, !sessionWarningPresent(afterDelete.Warnings, victimID) && warningOf(afterDelete.Warnings, "runtime:prompt", "rules_not_found", siblingID) != nil, "the committed deletion kept the Session's group: %+v; the deletion removed the sibling's group: %+v", afterDelete.Warnings, afterDelete.Warnings)
 		{
-			_, err := r.GetHydration(ctx, testCaller(), victimID)
+			_, err := r.GetHydration(ctx, testCaller(r), victimID)
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "hydration of the deleted subject = %v, want the typed absence", err)
 		}
 
@@ -888,7 +888,7 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 		late.publishPrompt(lateID, []protocol.Warning{{Source: "runtime:prompt", Kind: "late_prompt", Message: "late", SessionId: &lateID}})
 		late.replaceProtocolWarnings(lateID, []protocol.Warning{{Source: "runtime:protocol", Kind: "late_protocol", Message: "late", SessionId: &lateID}})
 		assertNoEvent(t, sub)
-		lateRead, err := r.GetWarnings(ctx, testCaller())
+		lateRead, err := r.GetWarnings(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Equal(t, lateRead.WarningsRevision.Revision, afterDelete.WarningsRevision.Revision)
 		if !slices.Equal(warningBodies(afterDelete.Warnings), warningBodies(lateRead.Warnings)) {
@@ -900,12 +900,12 @@ func TestWarningsDeleteArchiveAndLateReportLifetime(t *testing.T) {
 		bare, err := r.createSession(ctx, e.workspace("warn-bare"), "worker")
 		testassert.NoError(t, err)
 		{
-			_, err := r.ArchiveSession(ctx, testCaller(), bare.Identity.SessionID)
+			_, err := r.ArchiveSession(ctx, testCaller(r), bare.Identity.SessionID)
 			testassert.NoError(t, err)
 		}
 		beforeBare, _ := r.warnings.snapshot()
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), bare.Identity.SessionID)
+			_, err := r.DeleteSession(ctx, testCaller(r), bare.Identity.SessionID)
 			testassert.NoError(t, err)
 		}
 		{

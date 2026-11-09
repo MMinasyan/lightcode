@@ -18,7 +18,7 @@ func TestOwnerInstanceStampsEveryProjection(t *testing.T) {
 	r, e := openProjectionRuntime(t, storage.NewMemory())
 	defer closeProjectionRuntime(r)
 	instance := r.InstanceID()
-	caller := testCaller()
+	caller := testCaller(r)
 
 	configuration, err := r.GetConfiguration(ctx, caller)
 	testassert.Require(t, err == nil && configuration.ConfigurationRevision.InstanceId == instance, "configuration revision = %+v, want instance %q", configuration.ConfigurationRevision, instance)

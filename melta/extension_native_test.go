@@ -1548,7 +1548,7 @@ func TestNativeRegistrationDataIsOwned(t *testing.T) {
 	replaced := strings.Replace(string(data), `{"enabled":true}`, `{"enabled":true }`, 1)
 	testassert.Require(t, replaced != string(data), "fixture config carried no enabled section to replace")
 	writeServiceFile(t, e.configPath, replaced)
-	revision, err := r.Reload(ctx, testCaller())
+	revision, err := r.Reload(ctx, testCaller(r))
 	testassert.NoError(t, err)
 	testassert.Require(t, revision.Generation != "", "Reload returned no revision")
 	session, err := r.createSession(ctx, e.dataDir, "owned_agent")

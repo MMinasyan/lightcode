@@ -69,9 +69,10 @@ func runtimeNormalizeContext(_ context.Context, call model.ToolCall) (json.RawMe
 }
 
 // testCaller is the authenticated user grant the protocol host binds after
-// authentication; tests issue it through the same owner constructor.
-func testCaller() Caller {
-	c, err := newCaller(CallerContext{Origin: "user", Scope: harnessScope})
+// authentication; it is issued through the owner under test so every fixture
+// Caller is bound to that owner.
+func testCaller(owner *Melta) Caller {
+	c, err := owner.Caller(CallerContext{Origin: "user", Scope: harnessScope})
 	if err != nil {
 		panic(err)
 	}

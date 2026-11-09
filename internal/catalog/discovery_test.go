@@ -189,7 +189,7 @@ func TestDiscoveryCacheWriteReadRoundTripLoadsAttempt(t *testing.T) {
 	home := t.TempDir()
 	fetchedAt := time.Now().Add(-48 * time.Hour).UTC()
 	transport := discoveryTestTransport()
-	testassert.NoError(t, WriteDiscoveryCache(home, "local", transport, DiscoveredProvider{Models: map[string]DiscoveredModel{
+	testassert.NoError(t, writeDiscoveryCacheForTest(home, "local", transport, DiscoveredProvider{Models: map[string]DiscoveredModel{
 		"qwen3": {
 			Name:            "Qwen 3",
 			ContextWindow:   40960,
@@ -252,15 +252,15 @@ func TestReadDiscoveryCacheOldShapeWithoutMetadataKeepsUnknown(t *testing.T) {
 	testassert.Require(t, len(cache["local"].Models) == 0 && cache["local"].AttemptedAt.IsZero(), "legacy cache record = %#v, want unbound empty record", cache["local"])
 }
 
-func TestWriteDiscoveryAttemptPreservesCachedModels(t *testing.T) {
+func TestTryWriteDiscoveryAttemptPreservesCachedModels(t *testing.T) {
 	home := t.TempDir()
 	fetchedAt := time.Now().Add(-48 * time.Hour).UTC()
 	attemptedAt := time.Now().UTC()
 	transport := discoveryTestTransport()
-	testassert.NoError(t, WriteDiscoveryCache(home, "local", transport, DiscoveredProvider{Models: map[string]DiscoveredModel{
+	testassert.NoError(t, writeDiscoveryCacheForTest(home, "local", transport, DiscoveredProvider{Models: map[string]DiscoveredModel{
 		"qwen3": {Name: "Qwen 3", ContextWindow: 40960, MaxOutputTokens: 8192},
 	}}, fetchedAt))
-	testassert.NoError(t, WriteDiscoveryAttempt(home, "local", transport, attemptedAt))
+	testassert.NoError(t, writeDiscoveryAttemptForTest(home, "local", transport, attemptedAt))
 	cache, warnings := ReadDiscoveryCache(home)
 	testassert.Require(t, len(warnings) == 0, "ReadDiscoveryCache warnings = %#v", warnings)
 	{
@@ -270,9 +270,9 @@ func TestWriteDiscoveryAttemptPreservesCachedModels(t *testing.T) {
 	testassert.Require(t, cache["local"].AttemptedAt.Equal(attemptedAt), "attempt = %v, want %v", cache["local"].AttemptedAt, attemptedAt)
 }
 
-func TestWriteDiscoveryCacheRejectsUnsafeProviderID(t *testing.T) {
-	err := WriteDiscoveryCache(t.TempDir(), "../bad", discoveryTestTransport(), DiscoveredProvider{}, time.Now())
-	testassert.Require(t, err != nil && errors.Is(err, ErrInvalidModelRef), "WriteDiscoveryCache error = %v, want ErrInvalidModelRef", err)
+func TestTryWriteDiscoveryCacheRejectsUnsafeProviderID(t *testing.T) {
+	err := writeDiscoveryCacheForTest(t.TempDir(), "../bad", discoveryTestTransport(), DiscoveredProvider{}, time.Now())
+	testassert.Require(t, err != nil && errors.Is(err, ErrInvalidModelRef), "TryWriteDiscoveryCache error = %v, want ErrInvalidModelRef", err)
 }
 
 func floatPtr(v float64) *float64 {
@@ -342,7 +342,7 @@ func TestDiscoveryRecordsAreBoundForModelsAndTTL(t *testing.T) {
 	transportA := Transport{BaseURL: "http://a.test/v1"}
 	transportB := Transport{BaseURL: "http://b.test/v1"}
 	fetchedAt := time.Now().Add(-time.Hour).UTC()
-	testassert.NoError(t, WriteDiscoveryCache(home, "p", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"a": {ContextWindow: 4096}}}, fetchedAt))
+	testassert.NoError(t, writeDiscoveryCacheForTest(home, "p", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"a": {ContextWindow: 4096}}}, fetchedAt))
 	records, warnings := ReadDiscoveryCache(home)
 	testassert.Require(t, len(warnings) == 0 && records["p"].BoundTo(transportA), "records = %#v, warnings = %#v", records, warnings)
 	testassert.Require(t, records["p"].FetchedAt.Equal(fetchedAt) && records["p"].Models["a"].ContextWindow == 4096, "matching record = %#v", records["p"])
@@ -354,13 +354,13 @@ func TestDiscoveryRecordsAreBoundForModelsAndTTL(t *testing.T) {
 		recent, err := DiscoveryAttemptRecent(home, "p", transportB, time.Now().UTC())
 		testassert.Require(t, err == nil && !recent, "foreign transport recent = (%v, %v), want (false, nil)", recent, err)
 	}
-	testassert.NoError(t, WriteDiscoveryAttempt(home, "p", transportA, time.Now().UTC()))
+	testassert.NoError(t, writeDiscoveryAttemptForTest(home, "p", transportA, time.Now().UTC()))
 	records, _ = ReadDiscoveryCache(home)
 	testassert.Require(t, records["p"].Models["a"].ContextWindow == 4096 && records["p"].FetchedAt.Equal(fetchedAt), "matching attempt did not preserve record fields: %#v", records["p"])
-	testassert.NoError(t, WriteDiscoveryAttempt(home, "p", transportB, time.Now().UTC()))
+	testassert.NoError(t, writeDiscoveryAttemptForTest(home, "p", transportB, time.Now().UTC()))
 	records, _ = ReadDiscoveryCache(home)
 	testassert.Require(t, records["p"].BoundTo(transportB) && len(records["p"].Models) == 0 && records["p"].FetchedAt.IsZero(), "foreign attempt retained stale fields: %#v", records["p"])
-	testassert.NoError(t, WriteDiscoveryCache(home, "p", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"stale": {}}}, time.Now().UTC()))
+	testassert.NoError(t, writeDiscoveryCacheForTest(home, "p", transportA, DiscoveredProvider{Models: map[string]DiscoveredModel{"stale": {}}}, time.Now().UTC()))
 	records, _ = ReadDiscoveryCache(home)
 	cat := &Catalog{Providers: map[string]*Provider{"p": {ID: "p", Discovery: true, Transport: transportB}}}
 	candidates := DiscoveryRefreshCandidates(cat, records, time.Now().UTC())
@@ -487,7 +487,7 @@ func recordDiscoveryLockAcquisitions(t *testing.T) func() []string {
 // serialize and the fresh discovery survives.
 func TestConcurrentAttemptWritesLoseNoDiscovery(t *testing.T) {
 	home := t.TempDir()
-	testassert.NoError(t, WriteDiscoveryCache(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()))
+	testassert.NoError(t, writeDiscoveryCacheForTest(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()))
 	fresh := DiscoveredProvider{Models: map[string]DiscoveredModel{
 		"fresh-a": {Name: "Fresh A", ContextWindow: 4096},
 		"fresh-b": {Name: "Fresh B", ContextWindow: 8192},
@@ -500,22 +500,22 @@ func TestConcurrentAttemptWritesLoseNoDiscovery(t *testing.T) {
 	go func() { // attempt writer 1
 		defer wg.Done()
 		{
-			err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC())
-			testassert.Check(t, err == nil, "WriteDiscoveryAttempt 1: %v", err)
+			err := writeDiscoveryAttemptForTest(home, "p", discoveryTestTransport(), time.Now().UTC())
+			testassert.Check(t, err == nil, "TryWriteDiscoveryAttempt 1: %v", err)
 		}
 	}()
 	go func() { // attempt writer 2
 		defer wg.Done()
 		{
-			err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC())
-			testassert.Check(t, err == nil, "WriteDiscoveryAttempt 2: %v", err)
+			err := writeDiscoveryAttemptForTest(home, "p", discoveryTestTransport(), time.Now().UTC())
+			testassert.Check(t, err == nil, "TryWriteDiscoveryAttempt 2: %v", err)
 		}
 	}()
 	go func() { // successful refresh: publishes fresh discovery
 		defer wg.Done()
 		{
-			err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), fresh, time.Now().UTC())
-			testassert.Check(t, err == nil, "WriteDiscoveryCache: %v", err)
+			err := writeDiscoveryCacheForTest(home, "p", discoveryTestTransport(), fresh, time.Now().UTC())
+			testassert.Check(t, err == nil, "TryWriteDiscoveryCache: %v", err)
 		}
 	}()
 	wg.Wait()
@@ -546,7 +546,7 @@ func TestConcurrentAttemptWritesLoseNoDiscovery(t *testing.T) {
 // fresh discovery survives.
 func TestConcurrentAttemptAndDiscoveryWriteLoseNeither(t *testing.T) {
 	home := t.TempDir()
-	testassert.NoError(t, WriteDiscoveryCache(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()))
+	testassert.NoError(t, writeDiscoveryCacheForTest(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()))
 	fresh := DiscoveredProvider{Models: map[string]DiscoveredModel{
 		"fresh-a": {Name: "Fresh A", ContextWindow: 4096},
 		"fresh-b": {Name: "Fresh B", ContextWindow: 8192},
@@ -559,15 +559,15 @@ func TestConcurrentAttemptAndDiscoveryWriteLoseNeither(t *testing.T) {
 	go func() { // failed refresh: only its attempt write lands
 		defer wg.Done()
 		{
-			err := WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC())
+			err := writeDiscoveryAttemptForTest(home, "p", discoveryTestTransport(), time.Now().UTC())
 			testassert.Check(t, err == nil, "WriteDiscoveryAttempt: %v", err)
 		}
 	}()
 	go func() { // successful refresh: publishes fresh discovery
 		defer wg.Done()
 		{
-			err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), fresh, time.Now().UTC())
-			testassert.Check(t, err == nil, "WriteDiscoveryCache: %v", err)
+			err := writeDiscoveryCacheForTest(home, "p", discoveryTestTransport(), fresh, time.Now().UTC())
+			testassert.Check(t, err == nil, "TryWriteDiscoveryCache: %v", err)
 		}
 	}()
 	wg.Wait()
@@ -628,16 +628,16 @@ func TestConcurrentStaleTransportWriteAfterFreshTransport(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		{
-			err := WriteDiscoveryCache(home, "p", transportB, freshB, time.Now().UTC())
-			testassert.Check(t, err == nil, "fresh B WriteDiscoveryCache: %v", err)
+			err := writeDiscoveryCacheForTest(home, "p", transportB, freshB, time.Now().UTC())
+			testassert.Check(t, err == nil, "fresh B TryWriteDiscoveryCache: %v", err)
 		}
 	}()
 	<-bAcquired
 	go func() {
 		defer wg.Done()
 		{
-			err := WriteDiscoveryCache(home, "p", transportA, staleA, time.Now().Add(-48*time.Hour).UTC())
-			testassert.Check(t, err == nil, "stale A WriteDiscoveryCache: %v", err)
+			err := writeDiscoveryCacheForTest(home, "p", transportA, staleA, time.Now().Add(-48*time.Hour).UTC())
+			testassert.Check(t, err == nil, "stale A TryWriteDiscoveryCache: %v", err)
 		}
 	}()
 	close(allowB)
@@ -699,15 +699,15 @@ func TestConcurrentDiscoveryWritesDoNotTearFile(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			{
-				err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), setA, time.Now().UTC())
-				testassert.Check(t, err == nil, "WriteDiscoveryCache A: %v", err)
+				err := writeDiscoveryCacheForTest(home, "p", discoveryTestTransport(), setA, time.Now().UTC())
+				testassert.Check(t, err == nil, "TryWriteDiscoveryCache A: %v", err)
 			}
 		}()
 		go func() {
 			defer wg.Done()
 			{
-				err := WriteDiscoveryCache(home, "p", discoveryTestTransport(), setB, time.Now().UTC())
-				testassert.Check(t, err == nil, "WriteDiscoveryCache B: %v", err)
+				err := writeDiscoveryCacheForTest(home, "p", discoveryTestTransport(), setB, time.Now().UTC())
+				testassert.Check(t, err == nil, "TryWriteDiscoveryCache B: %v", err)
 			}
 		}()
 		wg.Wait()
@@ -734,7 +734,7 @@ func TestConcurrentDiscoveryWritesDoNotTearFile(t *testing.T) {
 func TestTryDiscoveryWriterRows(t *testing.T) {
 	t.Run("attempt_success", func(t *testing.T) {
 		home := t.TempDir()
-		testassert.NoError(t, WriteDiscoveryCache(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()))
+		testassert.NoError(t, writeDiscoveryCacheForTest(home, "p", discoveryTestTransport(), smallStale(), time.Now().Add(-48*time.Hour).UTC()))
 		ok, err := TryWriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC())
 		testassert.Require(t, ok && err == nil, "TryWriteDiscoveryAttempt = (%v, %v), want (true, nil)", ok, err)
 		records, _ := ReadDiscoveryCache(home)
@@ -844,7 +844,7 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 	})
 	t.Run("recent_attempt_suppresses", func(t *testing.T) {
 		home := t.TempDir()
-		testassert.NoError(t, WriteDiscoveryAttempt(home, "p", discoveryTestTransport(), time.Now().UTC()))
+		testassert.NoError(t, writeDiscoveryAttemptForTest(home, "p", discoveryTestTransport(), time.Now().UTC()))
 		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1"}}
 		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, nil, time.Now().UTC())
 		testassert.Require(t, !attempted && discovered == nil && len(warnings) == 0, "FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a recent attempt", attempted, discovered, warnings)
@@ -863,4 +863,36 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, nil, time.Now().UTC())
 		testassert.Require(t, !attempted && discovered == nil && len(warnings) == 0, "FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) for a disabled provider", attempted, discovered, warnings)
 	})
+}
+
+// writeDiscoveryCacheForTest drives the production one-attempt cache writer,
+// retrying only leaf contention so fixtures keep their eventual-write
+// outcome.
+func writeDiscoveryCacheForTest(cacheDir, providerID string, transport Transport, discovered DiscoveredProvider, fetchedAt time.Time) error {
+	for {
+		ok, err := TryWriteDiscoveryCache(cacheDir, providerID, transport, discovered, fetchedAt)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// writeDiscoveryAttemptForTest drives the production one-attempt attempt
+// writer, retrying only leaf contention so fixtures keep their
+// eventual-write outcome.
+func writeDiscoveryAttemptForTest(cacheDir, providerID string, transport Transport, attemptedAt time.Time) error {
+	for {
+		ok, err := TryWriteDiscoveryAttempt(cacheDir, providerID, transport, attemptedAt)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

@@ -895,7 +895,7 @@ func TestCompactLifecycleManualMaintenanceOpensOnlyMaintenanceInstance(t *testin
 		fixture.conversationOpen, fixture.maintenanceOpen = 0, 0
 		fixture.mu.Unlock()
 
-		_, err = r.CompactSession(ctx, testCaller(), sessionID, protocol.CompactRequest{OperationId: "compact-1"})
+		_, err = r.CompactSession(ctx, testCaller(r), sessionID, protocol.CompactRequest{OperationId: "compact-1"})
 		testassert.NoError(t, err)
 		awaitOperation(t, r, sessionID, "compact-1", harness.OperationSuccess)
 		deadline = time.Now().Add(10 * time.Second)
@@ -1017,7 +1017,7 @@ func TestCompactLifecycleCanceledInvocationOpeningDisposesOperation(t *testing.T
 		case <-time.After(10 * time.Second):
 			t.Fatal("the invocation opening never parked")
 		}
-		testassert.NoError(t, r.InterruptSession(context.Background(), testCaller(), sessionID))
+		testassert.NoError(t, r.InterruptSession(context.Background(), testCaller(r), sessionID))
 		awaitOperation(t, r, sessionID, "op-canceled", harness.OperationInterruption)
 		deadline := time.Now().Add(10 * time.Second)
 		for {

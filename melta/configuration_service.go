@@ -265,15 +265,13 @@ func (s *configurationService) subprocessEnvironment(ctx context.Context) ([]str
 	return s.credentials.SubprocessEnv(ctx, names)
 }
 
-// captureCredentials performs one credential observation for a build over the
-// union of every nonempty api_key_env the candidate catalog references and
-// every declared reference name, then folds the candidate's pending connection
-// key action into that same map. A mutation supplies the observation already
-// taken over the latest document as base; names first introduced by the
-// candidate are captured here and merged, so each name is observed exactly
-// once in the build. Provider and declared observations derive from the one
+// captureCredentials performs the build's one credential observation over the
+// union of every nonempty api_key_env the candidate catalog references, every
+// declared reference name, and the pending connection key name, then folds the
+// pending key action into that same map. Every name is observed exactly once
+// in the build; provider and declared observations derive from the one
 // resulting map, and no source call runs after the owning write.
-func (s *configurationService) captureCredentials(ctx context.Context, names []string, key *connectionEffects, base map[string]CredentialValue) (map[string]CredentialValue, error) {
+func (s *configurationService) captureCredentials(ctx context.Context, names []string, key *connectionEffects) (map[string]CredentialValue, error) {
 	seen := make(map[string]bool, len(names)+1)
 	unique := make([]string, 0, len(names)+1)
 	for _, name := range names {
@@ -286,31 +284,14 @@ func (s *configurationService) captureCredentials(ctx context.Context, names []s
 	if key != nil && key.keyEnv != "" && !seen[key.keyEnv] {
 		unique = append(unique, key.keyEnv)
 	}
-	var missing []string
-	if base != nil {
-		for _, name := range unique {
-			if _, ok := base[name]; !ok {
-				missing = append(missing, name)
-			}
-		}
-	} else {
-		missing = unique
-	}
 	captured := make(map[string]CredentialValue, len(unique))
-	if len(missing) != 0 {
-		fresh, err := s.credentials.Capture(ctx, missing)
+	if len(unique) != 0 {
+		fresh, err := s.credentials.Capture(ctx, unique)
 		if err != nil {
 			return nil, err
 		}
 		for name, value := range fresh {
 			captured[name] = value
-		}
-	}
-	if base != nil {
-		for name := range seen {
-			if value, ok := base[name]; ok {
-				captured[name] = value
-			}
 		}
 	}
 	if key != nil && key.keyEnv != "" {
@@ -561,15 +542,11 @@ func (s *configurationService) build(ctx context.Context, generation uint64) (*c
 // action used by declared-binding capture, present for every key-bearing edit
 // including custom creates, and it never changes the catalog-loader choice. A
 // connection candidate is fully validated before its Caller's first
-// persistence and is never rebuilt after it.
+// persistence and is never rebuilt after it. Every build takes its one
+// credential capture over the candidate's full name union; the only extra
+// observation is the mutation's pre-edit seed, which feeds edit decisions and
+// never the published map.
 func (s *configurationService) buildCaptured(ctx context.Context, generation uint64, configData []byte, conn, key *connectionEffects) (*configuration, error) {
-	return s.buildCapturedFrom(ctx, generation, configData, conn, key, nil)
-}
-
-// buildCapturedFrom is buildCaptured with a mutation's prior credential
-// observation; names it already captured are reused and only new candidate
-// names are observed.
-func (s *configurationService) buildCapturedFrom(ctx context.Context, generation uint64, configData []byte, conn, key *connectionEffects, base map[string]CredentialValue) (*configuration, error) {
 	if candidateBarrier != nil {
 		candidateBarrier()
 	}
@@ -601,7 +578,7 @@ func (s *configurationService) buildCapturedFrom(ctx context.Context, generation
 		return nil, configurationFailure(err)
 	}
 	secrets := resolveDeclaredSecrets(active, doc.Extensions)
-	credentials, err := s.captureCredentials(ctx, capturedCredentialNames(built.Catalog, secrets), key, base)
+	credentials, err := s.captureCredentials(ctx, capturedCredentialNames(built.Catalog, secrets), key)
 	if err != nil {
 		return nil, configurationFailure(err)
 	}

@@ -87,7 +87,7 @@ func TestSessionCommandCreateHeader(t *testing.T) {
 		defer closeProjectionRuntime(r)
 
 		workspace := filepath.Join(e.home, "command-ws")
-		header, err := r.CreateSession(ctx, testCaller(), workspace, wireSelection("solo"))
+		header, err := r.CreateSession(ctx, testCaller(r), workspace, wireSelection("solo"))
 		testassert.NoError(t, err)
 		snap := sessionViewThroughRuntime(t, r, header.SessionId)
 		if !reflect.DeepEqual(header, projectSession(snap.Header, r.instance)) {
@@ -99,12 +99,12 @@ func TestSessionCommandCreateHeader(t *testing.T) {
 		testassert.Require(t, header.Workspace == workspace && header.AgentSelection.Definition.DefinitionId == "solo" && header.Lifecycle == protocol.Open, "create header = %+v, want workspace %q solo open", header, workspace)
 
 		unclean := filepath.Join(e.home, "command-ws", "..", "command-ws")
-		uncleanHeader, err := r.CreateSession(ctx, testCaller(), unclean, wireSelection("solo"))
+		uncleanHeader, err := r.CreateSession(ctx, testCaller(r), unclean, wireSelection("solo"))
 		testassert.NoError(t, err)
 		testassert.Equal(t, uncleanHeader.Workspace, workspace)
 
 		{
-			_, err := r.CreateSession(ctx, testCaller(), "", wireSelection("solo"))
+			_, err := r.CreateSession(ctx, testCaller(r), "", wireSelection("solo"))
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "empty workspace header = %v, want harness.ErrInvalid", err)
 		}
 		{
@@ -112,11 +112,11 @@ func TestSessionCommandCreateHeader(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "empty workspace record = %v, want harness.ErrInvalid", err)
 		}
 
-		ghost, err := r.CreateSession(ctx, testCaller(), filepath.Join(e.home, "ghost-ws"), wireSelection("ghost"))
+		ghost, err := r.CreateSession(ctx, testCaller(r), filepath.Join(e.home, "ghost-ws"), wireSelection("ghost"))
 		testassert.NoError(t, err)
 		testassert.Equal(t, ghost.AgentSelection.Definition.DefinitionId, "ghost")
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), ghost.SessionId, commandSubmitRequest(t, "op-ghost", "hi"))
+			_, err := r.SubmitSession(ctx, testCaller(r), ghost.SessionId, commandSubmitRequest(t, "op-ghost", "hi"))
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit on unknown agent type = %v, want the preparation-time harness.ErrInvalid", err)
 		}
 		ghostSnap := sessionViewThroughRuntime(t, r, ghost.SessionId)
@@ -137,7 +137,7 @@ func TestSessionCommandAgentType(t *testing.T) {
 		testassert.NoError(t, err)
 		sessionID := rec.Identity.SessionID
 
-		header, err := r.SetSessionAgentType(ctx, testCaller(), sessionID, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("ghost")})
+		header, err := r.SetSessionAgentType(ctx, testCaller(r), sessionID, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("ghost")})
 		testassert.NoError(t, err)
 		testassert.Equal(t, header.AgentSelection.Definition.DefinitionId, "ghost")
 		snap := sessionViewThroughRuntime(t, r, sessionID)
@@ -145,7 +145,7 @@ func TestSessionCommandAgentType(t *testing.T) {
 			t.Fatalf("ghost header = %+v, want the real read projection %+v", header, projectSession(snap.Header, r.instance))
 		}
 
-		worker, err := r.SetSessionAgentType(ctx, testCaller(), sessionID, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
+		worker, err := r.SetSessionAgentType(ctx, testCaller(r), sessionID, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
 		testassert.NoError(t, err)
 		workerSnap := sessionViewThroughRuntime(t, r, sessionID)
 		if !reflect.DeepEqual(worker, projectSession(workerSnap.Header, r.instance)) || worker.SessionRevision != wireRevision(workerSnap.Header.Revision, r.instance) {
@@ -154,14 +154,14 @@ func TestSessionCommandAgentType(t *testing.T) {
 		testassert.Require(t, worker.SessionRevision.DurableRevision != header.SessionRevision.DurableRevision, "durable revision did not advance across the committed change: %+v", worker.SessionRevision)
 
 		{
-			_, err := r.SetSessionAgentType(ctx, testCaller(), sessionID, protocol.SetSessionAgentTypeRequest{})
+			_, err := r.SetSessionAgentType(ctx, testCaller(r), sessionID, protocol.SetSessionAgentTypeRequest{})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "empty agent type = %v, want harness.ErrInvalid", err)
 		}
 		after := sessionViewThroughRuntime(t, r, sessionID)
 		testassert.Equal(t, after.Header.AgentSelection.Definition.DefinitionID, "worker")
 
 		{
-			_, err := r.SetSessionAgentType(ctx, testCaller(), "ffffffffffffffffffffffffffffffff", protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
+			_, err := r.SetSessionAgentType(ctx, testCaller(r), "ffffffffffffffffffffffffffffffff", protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "set on absent session = %v, want harness.ErrNotFound", err)
 		}
 	})
@@ -183,19 +183,19 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 		testassert.NoError(t, err)
 		sessionID := first.Identity.SessionID
 
-		admitted, err := r.SubmitSession(ctx, testCaller(), sessionID, commandSubmitRequest(t, "op-1", "run"))
+		admitted, err := r.SubmitSession(ctx, testCaller(r), sessionID, commandSubmitRequest(t, "op-1", "run"))
 		testassert.NoError(t, err)
 		testassert.Require(t, admitted.Disposition == protocol.SubmitResultDispositionAdmitted && admitted.Operation != nil, "idle regular result = %+v, want admitted with an Operation", admitted)
 		testassert.Require(t, admitted.Operation.OperationId == "op-1" && admitted.Operation.Status == protocol.OperationStatusRunning, "idle regular operation = %+v, want op-1 running", admitted.Operation)
 		awaitOperation(t, r, sessionID, "op-1", harness.OperationSuccess)
 		awaitRestorableSession(t, r, sessionID)
 
-		retry, err := r.SubmitSession(ctx, testCaller(), sessionID, commandSubmitRequest(t, "op-1", "run"))
+		retry, err := r.SubmitSession(ctx, testCaller(r), sessionID, commandSubmitRequest(t, "op-1", "run"))
 		testassert.NoError(t, err)
 		testassert.Require(t, retry.Disposition == protocol.SubmitResultDispositionExisting && retry.Operation != nil, "same-ID retry = %+v, want existing with the first Operation", retry)
 		testassert.Require(t, retry.Operation.OperationId == "op-1" && retry.Operation.AdmittedAt.Equal(admitted.Operation.AdmittedAt), "same-ID retry operation = %+v, want the first-writer admission", retry.Operation)
 
-		queuedIdle, err := r.SubmitSession(ctx, testCaller(), sessionID, protocol.SubmitRequest{
+		queuedIdle, err := r.SubmitSession(ctx, testCaller(r), sessionID, protocol.SubmitRequest{
 			OperationId: "op-q-idle",
 			Mode:        protocol.SubmitRequestModeQueued,
 			Content:     []protocol.ContentPart{textContentPart(t, "queued while idle", nil)},
@@ -209,14 +209,14 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 		gate := make(chan struct{})
 		defer releaseCommandGate(gate)
 		e.server.setHold(gate)
-		active, err := r.SubmitSession(ctx, testCaller(), sessionID, commandSubmitRequest(t, "op-active", "active run"))
+		active, err := r.SubmitSession(ctx, testCaller(r), sessionID, commandSubmitRequest(t, "op-active", "active run"))
 		testassert.NoError(t, err)
 		testassert.Require(t, active.Disposition == protocol.SubmitResultDispositionAdmitted && active.Operation != nil, "active admission = %+v, want admitted", active)
 		<-e.server.arrived // the active model call is parked before the buffers are filled
-		steering, err := r.SubmitSession(ctx, testCaller(), sessionID, commandSubmitRequest(t, "op-steer", "steer"))
+		steering, err := r.SubmitSession(ctx, testCaller(r), sessionID, commandSubmitRequest(t, "op-steer", "steer"))
 		testassert.NoError(t, err)
 		testassert.Require(t, steering.Disposition == protocol.SubmitResultDispositionSteering && steering.Operation == nil, "steering result = %+v, want steering with nil Operation", steering)
-		queued, err := r.SubmitSession(ctx, testCaller(), sessionID, protocol.SubmitRequest{
+		queued, err := r.SubmitSession(ctx, testCaller(r), sessionID, protocol.SubmitRequest{
 			OperationId: "op-queued",
 			Mode:        protocol.SubmitRequestModeQueued,
 			Content:     []protocol.ContentPart{textContentPart(t, "queued", nil)},
@@ -252,7 +252,7 @@ func TestSessionCommandSubmitModes(t *testing.T) {
 
 		second, err := r.createSession(ctx, filepath.Join(e.home, "modes-b"), "solo")
 		testassert.NoError(t, err)
-		_, err = r.SubmitSession(ctx, testCaller(), second.Identity.SessionID, commandSubmitRequest(t, "op-1", "reuse"))
+		_, err = r.SubmitSession(ctx, testCaller(r), second.Identity.SessionID, commandSubmitRequest(t, "op-1", "reuse"))
 		testassert.Require(t, errors.Is(err, harness.ErrInvalid) && strings.Contains(err.Error(), "another session"), "cross-Session Operation ID reuse = %v, want the landed invalid rule", err)
 		secondSnap := sessionViewThroughRuntime(t, r, second.Identity.SessionID)
 		testassert.Require(t, len(secondSnap.Operations) == 0, "cross-Session reuse committed an Operation: %+v", secondSnap.Operations)
@@ -284,7 +284,7 @@ func TestSessionCommandSubmitContent(t *testing.T) {
 		testassert.NoError(t, image.FromImageURLPart(protocol.ImageURLPart{Kind: protocol.ImageUrl, Url: "https://example.test/x.png", Extra: &imageExtra}))
 		testassert.NoError(t, opaque.FromOpaquePart(protocol.OpaquePart{Kind: protocol.Opaque, OpaqueWireType: "audio", Extra: &opaqueExtra}))
 
-		res, err := r.SubmitSession(ctx, testCaller(), sessionID, protocol.SubmitRequest{
+		res, err := r.SubmitSession(ctx, testCaller(r), sessionID, protocol.SubmitRequest{
 			OperationId: "op-content",
 			Mode:        protocol.SubmitRequestModeRegular,
 			Content:     []protocol.ContentPart{text, image, opaque},
@@ -322,7 +322,7 @@ func TestSessionCommandSubmitContent(t *testing.T) {
 			"decode failure":   badDecode,
 			"model validation": missingWireType,
 		} {
-			_, err := r.SubmitSession(ctx, testCaller(), sessionID, protocol.SubmitRequest{
+			_, err := r.SubmitSession(ctx, testCaller(r), sessionID, protocol.SubmitRequest{
 				OperationId: "op-bad-" + strings.ReplaceAll(name, " ", "-"),
 				Mode:        protocol.SubmitRequestModeRegular,
 				Content:     []protocol.ContentPart{part},
@@ -330,7 +330,7 @@ func TestSessionCommandSubmitContent(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s = %v, want harness.ErrInvalid", name, err)
 		}
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), sessionID, protocol.SubmitRequest{
+			_, err := r.SubmitSession(ctx, testCaller(r), sessionID, protocol.SubmitRequest{
 				OperationId: "op-bad-mode",
 				Mode:        protocol.SubmitRequestMode("weird"),
 				Content:     []protocol.ContentPart{textContentPart(t, "x", nil)},
@@ -338,7 +338,7 @@ func TestSessionCommandSubmitContent(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "invalid mode = %v, want the Harness mode validator", err)
 		}
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), sessionID, protocol.SubmitRequest{
+			_, err := r.SubmitSession(ctx, testCaller(r), sessionID, protocol.SubmitRequest{
 				Mode:    protocol.SubmitRequestModeRegular,
 				Content: []protocol.ContentPart{textContentPart(t, "x", nil)},
 			})
@@ -363,16 +363,16 @@ func TestSessionCommandCompact(t *testing.T) {
 		testassert.NoError(t, err)
 		sessionID := rec.Identity.SessionID
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), sessionID, commandSubmitRequest(t, "op-seed", "seed"))
+			_, err := r.SubmitSession(ctx, testCaller(r), sessionID, commandSubmitRequest(t, "op-seed", "seed"))
 			testassert.NoError(t, err)
 		}
 		awaitOperation(t, r, sessionID, "op-seed", harness.OperationSuccess)
 		awaitRestorableSession(t, r, sessionID)
 
-		op, err := r.CompactSession(ctx, testCaller(), sessionID, protocol.CompactRequest{OperationId: "op-compact"})
+		op, err := r.CompactSession(ctx, testCaller(r), sessionID, protocol.CompactRequest{OperationId: "op-compact"})
 		testassert.NoError(t, err)
 		testassert.Require(t, op.OperationId == "op-compact" && op.RequestKind == protocol.OperationRequestKindCompact, "compact operation = %+v, want op-compact compact", op)
-		retry, err := r.CompactSession(ctx, testCaller(), sessionID, protocol.CompactRequest{OperationId: "op-compact"})
+		retry, err := r.CompactSession(ctx, testCaller(r), sessionID, protocol.CompactRequest{OperationId: "op-compact"})
 		testassert.NoError(t, err)
 		testassert.Require(t, retry.OperationId == op.OperationId && retry.AdmittedAt.Equal(op.AdmittedAt), "compact retry = %+v, want the first-writer Operation", retry)
 		awaitOperation(t, r, sessionID, "op-compact", harness.OperationSuccess)
@@ -382,11 +382,11 @@ func TestSessionCommandCompact(t *testing.T) {
 		defer releaseCommandGate(gate)
 		e.server.setHold(gate)
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), sessionID, commandSubmitRequest(t, "op-run", "run"))
+			_, err := r.SubmitSession(ctx, testCaller(r), sessionID, commandSubmitRequest(t, "op-run", "run"))
 			testassert.NoError(t, err)
 		}
 		{
-			_, err := r.CompactSession(ctx, testCaller(), sessionID, protocol.CompactRequest{OperationId: "op-compact-busy"})
+			_, err := r.CompactSession(ctx, testCaller(r), sessionID, protocol.CompactRequest{OperationId: "op-compact-busy"})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "non-idle compact = %v, want the Harness idle guard", err)
 		}
 		close(gate)
@@ -413,7 +413,7 @@ func TestSessionCommandFork(t *testing.T) {
 		testassert.NoError(t, err)
 		sourceID := source.Identity.SessionID
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), sourceID, commandSubmitRequest(t, "op-src", "boundary"))
+			_, err := r.SubmitSession(ctx, testCaller(r), sourceID, commandSubmitRequest(t, "op-src", "boundary"))
 			testassert.NoError(t, err)
 		}
 		awaitOperation(t, r, sourceID, "op-src", harness.OperationSuccess)
@@ -438,7 +438,7 @@ func TestSessionCommandFork(t *testing.T) {
 		} {
 			before := counting.listCount()
 			{
-				_, err := r.ForkSession(ctx, testCaller(), sourceID, req)
+				_, err := r.ForkSession(ctx, testCaller(r), sourceID, req)
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s fork = %v, want harness.ErrInvalid", name, err)
 			}
 			{
@@ -462,7 +462,7 @@ func TestSessionCommandFork(t *testing.T) {
 			Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 		}
 		before := counting.listCount()
-		result, err := r.ForkSession(ctx, testCaller(), sourceID, req)
+		result, err := r.ForkSession(ctx, testCaller(r), sourceID, req)
 		testassert.NoError(t, err)
 		testassert.Equal(t, counting.listCount()-before, 1)
 		destID := result.Session.SessionId
@@ -478,24 +478,24 @@ func TestSessionCommandFork(t *testing.T) {
 			t.Fatalf("fork header = %+v, want the real read projection %+v", result.Session, projectSession(destSnap.Header, r.instance))
 		}
 
-		retry, err := r.ForkSession(ctx, testCaller(), sourceID, req)
+		retry, err := r.ForkSession(ctx, testCaller(r), sourceID, req)
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(retry.Session, result.Session) && retry.Operation.OperationId == "op-fork", "fork retry = (%+v,%+v), want the identical first destination %+v", retry.Session, retry.Operation, result)
 
 		{
-			header, err := r.ArchiveSession(ctx, testCaller(), sourceID)
+			header, err := r.ArchiveSession(ctx, testCaller(r), sourceID)
 			testassert.Require(t, err == nil && header.Lifecycle == protocol.Archived, "archive source = (%+v, %v), want archived", header, err)
 		}
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), sourceID)
+			_, err := r.DeleteSession(ctx, testCaller(r), sourceID)
 			testassert.NoError(t, err)
 		}
 
-		afterDelete, err := r.ForkSession(ctx, testCaller(), sourceID, req)
+		afterDelete, err := r.ForkSession(ctx, testCaller(r), sourceID, req)
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(afterDelete.Session, result.Session) && afterDelete.Operation.OperationId == "op-fork", "post-deletion retry = (%+v,%+v), want the identical destination %+v", afterDelete.Session, afterDelete.Operation, result)
 		{
-			_, err := r.ForkSession(ctx, testCaller(), sourceID, protocol.ForkRequest{
+			_, err := r.ForkSession(ctx, testCaller(r), sourceID, protocol.ForkRequest{
 				BoundaryItemId: projectItemID(sourceID, assistantEntry),
 				OperationId:    "op-fork",
 				Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
@@ -503,7 +503,7 @@ func TestSessionCommandFork(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "mismatched boundary after source deletion = %v, want typed source unavailability", err)
 		}
 		{
-			_, err := r.ForkSession(ctx, testCaller(), sourceID, protocol.ForkRequest{
+			_, err := r.ForkSession(ctx, testCaller(r), sourceID, protocol.ForkRequest{
 				BoundaryItemId: boundaryItem,
 				OperationId:    "op-other",
 				Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
@@ -521,7 +521,7 @@ func TestSessionCommandFork(t *testing.T) {
 		awaitOperation(t, r, destID, "op-fork", harness.OperationSuccess)
 		awaitRestorableSession(t, r, destID)
 
-		sessions, err := r.ListSessions(ctx, testCaller(), protocol.ListSessionsParams{Workspace: filepath.Join(e.home, "fork-src"), Lifecycle: protocol.Open})
+		sessions, err := r.ListSessions(ctx, testCaller(r), protocol.ListSessionsParams{Workspace: filepath.Join(e.home, "fork-src"), Lifecycle: protocol.Open})
 		testassert.NoError(t, err)
 		testassert.Require(t, len(sessions) == 1 && sessions[0].SessionId == destID, "workspace sessions = %+v, want exactly the destination %q", sessions, destID)
 	})
@@ -539,7 +539,7 @@ func TestSessionCommandForkCorruptSource(t *testing.T) {
 		testassert.NoError(t, err)
 		sourceID := source.Identity.SessionID
 		{
-			_, err := first.SubmitSession(ctx, testCaller(), sourceID, commandSubmitRequest(t, "op-src", "boundary"))
+			_, err := first.SubmitSession(ctx, testCaller(first), sourceID, commandSubmitRequest(t, "op-src", "boundary"))
 			testassert.NoError(t, err)
 		}
 		awaitOperation(t, first, sourceID, "op-src", harness.OperationSuccess)
@@ -552,7 +552,7 @@ func TestSessionCommandForkCorruptSource(t *testing.T) {
 			OperationId:    "op-fork",
 			Content:        []protocol.ContentPart{textContentPart(t, "forked", nil)},
 		}
-		result, err := first.ForkSession(ctx, testCaller(), sourceID, req)
+		result, err := first.ForkSession(ctx, testCaller(first), sourceID, req)
 		testassert.NoError(t, err)
 		destID := result.Session.SessionId
 		awaitOperation(t, first, destID, "op-fork", harness.OperationSuccess)
@@ -565,7 +565,7 @@ func TestSessionCommandForkCorruptSource(t *testing.T) {
 
 		second, _ := openProjectionRuntime(t, store)
 		defer closeProjectionRuntime(second)
-		retry, err := second.ForkSession(ctx, testCaller(), sourceID, req)
+		retry, err := second.ForkSession(ctx, testCaller(second), sourceID, req)
 		testassert.NoError(t, err)
 		testassert.Require(t, retry.Session.SessionId == destID && retry.Operation.OperationId == "op-fork", "corrupt-source retry = (%q,%q), want the committed destination %q", retry.Session.SessionId, retry.Operation.OperationId, destID)
 
@@ -577,7 +577,7 @@ func TestSessionCommandForkCorruptSource(t *testing.T) {
 			"mismatched boundary": {BoundaryItemId: projectItemID(sourceID, "ffffffffffffffffffffffffffffffff"), OperationId: "op-fork", Content: req.Content},
 		} {
 			{
-				_, err := second.ForkSession(ctx, testCaller(), sourceID, bad)
+				_, err := second.ForkSession(ctx, testCaller(second), sourceID, bad)
 				testassert.Require(t, errors.Is(err, harness.ErrCorrupt), "%s corrupt-source fork = %v, want the original source corruption", name, err)
 			}
 		}
@@ -605,12 +605,12 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		defer releaseCommandGate(gate)
 		e.server.setHold(gate)
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), sessionID, commandSubmitRequest(t, "op-1", "run"))
+			_, err := r.SubmitSession(ctx, testCaller(r), sessionID, commandSubmitRequest(t, "op-1", "run"))
 			testassert.NoError(t, err)
 		}
 		<-e.server.arrived // the active model call is parked before the steering enqueue
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), sessionID, commandSubmitRequest(t, "op-steer", "steer"))
+			_, err := r.SubmitSession(ctx, testCaller(r), sessionID, commandSubmitRequest(t, "op-steer", "steer"))
 			testassert.NoError(t, err)
 		}
 		close(gate)
@@ -620,7 +620,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		before := sessionViewThroughRuntime(t, r, sessionID)
 		testassert.Require(t, before.Header.Revision.LocalRevision != 0, "fixture published no coordinator-local revision")
 
-		archived, err := r.ArchiveSession(ctx, testCaller(), sessionID)
+		archived, err := r.ArchiveSession(ctx, testCaller(r), sessionID)
 		testassert.NoError(t, err)
 		testassert.Require(t, archived.Lifecycle == protocol.Archived && archived.ArchivedAt != nil, "archive header = %+v, want archived with a timestamp", archived)
 		archivedSnap := sessionViewThroughRuntime(t, r, sessionID)
@@ -629,7 +629,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		}
 		testassert.Equal(t, archived.SessionRevision.LocalRevision, wireRevision(before.Header.Revision, r.instance).LocalRevision)
 
-		reopened, err := r.ReopenSession(ctx, testCaller(), sessionID)
+		reopened, err := r.ReopenSession(ctx, testCaller(r), sessionID)
 		testassert.NoError(t, err)
 		testassert.Require(t, reopened.Lifecycle == protocol.Open && reopened.ArchivedAt == nil, "reopen header = %+v, want open without a timestamp", reopened)
 		reopenedSnap := sessionViewThroughRuntime(t, r, sessionID)
@@ -643,11 +643,11 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		defer releaseCommandGate(runningGate)
 		e.server.setHold(runningGate)
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), running.Identity.SessionID, commandSubmitRequest(t, "op-running", "run"))
+			_, err := r.SubmitSession(ctx, testCaller(r), running.Identity.SessionID, commandSubmitRequest(t, "op-running", "run"))
 			testassert.NoError(t, err)
 		}
 		{
-			_, err := r.ArchiveSession(ctx, testCaller(), running.Identity.SessionID)
+			_, err := r.ArchiveSession(ctx, testCaller(r), running.Identity.SessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive running = %v, want the Harness running gate", err)
 		}
 		close(runningGate)
@@ -669,7 +669,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		openSession, err := r.createSession(ctx, filepath.Join(e.home, "life-open"), "solo")
 		testassert.NoError(t, err)
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), openSession.Identity.SessionID)
+			_, err := r.DeleteSession(ctx, testCaller(r), openSession.Identity.SessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "delete open Session = %v, want the archived-only rule", err)
 		}
 		{
@@ -678,11 +678,11 @@ func TestSessionCommandLifecycle(t *testing.T) {
 		}
 
 		{
-			_, err := r.ArchiveSession(ctx, testCaller(), sessionID)
+			_, err := r.ArchiveSession(ctx, testCaller(r), sessionID)
 			testassert.NoError(t, err)
 		}
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), sessionID)
+			_, err := r.DeleteSession(ctx, testCaller(r), sessionID)
 			testassert.NoError(t, err)
 		}
 		{
@@ -698,7 +698,7 @@ func TestSessionCommandLifecycle(t *testing.T) {
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleted by-ID read = %v, want harness.ErrNotFound", err)
 		}
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), sessionID)
+			_, err := r.DeleteSession(ctx, testCaller(r), sessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = %v, want harness.ErrNotFound", err)
 		}
 	})
@@ -734,15 +734,15 @@ func TestSessionCommandArchiveLiveBackground(t *testing.T) {
 		child := bg.launchChild(root, "child work", "op-child", 5)
 
 		{
-			_, err := bg.r.ArchiveSession(ctx, testCaller(), root)
+			_, err := bg.r.ArchiveSession(ctx, testCaller(bg.r), root)
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "archive with live background = %v, want the Harness live-member gate", err)
 		}
 		<-childStarted // the child's execution is open before the stop races it
-		testassert.NoError(t, bg.r.StopSession(ctx, testCaller(), root))
+		testassert.NoError(t, bg.r.StopSession(ctx, testCaller(bg.r), root))
 		awaitOperation(t, bg.r, child, "op-child", harness.OperationInterruption)
 		awaitIdleSession(t, bg.r, root)
 
-		header, err := bg.r.ArchiveSession(ctx, testCaller(), root)
+		header, err := bg.r.ArchiveSession(ctx, testCaller(bg.r), root)
 		testassert.NoError(t, err)
 		testassert.Require(t, header.Lifecycle == protocol.Archived, "archive after stop = %+v, want archived", header)
 	})
@@ -779,18 +779,18 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 				}
 			})
 			{
-				_, err := bg.r.SubmitSession(ctx, testCaller(), root, commandSubmitRequest(t, "op-int", "run"))
+				_, err := bg.r.SubmitSession(ctx, testCaller(bg.r), root, commandSubmitRequest(t, "op-int", "run"))
 				testassert.NoError(t, err)
 			}
 			<-started
-			testassert.NoError(t, bg.r.InterruptSession(ctx, testCaller(), root))
+			testassert.NoError(t, bg.r.InterruptSession(ctx, testCaller(bg.r), root))
 			{
 				status, err := operationStatusOf(store, root, "op-int")
 				testassert.Require(t, err == nil && status == harness.OperationRunning, "interrupt waited for the terminal: status = (%q, %v), want still running", status, err)
 			}
 			close(release)
 			awaitOperation(t, bg.r, root, "op-int", harness.OperationInterruption)
-			testassert.NoError(t, bg.r.InterruptSession(ctx, testCaller(), root))
+			testassert.NoError(t, bg.r.InterruptSession(ctx, testCaller(bg.r), root))
 		})
 
 		t.Run("child stop converges and permanently closes admission", func(t *testing.T) {
@@ -811,10 +811,10 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 			})
 			child := bg.launchChild(root, "child work", "op-child", 5)
 			<-childStarted // the child's execution is open before the stop races it
-			testassert.NoError(t, bg.r.StopSession(ctx, testCaller(), child))
+			testassert.NoError(t, bg.r.StopSession(ctx, testCaller(bg.r), child))
 			awaitOperation(t, bg.r, child, "op-child", harness.OperationInterruption)
 			{
-				_, err := bg.r.SubmitSession(ctx, testCaller(), child, commandSubmitRequest(t, "op-after", "late"))
+				_, err := bg.r.SubmitSession(ctx, testCaller(bg.r), child, commandSubmitRequest(t, "op-after", "late"))
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "submit to stopped child = %v, want the permanent closure", err)
 			}
 		})
@@ -851,12 +851,12 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 				return nil
 			})
 			{
-				_, err := bg.r.SubmitSession(ctx, testCaller(), root, commandSubmitRequest(t, "op-root", "run"))
+				_, err := bg.r.SubmitSession(ctx, testCaller(bg.r), root, commandSubmitRequest(t, "op-root", "run"))
 				testassert.NoError(t, err)
 			}
 			<-started
 			{
-				res, err := bg.r.SubmitSession(ctx, testCaller(), root, protocol.SubmitRequest{
+				res, err := bg.r.SubmitSession(ctx, testCaller(bg.r), root, protocol.SubmitRequest{
 					OperationId: "op-wait",
 					Mode:        protocol.SubmitRequestModeQueued,
 					Content:     []protocol.ContentPart{textContentPart(t, "queued", nil)},
@@ -866,7 +866,7 @@ func TestSessionCommandInterruptStop(t *testing.T) {
 			child := bg.launchChild(root, "child work", "op-member-child", 5)
 			<-childStarted
 
-			testassert.NoError(t, bg.r.StopSession(ctx, testCaller(), root))
+			testassert.NoError(t, bg.r.StopSession(ctx, testCaller(bg.r), root))
 			awaitOperation(t, bg.r, child, "op-member-child", harness.OperationInterruption)
 			{
 				status, err := operationStatusOf(store, root, "op-root")
@@ -895,13 +895,13 @@ func TestSessionCommandPreparationError(t *testing.T) {
 		failure := errors.New("controlled preparation failure")
 		bg.hook.failNext(failure)
 
-		res, err := bg.r.SubmitSession(ctx, testCaller(), root, commandSubmitRequest(t, "op-fail", "run"))
+		res, err := bg.r.SubmitSession(ctx, testCaller(bg.r), root, commandSubmitRequest(t, "op-fail", "run"))
 		testassert.Require(t, errors.Is(err, failure), "failing preparation = %v, want the injected error", err)
 		testassert.Require(t, res.Disposition == "" && res.Operation == nil, "failing preparation result = %+v, want the zero result", res)
 		snap := sessionViewThroughRuntime(t, bg.r, root)
 		testassert.Require(t, len(snap.Operations) == 0 && snap.Header.CurrentOperationID == "" && len(snap.History.HistoryHeaders()) == 0, "failing preparation committed state: %+v", snap)
 
-		ok, err := bg.r.SubmitSession(ctx, testCaller(), root, commandSubmitRequest(t, "op-ok", "run"))
+		ok, err := bg.r.SubmitSession(ctx, testCaller(bg.r), root, commandSubmitRequest(t, "op-ok", "run"))
 		testassert.NoError(t, err)
 		testassert.Require(t, ok.Disposition == protocol.SubmitResultDispositionAdmitted && ok.Operation != nil, "submit after failure = %+v, want admitted", ok)
 		awaitOperation(t, bg.r, root, "op-ok", harness.OperationSuccess)
@@ -920,7 +920,7 @@ func TestSessionCommandClosedOwner(t *testing.T) {
 		req := commandSubmitRequest(t, "op-closed", "x")
 
 		{
-			_, err := r.CreateSession(ctx, testCaller(), workspace, wireSelection("solo"))
+			_, err := r.CreateSession(ctx, testCaller(r), workspace, wireSelection("solo"))
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed create header = %v, want ErrClosed", err)
 		}
 		{
@@ -928,7 +928,7 @@ func TestSessionCommandClosedOwner(t *testing.T) {
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed create = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.ListSessions(ctx, testCaller(), protocol.ListSessionsParams{Workspace: workspace, Lifecycle: protocol.Open})
+			_, err := r.ListSessions(ctx, testCaller(r), protocol.ListSessionsParams{Workspace: workspace, Lifecycle: protocol.Open})
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed list = %v, want ErrClosed", err)
 		}
 		{
@@ -936,39 +936,39 @@ func TestSessionCommandClosedOwner(t *testing.T) {
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed read = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.SubmitSession(ctx, testCaller(), sessionID, req)
+			_, err := r.SubmitSession(ctx, testCaller(r), sessionID, req)
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed submit = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.CompactSession(ctx, testCaller(), sessionID, protocol.CompactRequest{OperationId: "op-closed"})
+			_, err := r.CompactSession(ctx, testCaller(r), sessionID, protocol.CompactRequest{OperationId: "op-closed"})
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed compact = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.ForkSession(ctx, testCaller(), sessionID, protocol.ForkRequest{BoundaryItemId: "x", OperationId: "op-closed", Content: req.Content})
+			_, err := r.ForkSession(ctx, testCaller(r), sessionID, protocol.ForkRequest{BoundaryItemId: "x", OperationId: "op-closed", Content: req.Content})
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed fork = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.SetSessionAgentType(ctx, testCaller(), sessionID, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("solo")})
+			_, err := r.SetSessionAgentType(ctx, testCaller(r), sessionID, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("solo")})
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed agent type = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.ArchiveSession(ctx, testCaller(), sessionID)
+			_, err := r.ArchiveSession(ctx, testCaller(r), sessionID)
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed archive = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.ReopenSession(ctx, testCaller(), sessionID)
+			_, err := r.ReopenSession(ctx, testCaller(r), sessionID)
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed reopen = %v, want ErrClosed", err)
 		}
 		{
-			err := r.InterruptSession(ctx, testCaller(), sessionID)
+			err := r.InterruptSession(ctx, testCaller(r), sessionID)
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed interrupt = %v, want ErrClosed", err)
 		}
 		{
-			err := r.StopSession(ctx, testCaller(), sessionID)
+			err := r.StopSession(ctx, testCaller(r), sessionID)
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed stop = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), sessionID)
+			_, err := r.DeleteSession(ctx, testCaller(r), sessionID)
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed delete = %v, want ErrClosed", err)
 		}
 	})
@@ -993,7 +993,7 @@ func TestSessionCommandCommitJoinsClose(t *testing.T) {
 		}
 		done := make(chan outcome, 1)
 		go func() {
-			res, err := bg.r.SubmitSession(ctx, testCaller(), root, commandSubmitRequest(t, "op-commit", "run"))
+			res, err := bg.r.SubmitSession(ctx, testCaller(bg.r), root, commandSubmitRequest(t, "op-commit", "run"))
 			done <- outcome{res: res, err: err}
 		}()
 		select {

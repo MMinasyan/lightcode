@@ -442,7 +442,7 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 		archivedAt := archiveBoundary.Add(time.Nanosecond)
 		writeServiceFile(t, e.configPath, ownerSweepProbedDocument(e.server.URL, `{"archive_after_days":1,"delete_after_archive_days":1}`))
 		{
-			_, err := r.Reload(context.Background(), testCaller())
+			_, err := r.Reload(context.Background(), testCaller(r))
 			testassert.NoError(t, err)
 		}
 
@@ -968,7 +968,7 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		testassert.NoError(t, os.WriteFile(unrelated, []byte("keep"), 0o644))
 
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), archivedID)
+			_, err := r.DeleteSession(ctx, testCaller(r), archivedID)
 			testassert.NoError(t, err)
 		}
 		mustNotExist(t, archivedCode, "the deleted session's artifact tree")
@@ -981,7 +981,7 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 
 		// a repeated delete is the ordinary not-found with nothing left to clean
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), archivedID)
+			_, err := r.DeleteSession(ctx, testCaller(r), archivedID)
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = err %v, want ErrNotFound", err)
 		}
 
@@ -990,7 +990,7 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		testassert.NoError(t, err)
 		archive(bare.Identity.SessionID)
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), bare.Identity.SessionID)
+			_, err := r.DeleteSession(ctx, testCaller(r), bare.Identity.SessionID)
 			testassert.NoError(t, err)
 		}
 
@@ -998,7 +998,7 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		const ghost = "0123456789abcdef0123456789abcdef" // valid hex identity, never registered
 		ghostCode := plantSessionCode(t, e.dataDir, ghost)
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), ghost)
+			_, err := r.DeleteSession(ctx, testCaller(r), ghost)
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "deleteSession of an unknown identity = err %v, want ErrNotFound", err)
 		}
 		mustExist(t, ghostCode, "the unknown identity's artifacts")
@@ -1008,12 +1008,12 @@ func TestPrivateDeleteSessionCleansArtifacts(t *testing.T) {
 		testassert.NoError(t, err)
 		openCode := plantSessionCode(t, e.dataDir, open.Identity.SessionID)
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), open.Identity.SessionID)
+			_, err := r.DeleteSession(ctx, testCaller(r), open.Identity.SessionID)
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "deleteSession of an open session = err %v, want ErrInvalid", err)
 		}
 		mustExist(t, openCode, "the open session's artifacts after the rejected delete")
 		{
-			_, err := r.DeleteSession(ctx, testCaller(), "not-a-session-id")
+			_, err := r.DeleteSession(ctx, testCaller(r), "not-a-session-id")
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "deleteSession of a malformed identity = err %v, want ErrInvalid", err)
 		}
 		mustExist(t, siblingCode, "the sibling session's artifacts after the malformed delete")
@@ -1047,7 +1047,7 @@ func TestPrivateDeleteSessionJoinsShutdown(t *testing.T) {
 		blocked.block(id)
 		done := make(chan error, 1)
 		go func() {
-			_, err := r.DeleteSession(ctx, testCaller(), id)
+			_, err := r.DeleteSession(ctx, testCaller(r), id)
 			done <- err
 		}()
 		select {
@@ -1108,7 +1108,7 @@ func TestPrivateDeleteSessionReturnsCleanupErrors(t *testing.T) {
 		testassert.NoError(t, os.Chmod(codeRoot, 0o555))
 		t.Cleanup(func() { os.Chmod(codeRoot, 0o755) })
 
-		result, delErr := r.DeleteSession(ctx, testCaller(), id)
+		result, delErr := r.DeleteSession(ctx, testCaller(r), id)
 		testassert.NoError(t, delErr)
 		testassert.Require(t, len(result.CleanupFailures) == 1 && result.CleanupFailures[0].ExtensionId == nil && result.CleanupFailures[0].Code == "storage" && strings.Contains(result.CleanupFailures[0].Message, code), "deleteSession cleanup result = %+v, want one local storage failure naming the blocked tree", result.CleanupFailures)
 		{
@@ -1274,7 +1274,7 @@ func TestMaintenanceShutdownJoinsSweepCleanup(t *testing.T) {
 		testassert.NoError(t, err)
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		{
-			_, err := r.Reload(context.Background(), testCaller())
+			_, err := r.Reload(context.Background(), testCaller(r))
 			testassert.NoError(t, err)
 		}
 
@@ -1357,7 +1357,7 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		{
-			_, err := r.Reload(context.Background(), testCaller())
+			_, err := r.Reload(context.Background(), testCaller(r))
 			testassert.NoError(t, err)
 		}
 		wrapped.armDeleteTarget(third)
@@ -1467,7 +1467,7 @@ func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
 
 		writeServiceFile(t, e.configPath, ownerSweepDocument(`{"archive_after_days":1,"delete_after_archive_days":1}`))
 		{
-			_, err := r.Reload(context.Background(), testCaller())
+			_, err := r.Reload(context.Background(), testCaller(r))
 			testassert.NoError(t, err)
 		}
 		readFailure := errors.New("test sweep register read failure")
@@ -1555,14 +1555,14 @@ func TestSweepSkipsHeldArtifactInterval(t *testing.T) {
 		testassert.NoError(t, os.WriteFile(file, []byte("v1"), 0o600))
 		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, held, op.Admission.AdmittedEntry.EntryID), file, "v1")
 		{
-			_, err := r.ArchiveSession(ctx, testCaller(), held)
+			_, err := r.ArchiveSession(ctx, testCaller(r), held)
 			testassert.NoError(t, err)
 		}
 		heldCode := filepath.Join(e.dataDir, "code", held)
 
 		sibling := projectionSession(t, r, filepath.Join(e.dataDir, "swept-ws"), "solo").Identity.SessionID
 		{
-			_, err := r.ArchiveSession(ctx, testCaller(), sibling)
+			_, err := r.ArchiveSession(ctx, testCaller(r), sibling)
 			testassert.NoError(t, err)
 		}
 		siblingCode := plantSessionCode(t, e.dataDir, sibling)

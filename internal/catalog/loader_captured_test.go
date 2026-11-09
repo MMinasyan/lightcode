@@ -202,7 +202,7 @@ func TestLoaderLoadCapturedContentionWarnsAndKeepsCachedInput(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	transport := Transport{BaseURL: server.URL + "/v1"}
-	testassert.NoError(t, WriteDiscoveryCache(home, "remote", transport, DiscoveredProvider{
+	testassert.NoError(t, writeDiscoveryCacheForTest(home, "remote", transport, DiscoveredProvider{
 		Models: map[string]DiscoveredModel{"cached-model": {ContextWindow: 4096}},
 	}, time.Now().Add(-48*time.Hour).UTC()))
 	holder, ok, err := atomicfs.TryAcquire(discoveryLockPath(home, "remote"))
@@ -236,7 +236,7 @@ func TestLoaderLoadCapturedAllowRefreshFilterRetained(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":[{"id":"remote-model","context_window":1000}]}`))
 	}))
 	t.Cleanup(server.Close)
-	testassert.NoError(t, WriteDiscoveryCache(home, "remote", Transport{BaseURL: server.URL + "/v1"}, DiscoveredProvider{
+	testassert.NoError(t, writeDiscoveryCacheForTest(home, "remote", Transport{BaseURL: server.URL + "/v1"}, DiscoveredProvider{
 		Models: map[string]DiscoveredModel{"cached-model": {ContextWindow: 4096}},
 	}, time.Now().Add(-48*time.Hour).UTC()))
 	fsys := fstest.MapFS{"builtin/remote.json": {Data: []byte(`{

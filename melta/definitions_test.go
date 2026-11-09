@@ -90,7 +90,7 @@ func TestRuntimeReadOnlyResolverCoexistsWithAgents(t *testing.T) {
 	testassert.NoError(t, err)
 	defer closeProjectionRuntime(owner)
 
-	view, err := owner.GetConfiguration(ctx, testCaller())
+	view, err := owner.GetConfiguration(ctx, testCaller(owner))
 	testassert.NoError(t, err)
 	var ownRef, guestRef protocol.DefinitionRef
 	ownCount, guestCount := 0, 0
@@ -163,7 +163,7 @@ func TestSettingsRequestUnionAcceptsExactlyOne(t *testing.T) {
 		{},
 		{Settings: &protocol.Settings{}, ExtensionEdit: &protocol.ExtensionEdit{ExtensionId: "agents", EditId: "set_model", Arguments: "{}"}},
 	} {
-		_, err := owner.UpdateSettings(ctx, testCaller(), request)
+		_, err := owner.UpdateSettings(ctx, testCaller(owner), request)
 		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "union request = %+v, want harness.ErrInvalid", request)
 		testassert.Require(t, owner.config.current() == published, "union rejection published a generation")
 	}

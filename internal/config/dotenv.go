@@ -16,9 +16,9 @@ func envLockPath(envPath string) string {
 	return filepath.Join(filepath.Dir(envPath), ".locks", "env.lock")
 }
 
-// ErrExternalKey is returned by ManagedEnv.Set when the requested key is
-// already present in the process environment from outside Lightcode (a shell
-// export). Lightcode refuses to shadow it.
+// ErrExternalKey is returned by ManagedEnv.TrySet and TryRemove when the
+// requested key is already present in the process environment from outside
+// Lightcode (a shell export). Lightcode refuses to shadow it.
 var ErrExternalKey = fmt.Errorf("env var is set externally; Lightcode will not override it")
 
 // CredentialValue is one source-coherent observation of an environment
@@ -33,8 +33,8 @@ type CredentialValue struct {
 
 // ManagedEnv is one explicit dotenv file. It never mutates the process
 // environment: Capture reads the file on every call with the process
-// environment taking precedence, and Set/Remove update only this file under
-// its cross-process lock.
+// environment taking precedence, and TrySet/TryRemove update only this file
+// under its cross-process lock.
 type ManagedEnv struct {
 	path string
 }
@@ -94,33 +94,16 @@ func parseEnviron(environ []string) map[string]string {
 	return out
 }
 
-// Set writes key=value to the .env file (adding or replacing the line). If key
-// is already set in the process env, Set returns ErrExternalKey and makes no
-// change — shell precedence is preserved on every write path.
+// TrySet writes key=value to the .env file (adding or replacing the line)
+// in one nonblocking lock attempt, so a shutting-down owner never parks on a
+// foreign env-lock holder. If key is already set in the process env, TrySet
+// returns ErrExternalKey and makes no change — shell precedence is preserved
+// on every write path. On leaf contention it returns an operation error and
+// mutates neither the file nor the process environment.
 //
 // The file write is atomic: a temp file in the same directory is written
 // with mode 0600 and renamed over the target, so a crash mid-write cannot
 // leave a partial .env.
-func (m *ManagedEnv) Set(key, value string) error {
-	if m == nil {
-		return fmt.Errorf("managed env is not initialized")
-	}
-	if err := validateEnvKeyValue(key, value); err != nil {
-		return err
-	}
-	if _, external := os.LookupEnv(key); external {
-		return ErrExternalKey
-	}
-	return atomicfs.WithLock(envLockPath(m.path), func() error {
-		return writeDotEnvLinePayload(m.path, key, value)
-	})
-}
-
-// TrySet is the one-attempt counterpart of Set for owner paths that must not
-// block a shutting-down owner on a foreign env-lock holder. It applies the
-// same external-key checks and the same payload as Set; on leaf contention it
-// returns an operation error and mutates neither the file nor the process
-// environment.
 func (m *ManagedEnv) TrySet(key, value string) error {
 	if m == nil {
 		return fmt.Errorf("managed env is not initialized")
@@ -143,33 +126,12 @@ func (m *ManagedEnv) TrySet(key, value string) error {
 	return nil
 }
 
-// Remove deletes key from the .env file. A key defined by the process
-// environment is refused with ErrExternalKey; an absent unmanaged name is a
-// successful no-op.
-func (m *ManagedEnv) Remove(key string) error {
-	if m == nil {
-		return fmt.Errorf("managed env is not initialized")
-	}
-	if _, external := os.LookupEnv(key); external {
-		return ErrExternalKey
-	}
-	file, _, err := readDotEnvFile(m.path)
-	if err != nil {
-		return err
-	}
-	if _, present := file[key]; !present {
-		return nil
-	}
-	return atomicfs.WithLock(envLockPath(m.path), func() error {
-		return removeDotEnvLinePayload(m.path, key)
-	})
-}
-
-// TryRemove is the one-attempt counterpart of Remove for owner paths that must
-// not block a shutting-down owner on a foreign env-lock holder. It applies the
-// same external-key refusal and the same absent no-op as Remove; on leaf
-// contention it returns an operation error and mutates neither the file nor
-// the process environment.
+// TryRemove deletes key from the .env file in one nonblocking lock attempt,
+// so a shutting-down owner never parks on a foreign env-lock holder. A key
+// defined by the process environment is refused with ErrExternalKey; an
+// absent unmanaged name is a successful no-op; on leaf contention it returns
+// an operation error and mutates neither the file nor the process
+// environment.
 func (m *ManagedEnv) TryRemove(key string) error {
 	if m == nil {
 		return fmt.Errorf("managed env is not initialized")
@@ -196,10 +158,21 @@ func (m *ManagedEnv) TryRemove(key string) error {
 	return nil
 }
 
-// SubprocessEnv returns the process environment with every name in excluded
-// removed. The managed file's values never enter this projection.
-func (m *ManagedEnv) SubprocessEnv(excluded []string) []string {
-	return EnvWithoutKeys(os.Environ(), excluded)
+// SubprocessEnv returns the process environment with every supplied excluded
+// name and every name the managed file defines removed, shell-supplied and
+// managed overlaps included. The managed file's values never enter this
+// projection; an unreadable file is an error rather than an ambient fallback.
+func (m *ManagedEnv) SubprocessEnv(excluded []string) ([]string, error) {
+	managed, _, err := ReadDotEnvKeys(m.Path())
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(excluded)+len(managed))
+	names = append(names, excluded...)
+	for name := range managed {
+		names = append(names, name)
+	}
+	return EnvWithoutKeys(os.Environ(), names), nil
 }
 
 // readDotEnvFile reads the file and returns parsed values plus human-readable
@@ -331,8 +304,8 @@ func isValidEnvKey(key string) bool {
 }
 
 // writeDotEnvLinePayload rewrites the .env file with key=value applied. It
-// runs under the env leaf lock held by the caller (WithLock or TryWithLock),
-// so it never reacquires the leaf.
+// runs under the env leaf lock held by the caller, so it never reacquires the
+// leaf.
 func writeDotEnvLinePayload(path, key, value string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -384,8 +357,8 @@ func writeDotEnvLinePayload(path, key, value string) error {
 }
 
 // removeDotEnvLinePayload rewrites the .env file with every line defining key
-// removed. It runs under the env leaf lock held by the caller (WithLock or
-// TryWithLock), so it never reacquires the leaf.
+// removed. It runs under the env leaf lock held by the caller, so it never
+// reacquires the leaf.
 func removeDotEnvLinePayload(path, key string) error {
 	existing, err := os.ReadFile(path)
 	if err != nil {

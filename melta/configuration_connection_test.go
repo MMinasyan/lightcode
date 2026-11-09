@@ -237,7 +237,7 @@ func assertFollowUpEditProvesReleasedOwnership(t *testing.T, r *Melta, providerI
 	t.Helper()
 	done := make(chan error, 1)
 	go func() {
-		_, err := r.UpdateProvider(context.Background(), testCaller(), providerID, protocol.ProviderEdit{})
+		_, err := r.UpdateProvider(context.Background(), testCaller(r), providerID, protocol.ProviderEdit{})
 		done <- err
 	}()
 	select {
@@ -306,7 +306,7 @@ func TestConnectProviderDiscoveryBackedManagedKey(t *testing.T) {
 		before, _, _ := runtimeMutationBaseline(t, r)
 
 		key := connectionKey
-		mutation, err := r.ConnectProvider(ctx, testCaller(), "groq", &key)
+		mutation, err := r.ConnectProvider(ctx, testCaller(r), "groq", &key)
 		testassert.NoError(t, err)
 		testassert.Equal(t, mutation.ConfigurationRevision.Generation, "2")
 		{
@@ -329,7 +329,9 @@ func TestConnectProviderDiscoveryBackedManagedKey(t *testing.T) {
 		}
 		envData, err := os.ReadFile(r.managedEnvForTest().Path())
 		testassert.Require(t, err == nil && strings.Contains(string(envData), "CONNECTION_DISC_KEY="+connectionKey+"\n"), ".env = (%q, %v), want the managed key line", envData, err)
-		for _, entry := range r.managedEnvForTest().SubprocessEnv(nil) {
+		snapshot, err := r.managedEnvForTest().SubprocessEnv(nil)
+		testassert.NoError(t, err)
+		for _, entry := range snapshot {
 			testassert.Require(t, !strings.HasPrefix(entry, "CONNECTION_DISC_KEY="), "the connected key leaked into the subprocess snapshot: %q", entry)
 		}
 
@@ -368,18 +370,18 @@ func TestConnectProviderRepeatStillPublishes(t *testing.T) {
 		defer closeRuntime()
 		ctx := context.Background()
 		t.Setenv("CONNECTION_USABLE_KEY", "usable-key-value")
-		_, err := r.Reload(ctx, testCaller())
+		_, err := r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		drainConnectionEvent(t, r.warnings, sub, "2")
 
 		// A repeat connection of an already-connected usable provider is a
 		// real publication under the one shared successful-edit rule.
-		first, err := r.ConnectProvider(ctx, testCaller(), "usablep", nil)
+		first, err := r.ConnectProvider(ctx, testCaller(r), "usablep", nil)
 		testassert.Require(t, err == nil && first.ConfigurationRevision.Generation == "3", "first connect = (%v, %q), want generation 3", err, first.ConfigurationRevision.Generation)
 		before, err := os.ReadFile(r.configPathForTest())
 		testassert.NoError(t, err)
 		drainConnectionEvent(t, r.warnings, sub, "3")
-		second, err := r.ConnectProvider(ctx, testCaller(), "usablep", nil)
+		second, err := r.ConnectProvider(ctx, testCaller(r), "usablep", nil)
 		testassert.Require(t, err == nil && second.ConfigurationRevision.Generation == "4", "repeat connect = (%v, %q), want generation 4", err, second.ConfigurationRevision.Generation)
 		drainConnectionEvent(t, r.warnings, sub, "4")
 		after, err := os.ReadFile(r.configPathForTest())
@@ -412,7 +414,7 @@ func TestConnectProviderUsableWindowRemovedRefuses(t *testing.T) {
 		fetches := server.requests()
 
 		key := connectionKey
-		_, err := r.ConnectProvider(ctx, testCaller(), "staticp", &key)
+		_, err := r.ConnectProvider(ctx, testCaller(r), "staticp", &key)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		{
 			got := server.requests()
@@ -434,7 +436,7 @@ func TestConnectProviderUsableSkipsFetch(t *testing.T) {
 		// An already-usable provider is never probed with a discovery fetch;
 		// a supplied key still updates the managed key through TrySet.
 		key := connectionKey
-		mutation, err := r.ConnectProvider(ctx, testCaller(), "usablep", &key)
+		mutation, err := r.ConnectProvider(ctx, testCaller(r), "usablep", &key)
 		testassert.NoError(t, err)
 		{
 			got := server.requests()
@@ -450,12 +452,12 @@ func TestConnectProviderUsableSkipsFetch(t *testing.T) {
 		// envelope, the provider read, a later typed error, and the event.
 		mutationBytes, merr := json.Marshal(mutation)
 		testassert.Require(t, merr == nil && !strings.Contains(string(mutationBytes), connectionKey), "mutation bytes carry the key value (%v)", merr)
-		detail, err := r.GetProvider(ctx, testCaller(), "usablep")
+		detail, err := r.GetProvider(ctx, testCaller(r), "usablep")
 		testassert.NoError(t, err)
 		detailBytes, derr := json.Marshal(detail)
 		testassert.Require(t, derr == nil && !strings.Contains(string(detailBytes), connectionKey), "provider read bytes carry the key value (%v)", derr)
 		{
-			_, err := r.ConnectProvider(ctx, testCaller(), "staticp", nil)
+			_, err := r.ConnectProvider(ctx, testCaller(r), "staticp", nil)
 			testassert.Require(t, err != nil && !strings.Contains(err.Error(), connectionKey), "refusal error = %v, want a typed error without the key value", err)
 		}
 		eventBytes, everr := json.Marshal(event)
@@ -472,7 +474,7 @@ func TestConnectProviderExternalKeyNeverPersisted(t *testing.T) {
 		// The shell key is set outside Lightcode and stays unmanaged. The
 		// published revision observes it at the next build.
 		t.Setenv("CONNECTION_DISC_KEY", "shell-exported-value")
-		_, err := r.Reload(ctx, testCaller())
+		_, err := r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		before, _, _ := runtimeMutationBaseline(t, r)
 		envBefore, err := os.ReadFile(r.managedEnvForTest().Path())
@@ -480,7 +482,7 @@ func TestConnectProviderExternalKeyNeverPersisted(t *testing.T) {
 
 		// Without a supplied credential the external value is used as-is and
 		// never persisted, removed, or overwritten.
-		mutation, err := r.ConnectProvider(ctx, testCaller(), "groq", nil)
+		mutation, err := r.ConnectProvider(ctx, testCaller(r), "groq", nil)
 		testassert.NoError(t, err)
 		testassert.Require(t, mutation.Result.Connected && mutation.Result.KeySource == protocol.ProviderKeySource(config.KeySourceExternal), "connected provider view = %+v, want an external key source", mutation.Result)
 		sawShell := false
@@ -502,7 +504,7 @@ func TestConnectProviderExternalKeyNeverPersisted(t *testing.T) {
 		// any configuration or cache side effect: the external variable is
 		// not silently substituted for the supplied key.
 		supplied := connectionKey
-		_, err = r.ConnectProvider(ctx, testCaller(), "groq", &supplied)
+		_, err = r.ConnectProvider(ctx, testCaller(r), "groq", &supplied)
 		testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration), "supplied key on an external binding = %v, want the pre-effect refusal", err)
 		if envValueForTest(r, "CONNECTION_DISC_KEY") != "shell-exported-value" || testManaged(r, "CONNECTION_DISC_KEY") {
 			t.Fatalf("external key after the refusal = (%q, %v), want it untouched and unmanaged", envValueForTest(r, "CONNECTION_DISC_KEY"), testManaged(r, "CONNECTION_DISC_KEY"))
@@ -533,7 +535,7 @@ func TestConnectProviderTransientKeyOverridesConfiguredAuthorization(t *testing.
 		writeServiceFile(t, r.configPathForTest(), edited)
 		writeAgentDefinitions(t, r.configPathForTest(), connectionAgentsDocument)
 		{
-			_, err := r.Reload(ctx, testCaller())
+			_, err := r.Reload(ctx, testCaller(r))
 			testassert.NoError(t, err)
 		}
 		drainConnectionEvent(t, r.warnings, sub, "2")
@@ -541,7 +543,7 @@ func TestConnectProviderTransientKeyOverridesConfiguredAuthorization(t *testing.
 
 		key := connectionKey
 		{
-			_, err := r.ConnectProvider(ctx, testCaller(), "groq", &key)
+			_, err := r.ConnectProvider(ctx, testCaller(r), "groq", &key)
 			testassert.NoError(t, err)
 		}
 		{
@@ -576,14 +578,14 @@ func TestConnectProviderKeylessFetchKeepsConfiguredAuthorization(t *testing.T) {
 		writeServiceFile(t, r.configPathForTest(), edited)
 		writeAgentDefinitions(t, r.configPathForTest(), connectionAgentsDocument)
 		{
-			_, err := r.Reload(ctx, testCaller())
+			_, err := r.Reload(ctx, testCaller(r))
 			testassert.NoError(t, err)
 		}
 		drainConnectionEvent(t, r.warnings, sub, "2")
 
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 		fetches := server.requests()
-		_, err := r.ConnectProvider(ctx, testCaller(), "moonshot", nil)
+		_, err := r.ConnectProvider(ctx, testCaller(r), "moonshot", nil)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		{
 			got := server.requests()
@@ -604,22 +606,22 @@ func TestConnectProviderKeyResolutionRefusals(t *testing.T) {
 		// A set-but-empty external value fails uniformly; the next build
 		// observes the shell value.
 		t.Setenv("CONNECTION_DISC_KEY", "")
-		_, err := r.Reload(ctx, testCaller())
+		_, err := r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		drainConnectionEvent(t, r.warnings, sub, "2")
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		// The required credential is missing.
-		_, err = r.ConnectProvider(ctx, testCaller(), "discp", nil)
+		_, err = r.ConnectProvider(ctx, testCaller(r), "discp", nil)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 
 		// An already-usable keyed provider with no credential anywhere still
 		// refuses through the one key-resolution rule (no fetch involved).
-		_, err = r.ConnectProvider(ctx, testCaller(), "staticp", nil)
+		_, err = r.ConnectProvider(ctx, testCaller(r), "staticp", nil)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 
 		// An unknown provider keeps the read path's typed error.
-		_, err = r.ConnectProvider(ctx, testCaller(), "ghost-provider", nil)
+		_, err = r.ConnectProvider(ctx, testCaller(r), "ghost-provider", nil)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, catalog.ErrUnknownProvider)
 	})
 }
@@ -645,21 +647,21 @@ func TestConnectProviderKeylessSuppliedKeyRefuses(t *testing.T) {
 	// the connect before any effect, leaving the owning file, the
 	// publication, and the managed env untouched.
 	key := connectionKey
-	_, err = r.ConnectProvider(ctx, testCaller(), "keylessusable", &key)
+	_, err = r.ConnectProvider(ctx, testCaller(r), "keylessusable", &key)
 	assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 	assertDotenvUnchanged(t, r, envBefore, "the refused keyless connect")
 
 	// The unusable keyless discovery provider takes the same pre-fetch
 	// refusal: no discovery record is written for it.
 	{
-		_, err := r.ConnectProvider(ctx, testCaller(), "keylessp", &key)
+		_, err := r.ConnectProvider(ctx, testCaller(r), "keylessp", &key)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 	}
 	assertDiscoveryCacheLacks(t, r, "keylessp", "ghost")
 
 	// Without a supplied key the keyless connect is the retained
 	// no-credential connection: no key action, one publication.
-	mutation, err := r.ConnectProvider(ctx, testCaller(), "keylessusable", nil)
+	mutation, err := r.ConnectProvider(ctx, testCaller(r), "keylessusable", nil)
 	testassert.Require(t, err == nil && mutation.Result.Connected && mutation.Result.KeySource == protocol.ProviderKeySource(config.KeySourceKeyless), "keyless connect without a key = (%v, %+v), want the connected keyless view", err, mutation.Result)
 	{
 		want := strconv.FormatUint(generation+1, 10)
@@ -688,13 +690,13 @@ func TestConnectProviderUnusableDiscoveryDisabledRefusals(t *testing.T) {
 
 		// The keyed unusable provider has a valid external credential: the
 		// guard still fires before any key resolution or fetch.
-		_, err = r.ConnectProvider(ctx, testCaller(), "staticempty", nil)
+		_, err = r.ConnectProvider(ctx, testCaller(r), "staticempty", nil)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		testassert.Require(t, !testManaged(r, "CONNECTION_STATIC_KEY"), "the refused keyed connect managed the external key")
 
 		// The keyless unusable provider takes the same guard with no
 		// credential involved.
-		_, err = r.ConnectProvider(ctx, testCaller(), "keylessempty", nil)
+		_, err = r.ConnectProvider(ctx, testCaller(r), "keylessempty", nil)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 
 		{
@@ -715,7 +717,7 @@ func TestConnectProviderUpdatesManagedKey(t *testing.T) {
 		testassert.NoError(t, r.managedEnvForTest().TrySet("CONNECTION_DISC_KEY", "stale-managed-value"))
 		updated := connectionKey
 		{
-			_, err := r.ConnectProvider(ctx, testCaller(), "groq", &updated)
+			_, err := r.ConnectProvider(ctx, testCaller(r), "groq", &updated)
 			testassert.NoError(t, err)
 		}
 		if envValueForTest(r, "CONNECTION_DISC_KEY") != connectionKey {
@@ -723,7 +725,9 @@ func TestConnectProviderUpdatesManagedKey(t *testing.T) {
 		}
 		// The connected-after-Open key is scrubbed from the live call-time
 		// snapshot.
-		for _, entry := range r.managedEnvForTest().SubprocessEnv(nil) {
+		snapshot, err := r.managedEnvForTest().SubprocessEnv(nil)
+		testassert.NoError(t, err)
+		for _, entry := range snapshot {
 			testassert.Require(t, !strings.HasPrefix(entry, "CONNECTION_DISC_KEY="), "the connected key leaked into the subprocess snapshot: %q", entry)
 		}
 	})
@@ -759,7 +763,7 @@ func (f *connectRaceFixture) start(providerID string, key *string) {
 	f.done = make(chan struct{})
 	go func() {
 		defer close(f.done)
-		f.result.mutation, f.result.err = f.r.ConnectProvider(context.Background(), testCaller(), providerID, key)
+		f.result.mutation, f.result.err = f.r.ConnectProvider(context.Background(), testCaller(f.r), providerID, key)
 	}()
 }
 
@@ -815,7 +819,7 @@ func TestConnectProviderRaceRemovedRefusesBeforeWrites(t *testing.T) {
 		// refusal baseline is the state that writer left, captured before
 		// the parked connect is released.
 		{
-			_, err := f.r.DeleteProvider(ctx, testCaller(), "discp")
+			_, err := f.r.DeleteProvider(ctx, testCaller(f.r), "discp")
 			testassert.NoError(t, err)
 		}
 		drainConnectionEvent(t, f.r.warnings, sub, "2")
@@ -841,7 +845,7 @@ func TestConnectProviderRaceTransportChangedRefuses(t *testing.T) {
 		// the baseline is the published state it left.
 		moved := "https://moved.test/v1"
 		{
-			_, err := f.r.UpdateProvider(ctx, testCaller(), "discp", protocol.ProviderEdit{BaseUrl: &moved})
+			_, err := f.r.UpdateProvider(ctx, testCaller(f.r), "discp", protocol.ProviderEdit{BaseUrl: &moved})
 			testassert.NoError(t, err)
 		}
 		drainConnectionEvent(t, f.r.warnings, sub, "2")
@@ -895,7 +899,7 @@ func TestConnectProviderRaceConcurrentModelsSkipsCacheWrite(t *testing.T) {
 		var result connectRaceResult
 		go func() {
 			defer close(done)
-			result.mutation, result.err = r.ConnectProvider(ctx, testCaller(), "discp", &key)
+			result.mutation, result.err = r.ConnectProvider(ctx, testCaller(r), "discp", &key)
 		}()
 		var releaseOnce sync.Once
 		proceed := func() { releaseOnce.Do(func() { close(release) }) }
@@ -907,7 +911,7 @@ func TestConnectProviderRaceConcurrentModelsSkipsCacheWrite(t *testing.T) {
 		// connect still publishes.
 		window := 4096
 		{
-			_, err := r.SaveModel(ctx, testCaller(), "discp", "ghost", protocol.ModelEdit{ContextWindow: &window})
+			_, err := r.SaveModel(ctx, testCaller(r), "discp", "ghost", protocol.ModelEdit{ContextWindow: &window})
 			testassert.NoError(t, err)
 		}
 		proceed()
@@ -944,7 +948,7 @@ func TestConnectProviderDiscoveryFilteredRefuses(t *testing.T) {
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		key := connectionKey
-		_, err := r.ConnectProvider(ctx, testCaller(), "discp", &key)
+		_, err := r.ConnectProvider(ctx, testCaller(r), "discp", &key)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		assertDiscoveryCacheLacks(t, r, "discp", "ghost")
 	})
@@ -975,7 +979,7 @@ func TestConnectProviderCacheContentionRefuses(t *testing.T) {
 		<-held
 
 		key := connectionKey
-		_, err = r.ConnectProvider(ctx, testCaller(), "groq", &key)
+		_, err = r.ConnectProvider(ctx, testCaller(r), "groq", &key)
 		close(released)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		assertDotenvUnchanged(t, r, envBefore, "the cache contention")
@@ -1005,8 +1009,9 @@ func TestConnectProviderCacheWrittenKeyWriteFails(t *testing.T) {
 		probe.fail = errors.New("injected .env sync failure")
 
 		key := connectionKey
-		_, err = r.ConnectProvider(ctx, testCaller(), "groq", &key)
+		_, err = r.ConnectProvider(ctx, testCaller(r), "groq", &key)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
+		testassert.Require(t, err != nil && strings.Contains(err.Error(), `discovery cache for provider "groq" was updated`), "partial-write error = %v, want the discovery-cache update stated", err)
 
 		records, _ := catalog.ReadDiscoveryCache(r.config.loader.CacheDir())
 		record, ok := records["groq"]
@@ -1035,14 +1040,14 @@ func TestConnectProviderCacheUnsafeIdentityRefuses(t *testing.T) {
 		writeServiceFile(t, r.configPathForTest(), raw)
 		writeAgentDefinitions(t, r.configPathForTest(), connectionAgentsDocument)
 		{
-			_, err := r.Reload(ctx, testCaller())
+			_, err := r.Reload(ctx, testCaller(r))
 			testassert.NoError(t, err)
 		}
 		drainConnectionEvent(t, r.warnings, sub, "2")
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		key := connectionKey
-		_, err := r.ConnectProvider(ctx, testCaller(), `bad\id`, &key)
+		_, err := r.ConnectProvider(ctx, testCaller(r), `bad\id`, &key)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		assertDiscoveryCacheLacks(t, r, `bad\id`, "fresh")
 	})
@@ -1061,7 +1066,7 @@ func TestConnectProviderNULKeyRefusedWithoutFileEffect(t *testing.T) {
 		// The NUL value fails the native env-value preflight before any
 		// owning env-file write: no line, no Setenv, no managed membership.
 		broken := "sk-\x00-broken"
-		_, err = r.ConnectProvider(ctx, testCaller(), "usablep", &broken)
+		_, err = r.ConnectProvider(ctx, testCaller(r), "usablep", &broken)
 		assertConnectionRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		testassert.Require(t, envValueForTest(r, "CONNECTION_USABLE_KEY") == "" && !testManaged(r, "CONNECTION_USABLE_KEY"), "the refused NUL write left env state behind")
 		assertDotenvUnchanged(t, r, envBefore, "the NUL refusal")
@@ -1081,7 +1086,7 @@ func TestConnectProviderFetchCancellationBeforePersistence(t *testing.T) {
 		key := connectionKey
 		done := make(chan error, 1)
 		go func() {
-			_, err := r.ConnectProvider(ctx, testCaller(), "discp", &key)
+			_, err := r.ConnectProvider(ctx, testCaller(r), "discp", &key)
 			done <- err
 		}()
 		<-arrive
@@ -1109,7 +1114,7 @@ func TestConnectProviderPublicationSurvivesLateCancellation(t *testing.T) {
 		key := connectionKey
 		done := make(chan error, 1)
 		go func() {
-			_, err := r.ConnectProvider(ctx, testCaller(), "groq", &key)
+			_, err := r.ConnectProvider(ctx, testCaller(r), "groq", &key)
 			done <- err
 		}()
 		select {
@@ -1138,7 +1143,7 @@ func TestConnectProviderClosedOwnerRefuses(t *testing.T) {
 		testassert.NoError(t, r.Close(ctx))
 		key := connectionKey
 		{
-			_, err := r.ConnectProvider(ctx, testCaller(), "discp", &key)
+			_, err := r.ConnectProvider(ctx, testCaller(r), "discp", &key)
 			testassert.Require(t, errors.Is(err, ErrClosed), "connect after Close = %v, want ErrClosed", err)
 		}
 		assertDiscoveryCacheLacks(t, r, "discp", "ghost")
@@ -1159,7 +1164,7 @@ func TestConnectProviderOwnerCloseDuringFetchRefuses(t *testing.T) {
 		key := connectionKey
 		done := make(chan error, 1)
 		go func() {
-			_, err := r.ConnectProvider(ctx, testCaller(), "discp", &key)
+			_, err := r.ConnectProvider(ctx, testCaller(r), "discp", &key)
 			done <- err
 		}()
 		<-arrive
@@ -1222,12 +1227,12 @@ func TestDisconnectProviderManagedKeyTable(t *testing.T) {
 				defer closeRuntime()
 				ctx := context.Background()
 				testassert.NoError(t, r.managedEnvForTest().TrySet(row.envName, row.seed))
-				_, err := r.Reload(ctx, testCaller())
+				_, err := r.Reload(ctx, testCaller(r))
 				testassert.NoError(t, err)
 				drainConnectionEvent(t, r.warnings, sub, "2")
 				before, _, _ := runtimeMutationBaseline(t, r)
 
-				mutation, err := r.DisconnectProvider(ctx, testCaller(), row.providerID)
+				mutation, err := r.DisconnectProvider(ctx, testCaller(r), row.providerID)
 				testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "3", "disconnectProvider = (%v, %+v), want generation 3", err, mutation)
 				drainConnectionEvent(t, r.warnings, sub, "3")
 				testassert.Require(t, envValueForTest(r, row.envName) == "" && !testManaged(r, row.envName), "the managed key survived the disconnect")
@@ -1327,18 +1332,18 @@ func TestConnectProviderOverlappingReadSeesPublishedPair(t *testing.T) {
 	key := connectionKey
 	connectDone := make(chan connectResult, 1)
 	go func() {
-		mutation, err := r.ConnectProvider(ctx, testCaller(), "usablep", &key)
+		mutation, err := r.ConnectProvider(ctx, testCaller(r), "usablep", &key)
 		connectDone <- connectResult{mutation, err}
 	}()
 	probe.awaitWriteStarted(t)
 
-	previous, err := r.GetProvider(ctx, testCaller(), "usablep")
+	previous, err := r.GetProvider(ctx, testCaller(r), "usablep")
 	testassert.Require(t, err == nil && previous.ConfigurationRevision.Generation == "1" && previous.Provider.KeySource != protocol.Managed && !previous.Provider.Connected, "overlapping read = (%v, %+v), want the previous unpublished-key pair without waiting", err, previous.Provider)
 	release()
 
 	connect := <-connectDone
 	testassert.Require(t, connect.err == nil, "connect: %v", connect.err)
-	next, err := r.GetProvider(ctx, testCaller(), "usablep")
+	next, err := r.GetProvider(ctx, testCaller(r), "usablep")
 	testassert.Require(t, err == nil && next.Provider.KeySource == protocol.Managed && next.Provider.Connected && next.ConfigurationRevision.Generation == connect.mutation.ConfigurationRevision.Generation, "%v; next read = source %v connected %v, want the published managed pair; got %v, want %v", err, next.Provider.KeySource, next.Provider.Connected, next.ConfigurationRevision.Generation, connect.mutation.ConfigurationRevision.Generation)
 	{
 		body, _ := json.Marshal(next)
@@ -1358,10 +1363,10 @@ func TestDisconnectProviderOverlappingReadStaysCoherent(t *testing.T) {
 	defer closeRuntime()
 	ctx := context.Background()
 	testassert.NoError(t, r.managedEnvForTest().TrySet("CONNECTION_USABLE_KEY", "managed-secret"))
-	_, err := r.Reload(ctx, testCaller())
+	_, err := r.Reload(ctx, testCaller(r))
 	testassert.NoError(t, err)
 	drainConnectionEvent(t, r.warnings, sub, "2")
-	before, err := r.GetProvider(ctx, testCaller(), "usablep")
+	before, err := r.GetProvider(ctx, testCaller(r), "usablep")
 	testassert.Require(t, err == nil && before.Provider.KeySource == protocol.Managed && before.Provider.Connected, "initial provider = (%v, %+v), want the managed connected state", err, before.Provider)
 	probe := installOwningSyncProbe(t, r.managedEnvForTest().Path())
 	defer probe.restore()
@@ -1375,18 +1380,18 @@ func TestDisconnectProviderOverlappingReadStaysCoherent(t *testing.T) {
 	}
 	disconnectDone := make(chan disconnectResult, 1)
 	go func() {
-		mutation, err := r.DisconnectProvider(ctx, testCaller(), "usablep")
+		mutation, err := r.DisconnectProvider(ctx, testCaller(r), "usablep")
 		disconnectDone <- disconnectResult{mutation, err}
 	}()
 	probe.awaitWriteStarted(t)
 
-	overlapping, err := r.GetProvider(ctx, testCaller(), "usablep")
+	overlapping, err := r.GetProvider(ctx, testCaller(r), "usablep")
 	testassert.Require(t, err == nil && overlapping.Provider.KeySource == protocol.Managed && overlapping.Provider.Connected && overlapping.ConfigurationRevision.Generation == "2", "overlapping read = (%v, %+v), want the previous managed pair without waiting", err, overlapping.Provider)
 	release()
 
 	disconnect := <-disconnectDone
 	testassert.Require(t, disconnect.err == nil, "disconnect: %v", disconnect.err)
-	next, err := r.GetProvider(ctx, testCaller(), "usablep")
+	next, err := r.GetProvider(ctx, testCaller(r), "usablep")
 	testassert.Require(t, err == nil && next.Provider.KeySource == protocol.None && !next.Provider.Connected && next.ConfigurationRevision.Generation == disconnect.mutation.ConfigurationRevision.Generation, "%v; next read = source %v connected %v, want the published removed state; got %v, want %v", err, next.Provider.KeySource, next.Provider.Connected, next.ConfigurationRevision.Generation, disconnect.mutation.ConfigurationRevision.Generation)
 }
 
@@ -1462,19 +1467,19 @@ func TestDisconnectProviderRefusals(t *testing.T) {
 		defer closeRuntime()
 		ctx := context.Background()
 		t.Setenv("CONNECTION_STATIC_KEY", "shell-exported-value")
-		_, err := r.Reload(ctx, testCaller())
+		_, err := r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		drainConnectionEvent(t, r.warnings, sub, "2")
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
 		// A keyless provider is removed, not disconnected: the nearest
 		// forbidden sibling of the successful disconnect.
-		_, err = r.DisconnectProvider(ctx, testCaller(), "keylessp")
+		_, err = r.DisconnectProvider(ctx, testCaller(r), "keylessp")
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, harness.ErrInvalid)
 
 		// An external set key refuses, naming the env variable alone — no
 		// value exists in a Lightcode store, and none is invented.
-		_, err = r.DisconnectProvider(ctx, testCaller(), "staticp")
+		_, err = r.DisconnectProvider(ctx, testCaller(r), "staticp")
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "CONNECTION_STATIC_KEY") && !strings.Contains(err.Error(), "shell-exported-value"), "external disconnect error %q, want the env name without any value", err)
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 	})
@@ -1490,7 +1495,7 @@ func TestDisconnectProviderAbsentUnmanagedSucceeds(t *testing.T) {
 
 		// The env name is set nowhere: the disconnect publishes the ready
 		// next generation through the same path, touching nothing.
-		mutation, err := r.DisconnectProvider(ctx, testCaller(), "staticp")
+		mutation, err := r.DisconnectProvider(ctx, testCaller(r), "staticp")
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2", "absent-key disconnect = (%v, %+v), want generation 2", err, mutation)
 		drainConnectionEvent(t, r.warnings, sub, "2")
 		after, err := os.ReadFile(r.configPathForTest())
@@ -1507,13 +1512,13 @@ func TestDisconnectProviderRepeatStillPublishes(t *testing.T) {
 		testassert.NoError(t, r.managedEnvForTest().TrySet("CONNECTION_USABLE_KEY", "managed-secret"))
 
 		{
-			_, err := r.DisconnectProvider(ctx, testCaller(), "usablep")
+			_, err := r.DisconnectProvider(ctx, testCaller(r), "usablep")
 			testassert.NoError(t, err)
 		}
 		drainConnectionEvent(t, r.warnings, sub, "2")
 		// The second disconnect takes the absent-unmanaged path and STILL
 		// publishes the ready next generation.
-		second, err := r.DisconnectProvider(ctx, testCaller(), "usablep")
+		second, err := r.DisconnectProvider(ctx, testCaller(r), "usablep")
 		testassert.Require(t, err == nil && second.ConfigurationRevision.Generation == "3", "repeat disconnect = (%v, %+v), want generation 3", err, second)
 		drainConnectionEvent(t, r.warnings, sub, "3")
 	})
@@ -1530,7 +1535,7 @@ func TestDisconnectProviderLatestRawTransportChangePublishes(t *testing.T) {
 		defer closeRuntime()
 		ctx := context.Background()
 		testassert.NoError(t, r.managedEnvForTest().TrySet("CONNECTION_USABLE_KEY", "managed-secret"))
-		_, rerr := r.Reload(ctx, testCaller())
+		_, rerr := r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, rerr)
 		drainConnectionEvent(t, r.warnings, sub, "2")
 
@@ -1544,7 +1549,7 @@ func TestDisconnectProviderLatestRawTransportChangePublishes(t *testing.T) {
 		writeAgentDefinitions(t, r.configPathForTest(), connectionAgentsDocument)
 		before, _, _ := runtimeMutationBaseline(t, r)
 
-		mutation, err := r.DisconnectProvider(ctx, testCaller(), "usablep")
+		mutation, err := r.DisconnectProvider(ctx, testCaller(r), "usablep")
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "3", "latest-raw disconnect = (%v, %+v), want generation 3", err, mutation)
 		drainConnectionEvent(t, r.warnings, sub, "3")
 		testassert.Require(t, mutation.Result.BaseUrl == moved && mutation.Result.ApiKeyEnv == "CONNECTION_USABLE_KEY" && !mutation.Result.Connected, "disconnect result = %+v, want the latest raw transport and the disconnected status", mutation.Result)
@@ -1567,7 +1572,7 @@ func TestDisconnectProviderLatestRawExternalRebindRefuses(t *testing.T) {
 		testassert.NoError(t, r.managedEnvForTest().TrySet("CONNECTION_USABLE_KEY", "managed-secret"))
 		reserveEnvKey(t, "CONNECTION_REBOUND_KEY")
 		t.Setenv("CONNECTION_REBOUND_KEY", "external-rebound-value")
-		_, rerr := r.Reload(ctx, testCaller())
+		_, rerr := r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, rerr)
 		drainConnectionEvent(t, r.warnings, sub, "2")
 
@@ -1582,7 +1587,7 @@ func TestDisconnectProviderLatestRawExternalRebindRefuses(t *testing.T) {
 		envBefore, err := os.ReadFile(r.managedEnvForTest().Path())
 		testassert.NoError(t, err)
 
-		_, err = r.DisconnectProvider(ctx, testCaller(), "usablep")
+		_, err = r.DisconnectProvider(ctx, testCaller(r), "usablep")
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		testassert.Require(t, envValueForTest(r, "CONNECTION_USABLE_KEY") != "" && testManaged(r, "CONNECTION_USABLE_KEY"), "a refused rebinding disconnect removed the published binding's key")
 		if envValueForTest(r, "CONNECTION_REBOUND_KEY") != "external-rebound-value" || testManaged(r, "CONNECTION_REBOUND_KEY") {
@@ -1618,7 +1623,7 @@ func TestDisconnectProviderLatestCandidateRemovedRefuses(t *testing.T) {
 		writeAgentDefinitions(t, r.configPathForTest(), connectionAgentsDocument)
 		before, generation, warnRev := runtimeMutationBaseline(t, r)
 
-		_, err = r.DisconnectProvider(ctx, testCaller(), "usablep")
+		_, err = r.DisconnectProvider(ctx, testCaller(r), "usablep")
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, catalog.ErrUnknownProvider)
 		testassert.Require(t, envValueForTest(r, "CONNECTION_USABLE_KEY") != "" && testManaged(r, "CONNECTION_USABLE_KEY"), "a refused disconnect removed the published binding's key")
 		assertDotenvUnchanged(t, r, envBefore, "the refused disconnect")
@@ -1638,7 +1643,7 @@ func TestCreateProviderGeneratedEnvNamePersistsExactKey(t *testing.T) {
 		key := "sk-live-add-1"
 		window := 4096
 		baseURL := "https://new.test/v1"
-		mutation, err := r.AddProvider(ctx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL},
+		mutation, err := r.AddProvider(ctx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key)
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2", "addProvider = (%v, %+v), want generation 2", err, mutation)
 		event := drainConnectionEvent(t, r.warnings, sub, "2")
@@ -1678,7 +1683,7 @@ func TestCreateProviderExplicitEmptyEnvKeylessRefuses(t *testing.T) {
 		key := connectionKey
 		window := 4096
 		baseURL := "https://new.test/v1"
-		_, err = r.AddProvider(ctx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &emptyEnv},
+		_, err = r.AddProvider(ctx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &emptyEnv},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key)
 		// The refusal oracle already pins the owning file, generation,
 		// warnings, and events; the .env silence is this row's own axis.
@@ -1687,7 +1692,7 @@ func TestCreateProviderExplicitEmptyEnvKeylessRefuses(t *testing.T) {
 
 		// Without a supplied key the explicit keyless create stays keyless.
 		{
-			_, err := r.AddProvider(ctx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &emptyEnv},
+			_, err := r.AddProvider(ctx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &emptyEnv},
 				map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, nil)
 			testassert.NoError(t, err)
 		}
@@ -1716,7 +1721,7 @@ func TestCreateProviderExternalBindingWithKeyRefusesBeforeWrites(t *testing.T) {
 		window := 4096
 		baseURL := "https://new.test/v1"
 		shellEnv := "CONNECTION_SHELL_KEY"
-		_, err = r.AddProvider(ctx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &shellEnv},
+		_, err = r.AddProvider(ctx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &shellEnv},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key)
 		// The refusal oracle already pins the owning file, generation,
 		// warnings, and events; the external sibling and the .env silence are
@@ -1841,7 +1846,7 @@ func TestCreateProviderKeySourceTable(t *testing.T) {
 
 				window := 4096
 				baseURL := "https://new.test/v1"
-				mutation, err := r.AddProvider(ctx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &row.envName},
+				mutation, err := r.AddProvider(ctx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &row.envName},
 					map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, row.key)
 				testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2", "key-source create = (%v, %+v), want generation 2", err, mutation)
 				drainConnectionEvent(t, r.warnings, sub, "2")
@@ -1876,7 +1881,7 @@ func TestCreateProviderGeneratedNameSkipsOccupiedNames(t *testing.T) {
 		holderEnv := "LIGHTCODE_CATALOGREF_API_KEY"
 		reserveEnvKey(t, holderEnv)
 		{
-			_, err := r.AddProvider(ctx, testCaller(), "catrefholder",
+			_, err := r.AddProvider(ctx, testCaller(r), "catrefholder",
 				protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &holderEnv},
 				map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, nil)
 			testassert.NoError(t, err)
@@ -1931,7 +1936,7 @@ func TestCreateProviderGeneratedNameSkipsOccupiedNames(t *testing.T) {
 				row.occupy(t)
 
 				key := "sk-live-" + row.id
-				mutation, err := r.AddProvider(ctx, testCaller(), row.id, protocol.ProviderEdit{BaseUrl: &baseURL},
+				mutation, err := r.AddProvider(ctx, testCaller(r), row.id, protocol.ProviderEdit{BaseUrl: &baseURL},
 					map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &key)
 				testassert.NoError(t, err)
 				generation++
@@ -1967,7 +1972,7 @@ func TestCreateProviderInvalidCandidateNoWrites(t *testing.T) {
 		supplied := connectionKey
 		window := 4096
 		baseURL := "https://new.test/v1"
-		_, err = r.AddProvider(ctx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ExtraBody: &reserved},
+		_, err = r.AddProvider(ctx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ExtraBody: &reserved},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &supplied)
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
 		assertDotenvUnchanged(t, r, envBefore, "the refused create")
@@ -1993,7 +1998,7 @@ func TestCreateProviderKeyFailureRestoresExactBytes(t *testing.T) {
 		window := 4096
 		baseURL := "https://new.test/v1"
 		restoreEnv := "CONNECTION_RESTORE_KEY"
-		_, err = r.AddProvider(ctx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
+		_, err = r.AddProvider(ctx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &broken)
 		testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration) && strings.Contains(err.Error(), "persist API key"), "create with a failing key write = %v, want the joined typed failure", err)
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
@@ -2021,7 +2026,7 @@ func TestCreateProviderKeyFailureRestoresPriorAbsence(t *testing.T) {
 		window := 4096
 		baseURL := "https://new.test/v1"
 		restoreEnv := "CONNECTION_RESTORE_KEY"
-		_, err := r.AddProvider(ctx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
+		_, err := r.AddProvider(ctx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &broken)
 		testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration), "create with a failing key write = %v, want the typed failure", err)
 		{
@@ -2062,7 +2067,7 @@ func TestCreateProviderKeyFailureJoinedRestoreError(t *testing.T) {
 		window := 4096
 		baseURL := "https://new.test/v1"
 		restoreEnv := "CONNECTION_RESTORE_KEY"
-		_, err := r.AddProvider(ctx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
+		_, err := r.AddProvider(ctx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
 			map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &broken)
 		testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration), "create with a failing restore = %v, want the typed failure", err)
 		testassert.Require(t, strings.Contains(err.Error(), "persist API key") && strings.Contains(err.Error(), "restore"), "joined failure = %v, want the key failure and the restore failure joined", err)
@@ -2093,7 +2098,7 @@ func TestCreateProviderRestoreDespiteCancellation(t *testing.T) {
 		restoreEnv := "CONNECTION_RESTORE_KEY"
 		done := make(chan error, 1)
 		go func() {
-			_, err := r.AddProvider(cancelCtx, testCaller(), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
+			_, err := r.AddProvider(cancelCtx, testCaller(r), "newp", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &restoreEnv},
 				map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, &broken)
 			done <- err
 		}()
@@ -2128,7 +2133,7 @@ func TestDiscoverCustomProviderPureRead(t *testing.T) {
 		fetches := server.requests()
 
 		headers := map[string]string{"X-Trace": "t1"}
-		candidates, err := r.DiscoverProvider(ctx, testCaller(), protocol.DiscoveryRequest{
+		candidates, err := r.DiscoverProvider(ctx, testCaller(r), protocol.DiscoveryRequest{
 			BaseUrl:   server.URL + "/v1",
 			ApiKeyEnv: "CONNECTION_DISC_REQ_KEY",
 			Headers:   &headers,
@@ -2155,7 +2160,7 @@ func TestDiscoverCustomProviderPureRead(t *testing.T) {
 		// The credential-header refusal fires before any fetch.
 		credHeaders := map[string]string{"Authorization": "Bearer forged"}
 		{
-			_, err := r.DiscoverProvider(ctx, testCaller(), protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", Headers: &credHeaders})
+			_, err := r.DiscoverProvider(ctx, testCaller(r), protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", Headers: &credHeaders})
 			testassert.Require(t, err != nil && errors.Is(err, harness.ErrInvalid), "credential-header discovery = %v, want the invalid refusal", err)
 		}
 		testassert.Equal(t, server.requests(), fetches+1)
@@ -2166,7 +2171,7 @@ func TestDiscoverCustomProviderPureRead(t *testing.T) {
 		// any fetch.
 		server.retarget(func(string) string { return connectionFullDiscovery })
 		t.Setenv("CONNECTION_EMPTY_REQ_KEY", "")
-		emptyAuthCandidates, err := r.DiscoverProvider(ctx, testCaller(), protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_EMPTY_REQ_KEY"})
+		emptyAuthCandidates, err := r.DiscoverProvider(ctx, testCaller(r), protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_EMPTY_REQ_KEY"})
 		testassert.Require(t, err == nil && len(emptyAuthCandidates) == 1 && emptyAuthCandidates[0].Id == "fresh", "set-empty env discovery = (%v, %+v), want the unauthenticated fetch's candidates", err, emptyAuthCandidates)
 		if auths := server.authorizations(); auths[len(auths)-1] != "" {
 			t.Fatalf("set-empty discovery authorization = %q, want the unauthenticated fetch", auths[len(auths)-1])
@@ -2176,7 +2181,7 @@ func TestDiscoverCustomProviderPureRead(t *testing.T) {
 			testassert.Require(t, got == fetches+2, "the set-empty discovery fetched (%d -> %d)", fetches+1, got)
 		}
 		{
-			_, err := r.DiscoverProvider(ctx, testCaller(), protocol.DiscoveryRequest{})
+			_, err := r.DiscoverProvider(ctx, testCaller(r), protocol.DiscoveryRequest{})
 			testassert.Require(t, err != nil && errors.Is(err, harness.ErrInvalid), "empty base URL discovery = %v, want the invalid refusal", err)
 		}
 		testassert.Equal(t, server.requests(), fetches+2)
@@ -2220,7 +2225,7 @@ func TestDiscoverCustomProviderSuppliedKey(t *testing.T) {
 
 		// Pre-save pasted-key discovery with no reference: the supplied
 		// value binds the transient fetch on its own.
-		pastedCandidates, err := r.DiscoverProvider(ctx, testCaller(), protocol.DiscoveryRequest{
+		pastedCandidates, err := r.DiscoverProvider(ctx, testCaller(r), protocol.DiscoveryRequest{
 			BaseUrl: server.URL + "/v1",
 			ApiKey:  ptrTo(pasted),
 		})
@@ -2230,7 +2235,7 @@ func TestDiscoverCustomProviderSuppliedKey(t *testing.T) {
 		// Pre-save pasted-key discovery over an externally owned reference:
 		// the supplied value binds the fetch; the referenced owner's value
 		// is never substituted for it.
-		pastedCandidates, err = r.DiscoverProvider(ctx, testCaller(), protocol.DiscoveryRequest{
+		pastedCandidates, err = r.DiscoverProvider(ctx, testCaller(r), protocol.DiscoveryRequest{
 			BaseUrl:   server.URL + "/v1",
 			ApiKeyEnv: "CONNECTION_SUPPLIED_EXT_KEY",
 			ApiKey:    ptrTo(pasted),
@@ -2246,10 +2251,10 @@ func TestDiscoverCustomProviderSuppliedKey(t *testing.T) {
 			}
 			return connectionEmptyDiscovery
 		})
-		fallbackCandidates, err := r.DiscoverProvider(ctx, testCaller(), protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_SUPPLIED_EXT_KEY"})
+		fallbackCandidates, err := r.DiscoverProvider(ctx, testCaller(r), protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_SUPPLIED_EXT_KEY"})
 		testassert.NoError(t, err)
 		assertCandidates(fallbackCandidates, "ghost")
-		emptySuppliedCandidates, err := r.DiscoverProvider(ctx, testCaller(), protocol.DiscoveryRequest{
+		emptySuppliedCandidates, err := r.DiscoverProvider(ctx, testCaller(r), protocol.DiscoveryRequest{
 			BaseUrl:   server.URL + "/v1",
 			ApiKeyEnv: "CONNECTION_SUPPLIED_EXT_KEY",
 			ApiKey:    ptrTo(""),
@@ -2265,7 +2270,7 @@ func TestDiscoverCustomProviderSuppliedKey(t *testing.T) {
 			}
 			return connectionEmptyDiscovery
 		})
-		unsetCandidates, err := r.DiscoverProvider(ctx, testCaller(), protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_SUPPLIED_UNSET_KEY"})
+		unsetCandidates, err := r.DiscoverProvider(ctx, testCaller(r), protocol.DiscoveryRequest{BaseUrl: server.URL + "/v1", ApiKeyEnv: "CONNECTION_SUPPLIED_UNSET_KEY"})
 		testassert.NoError(t, err)
 		assertCandidates(unsetCandidates, "fresh")
 
@@ -2313,7 +2318,7 @@ func TestDiscoverProviderModelsFiltersUsable(t *testing.T) {
 		defer closeRuntime()
 		ctx := context.Background()
 		t.Setenv("CONNECTION_USABLE_KEY", "usable-key-value")
-		_, err := r.Reload(ctx, testCaller())
+		_, err := r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		drainConnectionEvent(t, r.warnings, sub, "2")
 		_, generation, warnRev := runtimeMutationBaseline(t, r)
@@ -2321,7 +2326,7 @@ func TestDiscoverProviderModelsFiltersUsable(t *testing.T) {
 		attemptBefore := records["usablep"].AttemptedAt
 		fetches := server.requests()
 
-		candidates, err := r.DiscoverProviderModels(ctx, testCaller(), "usablep")
+		candidates, err := r.DiscoverProviderModels(ctx, testCaller(r), "usablep")
 		testassert.NoError(t, err)
 		testassert.Require(t, len(candidates) == 2 && candidates[0].Id == "a" && candidates[1].Id == "b" && !candidates[0].Usable && candidates[1].Usable && candidates[1].Cost != nil && candidates[1].Cost.Input != nil && *candidates[1].Cost.Input == 0.5, "candidates = %+v, want the sorted filtered pair a,b — the already-included usable m excluded; candidate flags = %+v, want windowless a unusable and usable b with its owned cost", candidates, candidates)
 		// The read wrote nothing: no cache write, no attempt marker, no
@@ -2336,7 +2341,7 @@ func TestDiscoverProviderModelsFiltersUsable(t *testing.T) {
 
 		// The typed unknown-provider error and the fetch failure class.
 		{
-			_, err := r.DiscoverProviderModels(ctx, testCaller(), "ghost-provider")
+			_, err := r.DiscoverProviderModels(ctx, testCaller(r), "ghost-provider")
 			testassert.Require(t, errors.Is(err, catalog.ErrUnknownProvider), "unknown provider discovery = %v, want ErrUnknownProvider", err)
 		}
 		server.retarget(func(auth string) string { return connectionEmptyDiscovery }) // the endpoint stops serving models
@@ -2349,7 +2354,7 @@ func TestDiscoverProviderModelsFiltersUsable(t *testing.T) {
 		testassert.NoError(t, rerr)
 		attemptBefore = records["usablep"].AttemptedAt
 		fetches = server.requests()
-		_, err = r.DiscoverProviderModels(ctx, testCaller(), "usablep")
+		_, err = r.DiscoverProviderModels(ctx, testCaller(r), "usablep")
 		testassert.Require(t, err != nil && errors.Is(err, ErrConfiguration), "failed model discovery = %v, want the typed refusal", err)
 		{
 			got := server.requests()
@@ -2365,11 +2370,11 @@ func TestDiscoverProviderModelsFiltersUsable(t *testing.T) {
 		server.retarget(func(auth string) string {
 			return `{"data":[{"id":"m","name":"Included","context_window":4096},{"id":"a","name":"A","context_window":0},{"id":"b","name":"B","context_window":8192,"cost":{"input":0.5}}]}`
 		})
-		copied, err := r.DiscoverProviderModels(ctx, testCaller(), "usablep")
+		copied, err := r.DiscoverProviderModels(ctx, testCaller(r), "usablep")
 		testassert.Require(t, err == nil && len(copied) == 2, "copied candidates = (%+v, %v), want the sorted filtered pair", copied, err)
 		copied[0].Id = "mutated"
 		copied[0].Name = "mutated"
-		reread, err := r.DiscoverProviderModels(ctx, testCaller(), "usablep")
+		reread, err := r.DiscoverProviderModels(ctx, testCaller(r), "usablep")
 		testassert.Require(t, err == nil && len(reread) == 2 && reread[0].Id == "a" && reread[0].Name == "A" && reread[1].Id == "b", "re-read candidates = (%+v, %v), want the immutable fetched pair", reread, err)
 
 		// The skip-all empty result is the non-nil [] shape: every fetched
@@ -2377,7 +2382,7 @@ func TestDiscoverProviderModelsFiltersUsable(t *testing.T) {
 		server.retarget(func(auth string) string {
 			return `{"data":[{"id":"m","name":"Included","context_window":4096}]}`
 		})
-		empty, err := r.DiscoverProviderModels(ctx, testCaller(), "usablep")
+		empty, err := r.DiscoverProviderModels(ctx, testCaller(r), "usablep")
 		testassert.Require(t, err == nil && empty != nil && len(empty) == 0, "skip-all candidates = (%+v, %v), want the non-nil empty list", empty, err)
 	})
 }
@@ -2459,7 +2464,7 @@ func TestProductionConnectThenCommandEnvironment(t *testing.T) {
 		// The provider connects after every plugin scope opened.
 		key := "chain-managed-secret"
 		{
-			_, err := r.ConnectProvider(ctx, testCaller(), "discp", &key)
+			_, err := r.ConnectProvider(ctx, testCaller(r), "discp", &key)
 			testassert.NoError(t, err)
 		}
 
@@ -2491,7 +2496,7 @@ func TestConnectProviderSpecialIDsAndKeyless(t *testing.T) {
 
 		// The keyless usable provider: no credential exists, none is needed,
 		// nothing is written but the ready publication.
-		mutation, err := r.ConnectProvider(ctx, testCaller(), "keylessusable", nil)
+		mutation, err := r.ConnectProvider(ctx, testCaller(r), "keylessusable", nil)
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2", "keyless connect = (%v, %+v), want generation 2", err, mutation)
 		testassert.Require(t, mutation.Result.KeySource == protocol.ProviderKeySource(config.KeySourceKeyless) && mutation.Result.Connected, "keyless provider view = %+v, want connected keyless", mutation.Result)
 		drainConnectionEvent(t, r.warnings, sub, "2")
@@ -2507,17 +2512,17 @@ func TestConnectProviderSpecialIDsAndKeyless(t *testing.T) {
 		writeServiceFile(t, r.configPathForTest(), raw)
 		writeAgentDefinitions(t, r.configPathForTest(), connectionAgentsDocument)
 		{
-			_, err := r.Reload(ctx, testCaller())
+			_, err := r.Reload(ctx, testCaller(r))
 			testassert.NoError(t, err)
 		}
 		drainConnectionEvent(t, r.warnings, sub, "3")
 		dotsBefore, _, _ := runtimeMutationBaseline(t, r)
 		reserveEnvKey(t, "CONNECTION_DOTS_KEY")
 		t.Setenv("CONNECTION_DOTS_KEY", "dots-key-value")
-		_, err = r.Reload(ctx, testCaller())
+		_, err = r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		drainConnectionEvent(t, r.warnings, sub, "4")
-		dotsMutation, err := r.ConnectProvider(ctx, testCaller(), "..", nil)
+		dotsMutation, err := r.ConnectProvider(ctx, testCaller(r), "..", nil)
 		testassert.Require(t, err == nil && dotsMutation.Result.Connected && dotsMutation.Result.Id == "..", "dotdot connect = (%v, %+v), want the connected `..` view", err, dotsMutation)
 		testassert.Equal(t, dotsMutation.ConfigurationRevision.Generation, "5")
 		drainConnectionEvent(t, r.warnings, sub, "5")

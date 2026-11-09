@@ -21,7 +21,7 @@ func TestMissingMetadataProducersReturnPublicNotFoundClass(t *testing.T) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
-		caller := testCaller()
+		caller := testCaller(r)
 		for name, run := range map[string]func() error{
 			"provider read": func() error {
 				_, err := r.GetProvider(ctx, caller, "ghost")
@@ -65,7 +65,7 @@ func TestClassifyProtocolMissingMetadata(t *testing.T) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
-		caller := testCaller()
+		caller := testCaller(r)
 		reserved := map[string]any{"stream": true}
 
 		rows := []struct {

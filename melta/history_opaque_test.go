@@ -20,7 +20,7 @@ func TestHistoryRoundTripsOpaqueNumbers(t *testing.T) {
 		r, e := openProjectionRuntime(t, store)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
-		caller := testCaller()
+		caller := testCaller(r)
 
 		workspace := filepath.Join(e.home, "exact")
 		created, err := r.CreateSession(ctx, caller, workspace, wireSelection("solo"))

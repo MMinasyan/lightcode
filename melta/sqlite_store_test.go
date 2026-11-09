@@ -449,7 +449,7 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 	testassert.NoError(t, err)
 	for _, want := range []string{"2", "3"} {
 		{
-			revision, err := r.Reload(ctx, testCaller())
+			revision, err := r.Reload(ctx, testCaller(r))
 			testassert.Require(t, err == nil && revision.Generation == want, "Reload = (%q, %v), want %s", revision, err, want)
 		}
 	}

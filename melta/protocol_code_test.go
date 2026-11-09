@@ -98,7 +98,7 @@ func TestCodeSnapshotsTargetGroups(t *testing.T) {
 
 		// A valid Session with no recorded groups lists a non-nil empty array
 		// before any capture exists.
-		initial, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(), session)
+		initial, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(r), session)
 		testassert.Require(t, err == nil && initial != nil && len(initial) == 0, "initial group list = (%+v, %v), want a non-nil empty list", initial, err)
 
 		// Admission order is op-z, then op-a: OperationID order is reversed.
@@ -117,7 +117,7 @@ func TestCodeSnapshotsTargetGroups(t *testing.T) {
 		captureCodeMutation(t, codeGroupRoot(r, session, secondEntry), created, created, []byte("new"))
 		testassert.NoError(t, os.MkdirAll(codeGroupRoot(r, session, emptyEntry), 0o700))
 
-		groups, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(), session)
+		groups, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(r), session)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(groups) == 2, "groups = %+v, want exactly the two recorded groups", groups)
 		testassert.Require(t, groups[0].OperationId == "op-z" && groups[1].OperationId == "op-a", "group order = (%q, %q), want admission order (op-z, op-a)", groups[0].OperationId, groups[1].OperationId)
@@ -129,7 +129,7 @@ func TestCodeSnapshotsTargetGroups(t *testing.T) {
 		// the next read.
 		groups[0].OperationId = "mutated"
 		groups[0].Files[0].Path = "mutated"
-		reread, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(), session)
+		reread, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(r), session)
 		testassert.Require(t, err == nil && len(reread) == 2 && reread[0].OperationId == "op-z" && reread[0].Files[0] == (protocol.SnapshotFile{Path: edited, Existed: true}), "re-read groups = (%+v, %v), want the immutable first projection", reread, err)
 	})
 }
@@ -254,7 +254,7 @@ func TestCodeSnapshotsSteeringDerivesOwnGroup(t *testing.T) {
 		captureCodeMutation(t, codeGroupRoot(f.r, session, steered), steeringFile, steeringFile, []byte("s1"))
 
 		awaitRestorableSession(t, f.r, session)
-		groups, err := f.r.ListSessionCodeSnapshots(context.Background(), testCaller(), session)
+		groups, err := f.r.ListSessionCodeSnapshots(context.Background(), testCaller(f.r), session)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(groups) == 2, "groups = %+v, want the predecessor's and the steering head's own groups", groups)
 		byOperation := map[string]protocol.CodeSnapshotGroup{}
@@ -270,14 +270,14 @@ func TestCodeSnapshotsSteeringDerivesOwnGroup(t *testing.T) {
 
 		// Restoring to the steering head's boundary leaves the predecessor's
 		// group untouched; restoring to the predecessor covers both.
-		result, err := f.r.RevertSessionCode(context.Background(), testCaller(), session, "op-steer")
+		result, err := f.r.RevertSessionCode(context.Background(), testCaller(f.r), session, "op-steer")
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.Restored) == 1 && result.Restored[0] == steeringFile, "restored = %v, want only the steering head's file", result.Restored)
 		{
 			data, err := os.ReadFile(admittedFile)
 			testassert.Require(t, err == nil && string(data) == "v1", "admitted-entry file = (%q, %v), want it untouched by the steering head's restore", data, err)
 		}
-		result, err = f.r.RevertSessionCode(context.Background(), testCaller(), session, "op-1")
+		result, err = f.r.RevertSessionCode(context.Background(), testCaller(f.r), session, "op-1")
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.Restored) == 1 && result.Restored[0] == admittedFile, "restored to the predecessor = %v, want the predecessor's file (the consumed steering group already restored)", result.Restored)
 		{
@@ -323,7 +323,7 @@ func TestCodeSnapshotsBoundaryAndRevertOrder(t *testing.T) {
 
 		// The middle Operation owns no recorded snapshots but is a valid
 		// boundary: op-a still rewinds.
-		result, err := f.r.RevertSessionCode(context.Background(), testCaller(), session, "op-m")
+		result, err := f.r.RevertSessionCode(context.Background(), testCaller(f.r), session, "op-m")
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.Restored) == 2 && slices.Contains(result.Restored, edited) && slices.Contains(result.Restored, created), "restored = %v, want the later group's edited and created files", result.Restored)
 		{
@@ -340,7 +340,7 @@ func TestCodeSnapshotsBoundaryAndRevertOrder(t *testing.T) {
 		// preimage v1 first and then op-z's v0. An OperationID-sorted pair
 		// addresses only op-z and skips on the v1 identity mismatch.
 		captureCodeMutation(t, codeGroupRoot(f.r, session, lastEntry), edited, edited, []byte("v2"))
-		result, err = f.r.RevertSessionCode(context.Background(), testCaller(), session, "op-z")
+		result, err = f.r.RevertSessionCode(context.Background(), testCaller(f.r), session, "op-z")
 		testassert.NoError(t, err)
 		{
 			data, err := os.ReadFile(edited)
@@ -351,14 +351,14 @@ func TestCodeSnapshotsBoundaryAndRevertOrder(t *testing.T) {
 		// a valid boundary and no group is opened.
 		f.compactIdle(session, "compact-op")
 		awaitRestorableSession(t, f.r, session)
-		groups, err := f.r.ListSessionCodeSnapshots(context.Background(), testCaller(), session)
+		groups, err := f.r.ListSessionCodeSnapshots(context.Background(), testCaller(f.r), session)
 		testassert.NoError(t, err)
 		for _, group := range groups {
 			testassert.Require(t, group.OperationId != "compact-op", "compact Operation listed a code group: %+v", group)
 		}
 		for _, boundary := range []string{"compact-op", "", "op-missing"} {
 			{
-				_, err := f.r.RevertSessionCode(context.Background(), testCaller(), session, boundary)
+				_, err := f.r.RevertSessionCode(context.Background(), testCaller(f.r), session, boundary)
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "revert boundary %q = %v, want harness.ErrInvalid", boundary, err)
 			}
 		}
@@ -396,7 +396,7 @@ func TestCodeSnapshotsSkipOnIdentityChange(t *testing.T) {
 		testassert.NoError(t, os.Symlink(elsewhere, moved))
 
 		awaitRestorableSession(t, r, session)
-		result, err := r.RevertSessionCode(context.Background(), testCaller(), session, "op-1")
+		result, err := r.RevertSessionCode(context.Background(), testCaller(r), session, "op-1")
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.Restored) == 0 && len(result.Skipped) == 2, "result = %+v, want both files skipped", result)
 		reasons := map[string]string{}
@@ -454,7 +454,7 @@ func TestCodeSnapshotsForkAndChildIndependence(t *testing.T) {
 		captureCodeMutation(t, codeGroupRoot(r, child, childEntry), childFile, childFile, []byte("c1"))
 
 		awaitRestorableSession(t, r, root)
-		result, err := r.RevertSessionCode(context.Background(), testCaller(), root, "op-root")
+		result, err := r.RevertSessionCode(context.Background(), testCaller(r), root, "op-root")
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.Restored) == 1 && result.Restored[0] == rootFile, "root restored = %v, want only the root file", result.Restored)
 		{
@@ -473,7 +473,7 @@ func TestCodeSnapshotsForkAndChildIndependence(t *testing.T) {
 			{forked, forkEntry, "op-fork"},
 			{child, childEntry, "op-child"},
 		} {
-			groups, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(), tc.session)
+			groups, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(r), tc.session)
 			testassert.Require(t, err == nil, "list %s: %v", tc.operation, err)
 			testassert.Require(t, len(groups) == 1 && groups[0].OperationId == tc.operation && groups[0].GroupItemId == projectItemID(tc.session, tc.entry), "%s groups = %+v, want the Session's own group", tc.operation, groups)
 		}
@@ -538,7 +538,7 @@ func TestCodeSnapshotsStateGates(t *testing.T) {
 		captureCodeMutation(t, codeGroupRoot(r, session, runningEntry), file, file, []byte("v1"))
 
 		{
-			_, err := r.RevertSessionCode(context.Background(), testCaller(), session, "op-1")
+			_, err := r.RevertSessionCode(context.Background(), testCaller(r), session, "op-1")
 			testassert.Require(t, errors.Is(err, harness.ErrConflict), "running restore = %v, want harness.ErrConflict", err)
 		}
 		{
@@ -548,7 +548,7 @@ func TestCodeSnapshotsStateGates(t *testing.T) {
 		close(gate)
 		awaitOperation(t, r, session, "op-1", harness.OperationSuccess)
 		awaitRestorableSession(t, r, session)
-		result, err := r.RevertSessionCode(context.Background(), testCaller(), session, "op-1")
+		result, err := r.RevertSessionCode(context.Background(), testCaller(r), session, "op-1")
 		testassert.Require(t, err == nil && len(result.Restored) == 1, "idle restore = (%+v, %v), want the restored file", result, err)
 
 		// A live background child refuses the parent's restore even while the
@@ -569,7 +569,7 @@ func TestCodeSnapshotsStateGates(t *testing.T) {
 			testassert.Require(t, len(children) != 0, "parent background membership is empty after a live child launch")
 		}
 		{
-			_, err := r.RevertSessionCode(context.Background(), testCaller(), parent, "op-parent")
+			_, err := r.RevertSessionCode(context.Background(), testCaller(r), parent, "op-parent")
 			testassert.Require(t, errors.Is(err, harness.ErrConflict), "live-child restore = %v, want harness.ErrConflict", err)
 		}
 		{
@@ -696,7 +696,7 @@ func parkRestore(t *testing.T, r *Melta, sessionID, boundary, fifo string) (*fif
 	t.Helper()
 	outcomes := make(chan restoreOutcome, 1)
 	go func() {
-		result, err := r.RevertSessionCode(context.Background(), testCaller(), sessionID, boundary)
+		result, err := r.RevertSessionCode(context.Background(), testCaller(r), sessionID, boundary)
 		outcomes <- restoreOutcome{result: result, err: err}
 	}()
 	return parkFIFO(t, fifo), outcomes
@@ -748,7 +748,7 @@ func TestCodeRevertCrossGroupSkipLedger(t *testing.T) {
 		// only a shared ledger keeps the older group from restoring.
 		testassert.NoError(t, os.WriteFile(file, []byte("v1"), 0o600))
 
-		result, err := r.RevertSessionCode(context.Background(), testCaller(), session, "op-first")
+		result, err := r.RevertSessionCode(context.Background(), testCaller(r), session, "op-first")
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.Restored) == 0 && len(result.Skipped) == 1 && result.Skipped[0].Path == file, "restored = %v, want no restore after the newer group's skip; skipped = %+v, want exactly one reported skip for %s", result.Restored, result.Skipped, file)
 		data, err := os.ReadFile(file)
@@ -783,7 +783,7 @@ func TestCodeRewindConflictWhileParked(t *testing.T) {
 
 		rewound := make(chan restoreOutcome, 1)
 		go func() {
-			result, err := r.RevertSessionCode(context.Background(), testCaller(), session, "op-first")
+			result, err := r.RevertSessionCode(context.Background(), testCaller(r), session, "op-first")
 			rewound <- restoreOutcome{result: result, err: err}
 		}()
 		var retry restoreOutcome
@@ -831,7 +831,7 @@ func TestDeleteSessionConflictsWithRestoreInterval(t *testing.T) {
 		groupRoot := codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID)
 		fifo := seedFIFOCodeEntry(t, groupRoot, file, "v1")
 		{
-			_, err := r.ArchiveSession(context.Background(), testCaller(), session)
+			_, err := r.ArchiveSession(context.Background(), testCaller(r), session)
 			testassert.NoError(t, err)
 		}
 
@@ -839,7 +839,7 @@ func TestDeleteSessionConflictsWithRestoreInterval(t *testing.T) {
 
 		defer park.flush()
 		{
-			_, err := r.DeleteSession(context.Background(), testCaller(), session)
+			_, err := r.DeleteSession(context.Background(), testCaller(r), session)
 			testassert.Require(t, errors.Is(err, harness.ErrConflict), "delete during a parked restore = %v, want the conflict class", err)
 		}
 		{
@@ -861,7 +861,7 @@ func TestDeleteSessionConflictsWithRestoreInterval(t *testing.T) {
 		testassert.Require(t, parked.err == nil, "parked restore = %v", parked.err)
 		// The interval, not the Session, blocked the deletion.
 		{
-			_, err := r.DeleteSession(context.Background(), testCaller(), session)
+			_, err := r.DeleteSession(context.Background(), testCaller(r), session)
 			testassert.NoError(t, err)
 		}
 		{
@@ -898,13 +898,13 @@ func TestCodeRestoreIntervalKeepsMetadataTransitionsAvailable(t *testing.T) {
 
 		defer park.flush()
 
-		changed, err := r.SetSessionAgentType(context.Background(), testCaller(), session, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
+		changed, err := r.SetSessionAgentType(context.Background(), testCaller(r), session, protocol.SetSessionAgentTypeRequest{AgentSelection: *wireSelection("worker")})
 		testassert.NoError(t, err)
 		testassert.Equal(t, changed.AgentSelection.Definition.DefinitionId, "worker")
-		archived, err := r.ArchiveSession(context.Background(), testCaller(), session)
+		archived, err := r.ArchiveSession(context.Background(), testCaller(r), session)
 		testassert.NoError(t, err)
 		testassert.Equal(t, archived.Lifecycle, protocol.Archived)
-		reopened, err := r.ReopenSession(context.Background(), testCaller(), session)
+		reopened, err := r.ReopenSession(context.Background(), testCaller(r), session)
 		testassert.NoError(t, err)
 		testassert.Require(t, reopened.Lifecycle == protocol.Open && reopened.AgentSelection.Definition.DefinitionId == "worker", "reopened header = %+v, want open with the changed selection", reopened)
 
@@ -1025,9 +1025,9 @@ func TestCodeSnapshotsLegacySessionDataStaysInert(t *testing.T) {
 		testassert.NoError(t, os.WriteFile(file, []byte("canonical-v1"), 0o600))
 		captureCodeMutation(t, codeGroupRoot(r, session, op.Admission.AdmittedEntry.EntryID), file, file, []byte("canonical-v2"))
 		awaitRestorableSession(t, r, session)
-		groups, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(), session)
+		groups, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(r), session)
 		testassert.Require(t, err == nil && len(groups) == 1 && groups[0].OperationId == "op-1", "canonical groups = (%+v, %v), want only the canonical group", groups, err)
-		result, err := r.RevertSessionCode(context.Background(), testCaller(), session, "op-1")
+		result, err := r.RevertSessionCode(context.Background(), testCaller(r), session, "op-1")
 		testassert.Require(t, err == nil && len(result.Restored) == 1 && result.Restored[0] == file, "canonical restore = (%+v, %v), want the canonical file", result, err)
 		{
 			data, err := os.ReadFile(file)
@@ -1042,11 +1042,11 @@ func TestCodeSnapshotsLegacySessionDataStaysInert(t *testing.T) {
 		// Identity boundary: the 8-hex legacy ID never addresses a canonical
 		// target route.
 		{
-			_, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(), legacyID)
+			_, err := r.ListSessionCodeSnapshots(context.Background(), testCaller(r), legacyID)
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "8-hex legacy id into the canonical list route = %v, want harness.ErrInvalid", err)
 		}
 		{
-			_, err := r.RevertSessionCode(context.Background(), testCaller(), legacyID, "op-1")
+			_, err := r.RevertSessionCode(context.Background(), testCaller(r), legacyID, "op-1")
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "8-hex legacy id into the canonical restore route = %v, want harness.ErrInvalid", err)
 		}
 	})
@@ -1114,7 +1114,7 @@ func TestCopiedForkInputNeverBecomesRewindGroup(t *testing.T) {
 		submitConvergedThroughRuntime(t, r, source, "op-2", "boundary", harness.OperationSuccess)
 		awaitIdleSession(t, r, source)
 		boundaryEntry := inputEntryID(t, r, source, "op-2")
-		forked, err := r.ForkSession(ctx, testCaller(), source, protocol.ForkRequest{
+		forked, err := r.ForkSession(ctx, testCaller(r), source, protocol.ForkRequest{
 			OperationId:    "op-fork",
 			BoundaryItemId: projectItemID(source, boundaryEntry),
 			Content:        []protocol.ContentPart{textContentPart(t, "replacement", nil)},
@@ -1140,7 +1140,7 @@ func TestCopiedForkInputNeverBecomesRewindGroup(t *testing.T) {
 		}
 		deadline := time.Now().Add(10 * time.Second)
 		for {
-			_, err = r.RevertSessionCode(ctx, testCaller(), destination, "")
+			_, err = r.RevertSessionCode(ctx, testCaller(r), destination, "")
 			if !errors.Is(err, harness.ErrConflict) || time.Now().After(deadline) {
 				break
 			}
@@ -1166,37 +1166,37 @@ func TestWorkspaceFileReadContainment(t *testing.T) {
 		canonical, err := filepath.EvalSymlinks(target)
 		testassert.NoError(t, err)
 
-		relative, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: filepath.Join("docs", "note.txt")})
+		relative, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: filepath.Join("docs", "note.txt")})
 		testassert.Require(t, err == nil && relative.Content == "hello" && relative.CanonicalPath == canonical && !relative.Truncated, "relative read = (%+v, %v), want the contained canonical view", relative, err)
-		absolute, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: target})
+		absolute, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: target})
 		testassert.Require(t, err == nil && absolute.CanonicalPath == canonical, "absolute read = (%+v, %v), want the same canonical target", absolute, err)
-		cleaned, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: filepath.Join("docs", "..", "docs", "note.txt")})
+		cleaned, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: filepath.Join("docs", "..", "docs", "note.txt")})
 		testassert.Require(t, err == nil && cleaned.Content == "hello", "cleaned read = (%+v, %v), want the contained target", cleaned, err)
 
 		outside := filepath.Join(e.home, "outside.txt")
 		testassert.NoError(t, os.WriteFile(outside, []byte("outside"), 0o600))
 		{
-			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: filepath.Join("..", "outside.txt")})
+			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: filepath.Join("..", "outside.txt")})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "dotdot read = %v, want harness.ErrInvalid", err)
 		}
 		{
-			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: outside})
+			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: outside})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "absolute outside read = %v, want harness.ErrInvalid", err)
 		}
 		testassert.NoError(t, os.Symlink(outside, filepath.Join(workspace, "escape")))
 		{
-			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "escape"})
+			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "escape"})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "outside symlink read = %v, want harness.ErrInvalid", err)
 		}
 		testassert.NoError(t, os.Symlink(target, filepath.Join(workspace, "inside-link")))
-		linked, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "inside-link"})
+		linked, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "inside-link"})
 		testassert.Require(t, err == nil && linked.Content == "hello" && linked.CanonicalPath == canonical, "inside symlink read = (%+v, %v), want the resolved contained target", linked, err)
 		for _, req := range []protocol.ReadFileRequest{
 			{Path: "note.txt"},
 			{Workspace: workspace},
 		} {
 			{
-				_, err := r.ReadWorkspaceFile(context.Background(), testCaller(), req)
+				_, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), req)
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "empty member %+v = %v, want harness.ErrInvalid", req, err)
 			}
 		}
@@ -1217,7 +1217,7 @@ func TestWorkspaceFileReadRefusals(t *testing.T) {
 				testassert.Require(t, err == nil, "write %s: %v", sensitive, err)
 			}
 			{
-				_, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: sensitive})
+				_, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: sensitive})
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "sensitive %q = %v, want harness.ErrInvalid", sensitive, err)
 			}
 		}
@@ -1227,22 +1227,22 @@ func TestWorkspaceFileReadRefusals(t *testing.T) {
 		hardlink := filepath.Join(workspace, "hardlink.txt")
 		testassert.NoError(t, os.Link(original, hardlink))
 		{
-			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "hardlink.txt"})
+			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "hardlink.txt"})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "hardlink read = %v, want harness.ErrInvalid", err)
 		}
 
 		fifo := filepath.Join(workspace, "pipe")
 		testassert.NoError(t, unix.Mkfifo(fifo, 0o600))
 		{
-			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "pipe"})
+			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "pipe"})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "fifo read = %v, want harness.ErrInvalid", err)
 		}
 		{
-			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "."})
+			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "."})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "directory read = %v, want harness.ErrInvalid", err)
 		}
 		{
-			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "missing.txt"})
+			_, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "missing.txt"})
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "missing read = %v, want harness.ErrNotFound", err)
 		}
 	})
@@ -1296,23 +1296,23 @@ func TestWorkspaceFileReadPrefixRule(t *testing.T) {
 		}
 
 		write("binary.bin", []byte{'A', 0xff, 0xfe, 'B', 0x80, 0x80, 'C'})
-		binary, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "binary.bin"})
+		binary, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "binary.bin"})
 		testassert.Require(t, err == nil && binary.Content == "A\uFFFDB\uFFFDC" && !binary.Truncated, "binary view = (%+v, %v), want the maximal invalid-run replacements", binary, err)
 
 		write("exact.txt", bytes.Repeat([]byte("a"), maxViewPrefixBytes))
-		exact, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "exact.txt"})
+		exact, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "exact.txt"})
 		testassert.Require(t, err == nil && !exact.Truncated && len(exact.Content) == maxViewPrefixBytes, "exact view = (%d bytes, truncated %v, err %v), want the untruncated 1 MiB", len(exact.Content), exact.Truncated, err)
 
 		large := append(bytes.Repeat([]byte("a"), maxViewPrefixBytes), []byte("tail")...)
 		write("large.txt", large)
-		view, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "large.txt"})
+		view, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "large.txt"})
 		testassert.Require(t, err == nil && view.Truncated && len(view.Content) == maxViewPrefixBytes && !strings.ContainsRune(view.Content, '\uFFFD'), "large view = (%d bytes, truncated %v, err %v), want exactly the first raw MiB", len(view.Content), view.Truncated, err)
 
 		// Truncation precedes conversion: the cap cuts the three-byte rune
 		// after its first byte, so the dangling run becomes one replacement.
 		midRune := append(bytes.Repeat([]byte("a"), maxViewPrefixBytes-1), []byte("\u20AC extra")...)
 		write("mid-rune.txt", midRune)
-		cut, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "mid-rune.txt"})
+		cut, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "mid-rune.txt"})
 		testassert.Require(t, err == nil && cut.Truncated && cut.Content == strings.Repeat("a", maxViewPrefixBytes-1)+"\uFFFD", "mid-rune view = (%q..., truncated %v, err %v), want the raw cap converted after truncation", cut.Content, cut.Truncated, err)
 
 		// No second converted-length cap: alternating invalid runs convert to
@@ -1320,7 +1320,7 @@ func TestWorkspaceFileReadPrefixRule(t *testing.T) {
 		// the 1 MiB raw prefix; a wire-length cap would cut it back to 1 MiB.
 		pattern := bytes.Repeat([]byte{0xff, 'A'}, maxViewPrefixBytes/2)
 		write("invalid.bin", append(pattern, 0x00))
-		expanded, err := r.ReadWorkspaceFile(context.Background(), testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "invalid.bin"})
+		expanded, err := r.ReadWorkspaceFile(context.Background(), testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "invalid.bin"})
 		testassert.Require(t, err == nil && expanded.Truncated && expanded.Content == strings.Repeat("\uFFFDA", maxViewPrefixBytes/2), "expanded view = (%d bytes, truncated %v, err %v), want 2 MiB of converted raw prefix without a wire cap", len(expanded.Content), expanded.Truncated, err)
 	})
 }
@@ -1338,15 +1338,15 @@ func TestCodeProducersClosedOwner(t *testing.T) {
 		sessionID := "0123456789abcdef0123456789abcdef"
 		workspace := filepath.Join(e.home, "closed-ws")
 		{
-			_, err := r.ListSessionCodeSnapshots(ctx, testCaller(), sessionID)
+			_, err := r.ListSessionCodeSnapshots(ctx, testCaller(r), sessionID)
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed list = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.RevertSessionCode(ctx, testCaller(), sessionID, "op")
+			_, err := r.RevertSessionCode(ctx, testCaller(r), sessionID, "op")
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed revert = %v, want ErrClosed", err)
 		}
 		{
-			_, err := r.ReadWorkspaceFile(ctx, testCaller(), protocol.ReadFileRequest{Workspace: workspace, Path: "x"})
+			_, err := r.ReadWorkspaceFile(ctx, testCaller(r), protocol.ReadFileRequest{Workspace: workspace, Path: "x"})
 			testassert.Require(t, errors.Is(err, ErrClosed), "closed viewer = %v, want ErrClosed", err)
 		}
 	})
@@ -1610,7 +1610,7 @@ func TestExecutionCleanupReleasesIntervalLast(t *testing.T) {
 		// The token is still held through the blocked cleanup and the not-yet-
 		// closed scopes: a restore conflicts before any directory work.
 		{
-			_, err := r.RevertSessionCode(context.Background(), testCaller(), session, "op-1")
+			_, err := r.RevertSessionCode(context.Background(), testCaller(r), session, "op-1")
 			testassert.Require(t, errors.Is(err, harness.ErrConflict), "restore during the blocked cleanup = %v, want the conflict class", err)
 		}
 		assertRegistryState(t, r.artifacts, sessionArtifactDir(r.dataDir, session), 1, 1, true)
@@ -1618,7 +1618,7 @@ func TestExecutionCleanupReleasesIntervalLast(t *testing.T) {
 		releaseCleanup() // the cleanup completes; the scoped closes and the release follow
 		awaitRestorableSession(t, r, session)
 		awaitNoRegistryEntries(t, r, "the settled cleanup")
-		result, err := r.RevertSessionCode(context.Background(), testCaller(), session, "op-1")
+		result, err := r.RevertSessionCode(context.Background(), testCaller(r), session, "op-1")
 		testassert.Require(t, err == nil && result.Restored != nil, "restore after the cleanup = (%+v, %v), want the admitted traversal", result, err)
 	})
 }
@@ -1645,7 +1645,7 @@ func TestRestoreIntervalCancellationAndShutdownOutcomes(t *testing.T) {
 		canceledCtx, cancelCaller := context.WithCancel(context.Background())
 		cancelCaller()
 		{
-			_, err := r.RevertSessionCode(canceledCtx, testCaller(), session, "op-1")
+			_, err := r.RevertSessionCode(canceledCtx, testCaller(r), session, "op-1")
 			testassert.Require(t, errors.Is(err, context.Canceled), "canceled restore = %v, want the caller's cancellation", err)
 		}
 		assertRegistryState(t, r.artifacts, sessionArtifactDir(r.dataDir, session), 0, 0, false)

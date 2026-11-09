@@ -337,7 +337,7 @@ func TestProjectionOperationActiveAndTerminal(t *testing.T) {
 		e.server.setHold(gate)
 		submitThroughRuntime(t, r, interruptedSession, "op-2", "again")
 		awaitModelArrival(t, e)
-		testassert.NoError(t, r.InterruptSession(context.Background(), testCaller(), interruptedSession))
+		testassert.NoError(t, r.InterruptSession(context.Background(), testCaller(r), interruptedSession))
 		interrupted := projectOperation(awaitOperation(t, r, interruptedSession, "op-2", harness.OperationInterruption))
 		testassert.Require(t, interrupted.Status == protocol.OperationStatusInterruption && interrupted.SettledAt != nil && interrupted.Detail != nil && *interrupted.Detail != "", "interrupted projection = %+v, want interruption with a required detail", interrupted)
 	})
@@ -366,18 +366,18 @@ func TestProjectionListFilters(t *testing.T) {
 		}
 		for name, params := range invalid {
 			{
-				_, err := r.ListSessions(context.Background(), testCaller(), params)
+				_, err := r.ListSessions(context.Background(), testCaller(r), params)
 				testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s: listSessions = %v, want harness.ErrInvalid", name, err)
 			}
 		}
 
-		openList, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws1, Lifecycle: "open"})
+		openList, err := r.ListSessions(context.Background(), testCaller(r), protocol.ListSessionsParams{Workspace: ws1, Lifecycle: "open"})
 		testassert.NoError(t, err)
 		testassert.Require(t, len(openList) == 1 && openList[0].SessionId == open1, "open list = %+v, want exactly %s", openList, open1)
-		archivedList, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws2, Lifecycle: "archived"})
+		archivedList, err := r.ListSessions(context.Background(), testCaller(r), protocol.ListSessionsParams{Workspace: ws2, Lifecycle: "archived"})
 		testassert.NoError(t, err)
 		testassert.Require(t, len(archivedList) == 1 && archivedList[0].SessionId == archived && archivedList[0].Lifecycle == protocol.Archived && archivedList[0].ArchivedAt != nil, "archived list = %+v, want exactly the archived %s", archivedList, archived)
-		noMatch, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws2, Lifecycle: "open"})
+		noMatch, err := r.ListSessions(context.Background(), testCaller(r), protocol.ListSessionsParams{Workspace: ws2, Lifecycle: "open"})
 		testassert.NoError(t, err)
 		testassert.Require(t, len(noMatch) == 0, "no-match list = %+v, want empty", noMatch)
 
@@ -386,7 +386,7 @@ func TestProjectionListFilters(t *testing.T) {
 		testassert.NoError(t, err)
 		relative, err := filepath.Rel(cwd, ws1)
 		testassert.NoError(t, err)
-		relativeList, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: relative, Lifecycle: "open"})
+		relativeList, err := r.ListSessions(context.Background(), testCaller(r), protocol.ListSessionsParams{Workspace: relative, Lifecycle: "open"})
 		testassert.NoError(t, err)
 		testassert.Require(t, len(relativeList) == 1 && relativeList[0].SessionId == open1 && relativeList[0].Workspace == ws1, "relative-root list = %+v, want exactly the normalized %s row", relativeList, ws1)
 	})
@@ -412,11 +412,11 @@ func TestProjectionListAndReadsAroundUnavailableSessions(t *testing.T) {
 		})
 		testassert.NoError(t, err)
 		{
-			_, err := r.DeleteSession(context.Background(), testCaller(), deleted)
+			_, err := r.DeleteSession(context.Background(), testCaller(r), deleted)
 			testassert.NoError(t, err)
 		}
 
-		list, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
+		list, err := r.ListSessions(context.Background(), testCaller(r), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
 		testassert.NoError(t, err)
 		testassert.Require(t, len(list) == 1 && list[0].SessionId == valid, "list = %+v, want exactly the valid %s", list, valid)
 
@@ -439,7 +439,7 @@ func TestProjectionWorkspaceNavigation(t *testing.T) {
 		defer closeProjectionRuntime(r)
 		// The empty navigation result is the non-nil [] shape before any
 		// Session exists.
-		initial, err := r.ListWorkspaces(context.Background(), testCaller())
+		initial, err := r.ListWorkspaces(context.Background(), testCaller(r))
 		testassert.Require(t, err == nil && initial != nil && len(initial) == 0, "initial workspaces = (%+v, %v), want the non-nil empty list", initial, err)
 		wsA := filepath.Join(e.home, "alpha")
 		wsB := filepath.Join(e.home, "beta")
@@ -447,7 +447,7 @@ func TestProjectionWorkspaceNavigation(t *testing.T) {
 		launchChildThroughRuntime(t, r, root, "child-op-1")
 		projectionSession(t, r, wsB, "solo")
 
-		workspaces, err := r.ListWorkspaces(context.Background(), testCaller())
+		workspaces, err := r.ListWorkspaces(context.Background(), testCaller(r))
 		testassert.NoError(t, err)
 		want := []protocol.Workspace{
 			{Root: wsA, DisplayName: filepath.Base(wsA)},
@@ -476,13 +476,13 @@ func TestProjectionCallerCopyOwnership(t *testing.T) {
 		header.SessionRevision.DurableRevision = "0"
 		header.CreatedAt = time.Time{}
 
-		list, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
+		list, err := r.ListSessions(context.Background(), testCaller(r), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
 		testassert.NoError(t, err)
 		wantList := append([]protocol.Session(nil), list...)
 		list[0].SessionId = "mutated"
 		list[0].SessionRevision.LocalRevision = "0"
 
-		workspaces, err := r.ListWorkspaces(context.Background(), testCaller())
+		workspaces, err := r.ListWorkspaces(context.Background(), testCaller(r))
 		testassert.NoError(t, err)
 		wantWorkspaces := append([]protocol.Workspace(nil), workspaces...)
 		if len(workspaces) == 1 {
@@ -491,10 +491,10 @@ func TestProjectionCallerCopyOwnership(t *testing.T) {
 
 		reread := projectSession(headerThroughRuntime(t, r, session), r.instance)
 		testassert.Require(t, reflect.DeepEqual(reread, wantHeader), "re-read header = %+v, want %+v", reread, wantHeader)
-		relisted, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
+		relisted, err := r.ListSessions(context.Background(), testCaller(r), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "open"})
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(relisted, wantList), "re-read list = %+v, want the immutable pre-mutation %+v", relisted, wantList)
-		rews, err := r.ListWorkspaces(context.Background(), testCaller())
+		rews, err := r.ListWorkspaces(context.Background(), testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(rews, wantWorkspaces), "re-read workspaces = %+v, want the immutable pre-mutation %+v", rews, wantWorkspaces)
 	})
@@ -532,7 +532,7 @@ func TestProjectionConcurrentReadDelete(t *testing.T) {
 		defer release()
 		deleteDone := make(chan error, 1)
 		go func() {
-			_, err := r.DeleteSession(context.Background(), testCaller(), session)
+			_, err := r.DeleteSession(context.Background(), testCaller(r), session)
 			deleteDone <- err
 		}()
 		select {
@@ -596,10 +596,10 @@ func TestProjectionClosedAndCanceledCallers(t *testing.T) {
 			return headerErrorThroughRuntime(context.Background(), r, "0123456789abcdef0123456789abcdef")
 		},
 		func() error {
-			_, err := r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: "/tmp/x", Lifecycle: "open"})
+			_, err := r.ListSessions(context.Background(), testCaller(r), protocol.ListSessionsParams{Workspace: "/tmp/x", Lifecycle: "open"})
 			return err
 		},
-		func() error { _, err := r.ListWorkspaces(context.Background(), testCaller()); return err },
+		func() error { _, err := r.ListWorkspaces(context.Background(), testCaller(r)); return err },
 	}
 	for i, call := range closed {
 		{
@@ -617,10 +617,10 @@ func TestProjectionClosedAndCanceledCallers(t *testing.T) {
 			return headerErrorThroughRuntime(canceled, r2, "0123456789abcdef0123456789abcdef")
 		},
 		func() error {
-			_, err := r2.ListSessions(canceled, testCaller(), protocol.ListSessionsParams{Workspace: "/tmp/x", Lifecycle: "open"})
+			_, err := r2.ListSessions(canceled, testCaller(r), protocol.ListSessionsParams{Workspace: "/tmp/x", Lifecycle: "open"})
 			return err
 		},
-		func() error { _, err := r2.ListWorkspaces(canceled, testCaller()); return err },
+		func() error { _, err := r2.ListWorkspaces(canceled, testCaller(r)); return err },
 	}
 	for i, call := range canceledCalls {
 		{
@@ -712,7 +712,7 @@ func TestProjectionCostEstimatesFromCapturedPricing(t *testing.T) {
 		const want = (6*1.5 + 4*0.5 + 2*3) / 1e6
 
 		empty := e.session("solo")
-		hydration, err := e.r.GetHydration(ctx, testCaller(), empty)
+		hydration, err := e.r.GetHydration(ctx, testCaller(e.r), empty)
 		testassert.NoError(t, err)
 		testassert.Require(t, hydration.Usage.Totals.EstimatedCostUsd != nil && *hydration.Usage.Totals.EstimatedCostUsd == 0, "no-producer hydration estimate = %+v, want the known zero", hydration.Usage.Totals.EstimatedCostUsd)
 
@@ -723,7 +723,7 @@ func TestProjectionCostEstimatesFromCapturedPricing(t *testing.T) {
 		priced := e.session("solo")
 		e.admit(priced, "op-1", "one")
 		e.awaitTerminal(priced, "op-1", harness.OperationSuccess)
-		hydration, err = e.r.GetHydration(ctx, testCaller(), priced)
+		hydration, err = e.r.GetHydration(ctx, testCaller(e.r), priced)
 		testassert.NoError(t, err)
 		testassert.Require(t, hydration.Usage.Totals.EstimatedCostUsd != nil && math.Abs(*hydration.Usage.Totals.EstimatedCostUsd-want) < 1e-12, "priced hydration estimate = %+v, want %v", hydration.Usage.Totals.EstimatedCostUsd, want)
 		view, err := e.sessionView(ctx, priced)
@@ -742,7 +742,7 @@ func TestProjectionCostEstimatesFromCapturedPricing(t *testing.T) {
 		})
 		e.admit(priced, "op-2", "two")
 		e.awaitTerminal(priced, "op-2", harness.OperationSuccess)
-		hydration, err = e.r.GetHydration(ctx, testCaller(), priced)
+		hydration, err = e.r.GetHydration(ctx, testCaller(e.r), priced)
 		testassert.NoError(t, err)
 		testassert.Require(t, hydration.Usage.Totals.EstimatedCostUsd == nil, "contaminated Session estimate = %+v, want absent", hydration.Usage.Totals.EstimatedCostUsd)
 		view, err = e.sessionView(ctx, priced)
@@ -842,7 +842,7 @@ func TestProjectionListCandidateDeletionDuringScan(t *testing.T) {
 		var list []protocol.Session
 		go func() {
 			var err error
-			list, err = r.ListSessions(context.Background(), testCaller(), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "archived"})
+			list, err = r.ListSessions(context.Background(), testCaller(r), protocol.ListSessionsParams{Workspace: ws, Lifecycle: "archived"})
 			listDone <- err
 		}()
 		select {
@@ -853,7 +853,7 @@ func TestProjectionListCandidateDeletionDuringScan(t *testing.T) {
 		// While the survivor's read is parked, the already-copied victim is
 		// deleted: the scan must observe it as absent, not fail.
 		{
-			_, err := r.DeleteSession(context.Background(), testCaller(), victim)
+			_, err := r.DeleteSession(context.Background(), testCaller(r), victim)
 			testassert.NoError(t, err)
 		}
 		gated.releaseGate()

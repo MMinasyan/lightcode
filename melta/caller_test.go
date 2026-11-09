@@ -69,11 +69,11 @@ func TestCallerScopeDeniesBeforePublish(t *testing.T) {
 		sessionA := projectionSession(t, r, workspaceA, "solo").Identity.SessionID
 		sessionB := projectionSession(t, r, workspaceB, "solo").Identity.SessionID
 
-		sessionCaller, err := newCaller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeSession, SessionID: sessionA}})
+		sessionCaller, err := r.Caller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeSession, SessionID: sessionA}})
 		testassert.NoError(t, err)
-		workspaceCaller, err := newCaller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeWorkspace, Workspace: workspaceA}})
+		workspaceCaller, err := r.Caller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeWorkspace, Workspace: workspaceA}})
 		testassert.NoError(t, err)
-		otherWorkspaceCaller, err := newCaller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeWorkspace, Workspace: workspaceB}})
+		otherWorkspaceCaller, err := r.Caller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeWorkspace, Workspace: workspaceB}})
 		testassert.NoError(t, err)
 
 		for name, row := range map[string]struct {
@@ -133,7 +133,7 @@ func TestProducerScopeAuthority(t *testing.T) {
 		sessionB := projectionSession(t, r, workspaceB, "solo").Identity.SessionID
 		archivedID := projectionSession(t, r, workspaceA, "solo").Identity.SessionID
 		{
-			_, err := r.ArchiveSession(ctx, testCaller(), archivedID)
+			_, err := r.ArchiveSession(ctx, testCaller(r), archivedID)
 			testassert.NoError(t, err)
 		}
 		testassert.NoError(t, os.MkdirAll(workspaceA, 0o700))
@@ -236,12 +236,12 @@ func TestProducerScopeAuthority(t *testing.T) {
 			}},
 		}
 
-		workspaceCaller, err := newCaller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeWorkspace, Workspace: workspaceA}})
+		workspaceCaller, err := r.Caller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeWorkspace, Workspace: workspaceA}})
 		testassert.NoError(t, err)
-		otherWorkspaceCaller, err := newCaller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeWorkspace, Workspace: workspaceB}})
+		otherWorkspaceCaller, err := r.Caller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeWorkspace, Workspace: workspaceB}})
 		testassert.NoError(t, err)
 		sessionCaller := func(id string) Caller {
-			c, err := newCaller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeSession, SessionID: id}})
+			c, err := r.Caller(CallerContext{Origin: harness.InputOriginUser, Scope: CallerScope{Kind: CallerScopeSession, SessionID: id}})
 			testassert.NoError(t, err)
 			return c
 		}
@@ -290,7 +290,7 @@ func TestProducerScopeAuthority(t *testing.T) {
 					c       Caller
 					allowed bool
 				}{
-					{"harness", testCaller(), true},
+					{"harness", testCaller(r), true},
 					{"workspace", workspaceCaller, item.target.Kind == CallerScopeWorkspace && item.target.Workspace == workspaceA || item.target.Kind == CallerScopeSession && workspaceOf[item.target.SessionID] == workspaceA},
 					{"other workspace", otherWorkspaceCaller, item.target.Kind == CallerScopeWorkspace && item.target.Workspace == workspaceB || item.target.Kind == CallerScopeSession && workspaceOf[item.target.SessionID] == workspaceB},
 					{"matching session", sessionCaller(matchingSession), item.target.Kind == CallerScopeSession},
@@ -326,7 +326,7 @@ func TestPluginCallerProvenanceCrossesTheProducer(t *testing.T) {
 		r, e := openProjectionRuntime(t, store)
 		defer closeProjectionRuntime(r)
 		sessionID := projectionSession(t, r, filepath.Join(e.home, "plugin-provenance"), "solo").Identity.SessionID
-		pluginCaller, err := newCaller(CallerContext{Origin: harness.InputOriginPlugin, ExtensionID: "calling.extension", Scope: CallerScope{Kind: CallerScopeHarness}})
+		pluginCaller, err := r.Caller(CallerContext{Origin: harness.InputOriginPlugin, ExtensionID: "calling.extension", Scope: CallerScope{Kind: CallerScopeHarness}})
 		testassert.NoError(t, err)
 		gate := make(chan struct{})
 		e.server.setHold(gate)
@@ -343,7 +343,7 @@ func TestPluginCallerProvenanceCrossesTheProducer(t *testing.T) {
 			testassert.Require(t, result.Disposition == protocol.SubmitResultDispositionSteering, "buffered submit = %s, want steering", result.Disposition)
 		}
 		{
-			hydration, err := r.GetHydration(ctx, testCaller(), sessionID)
+			hydration, err := r.GetHydration(ctx, testCaller(r), sessionID)
 			testassert.NoError(t, err)
 			testassert.Require(t, len(hydration.Pending.Steering) == 1 && hydration.Pending.Steering[0].ExtensionId != nil && *hydration.Pending.Steering[0].ExtensionId == "calling.extension", "pending steering = %+v, want the plugin extension", hydration.Pending.Steering)
 		}
@@ -356,7 +356,7 @@ func TestPluginCallerProvenanceCrossesTheProducer(t *testing.T) {
 		fact := commandInputFact(t, view, "op-plugin")
 		testassert.Require(t, fact.Input.Origin == harness.InputOriginPlugin && fact.Input.ExtensionID == "calling.extension", "committed input = %+v, want plugin/calling.extension", fact.Input)
 		{
-			hydration, err := r.GetHydration(ctx, testCaller(), sessionID)
+			hydration, err := r.GetHydration(ctx, testCaller(r), sessionID)
 			testassert.NoError(t, err)
 			var item protocol.InputItem
 			found := false
@@ -400,6 +400,11 @@ func TestCallerIsBoundToItsIssuingOwner(t *testing.T) {
 		}
 		if _, err := first.GetConfiguration(ctx, Caller{}); !errors.Is(err, ErrDenied) {
 			t.Fatalf("zero Caller = %v, want ErrDenied", err)
+		}
+		unbound, err := newCaller(CallerContext{Origin: harness.InputOriginUser, Scope: harnessScope})
+		testassert.NoError(t, err)
+		if _, err := first.GetConfiguration(ctx, unbound); !errors.Is(err, ErrDenied) {
+			t.Fatalf("unbound Caller = %v, want ErrDenied", err)
 		}
 		if _, err := first.GetConfiguration(ctx, issuedByFirst); err != nil {
 			t.Fatalf("own Caller = %v, want the producer reached", err)

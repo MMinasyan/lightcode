@@ -105,9 +105,9 @@ func newCaller(grant CallerContext) (Caller, error) {
 
 // authorize binds a producer target to this owner and its caller grant. A
 // caller issued by a different owner, or the zero Caller, is denied before any
-// target read; an unbound caller exists only for in-package fixtures.
+// target read.
 func (r *Melta) authorize(c Caller, ctx context.Context, h *harness.Harness, target CallerScope) error {
-	if c.owner != nil && c.owner != r {
+	if c.owner != r {
 		return fmt.Errorf("caller was not issued by this owner: %w", ErrDenied)
 	}
 	return c.authorize(ctx, h, target)

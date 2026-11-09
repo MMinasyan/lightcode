@@ -138,5 +138,5 @@ func (s *environmentCredentials) SubprocessEnv(ctx context.Context, excluded []s
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return s.env.SubprocessEnv(excluded), nil
+	return s.env.SubprocessEnv(excluded)
 }

@@ -42,7 +42,7 @@ func TestUpdateSettingsBaselineSectionsRequireObjects(t *testing.T) {
 					case "compaction":
 						settings.Compaction = wrong.raw
 					}
-					_, err := r.UpdateSettings(ctx, testCaller(), protocol.UpdateSettingsRequest{Settings: &settings})
+					_, err := r.UpdateSettings(ctx, testCaller(r), protocol.UpdateSettingsRequest{Settings: &settings})
 					testassert.Require(t, errors.Is(err, harness.ErrInvalid), "%s = %v, want the shared invalid class", member, err)
 					testassert.Equal(t, r.config.current().generation, generation)
 				})

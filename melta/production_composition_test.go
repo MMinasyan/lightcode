@@ -377,7 +377,7 @@ func TestProductionCrossBoundaryComposition(t *testing.T) {
 		// 2. The reload publishes a changed prompt while the operation runs.
 		writeAgentDefinitions(t, configPath, chainAgentsDocument("reloaded body"))
 		{
-			revision, err := r.Reload(ctx, testCaller())
+			revision, err := r.Reload(ctx, testCaller(r))
 			testassert.Require(t, err == nil && revision.Generation == "2", "Reload = (%q, %v), want 2", revision, err)
 		}
 

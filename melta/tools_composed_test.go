@@ -55,17 +55,17 @@ func TestComposedToolsSettingsPublication(t *testing.T) {
 	writeToolsConfig(t, e.configPath, toolsComposedDocument)
 	r, err := Open(ctx, e.options())
 	testassert.NoError(t, err)
-	if rev, err := r.Reload(ctx, testCaller()); err != nil || rev.Generation != "2" {
+	if rev, err := r.Reload(ctx, testCaller(r)); err != nil || rev.Generation != "2" {
 		_ = r.Close(ctx)
 		t.Fatalf("first Reload = (%q, %v), want revision 2", rev, err)
 	}
 	writeToolsConfig(t, e.configPath, toolsComposedInvalidDocument)
-	if _, err := r.Reload(ctx, testCaller()); err == nil || !errors.Is(err, ErrConfiguration) {
+	if _, err := r.Reload(ctx, testCaller(r)); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with a nonpositive consumed limit = %v, want a complete publication failure", err)
 	}
 	writeToolsConfig(t, e.configPath, toolsComposedNullDocument)
-	if _, err := r.Reload(ctx, testCaller()); err == nil || !errors.Is(err, ErrConfiguration) {
+	if _, err := r.Reload(ctx, testCaller(r)); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with a null tools section = %v, want the publisher's non-object rejection", err)
 	}
@@ -78,7 +78,7 @@ func TestComposedToolsSettingsPublication(t *testing.T) {
 		t.Fatalf("config file after the null tools rejection = %q (%v), want the unchanged null fixture", data, err)
 	}
 	writeToolsConfig(t, e.configPath, toolsComposedDocument)
-	rev, err := r.Reload(ctx, testCaller())
+	rev, err := r.Reload(ctx, testCaller(r))
 	if err != nil || rev.Generation != "3" {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload after the failures = (%q, %v), want generation 3: failed publications published nothing", rev, err)

@@ -81,7 +81,7 @@ func TestHydrationPendingDuringParkedQueuedDelivery(t *testing.T) {
 		parked := newDeliveryParkStore(store)
 		r, e := openProjectionRuntime(t, parked)
 		defer closeProjectionRuntime(r)
-		caller := testCaller()
+		caller := testCaller(r)
 
 		gate := make(chan struct{})
 		e.server.setHold(gate)

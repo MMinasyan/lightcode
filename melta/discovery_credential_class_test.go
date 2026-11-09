@@ -42,6 +42,6 @@ func TestDiscoverProviderCredentialCaptureUsesConfigurationClass(t *testing.T) {
 	owner, err := Open(context.Background(), options)
 	testassert.NoError(t, err)
 	defer func() { _ = owner.Close(context.Background()) }()
-	_, err = owner.DiscoverProvider(context.Background(), testCaller(), protocol.DiscoveryRequest{BaseUrl: "https://discover.test/v1", ApiKeyEnv: "DISCOVERY_KEY"})
+	_, err = owner.DiscoverProvider(context.Background(), testCaller(owner), protocol.DiscoveryRequest{BaseUrl: "https://discover.test/v1", ApiKeyEnv: "DISCOVERY_KEY"})
 	testassert.Require(t, errors.Is(err, ErrConfiguration), "discovery capture = %v, want ErrConfiguration", err)
 }

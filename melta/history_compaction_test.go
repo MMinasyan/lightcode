@@ -30,7 +30,7 @@ func TestHistoryCompactionRetainsOldCursor(t *testing.T) {
 		r, _ := openProjectionRuntime(t, store)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
-		caller := testCaller()
+		caller := testCaller(r)
 		get := func(cursor *string) (protocol.HistoryPage, error) {
 			return r.GetHistory(ctx, caller, session, cursor)
 		}

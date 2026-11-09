@@ -3,8 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MMinasyan/lightcode/internal/testassert"
 )
@@ -19,6 +21,17 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 
 	newMgr := func() *ManagedEnv {
 		return NewManagedEnv(envPath)
+	}
+	trySetForTest := func(m *ManagedEnv, key, value string) {
+		for {
+			err := m.TrySet(key, value)
+			if err != nil && strings.Contains(err.Error(), "lock is busy") {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			testassert.Check(t, err == nil, "TrySet %s: %v", key, err)
+			return
+		}
 	}
 
 	keys := []string{"LIGHTCODE_TEST_A", "LIGHTCODE_TEST_B", "LIGHTCODE_TEST_C"}
@@ -36,10 +49,7 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 		key := k
 		go func() {
 			defer wg.Done()
-			{
-				err := newMgr().Set(key, "v-"+key)
-				testassert.Check(t, err == nil, "Set %s: %v", key, err)
-			}
+			trySetForTest(newMgr(), key, "v-"+key)
 		}()
 	}
 	wg.Wait()
@@ -55,7 +65,7 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 
 	// A file-owned key is removed.
 	remover := newMgr()
-	testassert.NoError(t, remover.Remove(keys[0]))
+	testassert.NoError(t, remover.TryRemove(keys[0]))
 	present, _, _ = ReadDotEnvKeys(envPath)
 	{
 		_, ok := present[keys[0]]
@@ -64,7 +74,7 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 
 	// An absent removal is a no-op success.
 	before, _, _ := ReadDotEnvKeys(envPath)
-	testassert.NoError(t, newMgr().Remove("LIGHTCODE_TEST_ABSENT"))
+	testassert.NoError(t, newMgr().TryRemove("LIGHTCODE_TEST_ABSENT"))
 	after, _, _ := ReadDotEnvKeys(envPath)
 	testassert.Require(t, len(before) == len(after), "absent removal changed the file: %v -> %v", before, after)
 }

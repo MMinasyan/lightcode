@@ -1291,7 +1291,7 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 		models := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
 
 		// The create: the projected result is the new provider view.
-		mutation, err := r.AddProvider(ctx, testCaller(), "newp",
+		mutation, err := r.AddProvider(ctx, testCaller(r), "newp",
 			protocol.ProviderEdit{BaseUrl: ptrTo("https://new.test/v1")}, models, nil)
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2", "addProvider = (%v, %+v), want generation 2", err, mutation.ConfigurationRevision)
 		testassert.Require(t, mutation.Result.Id == "newp" && !mutation.Result.Builtin && len(mutation.Result.Models) == 1 && mutation.Result.Models[0].Source == protocol.ModelSource("user"), "created result = %+v, want the newp provider view with its user model", mutation.Result)
@@ -1299,28 +1299,28 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 
 		// The patch: the result projects the returned candidate.
 		name := "Patched"
-		mutation, err = r.UpdateProvider(ctx, testCaller(), "prov", protocol.ProviderEdit{Name: &name})
+		mutation, err = r.UpdateProvider(ctx, testCaller(r), "prov", protocol.ProviderEdit{Name: &name})
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "3" && mutation.Result.Name == "Patched", "updateProvider = (%v, %+v), want the patched view at generation 3", err, mutation)
 		drainMutationEventWithWarning(t, sub, "3", r.warnings)
 
 		// The reset: the previous effective name is restored.
-		mutation, err = r.ResetProviderField(ctx, testCaller(), "prov", protocol.ProviderFieldName)
+		mutation, err = r.ResetProviderField(ctx, testCaller(r), "prov", protocol.ProviderFieldName)
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "4" && mutation.Result.Name != "Patched", "resetProviderField = (%v, %+v), want the restored view at generation 4", err, mutation)
 		drainMutationEvent(t, sub, "4")
 
 		// The builtin user node's delete reveals the bundled base: the
 		// result carries the surviving effective post-state.
-		mutation, err = r.DeleteProvider(ctx, testCaller(), "openrouter")
+		mutation, err = r.DeleteProvider(ctx, testCaller(r), "openrouter")
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "5" && mutation.Result != nil && mutation.Result.Id == "openrouter" && mutation.Result.Builtin, "builtin delete = (%v, %+v), want the revealed bundled base at generation 5", err, mutation)
 		drainConnectionEvent(t, r.warnings, sub, "5")
 
 		// The hidden reset removes its own override.
 		{
-			_, err := r.UpdateProvider(ctx, testCaller(), "prov", protocol.ProviderEdit{Hidden: ptrTo(true)})
+			_, err := r.UpdateProvider(ctx, testCaller(r), "prov", protocol.ProviderEdit{Hidden: ptrTo(true)})
 			testassert.NoError(t, err)
 		}
 		drainMutationEvent(t, sub, "6")
-		mutation, err = r.ResetProviderField(ctx, testCaller(), "prov", protocol.ProviderFieldHidden)
+		mutation, err = r.ResetProviderField(ctx, testCaller(r), "prov", protocol.ProviderFieldHidden)
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "7" && !mutation.Result.Hidden, "hidden reset = (%v, %+v), want the removed override at generation 7", err, mutation)
 		drainConnectionEvent(t, r.warnings, sub, "7")
 
@@ -1332,15 +1332,15 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 			want error
 		}{
 			{"duplicate create", func() error {
-				_, err := r.AddProvider(ctx, testCaller(), "prov", protocol.ProviderEdit{BaseUrl: ptrTo("https://x.test/v1")}, models, nil)
+				_, err := r.AddProvider(ctx, testCaller(r), "prov", protocol.ProviderEdit{BaseUrl: ptrTo("https://x.test/v1")}, models, nil)
 				return err
 			}, harness.ErrInvalid},
 			{"unknown delete", func() error {
-				_, err := r.DeleteProvider(ctx, testCaller(), "ghost")
+				_, err := r.DeleteProvider(ctx, testCaller(r), "ghost")
 				return err
 			}, catalog.ErrUnknownProvider},
 			{"credential header", func() error {
-				_, err := r.UpdateProvider(ctx, testCaller(), "prov", protocol.ProviderEdit{Headers: &map[string]string{"Authorization": "x"}})
+				_, err := r.UpdateProvider(ctx, testCaller(r), "prov", protocol.ProviderEdit{Headers: &map[string]string{"Authorization": "x"}})
 				return err
 			}, harness.ErrInvalid},
 		}
@@ -1354,7 +1354,7 @@ func TestRuntimeProviderMetadataOperators(t *testing.T) {
 
 		// The standalone user definition's delete: the same operator with a
 		// null post-state — no subject remains.
-		mutation, err = r.DeleteProvider(ctx, testCaller(), "newp")
+		mutation, err = r.DeleteProvider(ctx, testCaller(r), "newp")
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "8" && mutation.Result == nil, "deleteProvider = (%v, %+v), want the null post-state at generation 8", err, mutation)
 		drainMutationEvent(t, sub, "8")
 	})
@@ -1378,19 +1378,19 @@ func TestRuntimeModelMetadataOperators(t *testing.T) {
 		// No source-specific lock applies: the rename lands as the bundled
 		// model's user override.
 		lockedName := "x"
-		mutation, err := r.SaveModel(ctx, testCaller(), "openrouter", bundledModel, protocol.ModelEdit{Name: &lockedName})
+		mutation, err := r.SaveModel(ctx, testCaller(r), "openrouter", bundledModel, protocol.ModelEdit{Name: &lockedName})
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Name == lockedName, "bundled rename = (%v, %+v), want the landed override at generation 2", err, mutation)
 
 		// The correctable member lands on the bundled model.
 		window := 2048
-		mutation, err = r.SaveModel(ctx, testCaller(), "openrouter", bundledModel, protocol.ModelEdit{ContextWindow: &window})
+		mutation, err = r.SaveModel(ctx, testCaller(r), "openrouter", bundledModel, protocol.ModelEdit{ContextWindow: &window})
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "3" && mutation.Result.ContextWindow == 2048, "bundled correctable patch = (%v, %+v), want the new window at generation 3", err, mutation)
 
 		// The override's delete reveals the bundled base; the reset restores
 		// the bundled window too.
-		mutation2, err := r.DeleteModel(ctx, testCaller(), "openrouter", bundledModel)
+		mutation2, err := r.DeleteModel(ctx, testCaller(r), "openrouter", bundledModel)
 		testassert.Require(t, err == nil && mutation2.ConfigurationRevision.Generation == "4" && mutation2.Result != nil && !mutation2.Result.Hidden, "bundled delete = (%v, %+v), want the revealed base at generation 4", err, mutation2)
-		mutation, err = r.ResetModelField(ctx, testCaller(), "openrouter", bundledModel, protocol.ModelFieldContextWindow)
+		mutation, err = r.ResetModelField(ctx, testCaller(r), "openrouter", bundledModel, protocol.ModelFieldContextWindow)
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "5", "bundled reset = (%v, %+v), want generation 5", err, mutation)
 		testassert.Require(t, mutation.Result.ContextWindow != 2048 && mutation.Result.ContextWindow != 0, "reset window = %d, want the restored bundled value", mutation.Result.ContextWindow)
 
@@ -1398,26 +1398,26 @@ func TestRuntimeModelMetadataOperators(t *testing.T) {
 		// upserts twice without a duplicate error.
 		slashWindow := 10
 		for _, generation := range []string{"6", "7"} {
-			mutation, err = r.SaveModel(ctx, testCaller(), "prov", "org/model", protocol.ModelEdit{ContextWindow: &slashWindow})
+			mutation, err = r.SaveModel(ctx, testCaller(r), "prov", "org/model", protocol.ModelEdit{ContextWindow: &slashWindow})
 			testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == generation && mutation.Result.Id == "org/model", "slash upsert = (%v, %+v), want the model at generation %s", err, mutation, generation)
 		}
 
 		// The standalone user model's delete: the same operator with a null
 		// post-state.
-		deletion, err := r.DeleteModel(ctx, testCaller(), "prov", "org/model")
+		deletion, err := r.DeleteModel(ctx, testCaller(r), "prov", "org/model")
 		testassert.Require(t, err == nil && deletion.ConfigurationRevision.Generation == "8" && deletion.Result == nil, "deleteModel = (%v, %+v), want the null post-state at generation 8", err, deletion)
 
 		// The typed unknown failures.
 		{
-			_, err := r.SaveModel(ctx, testCaller(), "ghost", "m", protocol.ModelEdit{})
+			_, err := r.SaveModel(ctx, testCaller(r), "ghost", "m", protocol.ModelEdit{})
 			testassert.Require(t, errors.Is(err, catalog.ErrUnknownProvider), "unknown provider = %v, want catalog.ErrUnknownProvider", err)
 		}
 		{
-			_, err := r.DeleteModel(ctx, testCaller(), "prov", "ghost")
+			_, err := r.DeleteModel(ctx, testCaller(r), "prov", "ghost")
 			testassert.Require(t, errors.Is(err, catalog.ErrUnknownModel), "unknown model = %v, want catalog.ErrUnknownModel", err)
 		}
 		{
-			_, err := r.SaveModel(ctx, testCaller(), "", "m", protocol.ModelEdit{})
+			_, err := r.SaveModel(ctx, testCaller(r), "", "m", protocol.ModelEdit{})
 			testassert.Require(t, errors.Is(err, harness.ErrInvalid), "empty provider id = %v, want harness.ErrInvalid", err)
 		}
 
@@ -1461,7 +1461,7 @@ func TestRuntimeModelMetadataMutationAffectsNextAdmissions(t *testing.T) {
 		// The mutated window keeps ordinary rows fitting: the edit's effect
 		// boundary is under test, not a compaction trigger.
 		window := 131072
-		mutation, err := r.SaveModel(ctx, testCaller(), "prov", "m", protocol.ModelEdit{ContextWindow: &window})
+		mutation, err := r.SaveModel(ctx, testCaller(r), "prov", "m", protocol.ModelEdit{ContextWindow: &window})
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2", "saveModel = (%v, %+v), want generation 2", err, mutation.ConfigurationRevision)
 
 		// Session B's next admission commits its capture under the new
@@ -1685,20 +1685,20 @@ func TestRuntimeHiddenVisibilityPicker(t *testing.T) {
 		models := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
 
 		// The connected keyless custom provider: its model is visible.
-		mutation, err := r.AddProvider(ctx, testCaller(), "keyless2",
+		mutation, err := r.AddProvider(ctx, testCaller(r), "keyless2",
 			protocol.ProviderEdit{BaseUrl: ptrTo("https://k2.test/v1")}, models, nil)
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2", "addProvider = (%v, %+v), want generation 2", err, mutation.ConfigurationRevision)
-		visible, err := r.ListModels(ctx, testCaller(), protocol.ListModelsParams{})
+		visible, err := r.ListModels(ctx, testCaller(r), protocol.ListModelsParams{})
 		testassert.Require(t, err == nil && modelListHas(visible, "keyless2", "m"), "visible picker = %+v (%v), want the connected keyless model", visible, err)
 
 		// hidden=true: the model leaves the visible picker, the full list
 		// keeps it, and the raw file carries the owned member.
 		hidden := true
-		mutation, err = r.UpdateProvider(ctx, testCaller(), "keyless2", protocol.ProviderEdit{Hidden: &hidden})
+		mutation, err = r.UpdateProvider(ctx, testCaller(r), "keyless2", protocol.ProviderEdit{Hidden: &hidden})
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "3" && mutation.Result.Hidden, "hidden patch = (%v, %+v), want the hidden view at generation 3", err, mutation)
-		visible, err = r.ListModels(ctx, testCaller(), protocol.ListModelsParams{})
+		visible, err = r.ListModels(ctx, testCaller(r), protocol.ListModelsParams{})
 		testassert.Require(t, err == nil && !modelListHas(visible, "keyless2", "m"), "visible picker after hide = %+v (%v), want the model excluded", visible, err)
-		full, err := r.ListModels(ctx, testCaller(), protocol.ListModelsParams{All: true})
+		full, err := r.ListModels(ctx, testCaller(r), protocol.ListModelsParams{All: true})
 		testassert.Require(t, err == nil && modelListHas(full, "keyless2", "m"), "full picker after hide = %+v (%v), want the model retained", full, err)
 		{
 			got := metadataRawProvider(t, e.configPath, "keyless2")["hidden"]
@@ -1707,9 +1707,9 @@ func TestRuntimeHiddenVisibilityPicker(t *testing.T) {
 
 		// hidden=false: the model rejoins the visible picker.
 		hidden = false
-		mutation, err = r.UpdateProvider(ctx, testCaller(), "keyless2", protocol.ProviderEdit{Hidden: &hidden})
+		mutation, err = r.UpdateProvider(ctx, testCaller(r), "keyless2", protocol.ProviderEdit{Hidden: &hidden})
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "4" && !mutation.Result.Hidden, "unhide patch = (%v, %+v), want the visible view at generation 4", err, mutation)
-		visible, err = r.ListModels(ctx, testCaller(), protocol.ListModelsParams{})
+		visible, err = r.ListModels(ctx, testCaller(r), protocol.ListModelsParams{})
 		testassert.Require(t, err == nil && modelListHas(visible, "keyless2", "m"), "visible picker after unhide = %+v (%v), want the model back", visible, err)
 		{
 			got := metadataRawProvider(t, e.configPath, "keyless2")["hidden"]
@@ -1719,7 +1719,7 @@ func TestRuntimeHiddenVisibilityPicker(t *testing.T) {
 		// The builtin provider hides through the same patch; its raw
 		// override entry carries the member.
 		hidden = true
-		mutation, err = r.UpdateProvider(ctx, testCaller(), "openrouter", protocol.ProviderEdit{Hidden: &hidden})
+		mutation, err = r.UpdateProvider(ctx, testCaller(r), "openrouter", protocol.ProviderEdit{Hidden: &hidden})
 		testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "5" && mutation.Result.Hidden, "builtin hide = (%v, %+v), want the hidden view at generation 5", err, mutation)
 		{
 			got := metadataRawProvider(t, e.configPath, "openrouter")["hidden"]
@@ -1727,7 +1727,7 @@ func TestRuntimeHiddenVisibilityPicker(t *testing.T) {
 		}
 
 		// The user model hides through the model patch.
-		modelMutation, err := r.SaveModel(ctx, testCaller(), "prov", "m", protocol.ModelEdit{Hidden: &hidden})
+		modelMutation, err := r.SaveModel(ctx, testCaller(r), "prov", "m", protocol.ModelEdit{Hidden: &hidden})
 		testassert.Require(t, err == nil && modelMutation.ConfigurationRevision.Generation == "6" && modelMutation.Result.Hidden, "model hide = (%v, %+v), want the hidden view at generation 6", err, modelMutation)
 		{
 			got := metadataRawModel(t, e.configPath, "prov", "m")["hidden"]
@@ -1764,26 +1764,26 @@ func TestRuntimeSpecialProviderIDsDirectOperators(t *testing.T) {
 				window := 1
 				models := map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}
 
-				mutation, err := r.AddProvider(ctx, testCaller(), id, protocol.ProviderEdit{BaseUrl: ptrTo("https://id.test/v1")}, models, nil)
+				mutation, err := r.AddProvider(ctx, testCaller(r), id, protocol.ProviderEdit{BaseUrl: ptrTo("https://id.test/v1")}, models, nil)
 				testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == "2" && mutation.Result.Id == id, "addProvider(%q) = (%v, %+v), want the exact ID at generation 2", id, err, mutation.Result)
 				{
 					_, present := metadataRawProvider(t, e.configPath, id)["transport"]
 					testassert.Require(t, present, "raw providers key %q missing", id)
 				}
 				name := "Ident"
-				mutation, err = r.UpdateProvider(ctx, testCaller(), id, protocol.ProviderEdit{Name: &name})
+				mutation, err = r.UpdateProvider(ctx, testCaller(r), id, protocol.ProviderEdit{Name: &name})
 				testassert.Require(t, err == nil && mutation.Result.Id == id && mutation.Result.Name == name, "updateProvider(%q) = (%v, %+v), want the exact ID", id, err, mutation.Result)
-				modelMutation, err := r.SaveModel(ctx, testCaller(), id, "m", protocol.ModelEdit{MaxOutputTokens: &window})
+				modelMutation, err := r.SaveModel(ctx, testCaller(r), id, "m", protocol.ModelEdit{MaxOutputTokens: &window})
 				testassert.Require(t, err == nil && modelMutation.Result.Id == "m" && !modelMutation.Result.ProviderHidden, "saveModel under %q = (%v, %+v), want the model view", id, err, modelMutation.Result)
-				mutation, err = r.ResetProviderField(ctx, testCaller(), id, protocol.ProviderFieldName)
+				mutation, err = r.ResetProviderField(ctx, testCaller(r), id, protocol.ProviderFieldName)
 				testassert.Require(t, err == nil && mutation.Result.Id == id && mutation.Result.Name != name, "resetProviderField(%q) = (%v, %+v), want the restored name", id, err, mutation.Result)
 				// The model-field reset and the user-model delete keep the
 				// exact identities too: all seven operators.
-				modelMutation, err = r.ResetModelField(ctx, testCaller(), id, "m", protocol.ModelFieldMaxOutputTokens)
+				modelMutation, err = r.ResetModelField(ctx, testCaller(r), id, "m", protocol.ModelFieldMaxOutputTokens)
 				testassert.Require(t, err == nil && modelMutation.Result.Id == "m" && modelMutation.Result.MaxOutputTokens == 0, "resetModelField(%q, m) = (%v, %+v), want the restored default", id, err, modelMutation.Result)
-				modelDeletion, err := r.DeleteModel(ctx, testCaller(), id, "m")
+				modelDeletion, err := r.DeleteModel(ctx, testCaller(r), id, "m")
 				testassert.Require(t, err == nil && modelDeletion.ConfigurationRevision.Generation == "7" && modelDeletion.Result == nil, "deleteModel(%q, m) = (%v, %+v), want the null deletion at generation 7", id, err, modelDeletion)
-				deletion, err := r.DeleteProvider(ctx, testCaller(), id)
+				deletion, err := r.DeleteProvider(ctx, testCaller(r), id)
 				testassert.Require(t, err == nil && deletion.ConfigurationRevision.Generation == "8" && deletion.Result == nil, "deleteProvider(%q) = (%v, %+v), want the null deletion at generation 8", id, err, deletion)
 				{
 					_, present := fileRoot(t, e.configPath)["providers"]
@@ -1861,37 +1861,37 @@ func TestRuntimeMetadataCorruptRawTypesTypedFailure(t *testing.T) {
 			{"providers member scalar", `{"providers":5,"sessions":{"archive_after_days":3}}`,
 				func() error {
 					name := "X"
-					_, err := r.UpdateProvider(ctx, testCaller(), "prov", protocol.ProviderEdit{Name: &name})
+					_, err := r.UpdateProvider(ctx, testCaller(r), "prov", protocol.ProviderEdit{Name: &name})
 					return err
 				}},
 			{"providers member array", `{"providers":[],"sessions":{"archive_after_days":3}}`,
 				func() error {
 					name := "X"
-					_, err := r.UpdateProvider(ctx, testCaller(), "prov", protocol.ProviderEdit{Name: &name})
+					_, err := r.UpdateProvider(ctx, testCaller(r), "prov", protocol.ProviderEdit{Name: &name})
 					return err
 				}},
 			{"provider entry nonobject", `{"providers":{"prov":5}}`,
 				func() error {
 					name := "X"
-					_, err := r.UpdateProvider(ctx, testCaller(), "prov", protocol.ProviderEdit{Name: &name})
+					_, err := r.UpdateProvider(ctx, testCaller(r), "prov", protocol.ProviderEdit{Name: &name})
 					return err
 				}},
 			{"transport nonobject", `{"providers":{"prov":{"transport":5,"discovery":false,"models":{"m":{"name":"M","context_window":4096}}}}}`,
 				func() error {
 					name := "X"
-					_, err := r.UpdateProvider(ctx, testCaller(), "prov", protocol.ProviderEdit{Name: &name})
+					_, err := r.UpdateProvider(ctx, testCaller(r), "prov", protocol.ProviderEdit{Name: &name})
 					return err
 				}},
 			{"models member nonobject", `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"SHELL_TEST_KEY"},"discovery":false,"models":5}}}`,
 				func() error {
 					maxOut := 10
-					_, err := r.SaveModel(ctx, testCaller(), "prov", "m", protocol.ModelEdit{MaxOutputTokens: &maxOut})
+					_, err := r.SaveModel(ctx, testCaller(r), "prov", "m", protocol.ModelEdit{MaxOutputTokens: &maxOut})
 					return err
 				}},
 			{"model entry nonobject", `{"providers":{"prov":{"transport":{"base_url":"https://prov.test/v1","api_key_env":"SHELL_TEST_KEY"},"discovery":false,"models":{"m":5}}}}`,
 				func() error {
 					maxOut := 10
-					_, err := r.SaveModel(ctx, testCaller(), "prov", "m", protocol.ModelEdit{MaxOutputTokens: &maxOut})
+					_, err := r.SaveModel(ctx, testCaller(r), "prov", "m", protocol.ModelEdit{MaxOutputTokens: &maxOut})
 					return err
 				}},
 		}
@@ -2396,7 +2396,7 @@ func TestRuntimeBuiltinWritablePositiveTable(t *testing.T) {
 		for _, row := range rows {
 			t.Run(row.name, func(t *testing.T) {
 				generation++
-				mutation, err := r.UpdateProvider(ctx, testCaller(), "openrouter", row.patch)
+				mutation, err := r.UpdateProvider(ctx, testCaller(r), "openrouter", row.patch)
 				testassert.Require(t, err == nil && mutation.ConfigurationRevision.Generation == strconv.Itoa(generation), "builtin writable patch = (%v, %+v), want generation %d", err, mutation.ConfigurationRevision, generation)
 				row.check(mutation)
 				drainMutationEvent(t, sub, strconv.Itoa(generation))
@@ -2408,7 +2408,7 @@ func TestRuntimeBuiltinWritablePositiveTable(t *testing.T) {
 		// write (the identity members are writable now).
 		before, publishedGeneration, warnRev := runtimeMutationBaseline(t, r)
 		forbidden := map[string]string{"Authorization": "x"}
-		_, lockErr := r.UpdateProvider(ctx, testCaller(), "openrouter", protocol.ProviderEdit{Headers: &forbidden})
+		_, lockErr := r.UpdateProvider(ctx, testCaller(r), "openrouter", protocol.ProviderEdit{Headers: &forbidden})
 		assertRuntimeMutationRefused(t, r, sub, before, publishedGeneration, warnRev, lockErr, harness.ErrInvalid)
 	})
 }

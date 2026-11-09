@@ -94,7 +94,7 @@ func TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments(t *testin
 	testassert.NoError(t, err)
 	defer sub.Close()
 
-	view, err := r.GetConfiguration(ctx, testCaller())
+	view, err := r.GetConfiguration(ctx, testCaller(r))
 	testassert.NoError(t, err)
 	read := view.Settings.Extensions
 	want := map[string]string{
@@ -1230,7 +1230,7 @@ func TestRuntimeSettingsMutationLastWriterWins(t *testing.T) {
 		testassert.NoError(t, err)
 		defer sub.Close()
 
-		view, err := r.GetConfiguration(ctx, testCaller())
+		view, err := r.GetConfiguration(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, view.ConfigurationRevision.Generation == "1", "initial revision = %+v, want generation 1", view.ConfigurationRevision)
 		stale := view.Settings // value copy: client 2's older whole-section document
@@ -1246,7 +1246,7 @@ func TestRuntimeSettingsMutationLastWriterWins(t *testing.T) {
 		mutation, err = updateSettingsOnly(r, ctx, stale)
 		testassert.NoError(t, err)
 		testassert.Require(t, mutation.ConfigurationRevision.Generation == "3" && mutation.Result.Sessions.ArchiveAfterDays == 3, "client 2 mutation = %+v, want generation 3 with the stale value", mutation)
-		fresh, err := r.GetConfiguration(ctx, testCaller())
+		fresh, err := r.GetConfiguration(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, fresh.ConfigurationRevision.Generation == "3" && fresh.Settings.Sessions.ArchiveAfterDays == 3, "fresh settings = rev %+v sessions %+v, want the stale writer's value at generation 3", fresh.ConfigurationRevision, fresh.Settings.Sessions)
 		for _, want := range []string{"2", "3"} {
@@ -1269,7 +1269,7 @@ func TestRuntimeSettingsMutationOwnershipAndResult(t *testing.T) {
 		testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.ConfigurationRevision.InstanceId == r.instance, "mutation revision = %+v, want generation 2 with the owner instance", mutation.ConfigurationRevision)
 		mutation.Result.Sessions.ArchiveAfterDays = 999
 		mutation.Result.Tools = json.RawMessage(`{"mutated":true}`)
-		fresh, err := r.GetConfiguration(ctx, testCaller())
+		fresh, err := r.GetConfiguration(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		testassert.Require(t, fresh.Settings.Sessions.ArchiveAfterDays == 5 && compactJSON(t, fresh.Settings.Tools) == compactJSON(t, mutationSettings().Tools), "a mutation of the returned result reached the published settings: %+v", fresh.Settings)
 	})
@@ -1652,4 +1652,64 @@ func TestConfigurationMutateExtensionEditRejectsMalformedArguments(t *testing.T)
 		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "arguments %s = %v, want harness.ErrInvalid", arguments, err)
 		testassert.Require(t, svc.current() == before.snapshot && bytes.Equal(bytesBefore, mustRead(t, h.configPath)), "arguments %s changed publication or source", arguments)
 	}
+}
+
+// rotatingCredentialSource returns one distinct value per Capture call for
+// every requested name, making a published map that merges separate
+// observations visible.
+type rotatingCredentialSource struct {
+	mu       sync.Mutex
+	captures int
+}
+
+func (s *rotatingCredentialSource) Capture(ctx context.Context, names []string) (map[string]CredentialValue, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.captures++
+	value := fmt.Sprintf("capture-%d", s.captures)
+	s.mu.Unlock()
+	out := make(map[string]CredentialValue, len(names))
+	for _, name := range names {
+		out[name] = CredentialValue{Value: value, Defined: true}
+	}
+	return out, nil
+}
+
+func (s *rotatingCredentialSource) Set(context.Context, string, string) error { return nil }
+func (s *rotatingCredentialSource) Remove(context.Context, string) error      { return nil }
+
+func (s *rotatingCredentialSource) SubprocessEnv(context.Context, []string) ([]string, error) {
+	return nil, nil
+}
+
+// TestMutationPublishesOneCoherentCredentialCapture proves a mutation's
+// published credential map is one capture over the candidate's full name
+// union taken after the edit applies, not a merge of the pre-edit seed
+// observation with a later capture of newly introduced names.
+func TestMutationPublishesOneCoherentCredentialCapture(t *testing.T) {
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, `{"providers":{"prov":`+nominalProvMember("https://prov.test/v1", "COHERENT_SEED_KEY", `{"m":{"name":"M","context_window":4096}}`)+`}}`)
+	svc := h.service(context.Background())
+	svc.credentials = &rotatingCredentialSource{}
+	_, err := svc.publish(context.Background())
+	testassert.NoError(t, err)
+	t.Cleanup(func() {
+		if resources := svc.current().resources; resources != nil {
+			_ = resources.release()
+		}
+	})
+
+	baseURL := "https://created.test/v1"
+	env := "COHERENT_NEW_KEY"
+	window := 4096
+	_, err = svc.mutate(context.Background(), svc.editProviderCreate(context.Background(), "created", protocol.ProviderEdit{BaseUrl: &baseURL, ApiKeyEnv: &env}, map[string]protocol.ModelEdit{"m": {ContextWindow: &window}}, nil))
+	testassert.NoError(t, err)
+
+	published := svc.current().credentials
+	seed := published["COHERENT_SEED_KEY"]
+	created := published["COHERENT_NEW_KEY"]
+	testassert.Require(t, seed.Defined && created.Defined, "published credentials = %+v, want both candidate names observed", published)
+	testassert.Require(t, seed.Value == created.Value, "published credentials combined separate observations: seed %q, created %q", seed.Value, created.Value)
 }

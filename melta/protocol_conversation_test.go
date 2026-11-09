@@ -689,7 +689,7 @@ func TestConversationProjectionSyntheticInterruptedResult(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the first call never started")
 		}
-		testassert.NoError(t, bg.r.InterruptSession(context.Background(), testCaller(), session))
+		testassert.NoError(t, bg.r.InterruptSession(context.Background(), testCaller(bg.r), session))
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
 
 		items := projectSessionItems(t, bg.r, session)
@@ -782,7 +782,7 @@ func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
 		writeAgentDefinitions(t, bg.e.configPath, lifecycleAgentsDocument)
 		enableFixturePlugin(t, bg.e.configPath, "bgtools")
 		{
-			_, err := bg.r.Reload(context.Background(), testCaller())
+			_, err := bg.r.Reload(context.Background(), testCaller(bg.r))
 			testassert.NoError(t, err)
 		}
 		sub, err := bg.r.Subscribe(256)
@@ -813,7 +813,7 @@ func TestConversationProjectionInterruptedPartialAssistant(t *testing.T) {
 				t.Fatal("the partial fragment never became published progress")
 			}
 		}
-		testassert.NoError(t, bg.r.InterruptSession(context.Background(), testCaller(), session))
+		testassert.NoError(t, bg.r.InterruptSession(context.Background(), testCaller(bg.r), session))
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationInterruption)
 
 		items := projectSessionItems(t, bg.r, session)
@@ -961,7 +961,7 @@ func TestConversationProjectionChildAndBackgroundCompletion(t *testing.T) {
 
 		completionID := bg.startJob(child, "cc000003")
 		stopper.addDelivery(child, completionID, "job report")
-		testassert.NoError(t, bg.r.StopSession(context.Background(), testCaller(), child))
+		testassert.NoError(t, bg.r.StopSession(context.Background(), testCaller(bg.r), child))
 
 		// The child's conversation: its own turn plus the typed completion
 		// signal naming the job member.
@@ -1168,7 +1168,7 @@ func TestConversationProjectionTerminalFailureWithoutAssistant(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the model effect never arrived")
 		}
-		testassert.NoError(t, bg.r.InterruptSession(context.Background(), testCaller(), interrupted))
+		testassert.NoError(t, bg.r.InterruptSession(context.Background(), testCaller(bg.r), interrupted))
 		awaitOperation(t, bg.r, interrupted, "op-int", harness.OperationInterruption)
 
 		items = projectSessionItems(t, bg.r, interrupted)

@@ -506,7 +506,7 @@ func (e *prepEnv) fork(ctx context.Context, req harness.ForkRequest) (harness.Fo
 // reload publishes the next configuration revision through the Melta's
 // actual Reload.
 func (e *prepEnv) Reload() error {
-	_, err := e.r.Reload(context.Background(), testCaller())
+	_, err := e.r.Reload(context.Background(), testCaller(e.r))
 	return err
 }
 
@@ -1507,7 +1507,7 @@ func TestPreparationInterruptBeforeAgentScopeEntrySettlesInterruption(t *testing
 		case <-time.After(10 * time.Second):
 			t.Fatal("the Agent-scope opening never parked")
 		}
-		testassert.NoError(t, e.r.InterruptSession(context.Background(), testCaller(), session))
+		testassert.NoError(t, e.r.InterruptSession(context.Background(), testCaller(e.r), session))
 		releaseGate()
 		rec := e.awaitTerminal(session, "op-int", harness.OperationInterruption)
 		if rec.State.Terminal != nil && strings.Contains(rec.State.Terminal.Detail, ErrClosed.Error()) {

@@ -1,18 +1,11 @@
 package config
 
 import (
-	"bufio"
-	"bytes"
-	"context"
 	"errors"
-	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/testassert"
@@ -28,8 +21,8 @@ func envKeyForTest(t *testing.T, suffix string) string {
 	return key
 }
 
-// TestManagedEnvOrdinaryRows drives the ordinary Set/Remove outcomes. Each
-// row carries its seed, external environment, its Set/Remove action, and
+// TestManagedEnvOrdinaryRows drives the ordinary TrySet/TryRemove outcomes. Each
+// row carries its seed, external environment, its TrySet/TryRemove action, and
 // independently authored post-state predicates for the file and the captured
 // observation. The $KEY placeholder in a seed or fragment is the row's env
 // key. The process environment is never mutated by a managed write.
@@ -129,9 +122,9 @@ func TestManagedEnvOrdinaryRows(t *testing.T) {
 
 			var err error
 			if row.remove {
-				err = m.Remove(key)
+				err = m.TryRemove(key)
 			} else {
-				err = m.Set(key, row.value)
+				err = m.TrySet(key, row.value)
 			}
 			if row.wantErr != nil {
 				testassert.Require(t, errors.Is(err, row.wantErr), "%s err = %v, want %v", row.name, err, row.wantErr)
@@ -164,6 +157,45 @@ func TestManagedEnvOrdinaryRows(t *testing.T) {
 	}
 }
 
+// TestSubprocessEnvExcludesManagedNames proves the child-environment
+// projection drops every name the managed file defines — even when the shell
+// also defines it — in addition to the supplied excluded names, and that an
+// unreadable managed file is an error rather than an ambient fallback.
+func TestSubprocessEnvExcludesManagedNames(t *testing.T) {
+	managedName := envKeyForTest(t, "SUBPROCESS_MANAGED")
+	overlapName := envKeyForTest(t, "SUBPROCESS_OVERLAP")
+	suppliedName := envKeyForTest(t, "SUBPROCESS_SUPPLIED")
+	keepName := envKeyForTest(t, "SUBPROCESS_KEEP")
+	path := filepath.Join(t.TempDir(), ".env")
+	testassert.NoError(t, os.WriteFile(path, []byte(managedName+"=file\n"+overlapName+"=file\n"), 0o600))
+	t.Setenv(overlapName, "shell")
+	t.Setenv(suppliedName, "supplied")
+	t.Setenv(keepName, "keep")
+	m := NewManagedEnv(path)
+
+	env, err := m.SubprocessEnv([]string{suppliedName})
+	testassert.NoError(t, err)
+	kept := false
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		switch name {
+		case managedName, overlapName, suppliedName:
+			t.Fatalf("subprocess environment kept excluded name %q: %q", name, entry)
+		case keepName:
+			kept = true
+			testassert.Require(t, entry == keepName+"=keep", "ordinary entry = %q, want the shell value", entry)
+		}
+	}
+	testassert.Require(t, kept, "the ordinary shell entry was dropped from the projection")
+
+	blocked := filepath.Join(t.TempDir(), "dir")
+	testassert.NoError(t, os.Mkdir(blocked, 0o700))
+	{
+		_, err := NewManagedEnv(blocked).SubprocessEnv(nil)
+		testassert.Require(t, err != nil, "an unreadable managed file produced an ambient environment")
+	}
+}
+
 // TestManagedEnvTwoExplicitLocationsIndependent proves two sources over
 // different explicit dotenv files hold independent values for the same name in
 // one process, while a real shell value has precedence in both and managed
@@ -184,7 +216,7 @@ func TestManagedEnvTwoExplicitLocationsIndependent(t *testing.T) {
 	testassert.Require(t, firstCapture[key].Value == "first" && firstCapture[key].Managed, "first source = %+v, want its own managed value", firstCapture[key])
 	testassert.Require(t, secondCapture[key].Value == "second" && secondCapture[key].Managed, "second source = %+v, want its own managed value", secondCapture[key])
 
-	testassert.NoError(t, first.Set(key, "first-updated"))
+	testassert.NoError(t, first.TrySet(key, "first-updated"))
 	secondCapture, err = second.Capture([]string{key})
 	testassert.NoError(t, err)
 	testassert.Require(t, secondCapture[key].Value == "second", "second source observed the first source's write: %+v", secondCapture[key])
@@ -199,11 +231,11 @@ func TestManagedEnvTwoExplicitLocationsIndependent(t *testing.T) {
 		testassert.NoError(t, err)
 		testassert.Require(t, captured[key].Value == "shell" && captured[key].Defined && !captured[key].Managed, "source under shell precedence = %+v, want the unmanaged shell value", captured[key])
 		{
-			err := source.Set(key, "shadow")
+			err := source.TrySet(key, "shadow")
 			testassert.Require(t, errors.Is(err, ErrExternalKey), "Set under shell precedence = %v, want ErrExternalKey", err)
 		}
 		{
-			err := source.Remove(key)
+			err := source.TryRemove(key)
 			testassert.Require(t, errors.Is(err, ErrExternalKey), "Remove under shell precedence = %v, want ErrExternalKey", err)
 		}
 	}
@@ -243,7 +275,6 @@ func TestManagedEnvRejectsNULValueWithoutFileEffect(t *testing.T) {
 		name    string
 		attempt func(*ManagedEnv) error
 	}{
-		{"Set", func(m *ManagedEnv) error { return m.Set(key, broken) }},
 		{"TrySet", func(m *ManagedEnv) error { return m.TrySet(key, broken) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,7 +300,7 @@ func TestManagedEnvSetValueWithSpacesIsQuoted(t *testing.T) {
 	testassert.NoError(t, os.WriteFile(path, []byte(""), 0o600))
 	key := envKeyForTest(t, "QUOTED")
 	m := NewManagedEnv(path)
-	testassert.NoError(t, m.Set(key, "has spaces"))
+	testassert.NoError(t, m.TrySet(key, "has spaces"))
 	data, _ := os.ReadFile(path)
 	if !strings.Contains(string(data), key+`="has spaces"`) {
 		t.Fatalf("quoted value not in file: %q", string(data))
@@ -285,7 +316,7 @@ func TestManagedEnvSetQuotedSpecialValueRoundTrips(t *testing.T) {
 	key := envKeyForTest(t, "SPECIAL")
 	value := "quote=\" slash=\\ line\nbreak tab	end"
 	m := NewManagedEnv(path)
-	testassert.NoError(t, m.Set(key, value))
+	testassert.NoError(t, m.TrySet(key, value))
 	data, _ := os.ReadFile(path)
 	body := string(data)
 	testassert.Require(t, !strings.Contains(body, "line\nbreak") && strings.Contains(body, `\n`) && strings.Contains(body, `\t`), "literal newline written inside env value: %q; newline/tab escapes missing from quoted value: %q", body, body)
@@ -543,106 +574,3 @@ func TestManagedEnvTryRemoveRows(t *testing.T) {
 // envBlockHolderEnv selects the child half of
 // TestManagedEnvSetBlocksUntilForeignLockReleases and names the env lock path
 // the child holds.
-const envBlockHolderEnv = "LIGHTCODE_CONFIG_ENV_BLOCK_HOLDER"
-
-// TestManagedEnvSetBlocksUntilForeignLockReleases proves the blocking Set
-// wrapper stays blocking for startup/non-owner callers: with a foreign process
-// holding the env leaf lock, Set stays parked and completes once the holder
-// releases. It is the positive control beside the one-attempt TrySet. The
-// holder is a self-exec child of this test binary, so the contention is a real
-// cross-process flock, not a same-process open.
-func TestManagedEnvSetBlocksUntilForeignLockReleases(t *testing.T) {
-	if lockPath := os.Getenv(envBlockHolderEnv); lockPath != "" {
-		l, err := atomicfs.Acquire(lockPath)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		fmt.Println("ready")
-		_, _ = io.Copy(io.Discard, os.Stdin)
-		if err := l.Release(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(3)
-		}
-		os.Exit(0)
-	}
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".env")
-	key := envKeyForTest(t, "BLOCK_SET")
-	lockPath := envLockPath(path)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestManagedEnvSetBlocksUntilForeignLockReleases$")
-	cmd.Env = append(os.Environ(), envBlockHolderEnv+"="+lockPath)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		cancel()
-		t.Fatalf("child stdin pipe: %v", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		t.Fatalf("child stdout pipe: %v", err)
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		cancel()
-		t.Fatalf("start child: %v", err)
-	}
-	ready := make(chan struct{})
-	scannerDone := make(chan struct{})
-	go func() {
-		defer close(scannerDone)
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			if scanner.Text() == "ready" {
-				close(ready)
-				return
-			}
-		}
-	}()
-	reap := func() error {
-		_ = stdin.Close()
-		err := cmd.Wait()
-		<-scannerDone
-		return err
-	}
-	fail := func() string {
-		cancel()
-		_ = reap()
-		return stderr.String()
-	}
-	t.Cleanup(func() { cancel(); _ = reap() })
-	select {
-	case <-ready:
-	case <-ctx.Done():
-		t.Fatalf("child never held the env lock within %v: %v\n%s", 30*time.Second, ctx.Err(), fail())
-	}
-
-	m := NewManagedEnv(path)
-	started := make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		close(started)
-		done <- m.Set(key, "hello")
-	}()
-	<-started
-	select {
-	case err := <-done:
-		t.Fatalf("Set returned %v while the foreign process held the env lock; the blocking wrapper must stay blocked", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	if err := reap(); err != nil {
-		t.Fatalf("child after release: %v\n%s", err, stderr.String())
-	}
-	select {
-	case err := <-done:
-		testassert.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Set did not complete after the holder released the env lock")
-	}
-	captured, err := m.Capture([]string{key})
-	testassert.NoError(t, err)
-	testassert.Require(t, captured[key].Value == "hello" && captured[key].Managed, "capture after blocked Set = %+v", captured[key])
-}

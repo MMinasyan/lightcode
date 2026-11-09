@@ -645,7 +645,7 @@ func TestProductionKeyResolution(t *testing.T) {
 		// A required credential that resolves empty rejects admission with
 		// the retained provider/env-name diagnostic; no Operation exists.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
-		_, err = r.Reload(ctx, testCaller())
+		_, err = r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		err = submitExpectFailure(r, session.Identity.SessionID, "op-missing", "please write")
 		testassert.Require(t, errors.Is(err, config.ErrMissingEnvVar) && errors.Is(err, harness.ErrInvalid) && strings.Contains(err.Error(), "PRODUCTION_TEST_KEY") && strings.Contains(err.Error(), `for provider "prov"`), "missing credential submit = %v, want the retained diagnostic wrapping both identities; missing credential diagnostic = %v, want the env name and provider identity", err, err)
@@ -659,7 +659,7 @@ func TestProductionKeyResolution(t *testing.T) {
 		// both the parked first request and the follow-up carry the captured
 		// key, and the turn completes.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
-		_, err = r.Reload(ctx, testCaller())
+		_, err = r.Reload(ctx, testCaller(r))
 		testassert.NoError(t, err)
 		e.server.armGate()
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please write")
@@ -710,7 +710,7 @@ func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing
 		}
 		connectDone := make(chan connectResult, 1)
 		go func() {
-			mutation, err := r.ConnectProvider(ctx, testCaller(), "prov", &key)
+			mutation, err := r.ConnectProvider(ctx, testCaller(r), "prov", &key)
 			connectDone <- connectResult{mutation, err}
 		}()
 		probe.awaitWriteStarted(t)
@@ -775,7 +775,7 @@ func TestProductionAdmissionUsesReadyRevisionDuringParkedBuild(t *testing.T) {
 		armed.Store(true)
 		reloadDone := make(chan error, 1)
 		go func() {
-			_, err := r.Reload(ctx, testCaller())
+			_, err := r.Reload(ctx, testCaller(r))
 			reloadDone <- err
 		}()
 		select {
@@ -856,7 +856,7 @@ func TestProductionReloadCapture(t *testing.T) {
 		enableFixturePlugin(t, e.configPath, "prodtools")
 		enableFixturePlugin(t, e.configPath, "park")
 		{
-			revision, err := r.Reload(ctx, testCaller())
+			revision, err := r.Reload(ctx, testCaller(r))
 			testassert.Require(t, err == nil && revision.Generation == "2", "Reload = (%q, %v), want 2", revision, err)
 		}
 		e.server.releaseGate()
