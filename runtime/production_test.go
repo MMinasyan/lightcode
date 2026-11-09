@@ -645,7 +645,7 @@ func TestProductionKeyResolution(t *testing.T) {
 		// A required credential that resolves empty rejects admission with
 		// the retained provider/env-name diagnostic; no Operation exists.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "")
-		_, err = r.Reload(ctx)
+		_, err = r.reload(ctx, protocolCaller())
 		testassert.NoError(t, err)
 		err = submitExpectFailure(r, session.Identity.SessionID, "op-missing", "please write")
 		testassert.Require(t, errors.Is(err, config.ErrMissingEnvVar) && errors.Is(err, harness.ErrInvalid) && strings.Contains(err.Error(), "PRODUCTION_TEST_KEY") && strings.Contains(err.Error(), `for provider "prov"`), "missing credential submit = %v, want the retained diagnostic wrapping both identities; missing credential diagnostic = %v, want the env name and provider identity", err, err)
@@ -659,7 +659,7 @@ func TestProductionKeyResolution(t *testing.T) {
 		// both the parked first request and the follow-up carry the captured
 		// key, and the turn completes.
 		e.t.Setenv("PRODUCTION_TEST_KEY", "production-secret-1")
-		_, err = r.Reload(ctx)
+		_, err = r.reload(ctx, protocolCaller())
 		testassert.NoError(t, err)
 		e.server.armGate()
 		submitThroughRuntime(t, r, session.Identity.SessionID, "op-1", "please write")
@@ -710,7 +710,7 @@ func TestProductionAdmissionRacingParkedManagedWriteUsesPublishedPair(t *testing
 		}
 		connectDone := make(chan connectResult, 1)
 		go func() {
-			mutation, err := r.connectProvider(ctx, "prov", &key)
+			mutation, err := r.connectProvider(ctx, protocolCaller(), "prov", &key)
 			connectDone <- connectResult{mutation, err}
 		}()
 		probe.awaitWriteStarted(t)
@@ -775,7 +775,7 @@ func TestProductionAdmissionUsesReadyRevisionDuringParkedBuild(t *testing.T) {
 		armed.Store(true)
 		reloadDone := make(chan error, 1)
 		go func() {
-			_, err := r.Reload(ctx)
+			_, err := r.reload(ctx, protocolCaller())
 			reloadDone <- err
 		}()
 		select {
@@ -856,7 +856,7 @@ func TestProductionReloadCapture(t *testing.T) {
 		enableFixturePlugin(t, e.configPath, "prodtools")
 		enableFixturePlugin(t, e.configPath, "park")
 		{
-			revision, err := r.Reload(ctx)
+			revision, err := r.reload(ctx, protocolCaller())
 			testassert.Require(t, err == nil && revision == "2", "Reload = (%q, %v), want 2", revision, err)
 		}
 		e.server.releaseGate()
@@ -916,7 +916,7 @@ func TestProductionQueuedAndFork(t *testing.T) {
 		testassert.Require(t, boundary != "", "no admitted input entry was found for the fork boundary")
 		var forked harness.SessionRecord
 		testassert.NoError(t, r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-			res, err := h.Fork(ctx, harness.ForkRequest{
+			res, err := h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: session.Identity.SessionID,
 				BoundaryEntryID: boundary,
 				OperationID:     "op-fork",

@@ -415,12 +415,14 @@ type OperationRecord struct {
 // struct shapes reachable as the HistoryFact payload members; no duplicate
 // field schema exists.
 
-// inputEntry is one admitted user, runtime, or plugin input.
+// inputEntry is one admitted user, runtime, or plugin input. ExtensionID is
+// present exactly for plugin attribution.
 type inputEntry struct {
 	SessionID   string              `json:"session_id"`
 	EntryID     string              `json:"entry_id"`
 	OperationID string              `json:"operation_id,omitempty"`
 	Origin      InputOrigin         `json:"origin"`
+	ExtensionID string              `json:"extension_id,omitempty"`
 	Content     []model.ContentPart `json:"content"`
 }
 

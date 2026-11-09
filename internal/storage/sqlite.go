@@ -32,8 +32,9 @@ const (
 	// into PRAGMA user_version at initialization and checked at open. Version
 	// 15 records selected Agent inputs in Session and Operation payloads;
 	// version 17 adds the strict external-data owner list to the Session
-	// payload. The SQL tables are unchanged.
-	sqliteSchemaVersion = 17
+	// payload; version 18 adds extension provenance to input payloads. The
+	// SQL tables are unchanged.
+	sqliteSchemaVersion = 18
 
 	// sqlitePoolDSN configures every physical connection of the long-lived
 	// pool: write-ahead logging, full synchronous durability, immediate

@@ -147,7 +147,7 @@ func TestRuntimeValueConfigurationAndUnusableHome(t *testing.T) {
 	updated := sourceConfigDocument(server.URL, keyEnv, "After")
 	testassert.NoError(t, value.Write(context.Background(), updated))
 	{
-		_, err := r.Reload(context.Background())
+		_, err := r.reload(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 	}
 	{
@@ -205,7 +205,7 @@ func TestCredentialCaptureBlockingAndFailingCandidates(t *testing.T) {
 	credentials.mu.Unlock()
 	reloadDone := make(chan error, 1)
 	go func() {
-		_, err := r.Reload(context.Background())
+		_, err := r.reload(context.Background(), protocolCaller())
 		reloadDone <- err
 	}()
 	select {
@@ -234,7 +234,7 @@ func TestCredentialCaptureBlockingAndFailingCandidates(t *testing.T) {
 	credentials.fail = true
 	credentials.mu.Unlock()
 	before := r.config.current().generation
-	_, err = r.Reload(context.Background())
+	_, err = r.reload(context.Background(), protocolCaller())
 	testassert.Require(t, errors.Is(err, ErrConfiguration), "failing capture reload = %v, want ErrConfiguration", err)
 	testassert.Equal(t, r.config.current().generation, before)
 	submitThroughRuntime(t, r, record.Identity.SessionID, "op-after-failure", "hello")

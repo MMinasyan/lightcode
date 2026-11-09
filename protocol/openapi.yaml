@@ -7,7 +7,7 @@
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "12"
+  version: "13"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -721,10 +721,13 @@ components:
           enum:
             - invalid
             - unauthorized
+            - denied
             - not_found
             - conflict
+            - incompatible
             - corrupt
             - closed
+            - cancelled
             - configuration
             - storage
             - unavailable
@@ -876,7 +879,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "12"
+            - "13"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every
@@ -1273,6 +1276,8 @@ components:
           type: string
         origin:
           $ref: "#/components/schemas/InputOrigin"
+        extension_id:
+          type: string
         content:
           type: array
           items:
@@ -1382,6 +1387,8 @@ components:
           type: string
         origin:
           $ref: "#/components/schemas/InputOrigin"
+        extension_id:
+          type: string
         content:
           type: array
           items:

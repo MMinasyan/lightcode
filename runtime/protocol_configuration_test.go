@@ -131,7 +131,7 @@ func TestConfigurationViewProjectsProvidersPinsSourcesKeySourcesAndHeaders(t *te
 		r, _ := openConfigurationRuntimeWithEnv(t, store, e, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 
-		view, err := r.getConfiguration(context.Background())
+		view, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Require(t, view.ConfigurationRevision.Generation == "1" && view.ConfigurationRevision.InstanceId == "", "configuration revision = %+v, want generation 1 with the empty pre-server instance", view.ConfigurationRevision)
 
@@ -215,19 +215,19 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 
 	// Every sibling resolves the one shared credential.
 	for _, id := range []string{"shalpha", "shbeta", "shgamma"} {
-		detail, err := r.getProvider(ctx, id)
+		detail, err := r.getProvider(ctx, protocolCaller(), id)
 		testassert.Require(t, err == nil && detail.Provider.Connected && detail.Provider.KeySource == protocol.ProviderKeySource(config.KeySourceManaged), "%s = (%v, %+v), want the shared managed connection", id, err, detail.Provider)
 	}
 
 	// The sibling's update keeps the shared reference and the variable.
 	name := "Renamed Alpha"
 	{
-		_, err := r.updateProvider(ctx, "shalpha", protocol.ProviderEdit{Name: &name})
+		_, err := r.updateProvider(ctx, protocolCaller(), "shalpha", protocol.ProviderEdit{Name: &name})
 		testassert.NoError(t, err)
 	}
 	drainConnectionEvent(t, r.warnings, sub, "2")
 	{
-		detail, err := r.getProvider(ctx, "shbeta")
+		detail, err := r.getProvider(ctx, protocolCaller(), "shbeta")
 		testassert.Require(t, err == nil && detail.Provider.Connected && detail.Provider.ApiKeyEnv == "SHARED_CRED_TEST_KEY", "shbeta after the sibling update = (%v, %+v), want the shared reference untouched", err, detail.Provider)
 	}
 	if envValueForTest(r, "SHARED_CRED_TEST_KEY") != "shared-secret-value" || !testManaged(r, "SHARED_CRED_TEST_KEY") {
@@ -239,7 +239,7 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 	// resolving it.
 	fresh := "RESHARED_TEST_KEY"
 	{
-		_, err := r.updateProvider(ctx, "shalpha", protocol.ProviderEdit{ApiKeyEnv: &fresh})
+		_, err := r.updateProvider(ctx, protocolCaller(), "shalpha", protocol.ProviderEdit{ApiKeyEnv: &fresh})
 		testassert.NoError(t, err)
 	}
 	drainConnectionEvent(t, r.warnings, sub, "3")
@@ -247,7 +247,7 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 		t.Fatalf("the rebinding unset the shared credential: %q", envValueForTest(r, "SHARED_CRED_TEST_KEY"))
 	}
 	{
-		detail, err := r.getProvider(ctx, "shbeta")
+		detail, err := r.getProvider(ctx, protocolCaller(), "shbeta")
 		testassert.Require(t, err == nil && detail.Provider.Connected, "shbeta after the rebinding = (%v, %+v), want the connection through the shared variable", err, detail.Provider)
 	}
 
@@ -255,14 +255,14 @@ func TestRuntimeSharedCredentialReference(t *testing.T) {
 	// still references the shared variable leaves the variable and every
 	// surviving sibling's connection intact — the variable is not a
 	// per-provider lease.
-	mutation, err := r.deleteProvider(ctx, "shbeta")
+	mutation, err := r.deleteProvider(ctx, protocolCaller(), "shbeta")
 	testassert.Require(t, err == nil && mutation.Result == nil, "shared-reference delete = (%v, %+v), want the null post-state", err, mutation)
 	drainConnectionEvent(t, r.warnings, sub, "4")
 	if envValueForTest(r, "SHARED_CRED_TEST_KEY") != "shared-secret-value" || !testManaged(r, "SHARED_CRED_TEST_KEY") {
 		t.Fatalf("the deletion removed the shared variable = (%q, %v)", envValueForTest(r, "SHARED_CRED_TEST_KEY"), testManaged(r, "SHARED_CRED_TEST_KEY"))
 	}
 	{
-		detail, err := r.getProvider(ctx, "shgamma")
+		detail, err := r.getProvider(ctx, protocolCaller(), "shgamma")
 		testassert.Require(t, err == nil && detail.Provider.Connected && detail.Provider.KeySource == protocol.ProviderKeySource(config.KeySourceManaged), "shgamma after the sibling deletion = (%v, %+v), want the surviving shared connection", err, detail.Provider)
 	}
 }
@@ -291,7 +291,7 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 
-		view, err := r.getConfiguration(context.Background())
+		view, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		sessions := view.Settings.Sessions
 		testassert.Require(t, !sessions.AutoArchive && sessions.ArchiveAfterDays == 3 && sessions.DeleteAfterArchiveDays == 7, "sessions settings = %+v, want the supplied values with the 7-day delete default", sessions)
@@ -314,7 +314,7 @@ func TestConfigurationViewProjectsSettingsAndRoster(t *testing.T) {
 		// sections projects an empty complete map.
 		absent, _ := openConfigurationRuntime(t, store, `{"providers":{}}`, "", settingsPlugins()...)
 		defer closeProjectionRuntime(absent)
-		absentView, err := absent.getConfiguration(context.Background())
+		absentView, err := absent.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Require(t, len(absentView.Settings.Extensions) == 0, "absent extension sections projected = %+v, want none", absentView.Settings.Extensions)
 		testassert.Require(t, string(absentView.Settings.Tools) == `{}` && string(absentView.Settings.Jobs) == `{}` && string(absentView.Settings.Compaction) == `{}`, "absent baseline sections = %s/%s/%s, want empty objects", absentView.Settings.Tools, absentView.Settings.Jobs, absentView.Settings.Compaction)
@@ -369,7 +369,7 @@ func TestConfigurationReadsRemainAvailableDuringParkedBuild(t *testing.T) {
 	armed.Store(true)
 	reloadDone := make(chan error, 1)
 	go func() {
-		_, err := r.Reload(context.Background())
+		_, err := r.reload(context.Background(), protocolCaller())
 		reloadDone <- err
 	}()
 	select {
@@ -378,12 +378,12 @@ func TestConfigurationReadsRemainAvailableDuringParkedBuild(t *testing.T) {
 		t.Fatal("the reload never reached the parked validator")
 	}
 
-	view, err := r.getConfiguration(context.Background())
+	view, err := r.getConfiguration(context.Background(), protocolCaller())
 	testassert.NoError(t, err)
 	testassert.Equal(t, view.ConfigurationRevision.Generation, "1")
 	releaseGate()
 	testassert.NoError(t, <-reloadDone)
-	after, err := r.getConfiguration(context.Background())
+	after, err := r.getConfiguration(context.Background(), protocolCaller())
 	testassert.Require(t, err == nil && after.ConfigurationRevision.Generation == "2", "read after the reload = (%v, generation %s), want generation 2", err, after.ConfigurationRevision.Generation)
 }
 
@@ -412,7 +412,7 @@ func TestConfigurationDefinedEmptyExternalKeySource(t *testing.T) {
 	defer closeProjectionRuntime(r)
 	ctx := context.Background()
 
-	view, err := r.getConfiguration(ctx)
+	view, err := r.getConfiguration(ctx, protocolCaller())
 	testassert.NoError(t, err)
 	for _, row := range []struct {
 		id        string
@@ -428,7 +428,7 @@ func TestConfigurationDefinedEmptyExternalKeySource(t *testing.T) {
 		testassert.Require(t, prov.Id == row.id && string(prov.KeySource) == row.source && prov.Connected == row.connected, "%s view missing: %+v; %s = key_source %q connected %v, want %q/%v", row.id, prov, row.id, prov.KeySource, prov.Connected, row.source, row.connected)
 	}
 
-	models, err := r.listModels(ctx, protocol.ListModelsParams{All: true})
+	models, err := r.listModels(ctx, protocolCaller(), protocol.ListModelsParams{All: true})
 	testassert.NoError(t, err)
 	included := map[string]bool{}
 	for _, entry := range models.Models {
@@ -447,9 +447,9 @@ func TestConfigurationModelPickerConnectedRules(t *testing.T) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 
-		visible, err := r.listModels(context.Background(), protocol.ListModelsParams{All: false})
+		visible, err := r.listModels(context.Background(), protocolCaller(), protocol.ListModelsParams{All: false})
 		testassert.NoError(t, err)
-		full, err := r.listModels(context.Background(), protocol.ListModelsParams{All: true})
+		full, err := r.listModels(context.Background(), protocolCaller(), protocol.ListModelsParams{All: true})
 		testassert.NoError(t, err)
 
 		// Connected providers only: unsetp's model is in neither list;
@@ -478,7 +478,7 @@ func TestConfigurationModelPickerConnectedRules(t *testing.T) {
 
 		// The per-provider model read: every model view of one provider,
 		// including the incomplete and hidden entries with usable flags.
-		models, err := r.listProviderModels(context.Background(), "prov")
+		models, err := r.listProviderModels(context.Background(), protocolCaller(), "prov")
 		testassert.NoError(t, err)
 		testassert.Require(t, len(models.Models) == 3 && models.ConfigurationRevision.Generation == "1", "got %v, want %v; provider models revision = %+v, want generation 1", len(models.Models), 3, models.ConfigurationRevision)
 		for _, model := range models.Models {
@@ -488,18 +488,18 @@ func TestConfigurationModelPickerConnectedRules(t *testing.T) {
 		// Identity rules: an unknown valid provider is the typed unknown
 		// error; an empty identity wraps the shared invalid sentinel.
 		{
-			_, err := r.getProvider(context.Background(), "absent")
+			_, err := r.getProvider(context.Background(), protocolCaller(), "absent")
 			testassert.Require(t, err != nil && strings.Contains(err.Error(), "unknown provider"), "getProvider(absent) = %v, want the typed unknown-provider error", err)
 		}
 		{
-			_, err := r.getProvider(context.Background(), "")
+			_, err := r.getProvider(context.Background(), protocolCaller(), "")
 			testassert.Require(t, strings.Contains(err.Error(), "provider id must be non-empty"), "getProvider(empty) = %v, want the shared invalid sentinel", err)
 		}
 		{
-			_, err := r.listProviderModels(context.Background(), "")
+			_, err := r.listProviderModels(context.Background(), protocolCaller(), "")
 			testassert.Require(t, strings.Contains(err.Error(), "provider id must be non-empty"), "listProviderModels(empty) = %v, want the shared invalid sentinel", err)
 		}
-		detail, err := r.getProvider(context.Background(), "prov")
+		detail, err := r.getProvider(context.Background(), protocolCaller(), "prov")
 		testassert.NoError(t, err)
 		testassert.Require(t, detail.Provider.Id == "prov" && detail.ConfigurationRevision.Generation == "1", "provider detail = %+v, want the projected view at generation 1", detail.Provider)
 	})
@@ -514,7 +514,7 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 
-		baseline, err := r.getConfiguration(context.Background())
+		baseline, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		expected, err := json.Marshal(baseline)
 		testassert.NoError(t, err)
@@ -544,14 +544,14 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 			}
 		}
 
-		fresh, err := r.getConfiguration(context.Background())
+		fresh, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		got, err := json.Marshal(fresh)
 		testassert.NoError(t, err)
 		testassert.Require(t, string(got) == string(expected), "a mutation of the returned view reached the captured configuration:\n%s\nwant\n%s", got, expected)
 
 		// The model list and provider detail own their values the same way.
-		list, err := r.listModels(context.Background(), protocol.ListModelsParams{All: true})
+		list, err := r.listModels(context.Background(), protocolCaller(), protocol.ListModelsParams{All: true})
 		testassert.NoError(t, err)
 		listExpected, err := json.Marshal(list)
 		testassert.NoError(t, err)
@@ -559,19 +559,19 @@ func TestConfigurationReadsOwnReturnedValues(t *testing.T) {
 			list.Models[0].DisplayName = "mutated"
 			list.Models = nil
 		}
-		detail, err := r.getProvider(context.Background(), "prov")
+		detail, err := r.getProvider(context.Background(), protocolCaller(), "prov")
 		testassert.NoError(t, err)
 		detailExpected, err := json.Marshal(detail)
 		testassert.NoError(t, err)
 		detail.Provider.Models[0].Name = "mutated"
 		detail.Provider.Headers["X-Trace"] = "mutated"
 
-		freshList, err := r.listModels(context.Background(), protocol.ListModelsParams{All: true})
+		freshList, err := r.listModels(context.Background(), protocolCaller(), protocol.ListModelsParams{All: true})
 		testassert.NoError(t, err)
 		gotList, err := json.Marshal(freshList)
 		testassert.NoError(t, err)
 		testassert.Require(t, string(gotList) == string(listExpected), "a mutation of the returned list reached the captured configuration")
-		freshDetail, err := r.getProvider(context.Background(), "prov")
+		freshDetail, err := r.getProvider(context.Background(), protocolCaller(), "prov")
 		testassert.NoError(t, err)
 		gotDetail, err := json.Marshal(freshDetail)
 		testassert.NoError(t, err)
@@ -588,21 +588,21 @@ func TestConfigurationFailedReloadLeavesClocksUnchanged(t *testing.T) {
 		r, e := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 
-		before, err := r.getConfiguration(context.Background())
+		before, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
-		warningsBefore, err := r.getWarnings(context.Background())
+		warningsBefore, err := r.getWarnings(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 
 		writeServiceFile(t, e.configPath, "{not json")
 		{
-			_, err := r.Reload(context.Background())
+			_, err := r.reload(context.Background(), protocolCaller())
 			testassert.Require(t, err != nil, "Reload over a malformed configuration succeeded, want failure")
 		}
 
-		after, err := r.getConfiguration(context.Background())
+		after, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Equal(t, after.ConfigurationRevision.Generation, before.ConfigurationRevision.Generation)
-		warningsAfter, err := r.getWarnings(context.Background())
+		warningsAfter, err := r.getWarnings(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Equal(t, warningsAfter.WarningsRevision.Revision, warningsBefore.WarningsRevision.Revision)
 	})
@@ -625,7 +625,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		t.Cleanup(setupSub.Close)
 
 		// Disconnected: no_provider plus the primary model's unavailability.
-		snap, err := r.getWarnings(context.Background())
+		snap, err := r.getWarnings(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		var setupKinds []string
 		for _, warning := range snap.Warnings {
@@ -641,7 +641,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		// warning event with the advanced revision.
 		testassert.NoError(t, r.managedEnvForTest().Set("UNSET_SETUP_KEY", "setup-secret"))
 		{
-			_, err := r.Reload(context.Background())
+			_, err := r.reload(context.Background(), protocolCaller())
 			testassert.NoError(t, err)
 		}
 		clearingConfig, ok := nextEvent(t, setupSub)
@@ -655,7 +655,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		clearingBody, err := clearingWarning.AsWarningChangedEvent()
 		testassert.NoError(t, err)
 		testassert.Require(t, scopeKind(t, clearingBody.Scope) == "runtime", "clearing reload's warning scope = %+v, want the runtime scope", clearingBody.Scope)
-		clear, err := r.getWarnings(context.Background())
+		clear, err := r.getWarnings(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		for _, warning := range clear.Warnings {
 			testassert.Require(t, warning.Source != "runtime:setup", "setup warning survived the connected reload: %+v", warning)
@@ -668,7 +668,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		// Idempotent reports advance nothing: reload again with no change —
 		// exactly one configuration event and NO warning hint.
 		{
-			_, err := r.Reload(context.Background())
+			_, err := r.reload(context.Background(), protocolCaller())
 			testassert.NoError(t, err)
 		}
 		idempotentConfig, ok := nextEvent(t, setupSub)
@@ -676,7 +676,7 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 			t.Fatalf("unchanged reload's configuration event = %s (ok=%v)", eventJSON(t, idempotentConfig), ok)
 		}
 		assertNoEvent(t, setupSub)
-		idempotent, err := r.getWarnings(context.Background())
+		idempotent, err := r.getWarnings(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Equal(t, idempotent.WarningsRevision.Revision, clear.WarningsRevision.Revision)
 
@@ -688,10 +688,10 @@ func TestConfigurationSetupWarningsLifecycle(t *testing.T) {
 		writeServiceFile(t, e.configPath, brokenDoc)
 		writeAgentDefinitions(t, e.configPath, definitions)
 		{
-			_, err := r.Reload(context.Background())
+			_, err := r.reload(context.Background(), protocolCaller())
 			testassert.NoError(t, err)
 		}
-		broken, err := r.getWarnings(context.Background())
+		broken, err := r.getWarnings(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		var sources []string
 		var catalogSeen, setupSeen bool
@@ -721,7 +721,7 @@ func TestConfigurationRosterRequiredArrays(t *testing.T) {
 		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
 		defer closeProjectionRuntime(r)
 
-		view, err := r.getConfiguration(context.Background())
+		view, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		type rosterProbe struct {
 			Name         string          `json:"name"`
@@ -804,7 +804,7 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 			testassert.Require(t, view.ProtocolMetadata.MustPreserve != nil && slices.Equal(*view.ProtocolMetadata.MustPreserve, []string{"x_keep"}) && view.ProtocolMetadata.Drop != nil && slices.Equal(*view.ProtocolMetadata.Drop, []string{"x_drop"}), "%s: prov must_preserve = %v, want [x_keep]; %s: prov drop = %v, want [x_drop]", where, view.ProtocolMetadata.MustPreserve, where, view.ProtocolMetadata.Drop)
 		}
 
-		configView, err := r.getConfiguration(context.Background())
+		configView, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		prov := findProvider(configView.Providers, "prov")
 		checkExtras("getConfiguration", prov)
@@ -814,10 +814,10 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 		for _, model := range prov.Models {
 			testassert.Require(t, model.SystemRole == protocol.SystemRole("system") && model.UsageInStream, "prov/%s system_role = %q usage_in_stream = %v, want the effective defaults", model.Id, model.SystemRole, model.UsageInStream)
 		}
-		list, err := r.listProviders(context.Background())
+		list, err := r.listProviders(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		checkExtras("listProviders", findProvider(list.Providers, "prov"))
-		detail, err := r.getProvider(context.Background(), "prov")
+		detail, err := r.getProvider(context.Background(), protocolCaller(), "prov")
 		testassert.NoError(t, err)
 		checkExtras("getProvider", detail.Provider)
 		testassert.Require(t, configView.ConfigurationRevision.Generation == list.ConfigurationRevision.Generation && list.ConfigurationRevision.Generation == detail.ConfigurationRevision.Generation, "the three read paths disagree on the generation: %q/%q/%q", configView.ConfigurationRevision.Generation, list.ConfigurationRevision.Generation, detail.ConfigurationRevision.Generation)
@@ -832,7 +832,7 @@ func TestConfigurationProviderExtrasExactAndOwned(t *testing.T) {
 		*detail.Provider.ProtocolMetadata.Family = "mutated"
 		(*detail.Provider.ProtocolMetadata.MustPreserve)[0] = "mutated"
 		(*detail.Provider.ProtocolMetadata.Drop)[0] = "mutated"
-		fresh, err := r.getProvider(context.Background(), "prov")
+		fresh, err := r.getProvider(context.Background(), protocolCaller(), "prov")
 		testassert.NoError(t, err)
 		got, err := json.Marshal(fresh.Provider)
 		testassert.NoError(t, err)
@@ -870,7 +870,7 @@ func TestConfigurationModelSourceExactThroughCapturedCatalog(t *testing.T) {
 
 		// Before any cache record: the bundled provider's shipped models are
 		// bundled and the user-layer model is user; nothing is discovered.
-		before, err := r.getConfiguration(context.Background())
+		before, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		openrouter := findProvider(before.Providers, "openrouter")
 		testassert.Require(t, openrouter.Builtin, "openrouter builtin = false, want the bundled identity")
@@ -891,10 +891,10 @@ func TestConfigurationModelSourceExactThroughCapturedCatalog(t *testing.T) {
 			catalog.DiscoveredProvider{Models: map[string]catalog.DiscoveredModel{"found-via-cache": {Name: "Found Via Cache", ContextWindow: 4096}}},
 			time.Now().UTC()))
 		{
-			_, err := r.Reload(context.Background())
+			_, err := r.reload(context.Background(), protocolCaller())
 			testassert.NoError(t, err)
 		}
-		after, err := r.getConfiguration(context.Background())
+		after, err := r.getConfiguration(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		reloaded := findProvider(after.Providers, "openrouter")
 		testassert.Require(t, reloaded.Id == "openrouter", "reloaded openrouter view missing")
@@ -917,7 +917,7 @@ func TestConfigurationModelSourceExactThroughCapturedCatalog(t *testing.T) {
 		// The picker carries the same exact labels from the captured catalog,
 		// still connected-only: the disconnected openrouter appears in neither
 		// list, and the connected custom provider's model is user.
-		list, err := r.listModels(context.Background(), protocol.ListModelsParams{All: true})
+		list, err := r.listModels(context.Background(), protocolCaller(), protocol.ListModelsParams{All: true})
 		testassert.NoError(t, err)
 		pickerLabels := map[string]string{}
 		for _, entry := range list.Models {

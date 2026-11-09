@@ -217,7 +217,7 @@ func TestObservationTwoHealthyOrderOneSaturatedNoReplay(t *testing.T) {
 		awaitOperation(t, bg.r, session, "op-1", harness.OperationSuccess)
 		awaitRestorableSession(t, bg.r, session)
 		{
-			_, err := bg.r.Reload(ctx)
+			_, err := bg.r.reload(ctx, protocolCaller())
 			testassert.NoError(t, err)
 		}
 
@@ -482,11 +482,11 @@ func TestObservationPluginReportsLandWithRealAttribution(t *testing.T) {
 		assertNoEvent(t, sub)
 
 		for _, sessionID := range []string{session.Identity.SessionID, other.Identity.SessionID} {
-			hydration, err := r.buildHydration(ctx, sessionID)
+			hydration, err := r.buildHydration(ctx, protocolCaller(), sessionID)
 			testassert.Require(t, err == nil, "buildHydration(%s): %v", sessionID, err)
 			testassert.Require(t, warningOf(hydration.Warnings, "plugin:alpha", "install_failed", "") != nil && warningOf(hydration.Warnings, "plugin:beta", "server_unavailable", "") != nil, "hydration of %s misses a plugin group: %+v", sessionID, hydration.Warnings)
 		}
-		all, err := r.getWarnings(ctx)
+		all, err := r.getWarnings(ctx, protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Require(t, warningOf(all.Warnings, "plugin:alpha", "install_failed", "") != nil && warningOf(all.Warnings, "plugin:beta", "server_unavailable", "") != nil, "the unfiltered read misses a plugin group: %+v", all.Warnings)
 		counts := map[string]int{}
@@ -625,7 +625,7 @@ func TestObservationStopAllJobFinishHints(t *testing.T) {
 
 		// Authoritative hydration agrees: no member and a revision not older
 		// than the hint.
-		hydration, err := bg.r.buildHydration(ctx, jobSession)
+		hydration, err := bg.r.buildHydration(ctx, protocolCaller(), jobSession)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(hydration.Background) == 0, "hydration background = %+v, want no member after the stop", hydration.Background)
 		testassert.Require(t, !lessPair(t, hydration.SessionRevision, finishPair), "hydration revision %+v is older than the job finish hint %+v", hydration.SessionRevision, finishPair)

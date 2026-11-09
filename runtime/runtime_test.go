@@ -1008,7 +1008,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
-					revision, err := r.Reload(context.Background())
+					revision, err := r.reload(context.Background(), protocolCaller())
 					if err != nil {
 						t.Errorf("Reload: %v", err)
 						return
@@ -1042,7 +1042,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			defer cancel()
 			reloadDone := make(chan error, 1)
 			go func() {
-				_, err := r.Reload(ctx)
+				_, err := r.reload(ctx, protocolCaller())
 				reloadDone <- err
 			}()
 			<-arrive
@@ -1053,7 +1053,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 				testassert.Require(t, errors.Is(err, context.Canceled), "canceled Reload = %v, want the caller's own context error", err)
 			}
 			{
-				revision, err := r.Reload(context.Background())
+				revision, err := r.reload(context.Background(), protocolCaller())
 				testassert.Require(t, err == nil && revision == "2", "Reload after the canceled build = (%q, %v), want 2: a failed build consumes no generation", revision, err)
 			}
 		})
@@ -1072,7 +1072,7 @@ func TestRuntimeReloadSerializesAndShutdownJoinsTheBuild(t *testing.T) {
 			t.Cleanup(func() { candidateBarrier = nil })
 			reloadDone := make(chan error, 1)
 			go func() {
-				_, err := r.Reload(context.Background())
+				_, err := r.reload(context.Background(), protocolCaller())
 				reloadDone <- err
 			}()
 			<-arrive
@@ -1134,7 +1134,7 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 				testassert.Require(t, errors.Is(err, context.Canceled), "canceled request = %v, want the caller's own error", err)
 			}
 			{
-				revision, err := r.Reload(context.Background())
+				revision, err := r.reload(context.Background(), protocolCaller())
 				testassert.Require(t, err == nil && revision == "2", "Reload after a canceled request = (%q, %v), want the owner alive at revision 2", revision, err)
 			}
 			testassert.NoError(t, r.Close(context.Background()))
@@ -1151,7 +1151,7 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 			canceledWork, cancelWatcherFree := context.WithCancel(context.Background())
 			cancelWatcherFree()
 			r.work, r.cancelWork = canceledWork, func() {}
-			_, reloadErr := r.Reload(context.Background())
+			_, reloadErr := r.reload(context.Background(), protocolCaller())
 			ranGuardedCall := false
 			guardedErr := r.withHarness(context.Background(), func(context.Context, *harness.Harness) error {
 				ranGuardedCall = true
@@ -1208,13 +1208,13 @@ func TestRuntimeLifetimeBelongsToTheProcessNotItsClients(t *testing.T) {
 			testassert.NoError(t, err)
 			testassert.NoError(t, r.Close(context.Background()))
 			{
-				_, err := r.Reload(context.Background())
+				_, err := r.reload(context.Background(), protocolCaller())
 				testassert.Require(t, errors.Is(err, ErrClosed), "Reload after Close = %v, want ErrClosed", err)
 			}
 			callerCtx, cancelCaller := context.WithCancel(context.Background())
 			cancelCaller()
 			{
-				_, err := r.Reload(callerCtx)
+				_, err := r.reload(callerCtx, protocolCaller())
 				testassert.Require(t, errors.Is(err, ErrClosed), "Reload after Close with a canceled caller = %v, want ErrClosed: admission rejects before the caller check", err)
 			}
 			{
@@ -1336,7 +1336,7 @@ func TestRuntimeWorkspaceIdentityIsLexicalNormalization(t *testing.T) {
 			testassert.Require(t, boundary != "", "no admitted input entry was found")
 			var forked harness.SessionRecord
 			err = r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-				res, err := h.Fork(ctx, harness.ForkRequest{
+				res, err := h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 					SourceSessionID: left.Identity.SessionID,
 					BoundaryEntryID: boundary,
 					OperationID:     "op-fork",

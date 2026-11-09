@@ -74,9 +74,12 @@ func sessionArtifactDir(dataDir, sessionID string) string {
 // Session, ascending by the owning Operation's admitted-entry sequence, from
 // one admitted narrow history capture. Only groups that recorded files are
 // listed; a valid Session with none returns an empty, non-nil list.
-func (r *Runtime) listSessionCodeSnapshots(ctx context.Context, sessionID string) ([]protocol.CodeSnapshotGroup, error) {
+func (r *Runtime) listSessionCodeSnapshots(ctx context.Context, c caller, sessionID string) ([]protocol.CodeSnapshotGroup, error) {
 	var groups []protocol.CodeSnapshotGroup
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		view, err := h.ReadHistoryView(ctx, sessionID)
 		if err != nil {
 			return err
@@ -130,16 +133,18 @@ func projectCodeSnapshotGroups(sessionID string, headers []harness.HistoryEntryH
 // captures and validates its one narrow history view while holding the token,
 // then traverses under it. Every group's partial result is accumulated before
 // its error is handled; a traversal failure returns that accumulated result
-// with the internal error class, while a pre-traversal refusal returns no
-// result.
-func (r *Runtime) revertSessionCode(ctx context.Context, sessionID, boundaryOperationID string) (protocol.CodeRevertResult, error) {
+// with its public class, while a pre-traversal refusal returns no result.
+func (r *Runtime) revertSessionCode(ctx context.Context, c caller, sessionID, boundaryOperationID string) (protocol.CodeRevertResult, error) {
 	var result protocol.CodeRevertResult
-	releaseArtifacts, err := r.artifacts.acquireTry(sessionArtifactDir(r.dataDir, sessionID))
-	if err != nil {
-		return result, err
-	}
-	defer releaseArtifacts()
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
+		releaseArtifacts, err := r.artifacts.acquireTry(sessionArtifactDir(r.dataDir, sessionID))
+		if err != nil {
+			return err
+		}
+		defer releaseArtifacts()
 		view, err := h.ReadHistoryView(ctx, sessionID)
 		if err != nil {
 			return err
@@ -219,12 +224,12 @@ func accumulateCodeRevert(result *protocol.CodeRevertResult, group snapshot.Reve
 }
 
 // codeRevertFailure projects a traversal failure onto the same accumulated
-// result DTO: the internal error class rides the result while the Go error
+// result DTO: the shared public class rides the result while the Go error
 // stays non-nil, so a caller can never read the partial work as an empty
 // success or a completed rollback. It never fills Error.SessionId — that
 // generated field names a target Session.
 func codeRevertFailure(result protocol.CodeRevertResult, err error) (protocol.CodeRevertResult, error) {
-	result.Error = &protocol.Error{Code: protocol.ErrorCodeInternal, Message: err.Error()}
+	result.Error = &protocol.Error{Code: protocolErrorCode(err), Message: err.Error()}
 	return result, fmt.Errorf("restore code snapshots: %w", err)
 }
 
@@ -252,12 +257,19 @@ const maxViewPrefixBytes = 1 << 20
 // bytes existed. The raw prefix is converted with the maximal invalid-byte
 // replacement, so a regular text and a binary file follow the same display
 // rule and conversion may expand the returned content beyond 1 MiB.
-func (r *Runtime) readWorkspaceFile(ctx context.Context, req protocol.ReadFileRequest) (protocol.ReadFileResult, error) {
+func (r *Runtime) readWorkspaceFile(ctx context.Context, c caller, req protocol.ReadFileRequest) (protocol.ReadFileResult, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ReadFileResult{}, err
 	}
 	defer release()
+	workspace, err := filepath.Abs(req.Workspace)
+	if err != nil {
+		return protocol.ReadFileResult{}, fmt.Errorf("normalize workspace: %v: %w", err, harness.ErrInvalid)
+	}
+	if err := c.authorize(ctx, nil, callerScope{kind: callerScopeWorkspace, workspace: workspace}); err != nil {
+		return protocol.ReadFileResult{}, err
+	}
 	canonical, err := viewerCanonicalTarget(req.Workspace, req.Path)
 	if err != nil {
 		return protocol.ReadFileResult{}, err

@@ -15,6 +15,7 @@ import (
 type PendingInput struct {
 	OperationID string
 	Origin      InputOrigin
+	ExtensionID string
 	Content     []model.ContentPart
 }
 
@@ -226,6 +227,7 @@ func captureSessionReadLocked(c *coordinator) SessionReadView {
 		view.Steering = append(view.Steering, PendingInput{
 			OperationID: item.operationID,
 			Origin:      item.origin,
+			ExtensionID: item.extensionID,
 			Content:     ownContentParts(item.content),
 		})
 	}
@@ -233,6 +235,7 @@ func captureSessionReadLocked(c *coordinator) SessionReadView {
 		view.Queued = append(view.Queued, PendingInput{
 			OperationID: item.operationID,
 			Origin:      item.origin,
+			ExtensionID: item.extensionID,
 			Content:     ownContentParts(item.content),
 		})
 	}

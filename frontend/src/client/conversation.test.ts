@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 // The conversation renderer: all five generated item variants, refusal and
 // tool-call presentation, opaque fields rendered without control
-// interpretation, XSS-safe markdown, user-origin input action eligibility,
+// interpretation, XSS-safe markdown, input action eligibility,
 // scroll follow versus deliberate scroll, and the provisional activity area.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, tick, unmount } from 'svelte';

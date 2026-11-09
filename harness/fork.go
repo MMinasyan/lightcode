@@ -10,13 +10,17 @@ import (
 )
 
 // ForkRequest is the input of one transactional fork: the idle open or
-// archived source Session, the user-origin input entry whose conversation
+// archived source Session, the canonical input entry whose conversation
 // prefix the destination inherits, the caller Operation identity of the
-// fresh destination admission, and its content.
+// fresh destination admission, the replacement input's origin/provenance,
+// and its content. Source origin is attribution only; every committed input
+// is an eligible boundary.
 type ForkRequest struct {
 	SourceSessionID string
 	BoundaryEntryID string
 	OperationID     string
+	Origin          InputOrigin
+	ExtensionID     string // present exactly for plugin replacement attribution
 	Content         []model.ContentPart
 }
 
@@ -28,21 +32,23 @@ type ForkResult struct {
 }
 
 // Fork forks one idle open or archived source Session at the selected
-// user-origin input boundary: it first resolves the caller Operation ID's
+// canonical input boundary: it first resolves the caller Operation ID's
 // idempotency lookup, then reserves the source coordinator, prepares the
 // destination view outside locks and storage, and performs one store-wide
 // transaction that revalidates the source, creates the destination Session
 // with source/boundary lineage, copies only the strict-before-boundary
 // eligible entries under new identities, and runs the shared in-transaction
-// destination admission producer with a fixed user origin. Destination
-// execution starts only after the commit. Source records and the source's
-// process-local buffers are never changed, and lineage is informational
-// only: source and fork archive or delete independently.
+// destination admission producer with the caller's replacement origin and
+// provenance. Source origin is attribution only: every committed input entry
+// is an eligible boundary, including an independently copied prefix input.
+// Destination execution starts only after the commit. Source records and the
+// source's process-local buffers are never changed, and lineage is
+// informational only: source and fork archive or delete independently.
 func (h *Harness) Fork(ctx context.Context, req ForkRequest) (ForkResult, error) {
 	if err := h.ctx.Err(); err != nil { // cancellation has closed admission
 		return ForkResult{}, err
 	}
-	content, err := validateSubmitInput(req.OperationID, InputOriginUser, req.Content)
+	content, err := validateSubmitInput(req.OperationID, req.Origin, req.ExtensionID, req.Content)
 	if err != nil {
 		return ForkResult{}, err
 	}
@@ -198,16 +204,17 @@ func (h *Harness) forkExisting(ctx context.Context, req ForkRequest) (ForkResult
 
 // forkTransaction is Fork's one store-wide transaction: it revalidates the
 // source identity and revision, requires the selected boundary to be a
-// user-origin input entry, creates the destination Session with source
-// Workspace/current Agent type and source/boundary lineage, copies only the
-// strict-before-boundary input, assistant, tool_result, signal, and
-// compaction entries under new identities — clearing source Operation
-// ownership and usage and rewriting copied references, with copied signal
-// source Operations informational only — excludes Operation settlements and
-// every source Operation register, points the destination projection at the
-// last copied compaction entry, and runs the shared in-transaction
-// destination admission producer with a fixed user origin and the freshly
-// prepared capture. First-writer resolution stays with the Fork caller.
+// committed canonical input entry independent of its origin, creates the
+// destination Session with source Workspace/current Agent type and
+// source/boundary lineage, copies only the strict-before-boundary input,
+// assistant, tool_result, signal, and compaction entries under new
+// identities — clearing source Operation ownership and usage and rewriting
+// copied references, with copied signal source Operations informational only
+// — excludes Operation settlements and every source Operation register,
+// points the destination projection at the last copied compaction entry, and
+// runs the shared in-transaction destination admission producer with the
+// caller's replacement origin/provenance and the freshly prepared capture.
+// First-writer resolution stays with the Fork caller.
 func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRecord, req ForkRequest, content []model.ContentPart, capture ExecutionCapture, out *forkCommit) error {
 	sreg, err := tx.ReadRegister(RegisterKey{SessionID: req.SourceSessionID, Kind: RegisterSession})
 	if err != nil {
@@ -235,9 +242,6 @@ func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRec
 		}
 		if decoded.Input == nil {
 			return invalidInput("boundary entry %q is a %s entry; forking requires an input boundary", req.BoundaryEntryID, env.Kind)
-		}
-		if decoded.Input.Origin != InputOriginUser {
-			return invalidInput("boundary entry %q has origin %q; forking requires a user-origin boundary", req.BoundaryEntryID, decoded.Input.Origin)
 		}
 		boundarySeq, boundaryFound = env.Sequence, true
 		break
@@ -303,7 +307,8 @@ func (h *Harness) forkTransaction(tx Transaction, destID string, view SessionRec
 		SessionID:   destID,
 		OperationID: req.OperationID,
 		Kind:        RequestKindMessage,
-		Origin:      InputOriginUser,
+		Origin:      req.Origin,
+		ExtensionID: req.ExtensionID,
 		Content:     content,
 	})
 	if perr != nil {

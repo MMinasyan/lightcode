@@ -327,7 +327,7 @@ func TestAdaptationNativeSelectionRefusalAndReloadCapture(t *testing.T) {
 	}()
 	<-arrived
 	writeAdaptationEntries(t, e.configPath, `[{"pattern":"*adaptive*","prompt":"SECOND"}]`)
-	_, reloadErr := r.Reload(ctx)
+	_, reloadErr := r.reload(ctx, protocolCaller())
 	testassert.NoError(t, reloadErr)
 	close(release)
 	testassert.NoError(t, <-done)
@@ -369,7 +369,7 @@ func TestAdaptationNativeConfigurationPublication(t *testing.T) {
 	r, err := e.openPlugins(ctx, ShippedAdaptationPlugin())
 	testassert.NoError(t, err)
 	writeAdaptationSection(t, e.configPath, `{"enabled":false,"entries":[{"pattern":2}]}`)
-	_, err = r.Reload(ctx)
+	_, err = r.reload(ctx, protocolCaller())
 	testassert.NoError(t, err)
 	data, err := os.ReadFile(e.configPath)
 	testassert.Require(t, err == nil && strings.Contains(string(data), `"enabled":false,"entries":[{"pattern":2}]`), "inactive reload changed or dropped the retained section: %s (%v)", data, err)
@@ -400,12 +400,12 @@ func TestAdaptationNativeConfigurationPublication(t *testing.T) {
 	// changing the owning file.
 	validEntries := `[{"pattern":"*","unknown":true}]`
 	e2, r2 := newAdaptationRuntime(t, validEntries, parkPlugin(&parkingHook{}))
-	view, err := r2.getConfiguration(ctx)
+	view, err := r2.getConfiguration(ctx, protocolCaller())
 	testassert.NoError(t, err)
 	settings := view.Settings
-	_, err = r2.updateSettings(ctx, protocol.UpdateSettingsRequest{Settings: &settings})
+	_, err = r2.updateSettings(ctx, protocolCaller(), protocol.UpdateSettingsRequest{Settings: &settings})
 	testassert.NoError(t, err)
-	written, err := r2.getConfiguration(ctx)
+	written, err := r2.getConfiguration(ctx, protocolCaller())
 	testassert.NoError(t, err)
 	beforeGeneration := written.ConfigurationRevision.Generation
 	data, err = os.ReadFile(e2.configPath)
@@ -416,11 +416,11 @@ func TestAdaptationNativeConfigurationPublication(t *testing.T) {
 	testassert.NoError(t, err)
 	settings = written.Settings
 	settings.Extensions["adaptation"] = `{"enabled":true,"entries":[{"pattern":"*","prompt":1}]}`
-	_, err = r2.updateSettings(ctx, protocol.UpdateSettingsRequest{Settings: &settings})
+	_, err = r2.updateSettings(ctx, protocolCaller(), protocol.UpdateSettingsRequest{Settings: &settings})
 	testassert.Require(t, err != nil, "settings write accepted an invalid active adaptation section")
 	after, err := os.ReadFile(e2.configPath)
 	testassert.Require(t, err == nil && string(before) == string(after), "a rejected settings write changed the owning file")
-	fresh, err := r2.getConfiguration(ctx)
+	fresh, err := r2.getConfiguration(ctx, protocolCaller())
 	testassert.NoError(t, err)
 	testassert.Equal(t, fresh.ConfigurationRevision.Generation, beforeGeneration)
 	testassert.NoError(t, r2.Close(ctx))

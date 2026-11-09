@@ -175,7 +175,7 @@ func TestProtocolServerStreamIsolation(t *testing.T) {
 	awaitHealthy(100)
 	before := healthyCount.Load()
 	{
-		_, err := r.submitSession(ctx, session, protocol.SubmitRequest{
+		_, err := r.submitSession(ctx, protocolCaller(), session, protocol.SubmitRequest{
 			OperationId: "op-final", Mode: "queued",
 			Content: []protocol.ContentPart{textContentPart(t, "final", nil)},
 		})
@@ -452,7 +452,7 @@ func TestProtocolServerDiscoveryPublication(t *testing.T) {
 	if err := decoder.Decode(&published); err != nil {
 		t.Fatalf("decode published record %s: %v", string(data), err)
 	}
-	testassert.Require(t, published.Endpoint == ps.Endpoint() && published.InstanceId == ps.instance && published.ProtocolVersion == string(protocol.N12) && published.Credential == ps.credential, "published record = %+v, want the endpoint, identity, wire version, and credential", published)
+	testassert.Require(t, published.Endpoint == ps.Endpoint() && published.InstanceId == ps.instance && published.ProtocolVersion == string(protocol.N13) && published.Credential == ps.credential, "published record = %+v, want the endpoint, identity, wire version, and credential", published)
 
 	// A second publication is refused — successful publication cannot repeat.
 	second := filepath.Join(dir, "second.json")
@@ -665,7 +665,7 @@ func TestProtocolServerStreamDisconnectPreservesLiveJob(t *testing.T) {
 	testassert.Equal(t, countEvents(e.events.all(), "stopjob"), 0)
 
 	// The existing stop path completes the job through the fixture seam.
-	testassert.NoError(t, r.stopSession(ctx, session))
+	testassert.NoError(t, r.stopSession(ctx, protocolCaller(), session))
 	testassert.Equal(t, countEvents(e.events.all(), "stopjob"), 1)
 	settled, err := client.GetSessionHydrationWithResponse(ctx, session)
 	testassert.Require(t, err == nil && settled.JSON200 != nil, "hydration after stop: %v", err)

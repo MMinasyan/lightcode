@@ -37,13 +37,13 @@ func TestComposedJobsSettingsPublication(t *testing.T) {
 	writeToolsConfig(t, e.configPath, accept)
 	r, err := Open(ctx, e.options())
 	testassert.NoError(t, err)
-	if rev, err := r.Reload(ctx); err != nil || rev != "2" {
+	if rev, err := r.reload(ctx, protocolCaller()); err != nil || rev != "2" {
 		_ = r.Close(ctx)
 		t.Fatalf("first Reload = (%q, %v), want revision 2", rev, err)
 	}
 
 	writeToolsConfig(t, e.configPath, violation)
-	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, ErrConfiguration) {
+	if _, err := r.reload(ctx, protocolCaller()); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with an out-of-range jobs limit = %v, want a complete publication failure", err)
 	} else if !strings.Contains(err.Error(), "jobs: max_output_bytes must be between 1024 and 1048576") {
@@ -52,7 +52,7 @@ func TestComposedJobsSettingsPublication(t *testing.T) {
 	}
 
 	writeToolsConfig(t, e.configPath, badType)
-	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, ErrConfiguration) {
+	if _, err := r.reload(ctx, protocolCaller()); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with a wrong-typed jobs field = %v, want a complete publication failure", err)
 	} else if !strings.Contains(err.Error(), "jobs: invalid settings:") {
@@ -61,13 +61,13 @@ func TestComposedJobsSettingsPublication(t *testing.T) {
 	}
 
 	writeToolsConfig(t, e.configPath, nullSection)
-	if _, err := r.Reload(ctx); err == nil || !errors.Is(err, ErrConfiguration) {
+	if _, err := r.reload(ctx, protocolCaller()); err == nil || !errors.Is(err, ErrConfiguration) {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload with a null jobs section = %v, want the publisher's non-object rejection", err)
 	}
 
 	writeToolsConfig(t, e.configPath, accept)
-	rev, err := r.Reload(ctx)
+	rev, err := r.reload(ctx, protocolCaller())
 	if err != nil || rev != "3" {
 		_ = r.Close(ctx)
 		t.Fatalf("Reload after the failures = (%q, %v), want generation 3: failed publications published nothing", rev, err)

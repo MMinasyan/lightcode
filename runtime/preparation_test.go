@@ -506,7 +506,7 @@ func (e *prepEnv) fork(ctx context.Context, req harness.ForkRequest) (harness.Fo
 // reload publishes the next configuration revision through the Runtime's
 // actual Reload.
 func (e *prepEnv) reload() (string, error) {
-	return e.r.Reload(context.Background())
+	return e.r.reload(context.Background(), protocolCaller())
 }
 
 func (e *prepEnv) admit(sessionID, operationID, text string) harness.SubmitResult {
@@ -759,7 +759,7 @@ func TestPreparationReloadDoesNotRecaptureInFlightPreparation(t *testing.T) {
 					e.hooks[0].parkNext(release, arrived)
 					boundary := e.inputEntry(session, "op-1")
 					go func() {
-						res, err := e.fork(context.Background(), harness.ForkRequest{
+						res, err := e.fork(context.Background(), harness.ForkRequest{Origin: harness.InputOriginUser,
 							SourceSessionID: session,
 							BoundaryEntryID: boundary,
 							OperationID:     "fork-op",
@@ -980,7 +980,7 @@ func TestPreparationPreparationHookErrorOnDrainedAndForkDelivery(t *testing.T) {
 			sourceBeforeView, err := e.sessionView(context.Background(), session)
 			testassert.NoError(t, err)
 			e.hooks[0].failNext(errHook)
-			res, err := e.fork(context.Background(), harness.ForkRequest{
+			res, err := e.fork(context.Background(), harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: session,
 				BoundaryEntryID: boundary,
 				OperationID:     "fork-1",
@@ -1506,7 +1506,7 @@ func TestPreparationInterruptBeforeAgentScopeEntrySettlesInterruption(t *testing
 		case <-time.After(10 * time.Second):
 			t.Fatal("the Agent-scope opening never parked")
 		}
-		testassert.NoError(t, e.r.interruptSession(context.Background(), session))
+		testassert.NoError(t, e.r.interruptSession(context.Background(), protocolCaller(), session))
 		releaseGate()
 		rec := e.awaitTerminal(session, "op-int", harness.OperationInterruption)
 		if rec.State.Terminal != nil && strings.Contains(rec.State.Terminal.Detail, ErrClosed.Error()) {

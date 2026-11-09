@@ -637,10 +637,10 @@ func (c *composition) childLaunchHandler(ctx context.Context, call extension.Cal
 	// same-ID definition.
 	target := request.Definition.PermissionTarget()
 	if !slices.Contains(grant.permissions, harness.PermissionRequest{Permission: harness.PermissionChildLaunch, Target: target}) {
-		return extension.Result{}, fmt.Errorf("child launch target %q is not authorized by the prepared plan: %w", target, ErrClosed)
+		return extension.Result{}, fmt.Errorf("child launch target %q is not authorized by the prepared plan: %w", target, ErrDenied)
 	}
 	if call.SessionID == "" {
-		return extension.Result{}, fmt.Errorf("child launch has no calling Session: %w", ErrClosed)
+		return extension.Result{}, fmt.Errorf("child launch has no calling Session: %w", ErrDenied)
 	}
 	if c.hosts == nil || c.hosts.background == nil || c.hosts.background.h == nil {
 		return extension.Result{}, ErrClosed
@@ -650,6 +650,7 @@ func (c *composition) childLaunchHandler(ctx context.Context, call extension.Cal
 		AgentSelection:  harness.AgentSelection{Definition: &request.Definition},
 		Content:         []model.ContentPart{{Kind: model.PartText, Text: request.Prompt}},
 		OperationID:     request.OperationID,
+		ExtensionID:     call.ExtensionID,
 		MaxConcurrent:   request.MaxConcurrent,
 		OutputLimit:     request.OutputLimit,
 	})

@@ -214,7 +214,7 @@ func TestRuntimeConfigurationResourceReplacement(t *testing.T) {
 		testassert.Equal(t, opens.Load(), int64(0))
 		writeServiceFile(t, e.configPath, `{"extensions":{"alpha":{"enabled":true}}}`)
 		before := r.config.current()
-		_, err = r.Reload(context.Background())
+		_, err = r.reload(context.Background(), protocolCaller())
 		testassert.Require(t, errors.Is(err, ErrConfiguration) && r.config.current() == before && opens.Load() == 0, "invalid active graph = %v", err)
 	})
 	t.Run("inactive extension remains unconstructed across reload", func(t *testing.T) {
@@ -231,7 +231,7 @@ func TestRuntimeConfigurationResourceReplacement(t *testing.T) {
 		testassert.Equal(t, activeOpens.Load(), int64(1))
 		resources := r.config.current().resources
 		writeServiceFile(t, e.configPath, `{"extensions":{"alpha":{"enabled":false,"value":[1,2]},"beta":{"enabled":true},"uninstalled":{"enabled":true,"data":5}}}`)
-		_, err = r.Reload(context.Background())
+		_, err = r.reload(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Equal(t, opens.Load(), int64(0))
 		testassert.Equal(t, activeOpens.Load(), int64(1))
@@ -258,28 +258,28 @@ func TestRuntimeConfigurationResourceReplacement(t *testing.T) {
 		return extension.Instance{}, errFactory
 	}
 	testassert.Equal(t, opens.Load(), int64(1))
-	_, err = r.Reload(context.Background())
+	_, err = r.reload(context.Background(), protocolCaller())
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(1))
-	view, err := r.getConfiguration(context.Background())
+	view, err := r.getConfiguration(context.Background(), protocolCaller())
 	testassert.NoError(t, err)
 	view.Settings.Sessions.ArchiveAfterDays++
 	_, err = updateSettingsOnly(r, context.Background(), view.Settings)
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(1))
 	testassert.Equal(t, string(r.config.current().extensions["alpha"]), `{ "enabled":true,"value" : 1 }`)
-	_, err = r.updateProvider(context.Background(), "prov", protocol.ProviderEdit{})
+	_, err = r.updateProvider(context.Background(), protocolCaller(), "prov", protocol.ProviderEdit{})
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(1))
 	testassert.Equal(t, string(r.config.current().extensions["alpha"]), `{ "enabled":true,"value" : 1 }`)
 	writeServiceFile(t, e.configPath, extensionConfig(`{"enabled":true,"value":2}`))
-	_, err = r.Reload(context.Background())
+	_, err = r.reload(context.Background(), protocolCaller())
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(2))
 	testassert.Equal(t, closes.Load(), int64(1))
 	for i, document := range []string{extensionConfig(`{ "enabled":true,"value":2}`), extensionConfig(`{"enabled":true}`), extensionConfig(`{"enabled":true,"value":3}`)} {
 		writeServiceFile(t, e.configPath, document)
-		_, err := r.Reload(context.Background())
+		_, err := r.reload(context.Background(), protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Equal(t, opens.Load(), int64(i+3))
 		testassert.Equal(t, closes.Load(), int64(i+2))
@@ -409,7 +409,7 @@ func TestRuntimeCanceledCandidateDisposesOnlyItsPrefix(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { _, err := r.Reload(ctx); done <- err }()
+	go func() { _, err := r.reload(ctx, protocolCaller()); done <- err }()
 	<-entered
 	cancel()
 	testassert.Require(t, errors.Is(<-done, context.Canceled), "canceled candidate did not return cancellation")
@@ -445,10 +445,10 @@ func TestRuntimeRetirementDoesNotHoldPublicationLocks(t *testing.T) {
 	defer func() { releaseOnce.Do(func() { close(release) }); _ = r.Close(context.Background()) }()
 	writeServiceFile(t, e.configPath, resourceServiceConfig(`{"v":2}`))
 	first := make(chan error, 1)
-	go func() { _, err := r.Reload(context.Background()); first <- err }()
+	go func() { _, err := r.reload(context.Background(), protocolCaller()); first <- err }()
 	<-entered
 	second := make(chan error, 1)
-	go func() { _, err := r.Reload(context.Background()); second <- err }()
+	go func() { _, err := r.reload(context.Background(), protocolCaller()); second <- err }()
 	select {
 	case err := <-second:
 		testassert.NoError(t, err)
@@ -499,7 +499,7 @@ func TestRuntimeRetiredResourcesReleaseBeforeArtifactInterval(t *testing.T) {
 	submitThroughRuntime(t, r, session.Identity.SessionID, "op-owned", "work")
 	<-modelStarted
 	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"v":2}`, ""))
-	_, err = r.Reload(context.Background())
+	_, err = r.reload(context.Background(), protocolCaller())
 	testassert.NoError(t, err)
 	modelOnce.Do(func() { close(modelRelease) })
 	<-closeStarted
@@ -559,7 +559,7 @@ func TestRuntimePreparedReservationSurvivesUntilOpening(t *testing.T) {
 	}()
 	<-store.parked
 	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"v":2}`, `,"operation":{"enabled":true}`))
-	_, err = r.Reload(context.Background())
+	_, err = r.reload(context.Background(), protocolCaller())
 	testassert.NoError(t, err)
 	testassert.Equal(t, opens.Load(), int64(2))
 	testassert.Equal(t, closes.Load(), int64(0))
@@ -614,7 +614,7 @@ func TestRuntimeDiscardedPreparationReleasesRetiredResources(t *testing.T) {
 	}()
 	<-store.entered
 	writeServiceFile(t, e.configPath, ownerResourceConfig(e.server.URL, `{"value":2}`, ""))
-	_, err = r.Reload(context.Background())
+	_, err = r.reload(context.Background(), protocolCaller())
 	testassert.NoError(t, err)
 	testassert.Equal(t, closes.Load(), int64(0))
 	close(store.release)

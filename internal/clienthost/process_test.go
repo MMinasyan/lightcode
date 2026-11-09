@@ -643,7 +643,7 @@ func TestClientHostConcurrentStartup(t *testing.T) {
 		t.Fatalf("client instance %q, record %q", clients[0].InstanceID(), record.InstanceID)
 	}
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N12, "authenticated health = %s/%s, want the record's instance and wire version", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N13, "authenticated health = %s/%s, want the record's instance and wire version", health.InstanceId, health.ProtocolVersion)
 
 	winners := 0
 	for _, l := range []*launched{first, second} {
@@ -698,7 +698,7 @@ func TestClientHostIncompatibleIncumbent(t *testing.T) {
 		testassert.Require(t, bytes.Equal(after, before), "the incompatible record changed across the probe")
 	}
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N12, "the incumbent's real health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N13, "the incumbent's real health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	incumbent.stopAndJoin(t)
 }
 
@@ -768,7 +768,7 @@ func TestClientHostCancellationDoesNotKillOwner(t *testing.T) {
 	record := readRecord(t, filepath.Join(s.dataDir, "runtime.json"))
 	testassert.Equal(t, record.Endpoint, endpoint)
 	health := authenticatedHealth(t, record.Endpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N12, "the surviving owner health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N13, "the surviving owner health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	pid := attemptPID(t, attempts[0])
 	testassert.Require(t, aliveProcessByPID(pid), "the canceled Connect killed owner process %d", pid)
 	{
@@ -801,7 +801,7 @@ func TestClientHostHealthTimeoutPreservesHolder(t *testing.T) {
 	testassert.Require(t, errors.Is(err, context.DeadlineExceeded), "Connect against a parked health holder = %v, want the caller deadline", err)
 
 	health := authenticatedHealth(t, originalEndpoint, record.Credential)
-	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N12, "the preserved holder health = %s/%s", health.InstanceId, health.ProtocolVersion)
+	testassert.Require(t, health.InstanceId == record.InstanceID && health.ProtocolVersion == protocol.N13, "the preserved holder health = %s/%s", health.InstanceId, health.ProtocolVersion)
 	{
 		after := readFile(t, recordPath)
 		testassert.Require(t, bytes.Equal(after, before), "the parked record changed across the failed probes")

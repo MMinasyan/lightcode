@@ -48,12 +48,15 @@ var connectHTTPClient = &http.Client{Timeout: connectDiscoveryTimeout}
 // discovery and the managed key in that order before the shared commit. A
 // repeat connection is a real publication: the ready next generation always
 // consumes and publishes.
-func (r *Runtime) connectProvider(ctx context.Context, providerID string, optionalKey *string) (protocol.ProviderMutation, error) {
+func (r *Runtime) connectProvider(ctx context.Context, c caller, providerID string, optionalKey *string) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ProviderMutation{}, err
+	}
 	captured, err := r.config.capture(ctx)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
@@ -113,12 +116,15 @@ func (r *Runtime) connectProvider(ctx context.Context, providerID string, option
 // alone, a keyless provider refuses, and an absent unmanaged key publishes
 // the successful disconnected status without touching anything. There is no
 // busy-turn refusal: disconnects no longer gate on running work.
-func (r *Runtime) disconnectProvider(ctx context.Context, providerID string) (protocol.ProviderMutation, error) {
+func (r *Runtime) disconnectProvider(ctx context.Context, c caller, providerID string) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ProviderMutation{}, err
+	}
 	plan := &connectionEffects{providerID: providerID}
 	captured, err := r.config.mutate(ctx, r.config.editProviderDisconnect(providerID, plan))
 	if err != nil {
@@ -140,12 +146,15 @@ func (r *Runtime) disconnectProvider(ctx context.Context, providerID string) (pr
 // owner's captured value, where named-unset and named-defined-empty both
 // mean no credential and fetch unauthenticated, matching saved-provider
 // discovery. Nothing is persisted or published in any case.
-func (r *Runtime) discoverProvider(ctx context.Context, req protocol.DiscoveryRequest) ([]protocol.DiscoveredModelCandidate, error) {
+func (r *Runtime) discoverProvider(ctx context.Context, c caller, req protocol.DiscoveryRequest) ([]protocol.DiscoveredModelCandidate, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return nil, err
+	}
 	baseURL := strings.TrimSpace(req.BaseUrl)
 	if baseURL == "" {
 		return nil, invalidEdit("base_url is required")
@@ -178,12 +187,15 @@ func (r *Runtime) discoverProvider(ctx context.Context, req protocol.DiscoveryRe
 // the capture's own transport and credential sample bind one transient fetch
 // transport before HTTP, nothing is written, and the returned sorted
 // candidates exclude the provider's already-included usable model IDs.
-func (r *Runtime) discoverProviderModels(ctx context.Context, providerID string) ([]protocol.DiscoveredModelCandidate, error) {
+func (r *Runtime) discoverProviderModels(ctx context.Context, c caller, providerID string) ([]protocol.DiscoveredModelCandidate, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return nil, err
+	}
 	captured, err := r.config.capture(ctx)
 	if err != nil {
 		return nil, err

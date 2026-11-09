@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/protocol"
 )
 
@@ -23,9 +23,11 @@ import (
 // dependency exists, and no credential, request body, or header value is ever
 // rendered into an error or a log.
 
-// errUnauthorized is the one authentication failure class: the credential
-// never rides the message, and no presented header value is echoed.
-var errUnauthorized = errors.New("missing or invalid bearer credential")
+// unauthorizedMessage is the transport's one authentication refusal text: the
+// credential never rides the message, and no presented header value is
+// echoed. HTTP authentication is a transport gate, not a command-producer
+// class.
+const unauthorizedMessage = "missing or invalid bearer credential"
 
 // decodeRequestBody reads one uncapped request body as exactly one JSON
 // document and decodes it natively into the generated request type:
@@ -239,33 +241,83 @@ func validateContentPart(raw []byte, part protocol.ContentPart, path string) err
 	return validateDecodedValue(raw, reflect.ValueOf(variant), path)
 }
 
-// classifyProtocolError maps one error to its schema error code and HTTP
-// status by errors.Is/As over the existing typed classes, never rendered
-// text. Caller-input invalidity outranks the complete-candidate configuration
-// failure that may wrap it; the closed class is the Runtime's own closure
-// sentinel alone, and every unclassified error — plain caller cancellation
-// and deadline errors included — is internal.
-func classifyProtocolError(err error) (protocol.ErrorCode, int) {
+// protocolErrorCode classifies one error into its public class by
+// errors.Is/As over the existing typed sentinels, never rendered text.
+// Caller-input invalidity outranks the complete-candidate configuration
+// failure that may wrap it; caller cancellation/deadline is its own cancelled
+// class, and every unclassified error is internal. The same mapping stamps
+// producer-owned partial results, so HTTP never uniquely supplies
+// classification of a private error.
+func protocolErrorCode(err error) protocol.ErrorCode {
 	switch {
-	case errors.Is(err, errUnauthorized):
-		return protocol.ErrorCodeUnauthorized, http.StatusUnauthorized
+	case errors.Is(err, ErrDenied):
+		return protocol.ErrorCodeDenied
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return protocol.ErrorCodeCancelled
 	case errors.Is(err, harness.ErrInvalid):
-		return protocol.ErrorCodeInvalid, http.StatusBadRequest
-	case errors.Is(err, harness.ErrNotFound), errors.Is(err, catalog.ErrUnknownProvider), errors.Is(err, catalog.ErrUnknownModel):
-		return protocol.ErrorCodeNotFound, http.StatusNotFound
+		return protocol.ErrorCodeInvalid
+	case errors.Is(err, harness.ErrNotFound):
+		return protocol.ErrorCodeNotFound
 	case errors.Is(err, harness.ErrConflict):
-		return protocol.ErrorCodeConflict, http.StatusConflict
+		return protocol.ErrorCodeConflict
+	case errors.Is(err, harness.ErrIncompatible):
+		return protocol.ErrorCodeIncompatible
 	case errors.Is(err, ErrClosed):
-		return protocol.ErrorCodeClosed, http.StatusGone
+		return protocol.ErrorCodeClosed
 	case errors.Is(err, harness.ErrCorrupt):
-		return protocol.ErrorCodeCorrupt, http.StatusUnprocessableEntity
+		return protocol.ErrorCodeCorrupt
 	case errors.Is(err, ErrConfiguration):
-		return protocol.ErrorCodeConfiguration, http.StatusUnprocessableEntity
+		return protocol.ErrorCodeConfiguration
 	case errors.Is(err, harness.ErrStorage):
-		return protocol.ErrorCodeStorage, http.StatusInternalServerError
+		return protocol.ErrorCodeStorage
 	default:
-		return protocol.ErrorCodeInternal, http.StatusInternalServerError
+		return protocol.ErrorCodeInternal
 	}
+}
+
+// protocolErrorStatus is the one public class-to-status table.
+func protocolErrorStatus(code protocol.ErrorCode) int {
+	switch code {
+	case protocol.ErrorCodeInvalid:
+		return http.StatusBadRequest
+	case protocol.ErrorCodeUnauthorized:
+		return http.StatusUnauthorized
+	case protocol.ErrorCodeDenied:
+		return http.StatusForbidden
+	case protocol.ErrorCodeNotFound:
+		return http.StatusNotFound
+	case protocol.ErrorCodeConflict, protocol.ErrorCodeIncompatible:
+		return http.StatusConflict
+	case protocol.ErrorCodeClosed:
+		return http.StatusGone
+	case protocol.ErrorCodeCancelled:
+		return http.StatusRequestTimeout
+	case protocol.ErrorCodeConfiguration, protocol.ErrorCodeCorrupt:
+		return http.StatusUnprocessableEntity
+	case protocol.ErrorCodeUnavailable:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// classifyProtocolError maps one error to its schema error code and HTTP
+// status through the one public class table: classification has already
+// happened at the producer, and no transport case reinterprets a private
+// error.
+func classifyProtocolError(err error) (protocol.ErrorCode, int) {
+	code := protocolErrorCode(err)
+	return code, protocolErrorStatus(code)
+}
+
+// writeProtocolAuthError writes the transport gate's one authentication
+// refusal. It is not a command-producer class, so it does not pass through the
+// public-class mapper.
+func writeProtocolAuthError(w http.ResponseWriter) {
+	body, _ := json.Marshal(protocol.Error{Code: protocol.ErrorCodeUnauthorized, Message: unauthorizedMessage}) // plain string members; the marshal cannot fail
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write(body)
 }
 
 // writeProtocolError writes one schema-defined typed error body. The

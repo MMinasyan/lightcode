@@ -66,7 +66,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 		creation := rawProtocol(t, http.MethodPost, protocolTarget(ps, "/v1/sessions"), "bad",
 			fmt.Sprintf(`{"workspace":%q,"agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"solo"}}}`, workspace))
 		testassert.Equal(t, creation.StatusCode, http.StatusUnauthorized)
-		sessions, err := r.listSessions(ctx, protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
+		sessions, err := r.listSessions(ctx, protocolCaller(), protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
 		testassert.NoError(t, err)
 		testassert.Equal(t, len(sessions), 0)
 
@@ -104,7 +104,7 @@ func TestProtocolServerAuthenticationOrder(t *testing.T) {
 			t.Fatalf("decode versioned health: %v", err)
 		}
 		versionedResponse.Body.Close()
-		testassert.Equal(t, health.ProtocolVersion, protocol.N12)
+		testassert.Equal(t, health.ProtocolVersion, protocol.N13)
 	})
 }
 
@@ -134,7 +134,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 				typed := decodeProtocolError(t, response)
 				testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "%s error = %+v, want invalid", name, typed)
 			}
-			sessions, err := r.listSessions(ctx, protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
+			sessions, err := r.listSessions(ctx, protocolCaller(), protocol.ListSessionsParams{Workspace: workspace, Lifecycle: "open"})
 			testassert.Require(t, err == nil, "list after %s: %v", name, err)
 			testassert.Require(t, len(sessions) == 0, "%s created a session, want no mutation before validation", name)
 		}
@@ -253,11 +253,11 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		defer validModalities.Body.Close()
 		testassert.Equal(t, validModalities.StatusCode, http.StatusOK)
 		{
-			_, err := r.getProvider(ctx, "validmods")
+			_, err := r.getProvider(ctx, protocolCaller(), "validmods")
 			testassert.NoError(t, err)
 		}
 		{
-			_, err := r.getProvider(ctx, "newp")
+			_, err := r.getProvider(ctx, protocolCaller(), "newp")
 			testassert.Require(t, errors.Is(err, catalog.ErrUnknownProvider), "rejected creation wrote a provider: %v", err)
 		}
 
@@ -266,7 +266,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 		// the reset path's removed options enum are refused before any
 		// mutation, leaving the addressed provider and its revision
 		// untouched.
-		beforeRetired, err := r.getProvider(ctx, "validmods")
+		beforeRetired, err := r.getProvider(ctx, protocolCaller(), "validmods")
 		testassert.NoError(t, err)
 		retiredEdit := func(name, body string) {
 			t.Helper()
@@ -287,7 +287,7 @@ func TestProtocolServerStrictBodies(t *testing.T) {
 			typed := decodeProtocolError(t, retiredReset)
 			testassert.Require(t, typed.Code == protocol.ErrorCodeInvalid, "retired reset options error = %+v, want invalid", typed)
 		}
-		afterRetired, err := r.getProvider(ctx, "validmods")
+		afterRetired, err := r.getProvider(ctx, protocolCaller(), "validmods")
 		testassert.NoError(t, err)
 		testassert.Require(t, reflect.DeepEqual(beforeRetired, afterRetired), "a retired-control refusal changed the provider:\nbefore %+v\nafter  %+v", beforeRetired, afterRetired)
 
@@ -671,16 +671,19 @@ func TestProtocolServerErrorClasses(t *testing.T) {
 
 	// The classifier table for the classes a wire request cannot reach
 	// deterministically: the Runtime's own closure sentinel is the closed
-	// class alone, while plain caller cancellation, deadline, storage, and
-	// unclassified errors follow the default internal rule.
+	// class, denied is the authority class, caller cancellation and deadline
+	// share the cancelled class, an incompatible store is incompatible, and
+	// every unclassified error is internal.
 	classes := []struct {
 		err    error
 		code   protocol.ErrorCode
 		status int
 	}{
 		{fmt.Errorf("wrapped: %w", ErrClosed), protocol.ErrorCodeClosed, http.StatusGone},
-		{context.Canceled, protocol.ErrorCodeInternal, http.StatusInternalServerError},
-		{context.DeadlineExceeded, protocol.ErrorCodeInternal, http.StatusInternalServerError},
+		{fmt.Errorf("scope: %w", ErrDenied), protocol.ErrorCodeDenied, http.StatusForbidden},
+		{context.Canceled, protocol.ErrorCodeCancelled, http.StatusRequestTimeout},
+		{context.DeadlineExceeded, protocol.ErrorCodeCancelled, http.StatusRequestTimeout},
+		{fmt.Errorf("store: %w", harness.ErrIncompatible), protocol.ErrorCodeIncompatible, http.StatusConflict},
 		{fmt.Errorf("engine: %w", harness.ErrStorage), protocol.ErrorCodeStorage, http.StatusInternalServerError},
 		{errors.New("anything unclassified"), protocol.ErrorCodeInternal, http.StatusInternalServerError},
 	}
@@ -712,43 +715,43 @@ func TestClassifyProtocolMissingMetadata(t *testing.T) {
 			status int
 		}{
 			{"provider read missing", func() error {
-				_, err := r.getProvider(ctx, "ghost")
+				_, err := r.getProvider(ctx, protocolCaller(), "ghost")
 				return err
 			}, catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"provider delete missing", func() error {
-				_, err := r.deleteProvider(ctx, "ghost")
+				_, err := r.deleteProvider(ctx, protocolCaller(), "ghost")
 				return err
 			}, catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"provider field reset missing", func() error {
-				_, err := r.resetProviderField(ctx, "ghost", protocol.ProviderFieldName)
+				_, err := r.resetProviderField(ctx, protocolCaller(), "ghost", protocol.ProviderFieldName)
 				return err
 			}, catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"model delete missing", func() error {
-				_, err := r.deleteModel(ctx, "prov", "ghost")
+				_, err := r.deleteModel(ctx, protocolCaller(), "prov", "ghost")
 				return err
 			}, catalog.ErrUnknownModel, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"model field reset missing", func() error {
-				_, err := r.resetModelField(ctx, "prov", "ghost", protocol.ModelFieldName)
+				_, err := r.resetModelField(ctx, protocolCaller(), "prov", "ghost", protocol.ModelFieldName)
 				return err
 			}, catalog.ErrUnknownModel, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"model delete under missing provider", func() error {
-				_, err := r.deleteModel(ctx, "ghost", "m")
+				_, err := r.deleteModel(ctx, protocolCaller(), "ghost", "m")
 				return err
 			}, catalog.ErrUnknownProvider, protocol.ErrorCodeNotFound, http.StatusNotFound},
 			{"empty provider identity", func() error {
-				_, err := r.deleteProvider(ctx, "")
+				_, err := r.deleteProvider(ctx, protocolCaller(), "")
 				return err
 			}, harness.ErrInvalid, protocol.ErrorCodeInvalid, http.StatusBadRequest},
 			{"empty model identity", func() error {
-				_, err := r.deleteModel(ctx, "prov", "")
+				_, err := r.deleteModel(ctx, protocolCaller(), "prov", "")
 				return err
 			}, harness.ErrInvalid, protocol.ErrorCodeInvalid, http.StatusBadRequest},
 			{"invalid model field on a missing model", func() error {
-				_, err := r.resetModelField(ctx, "prov", "ghost", protocol.ModelField("bogus"))
+				_, err := r.resetModelField(ctx, protocolCaller(), "prov", "ghost", protocol.ModelField("bogus"))
 				return err
 			}, harness.ErrInvalid, protocol.ErrorCodeInvalid, http.StatusBadRequest},
 			{"complete candidate refusal", func() error {
-				_, err := r.saveModel(ctx, "prov", "m", protocol.ModelEdit{ExtraBody: &reserved})
+				_, err := r.saveModel(ctx, protocolCaller(), "prov", "m", protocol.ModelEdit{ExtraBody: &reserved})
 				return err
 			}, ErrConfiguration, protocol.ErrorCodeConfiguration, http.StatusUnprocessableEntity},
 		}
@@ -759,6 +762,52 @@ func TestClassifyProtocolMissingMetadata(t *testing.T) {
 				testassert.Require(t, errors.Is(err, row.want), "producer refusal = %v, want class %v", err, row.want)
 				code, status := classifyProtocolError(fmt.Errorf("wrapped: %w", err))
 				testassert.Require(t, code == row.code && status == row.status, "classify(%v) = (%s, %d), want (%s, %d)", err, code, status, row.code, row.status)
+			})
+		}
+	})
+}
+
+// TestMissingMetadataProducersReturnPublicNotFoundClass proves the public
+// class comes from the producer boundary, not the mapper: every real
+// unknown-provider and unknown-model producer refusal satisfies the public
+// harness.ErrNotFound identity directly, and the transport only maps that
+// public sentinel to the wire class and status.
+func TestMissingMetadataProducersReturnPublicNotFoundClass(t *testing.T) {
+	eachPrepStoreOnce(t, func(t *testing.T, store harness.Storage) {
+		r, _ := openConfigurationRuntime(t, store, configurationProvidersDocument, configurationAgentsDocument, settingsPlugins()...)
+		defer closeProjectionRuntime(r)
+		ctx := context.Background()
+		for name, run := range map[string]func() error{
+			"provider read": func() error {
+				_, err := r.getProvider(ctx, protocolCaller(), "ghost")
+				return err
+			},
+			"provider delete": func() error {
+				_, err := r.deleteProvider(ctx, protocolCaller(), "ghost")
+				return err
+			},
+			"provider field reset": func() error {
+				_, err := r.resetProviderField(ctx, protocolCaller(), "ghost", protocol.ProviderFieldName)
+				return err
+			},
+			"model delete": func() error {
+				_, err := r.deleteModel(ctx, protocolCaller(), "prov", "ghost")
+				return err
+			},
+			"model field reset": func() error {
+				_, err := r.resetModelField(ctx, protocolCaller(), "prov", "ghost", protocol.ModelFieldName)
+				return err
+			},
+			"model delete under missing provider": func() error {
+				_, err := r.deleteModel(ctx, protocolCaller(), "ghost", "m")
+				return err
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				err := run()
+				testassert.Require(t, err != nil && errors.Is(err, harness.ErrNotFound), "producer refusal = %v, want the public not-found class", err)
+				code, status := classifyProtocolError(fmt.Errorf("wrapped: %w", err))
+				testassert.Require(t, code == protocol.ErrorCodeNotFound && status == http.StatusNotFound, "classify(%v) = (%s, %d), want not_found 404", err, code, status)
 			})
 		}
 	})

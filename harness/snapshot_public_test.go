@@ -383,7 +383,7 @@ func TestPublicSnapshotSessionPendingPublications(t *testing.T) {
 		forkWait := &waitContext{Context: forkBase, consulted: make(chan struct{})}
 		forkDone := make(chan error, 1)
 		go func() {
-			_, err := f.h.Fork(forkWait, harness.ForkRequest{
+			_, err := f.h.Fork(forkWait, harness.ForkRequest{Origin: harness.InputOriginUser,
 				SourceSessionID: session, BoundaryEntryID: boundary, OperationID: "fork-1",
 				Content: []model.ContentPart{{Kind: model.PartText, Text: "fork work"}},
 			})
@@ -1048,6 +1048,7 @@ func TestPublicSnapshotChildStopRevisions(t *testing.T) {
 			AgentSelection:  publicSelection("coder"),
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: "child work"}},
 			OperationID:     "child-op-1",
+			ExtensionID:     "test.extension",
 			MaxConcurrent:   1,
 			OutputLimit:     1024,
 		})
@@ -1964,7 +1965,7 @@ func TestPublicManualCompactExecutionCloserAndNoBufferFork(t *testing.T) {
 				return err
 			}},
 			{"fork", func(ctx context.Context) error {
-				_, err := f.h.Fork(ctx, harness.ForkRequest{
+				_, err := f.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 					SourceSessionID: session, BoundaryEntryID: historyIDsOf(view.History.HistoryHeaders())[0],
 					OperationID: "fork-blocked", Content: []model.ContentPart{{Kind: model.PartText, Text: "fork work"}},
 				})
@@ -2007,7 +2008,7 @@ func TestPublicManualCompactExecutionCloserAndNoBufferFork(t *testing.T) {
 		}
 		// No buffers are pending: a valid Fork of the retired compact Operation
 		// succeeds immediately.
-		forked, err := f.h.Fork(ctx, harness.ForkRequest{
+		forked, err := f.h.Fork(ctx, harness.ForkRequest{Origin: harness.InputOriginUser,
 			SourceSessionID: session, BoundaryEntryID: historyIDsOf(view.History.HistoryHeaders())[0],
 			OperationID: "fork-after-close", Content: []model.ContentPart{{Kind: model.PartText, Text: "forked"}},
 		})

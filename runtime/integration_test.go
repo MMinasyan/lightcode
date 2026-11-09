@@ -460,7 +460,7 @@ func TestAssembledPhaseIntegration(t *testing.T) {
 		writeServiceFile(t, e.configPath, assembledConfigDocument(server.URL, "T2", "L2"))
 		writeAgentDefinitions(t, e.configPath, assembledAgentsDocument)
 		{
-			revision, err := r.Reload(ctx)
+			revision, err := r.reload(ctx, protocolCaller())
 			testassert.Require(t, err == nil && revision == "2", "Reload over the blocked Operation = (%q, %v), want 2", revision, err)
 		}
 		testassert.Require(t, countEvents(e.events.all(), "close:depper") == 0 && countEvents(e.events.all(), "close:base") == 0, "retired bindings closed while the nested call was parked: %v", e.events.all())

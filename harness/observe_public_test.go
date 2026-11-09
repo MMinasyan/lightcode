@@ -57,6 +57,7 @@ func publicChildLaunch(root string) harness.LaunchChildRequest {
 		AgentSelection:  publicSelection("coder"),
 		Content:         []model.ContentPart{{Kind: model.PartText, Text: "child"}},
 		OperationID:     "child-op-1",
+		ExtensionID:     "test.extension",
 		MaxConcurrent:   2,
 		OutputLimit:     1024,
 	}

@@ -356,6 +356,7 @@ type SubmitRequest struct {
 	SessionID   string
 	OperationID string
 	Origin      InputOrigin
+	ExtensionID string // present exactly for plugin attribution
 	Content     []model.ContentPart
 	Mode        MessageMode
 }
@@ -412,6 +413,7 @@ type Harness struct {
 type pendingMessage struct {
 	operationID string
 	origin      InputOrigin
+	extensionID string
 	content     []model.ContentPart
 }
 
@@ -771,7 +773,7 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 	default:
 		return SubmitResult{}, invalidInput("message mode %q is not one of regular or queued", req.Mode)
 	}
-	content, err := validateSubmitInput(req.OperationID, req.Origin, req.Content)
+	content, err := validateSubmitInput(req.OperationID, req.Origin, req.ExtensionID, req.Content)
 	if err != nil {
 		return SubmitResult{}, err
 	}
@@ -816,7 +818,7 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 		return SubmitResult{}, err
 	}
 	if c.graph.Session.State.CurrentOperationID != "" || c.run != nil { // active: buffer by mode; the enqueue is the publication gate
-		item := &pendingMessage{operationID: req.OperationID, origin: req.Origin, content: content}
+		item := &pendingMessage{operationID: req.OperationID, origin: req.Origin, extensionID: req.ExtensionID, content: content}
 		disposition := DispositionSteering
 		if req.Mode == MessageModeQueued {
 			c.queued = append(c.queued, item)
@@ -838,6 +840,7 @@ func (h *Harness) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, 
 		OperationID: req.OperationID,
 		Kind:        RequestKindMessage,
 		Origin:      req.Origin,
+		ExtensionID: req.ExtensionID,
 		Content:     content,
 	})
 	if err != nil {
@@ -1570,6 +1573,7 @@ type admissionRequest struct {
 	OperationID string
 	Kind        RequestKind
 	Origin      InputOrigin
+	ExtensionID string
 	Content     []model.ContentPart
 	// buffered identifies a drain's head for removal during adoption; nil
 	// leaves the FIFOs unchanged for ordinary admissions.
@@ -1585,16 +1589,15 @@ var errAdmissionExisting = errors.New("harness: operation already admitted in th
 // coordinator's validated view. It keeps the landed conflict class reachable.
 var errRevisionRace = fmt.Errorf("harness: session changed concurrently: %w", ErrConflict)
 
-// validateSubmitInput validates one submitted message's identity, origin, and
-// content, returning the owned content copy every downstream use consumes.
-func validateSubmitInput(operationID string, origin InputOrigin, content []model.ContentPart) ([]model.ContentPart, error) {
+// validateSubmitInput validates one submitted message's identity, origin,
+// provenance, and content, returning the owned content copy every downstream
+// use consumes. Extension provenance is present exactly for plugin origin.
+func validateSubmitInput(operationID string, origin InputOrigin, extensionID string, content []model.ContentPart) ([]model.ContentPart, error) {
 	if err := validateOperationIdentity(operationID, "operation id"); err != nil {
 		return nil, invalidInput("operation id: %v", err)
 	}
-	switch origin {
-	case InputOriginUser, InputOriginRuntime, InputOriginPlugin:
-	default:
-		return nil, invalidInput("input origin %q is not one of user, runtime or plugin", origin)
+	if err := validateInputProvenance(origin, extensionID); err != nil {
+		return nil, err
 	}
 	owned := make([]model.ContentPart, 0, len(content))
 	for i, part := range content {
@@ -1605,6 +1608,24 @@ func validateSubmitInput(operationID string, origin InputOrigin, content []model
 		owned = append(owned, validated)
 	}
 	return owned, nil
+}
+
+// validateInputProvenance enforces the closed origin and its attribution:
+// plugin input names its extension, and no other origin carries one.
+func validateInputProvenance(origin InputOrigin, extensionID string) error {
+	switch origin {
+	case InputOriginUser, InputOriginRuntime:
+		if extensionID != "" {
+			return invalidInput("input origin %q must not carry extension attribution", origin)
+		}
+	case InputOriginPlugin:
+		if extensionID == "" {
+			return invalidInput("plugin input requires extension attribution")
+		}
+	default:
+		return invalidInput("input origin %q is not one of user, runtime or plugin", origin)
+	}
+	return nil
 }
 
 // admitReserved is the reserved admission body: the re-checked existing,
@@ -1919,6 +1940,7 @@ func produceAdmission(tx Transaction, session SessionRecord, capture ExecutionCa
 		EntryID:     entryID,
 		OperationID: req.OperationID,
 		Origin:      req.Origin,
+		ExtensionID: req.ExtensionID,
 		Content:     req.Content,
 	}
 	payload, err := encodeInputEntry(input)
@@ -2059,6 +2081,7 @@ func (h *Harness) drainBuffers(c *coordinator, run *activeExecution) {
 			OperationID: item.operationID,
 			Kind:        RequestKindMessage,
 			Origin:      item.origin,
+			ExtensionID: item.extensionID,
 			Content:     item.content,
 			buffered:    item,
 		})

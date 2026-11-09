@@ -145,10 +145,13 @@ func (e ConfigurationChangedEventKind) Valid() bool {
 
 // Defines values for ErrorCode.
 const (
+	ErrorCodeCancelled     ErrorCode = "cancelled"
 	ErrorCodeClosed        ErrorCode = "closed"
 	ErrorCodeConfiguration ErrorCode = "configuration"
 	ErrorCodeConflict      ErrorCode = "conflict"
 	ErrorCodeCorrupt       ErrorCode = "corrupt"
+	ErrorCodeDenied        ErrorCode = "denied"
+	ErrorCodeIncompatible  ErrorCode = "incompatible"
 	ErrorCodeInternal      ErrorCode = "internal"
 	ErrorCodeInvalid       ErrorCode = "invalid"
 	ErrorCodeNotFound      ErrorCode = "not_found"
@@ -160,6 +163,8 @@ const (
 // Valid indicates whether the value is a known member of the ErrorCode enum.
 func (e ErrorCode) Valid() bool {
 	switch e {
+	case ErrorCodeCancelled:
+		return true
 	case ErrorCodeClosed:
 		return true
 	case ErrorCodeConfiguration:
@@ -167,6 +172,10 @@ func (e ErrorCode) Valid() bool {
 	case ErrorCodeConflict:
 		return true
 	case ErrorCodeCorrupt:
+		return true
+	case ErrorCodeDenied:
+		return true
+	case ErrorCodeIncompatible:
 		return true
 	case ErrorCodeInternal:
 		return true
@@ -208,13 +217,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N12 HealthProtocolVersion = "12"
+	N13 HealthProtocolVersion = "13"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N12:
+	case N13:
 		return true
 	default:
 		return false
@@ -1229,6 +1238,7 @@ type ImageURLPartKind string
 type InputItem struct {
 	CommittedAt time.Time     `json:"committed_at"`
 	Content     []ContentPart `json:"content"`
+	ExtensionId *string       `json:"extension_id,omitempty"`
 	ItemId      string        `json:"item_id"`
 	Kind        InputItemKind `json:"kind"`
 	OperationId *string       `json:"operation_id,omitempty"`
@@ -1452,6 +1462,7 @@ type OperationScopeKind string
 // PendingInput defines model for PendingInput.
 type PendingInput struct {
 	Content     []ContentPart `json:"content"`
+	ExtensionId *string       `json:"extension_id,omitempty"`
 	OperationId string        `json:"operation_id"`
 	Origin      InputOrigin   `json:"origin"`
 }

@@ -473,6 +473,7 @@ func (b *bgRuntime) launchChild(parent, prompt, operationID string, maxConcurren
 			AgentSelection:  suppliedDefinition("worker"),
 			Content:         []model.ContentPart{{Kind: model.PartText, Text: prompt}},
 			OperationID:     operationID,
+			ExtensionID:     "test.extension",
 			MaxConcurrent:   maxConcurrent,
 			OutputLimit:     4096,
 		})

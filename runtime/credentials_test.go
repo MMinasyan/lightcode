@@ -892,7 +892,7 @@ func TestDefinedEmptyExternalSharedKeyRefusesSuppliedConnect(t *testing.T) {
 	testassert.Require(t, !capturedEnvIsSet(captured.snapshot.credentials)(name), "defined-empty external shared key reported as set")
 
 	key := "supplied-key-must-refuse"
-	if _, err := r.connectProvider(context.Background(), "prov", &key); err == nil || !strings.Contains(err.Error(), "set externally") {
+	if _, err := r.connectProvider(context.Background(), protocolCaller(), "prov", &key); err == nil || !strings.Contains(err.Error(), "set externally") {
 		t.Fatalf("connectProvider with a defined-empty external shared key = %v, want the external refusal", err)
 	}
 	after, err := os.ReadFile(e.configPath)
@@ -1305,7 +1305,7 @@ func TestDeclaredCredentialCapturesStayPerOperation(t *testing.T) {
 
 	// A changed value under the same name is observed at the next build.
 	t.Setenv(first, "changed-secret")
-	_, err = r.Reload(context.Background())
+	_, err = r.reload(context.Background(), protocolCaller())
 	testassert.NoError(t, err)
 	secondSession := create()
 	submitThroughRuntime(t, r, secondSession.Identity.SessionID, "op-second", "hello")
@@ -1315,7 +1315,7 @@ func TestDeclaredCredentialCapturesStayPerOperation(t *testing.T) {
 	// resource set captures the new name while the parked Operation keeps the
 	// old name and value.
 	writeServiceFile(t, e.configPath, credentialConfigDocument(e.server.URL, second, second))
-	revision, err := r.Reload(context.Background())
+	revision, err := r.reload(context.Background(), protocolCaller())
 	testassert.Require(t, err == nil && revision == "3", "Reload = (%q, %v), want 3", revision, err)
 	testassert.Require(t, r.config.current().resources != firstResources, "the rotated declared binding reused the pre-reload resource set")
 	thirdSession := create()

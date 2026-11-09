@@ -94,7 +94,7 @@ func TestRuntimeSettingsReadSaveRoundTripPreservesOwnedPluginDocuments(t *testin
 	testassert.NoError(t, err)
 	defer sub.Close()
 
-	view, err := r.getConfiguration(ctx)
+	view, err := r.getConfiguration(ctx, protocolCaller())
 	testassert.NoError(t, err)
 	read := view.Settings.Extensions
 	want := map[string]string{
@@ -1230,7 +1230,7 @@ func TestRuntimeSettingsMutationLastWriterWins(t *testing.T) {
 		testassert.NoError(t, err)
 		defer sub.Close()
 
-		view, err := r.getConfiguration(ctx)
+		view, err := r.getConfiguration(ctx, protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Require(t, view.ConfigurationRevision.Generation == "1", "initial revision = %+v, want generation 1", view.ConfigurationRevision)
 		stale := view.Settings // value copy: client 2's older whole-section document
@@ -1246,7 +1246,7 @@ func TestRuntimeSettingsMutationLastWriterWins(t *testing.T) {
 		mutation, err = updateSettingsOnly(r, ctx, stale)
 		testassert.NoError(t, err)
 		testassert.Require(t, mutation.ConfigurationRevision.Generation == "3" && mutation.Result.Sessions.ArchiveAfterDays == 3, "client 2 mutation = %+v, want generation 3 with the stale value", mutation)
-		fresh, err := r.getConfiguration(ctx)
+		fresh, err := r.getConfiguration(ctx, protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Require(t, fresh.ConfigurationRevision.Generation == "3" && fresh.Settings.Sessions.ArchiveAfterDays == 3, "fresh settings = rev %+v sessions %+v, want the stale writer's value at generation 3", fresh.ConfigurationRevision, fresh.Settings.Sessions)
 		for _, want := range []string{"2", "3"} {
@@ -1269,7 +1269,7 @@ func TestRuntimeSettingsMutationOwnershipAndResult(t *testing.T) {
 		testassert.Require(t, mutation.ConfigurationRevision.Generation == "2" && mutation.ConfigurationRevision.InstanceId == "", "mutation revision = %+v, want generation 2 with the empty pre-server instance", mutation.ConfigurationRevision)
 		mutation.Result.Sessions.ArchiveAfterDays = 999
 		mutation.Result.Tools = json.RawMessage(`{"mutated":true}`)
-		fresh, err := r.getConfiguration(ctx)
+		fresh, err := r.getConfiguration(ctx, protocolCaller())
 		testassert.NoError(t, err)
 		testassert.Require(t, fresh.Settings.Sessions.ArchiveAfterDays == 5 && compactJSON(t, fresh.Settings.Tools) == compactJSON(t, mutationSettings().Tools), "a mutation of the returned result reached the published settings: %+v", fresh.Settings)
 	})

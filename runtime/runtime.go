@@ -422,9 +422,12 @@ func (r *Runtime) createSessionRecord(ctx context.Context, h *harness.Harness, w
 // absent Session returns the Harness not-found unchanged, authorizing no
 // cleanup. Any other Harness error (invalid input, corruption, revision
 // races, a closed admission) returns as-is and authorizes no cleanup.
-func (r *Runtime) deleteSession(ctx context.Context, sessionID string) (protocol.DeletionResult, error) {
+func (r *Runtime) deleteSession(ctx context.Context, c caller, sessionID string) (protocol.DeletionResult, error) {
 	var result protocol.DeletionResult
 	err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		releaseArtifacts, err := r.artifacts.acquireTry(sessionArtifactDir(r.dataDir, sessionID))
 		if err != nil {
 			return err
@@ -456,12 +459,22 @@ func (r *Runtime) removeSessionCode(sessionID string) error {
 // gate and returns its revision string. It is serialized by the configuration
 // service's own build mutex; the gate joins it to shutdown and holds no
 // Runtime mutex across the build.
+// Reload is the trusted embedding/test entry over the caller-aware reload:
+// it binds the authenticated harness-scoped user grant until the public owner
+// commands land.
 func (r *Runtime) Reload(ctx context.Context) (string, error) {
+	return r.reload(ctx, protocolCaller())
+}
+
+func (r *Runtime) reload(ctx context.Context, c caller) (string, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return "", err
+	}
 	snapshot, err := r.config.publish(ctx)
 	if err != nil {
 		return "", err

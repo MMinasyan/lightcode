@@ -64,13 +64,13 @@ func EqualEventForTest(a, b Event) bool {
 // GetConfigurationForTest bridges the private configuration read for the
 // external composition tests. It is absent from production builds.
 func GetConfigurationForTest(r *Runtime) (protocol.ConfigurationView, error) {
-	return r.getConfiguration(context.Background())
+	return r.getConfiguration(context.Background(), protocolCaller())
 }
 
 // GetWarningsForTest bridges the unfiltered warning read for the external
 // composition tests. It is absent from production builds.
 func GetWarningsForTest(r *Runtime) (protocol.WarningsSnapshot, error) {
-	return r.getWarnings(context.Background())
+	return r.getWarnings(context.Background(), protocolCaller())
 }
 
 // UpdateSettingsForTest bridges the private settings/extension-edit mutation —
@@ -78,7 +78,7 @@ func GetWarningsForTest(r *Runtime) (protocol.WarningsSnapshot, error) {
 // that compose the real plugin validators. It is absent from production
 // builds.
 func UpdateSettingsForTest(r *Runtime, settings protocol.Settings) (protocol.SettingsMutation, error) {
-	return r.updateSettings(context.Background(), protocol.UpdateSettingsRequest{Settings: &settings})
+	return r.updateSettings(context.Background(), protocolCaller(), protocol.UpdateSettingsRequest{Settings: &settings})
 }
 
 // SetAgentDefinitionModelForTest drives the supplied set_model configuration edit
@@ -93,7 +93,7 @@ func SetAgentDefinitionModelForTest(r *Runtime, agentType, modelRef string) (pro
 	if err != nil {
 		return protocol.SettingsMutation{}, err
 	}
-	return r.updateSettings(context.Background(), protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
+	return r.updateSettings(context.Background(), protocolCaller(), protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
 		ExtensionId: "agents",
 		EditId:      "set_model",
 		Arguments:   string(arguments),

@@ -74,7 +74,7 @@ func (s *configurationService) editAgentModel(agentType, ref string) configurati
 // updateSettingsOnly drives the settings arm of the settings/extension-edit
 // request union.
 func updateSettingsOnly(r *Runtime, ctx context.Context, settings protocol.Settings) (protocol.SettingsMutation, error) {
-	return r.updateSettings(ctx, protocol.UpdateSettingsRequest{Settings: &settings})
+	return r.updateSettings(ctx, protocolCaller(), protocol.UpdateSettingsRequest{Settings: &settings})
 }
 
 // setAgentTypeModel drives the supplied set_model extension edit through the
@@ -88,7 +88,7 @@ func (r *Runtime) setAgentTypeModel(ctx context.Context, agentType, ref string) 
 	if err != nil {
 		return protocol.SettingsMutation{}, err
 	}
-	return r.updateSettings(ctx, protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
+	return r.updateSettings(ctx, protocolCaller(), protocol.UpdateSettingsRequest{ExtensionEdit: &protocol.ExtensionEdit{
 		ExtensionId: "agents",
 		EditId:      "set_model",
 		Arguments:   string(arguments),

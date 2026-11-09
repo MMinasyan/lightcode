@@ -287,18 +287,18 @@ func (c *CLI) inputMenu(s stamp, revert bool) {
 			continue
 		}
 		input, err := item.AsInputItem()
-		if err != nil || input.Origin != protocol.InputOriginUser || (revert && input.OperationId == nil) {
+		if err != nil || (revert && input.OperationId == nil) {
 			continue
 		}
 		items = append(items, terminal.MenuItem{Label: contentText(input.Content), Detail: input.ItemId, Selectable: true, Extra: input})
 	}
 	if r.cursor != nil {
-		items = append(items, terminal.MenuItem{Label: "Older user inputs", Selectable: true, Extra: "older"})
+		items = append(items, terminal.MenuItem{Label: "Older inputs", Selectable: true, Extra: "older"})
 	}
 	c.mu.Unlock()
-	kind, title := "fork", "Replace a user input — fork does not restore code"
+	kind, title := "fork", "Replace an input — fork does not restore code"
 	if revert {
-		kind, title = "revert", "Rewind code before an owned user input; conversation unchanged"
+		kind, title = "revert", "Rewind code before an owned input; conversation unchanged"
 	}
 	c.showMenu(s, kind, title, items)
 }

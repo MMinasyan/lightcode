@@ -191,14 +191,14 @@ func TestDataServiceAssignsExtensionOwnedDirectories(t *testing.T) {
 
 		// An archived but current Session still assigns its namespace.
 		{
-			_, err := r.archiveSession(ctx, id)
+			_, err := r.archiveSession(ctx, protocolCaller(), id)
 			testassert.NoError(t, err)
 		}
 		archivedView, archivedCalls := dataView(t, r, a.capability, id, nativeGrant{})
 		testassert.Equal(t, namespaceDirectory(t, archivedCalls, "session_namespace"), wantA)
 		archivedView.end()
 
-		result, err := r.deleteSession(ctx, id)
+		result, err := r.deleteSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.CleanupFailures) == 0, "deletion result = %+v, want complete cleanup", result)
 		mustNotExist(t, filepath.Join(e.dataDir, "code", id), "the whole deleted Session tree")
@@ -320,7 +320,7 @@ func TestDataServiceStandaloneWriterHoldsInterval(t *testing.T) {
 	testassert.NoError(t, err)
 	id := session.Identity.SessionID
 	{
-		_, err := r.archiveSession(ctx, id)
+		_, err := r.archiveSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 	}
 	view, calls := dataView(t, r, a.capability, id, nativeGrant{})
@@ -329,7 +329,7 @@ func TestDataServiceStandaloneWriterHoldsInterval(t *testing.T) {
 
 	deleteDone := make(chan error, 1)
 	go func() {
-		_, err := r.deleteSession(ctx, id)
+		_, err := r.deleteSession(ctx, protocolCaller(), id)
 		deleteDone <- err
 	}()
 	select {
@@ -361,7 +361,7 @@ func TestDataServiceStandaloneWriterHoldsInterval(t *testing.T) {
 
 	view.end()
 	{
-		result, err := r.deleteSession(ctx, id)
+		result, err := r.deleteSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.CleanupFailures) == 0, "delete after the writer released = %+v", result)
 	}
@@ -473,7 +473,7 @@ func TestDataServiceClaimRequiresDeclaration(t *testing.T) {
 	testassert.Require(t, len(sessionOwners(t, store, id)) == 1, "a busy claim changed the owners: %v", sessionOwners(t, store, id))
 
 	{
-		_, err := r.archiveSession(ctx, id)
+		_, err := r.archiveSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 	}
 	archivedView, archivedCalls := dataView(t, r, a.capability, id, nativeGrant{})
@@ -525,7 +525,7 @@ func TestDataServiceOwnersDeletionAndCleanupFailureTokens(t *testing.T) {
 		view.end()
 	}
 	{
-		_, err := r.deleteSession(ctx, id) // open Session: refused before any cleanup
+		_, err := r.deleteSession(ctx, protocolCaller(), id) // open Session: refused before any cleanup
 		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "open Session delete = %v, want the refusal", err)
 	}
 	testassert.Require(t, goodCalls.Load() == 0 && badCalls.Load() == 0, "a refused deletion ran cleanup callbacks")
@@ -534,14 +534,14 @@ func TestDataServiceOwnersDeletionAndCleanupFailureTokens(t *testing.T) {
 	testassert.NoError(t, os.MkdirAll(cache, 0o700))
 	testassert.NoError(t, os.WriteFile(filepath.Join(cache, "keep"), []byte("cache"), 0o600))
 	{
-		_, err := r.archiveSession(ctx, id)
+		_, err := r.archiveSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 	}
 	codeRoot := filepath.Join(e.dataDir, "code")
 	testassert.NoError(t, os.Chmod(codeRoot, 0o555))
 	t.Cleanup(func() { os.Chmod(codeRoot, 0o755) })
 
-	result, err := r.deleteSession(ctx, id)
+	result, err := r.deleteSession(ctx, protocolCaller(), id)
 	testassert.NoError(t, err)
 	testassert.Require(t, len(result.CleanupFailures) == 2, "cleanup failures = %+v, want the local storage failure and the external unavailable failure", result.CleanupFailures)
 	testassert.Require(t, result.CleanupFailures[0].ExtensionId == nil && result.CleanupFailures[0].Code == "storage", "local failure = %+v, want the storage class with no extension id", result.CleanupFailures[0])
@@ -560,7 +560,7 @@ func TestDataServiceOwnersDeletionAndCleanupFailureTokens(t *testing.T) {
 	mustExist(t, e.configPath, "the configuration after partial cleanup")
 	testassert.NoError(t, os.Chmod(codeRoot, 0o755))
 	{
-		repeated, err := r.deleteSession(ctx, id)
+		repeated, err := r.deleteSession(ctx, protocolCaller(), id)
 		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = (%+v, %v), want the ordinary not-found", repeated, err)
 		testassert.Require(t, len(repeated.CleanupFailures) == 0, "repeated delete produced a cleanup result: %+v", repeated)
 		testassert.Require(t, goodCalls.Load() == 1 && badCalls.Load() == 1, "repeated delete replayed owner cleanup: calls = (%d, %d)", goodCalls.Load(), badCalls.Load())
@@ -594,16 +594,16 @@ func TestDataServiceDeletionResultOnlyFromCommittingDelete(t *testing.T) {
 	testassert.NoError(t, err)
 	view.end()
 	{
-		_, err := r.archiveSession(ctx, id)
+		_, err := r.archiveSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 	}
 
-	result, err := r.deleteSession(ctx, id)
+	result, err := r.deleteSession(ctx, protocolCaller(), id)
 	testassert.NoError(t, err)
 	testassert.Require(t, len(result.CleanupFailures) == 1 && result.CleanupFailures[0].ExtensionId != nil && *result.CleanupFailures[0].ExtensionId == "probe_bad" && result.CleanupFailures[0].Code == protocol.CleanupFailureCodeUnavailable, "first deletion failures = %+v, want the owner's unavailable failure", result.CleanupFailures)
 	testassert.Require(t, cleanupCalls.Load() == 1, "cleanup calls = %d, want the committing deletion's one attempt", cleanupCalls.Load())
 
-	repeated, err := r.deleteSession(ctx, id)
+	repeated, err := r.deleteSession(ctx, protocolCaller(), id)
 	testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = (%+v, %v), want the ordinary not-found", repeated, err)
 	testassert.Require(t, len(repeated.CleanupFailures) == 0, "repeated delete produced a cleanup result: %+v", repeated)
 	testassert.Require(t, cleanupCalls.Load() == 1, "repeated delete replayed external cleanup: calls = %d", cleanupCalls.Load())
@@ -635,13 +635,13 @@ func TestDataServiceCleanupDisabledAndRemovedOwners(t *testing.T) {
 			view.end()
 		}
 		writeServiceFile(t, e.configPath, strings.TrimSuffix(ownerConfigDocument(e.server.URL), "}")+`,"extensions":{"agents":{"enabled":true,"definitions":`+ownerAgentsDocument+`},"probe_good":{"enabled":true},"probe_bad":{"enabled":false}}}`)
-		_, err = r.Reload(ctx)
+		_, err = r.reload(ctx, protocolCaller())
 		testassert.NoError(t, err)
 		{
-			_, err := r.archiveSession(ctx, id)
+			_, err := r.archiveSession(ctx, protocolCaller(), id)
 			testassert.NoError(t, err)
 		}
-		result, err := r.deleteSession(ctx, id)
+		result, err := r.deleteSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.CleanupFailures) == 1 && result.CleanupFailures[0].ExtensionId != nil && *result.CleanupFailures[0].ExtensionId == "probe_bad" && result.CleanupFailures[0].Code == "unavailable", "disabled owner result = %+v, want the unavailable failure", result.CleanupFailures)
 		testassert.Require(t, goodCalls.Load() == 1 && badCalls.Load() == 0, "cleanup calls = (%d, %d), want only the installed owner invoked", goodCalls.Load(), badCalls.Load())
@@ -668,10 +668,10 @@ func TestDataServiceCleanupDisabledAndRemovedOwners(t *testing.T) {
 			return h.ClaimExternalData(ctx, id, "probe_removed")
 		}))
 		{
-			_, err := r.archiveSession(ctx, id)
+			_, err := r.archiveSession(ctx, protocolCaller(), id)
 			testassert.NoError(t, err)
 		}
-		result, err := r.deleteSession(ctx, id)
+		result, err := r.deleteSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.CleanupFailures) == 1 && result.CleanupFailures[0].ExtensionId != nil && *result.CleanupFailures[0].ExtensionId == "probe_removed" && result.CleanupFailures[0].Code == "unavailable", "removed owner result = %+v, want the unavailable failure", result.CleanupFailures)
 		testassert.Require(t, goodCalls.Load() == 0, "an unrelated owner cleanup ran")
@@ -700,7 +700,7 @@ func TestDataServiceSweepReportsCleanupFailures(t *testing.T) {
 	testassert.NoError(t, err)
 	view.end()
 	{
-		_, err := r.archiveSession(ctx, id)
+		_, err := r.archiveSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 	}
 	stderr := captureSweepStderr(t)
@@ -747,12 +747,12 @@ func TestDataServiceCleanupJoinsShutdown(t *testing.T) {
 	testassert.NoError(t, err)
 	view.end()
 	{
-		_, err := r.archiveSession(ctx, id)
+		_, err := r.archiveSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 	}
 	deleteDone := make(chan error, 1)
 	go func() {
-		_, err := r.deleteSession(context.Background(), id)
+		_, err := r.deleteSession(context.Background(), protocolCaller(), id)
 		deleteDone <- err
 	}()
 	select {
@@ -921,7 +921,7 @@ func TestDataServiceOperationClaimAndCleanup(t *testing.T) {
 					testassert.Require(t, errors.Is(err, errArtifactBusy), "the Operation's claim did not retain its borrowed execution interval: %v", err)
 				}
 				{
-					_, err := r.deleteSession(ctx, id)
+					_, err := r.deleteSession(ctx, protocolCaller(), id)
 					testassert.Require(t, errors.Is(err, harness.ErrConflict), "delete during the active claim callback = %v, want the interval conflict", err)
 				}
 				r.runSweepPass(ctx, time.Now().Add(100*time.Hour))
@@ -947,10 +947,10 @@ func TestDataServiceOperationClaimAndCleanup(t *testing.T) {
 					time.Sleep(10 * time.Millisecond)
 				}
 				{
-					_, err := r.archiveSession(ctx, id)
+					_, err := r.archiveSession(ctx, protocolCaller(), id)
 					testassert.NoError(t, err)
 				}
-				result, err := r.deleteSession(ctx, id)
+				result, err := r.deleteSession(ctx, protocolCaller(), id)
 				testassert.NoError(t, err)
 				testassert.Require(t, len(result.CleanupFailures) == 0, "delete after the active claim = %+v, want complete cleanup", result)
 				testassert.Require(t, cleanupCalls.Load() == 1, "cleanup calls = %d, want the owner's actual cleanup once", cleanupCalls.Load())
@@ -963,7 +963,7 @@ func TestDataServiceOperationClaimAndCleanup(t *testing.T) {
 					testassert.Require(t, errors.Is(err, harness.ErrNotFound), "canonical deletion = %v, want it committed", err)
 				}
 				{
-					repeated, err := r.deleteSession(ctx, id)
+					repeated, err := r.deleteSession(ctx, protocolCaller(), id)
 					testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = (%+v, %v), want the ordinary not-found", repeated, err)
 					testassert.Require(t, cleanupCalls.Load() == 1, "repeated delete replayed cleanup: calls = %d", cleanupCalls.Load())
 				}
@@ -1068,13 +1068,13 @@ func TestDataServiceCleanupCancellationReportsUnavailable(t *testing.T) {
 	testassert.NoError(t, err)
 	view.end()
 	{
-		_, err := r.archiveSession(context.Background(), id)
+		_, err := r.archiveSession(context.Background(), protocolCaller(), id)
 		testassert.NoError(t, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan protocol.DeletionResult, 1)
 	go func() {
-		result, _ := r.deleteSession(ctx, id)
+		result, _ := r.deleteSession(ctx, protocolCaller(), id)
 		done <- result
 	}()
 	select {
@@ -1119,11 +1119,11 @@ func TestDataServiceClaimDeletedSessionRefused(t *testing.T) {
 	testassert.NoError(t, err)
 	siblingID := sibling.Identity.SessionID
 	{
-		_, err := r.archiveSession(ctx, id)
+		_, err := r.archiveSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 	}
 	{
-		result, err := r.deleteSession(ctx, id)
+		result, err := r.deleteSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.CleanupFailures) == 0, "deletion = %+v", result)
 	}
@@ -1196,10 +1196,10 @@ func TestDataServiceCleanupResultSiblings(t *testing.T) {
 		id := session.Identity.SessionID
 		claimAll(t, r, store, id, good, domain, goerror, invalid)
 		{
-			_, err := r.archiveSession(ctx, id)
+			_, err := r.archiveSession(ctx, protocolCaller(), id)
 			testassert.NoError(t, err)
 		}
-		result, err := r.deleteSession(ctx, id)
+		result, err := r.deleteSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.CleanupFailures) == 3, "failures = %+v, want domain, Go error and invalid-result siblings", result.CleanupFailures)
 		for _, failure := range result.CleanupFailures {
@@ -1221,7 +1221,7 @@ func TestDataServiceCleanupResultSiblings(t *testing.T) {
 			})
 			testassert.Require(t, errors.Is(err, harness.ErrNotFound), "canonical deletion = %v, want it committed", err)
 		}
-		repeated, err := r.deleteSession(ctx, id)
+		repeated, err := r.deleteSession(ctx, protocolCaller(), id)
 		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "repeated delete = (%+v, %v), want the ordinary not-found", repeated, err)
 		testassert.Require(t, len(repeated.CleanupFailures) == 0, "repeated delete produced a cleanup result: %+v", repeated)
 		for name, counter := range calls {
@@ -1246,7 +1246,7 @@ func TestDataServiceCleanupResultSiblings(t *testing.T) {
 		id := session.Identity.SessionID
 		claimAll(t, r, store, id, good, domain, goerror, invalid)
 		{
-			_, err := r.archiveSession(ctx, id)
+			_, err := r.archiveSession(ctx, protocolCaller(), id)
 			testassert.NoError(t, err)
 		}
 		stderr := captureSweepStderr(t)
@@ -1436,7 +1436,7 @@ func TestDataServiceRootHookClaimAcrossLifetimes(t *testing.T) {
 						testassert.Require(t, errors.Is(err, errArtifactBusy), "the %s/%s hook lost the execution interval: %v", boundary, lifetime, err)
 					}
 					{
-						_, err := r.deleteSession(ctx, id)
+						_, err := r.deleteSession(ctx, protocolCaller(), id)
 						testassert.Require(t, errors.Is(err, harness.ErrConflict), "delete during the %s/%s hook = %v, want the conflict", boundary, lifetime, err)
 					}
 					r.runSweepPass(ctx, time.Now().Add(100*time.Hour))
@@ -1462,10 +1462,10 @@ func TestDataServiceRootHookClaimAcrossLifetimes(t *testing.T) {
 						time.Sleep(10 * time.Millisecond)
 					}
 					{
-						_, err := r.archiveSession(ctx, id)
+						_, err := r.archiveSession(ctx, protocolCaller(), id)
 						testassert.NoError(t, err)
 					}
-					result, err := r.deleteSession(ctx, id)
+					result, err := r.deleteSession(ctx, protocolCaller(), id)
 					testassert.NoError(t, err)
 					testassert.Require(t, len(result.CleanupFailures) == 0, "delete after the hook = %+v, want complete cleanup", result)
 					testassert.Require(t, cleanupCalls.Load() == 1, "cleanup calls = %d, want the hook owner's actual cleanup once", cleanupCalls.Load())
@@ -1591,7 +1591,7 @@ func TestDataServiceNestedClaimAcrossLifetime(t *testing.T) {
 			testassert.Require(t, errors.Is(err, errArtifactBusy), "the nested provider lost the execution interval: %v", err)
 		}
 		{
-			_, err := r.deleteSession(ctx, id)
+			_, err := r.deleteSession(ctx, protocolCaller(), id)
 			testassert.Require(t, errors.Is(err, harness.ErrConflict), "delete during the nested provider = %v, want the conflict", err)
 		}
 		releaseProviderOnce()
@@ -1610,10 +1610,10 @@ func TestDataServiceNestedClaimAcrossLifetime(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		{
-			_, err := r.archiveSession(ctx, id)
+			_, err := r.archiveSession(ctx, protocolCaller(), id)
 			testassert.NoError(t, err)
 		}
-		result, err := r.deleteSession(ctx, id)
+		result, err := r.deleteSession(ctx, protocolCaller(), id)
 		testassert.NoError(t, err)
 		testassert.Require(t, len(result.CleanupFailures) == 0, "delete after the nested claim = %+v, want complete cleanup", result)
 		testassert.Require(t, cleanupCalls.Load() == 1, "cleanup calls = %d, want the nested provider owner once", cleanupCalls.Load())
@@ -1677,16 +1677,16 @@ func TestDataServiceCleanupHasNoSessionOrWorkAuthority(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	{
-		_, err := r.archiveSession(ctx, targetID)
+		_, err := r.archiveSession(ctx, protocolCaller(), targetID)
 		testassert.NoError(t, err)
 	}
-	result, err := r.deleteSession(ctx, targetID)
+	result, err := r.deleteSession(ctx, protocolCaller(), targetID)
 	testassert.NoError(t, err)
 	testassert.Require(t, len(result.CleanupFailures) == 0, "cleanup result = %+v, want success", result)
 	testassert.Require(t, cleanupCompleted.Load(), "cleanup callback did not complete")
 	testassert.Require(t, observedSession == "" && observedOp == "", "cleanup identity = session %q operation %q, want empty", observedSession, observedOp)
 	testassert.Require(t, errors.Is(dataErr, ErrClosed), "cleanup Session namespace error = %v, want the closed refusal", dataErr)
-	testassert.Require(t, errors.Is(launchErr, ErrClosed), "cleanup child-launch error = %v, want the closed/unauthorized refusal", launchErr)
+	testassert.Require(t, errors.Is(launchErr, ErrDenied), "cleanup child-launch error = %v, want the denied/unauthorized refusal", launchErr)
 	{
 		err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
 			_, err := h.Submit(ctx, harness.SubmitRequest{
@@ -1845,7 +1845,7 @@ func TestDataServiceCleanupBatchRetainsOriginalResourcesAcrossReload(t *testing.
 				owners := sessionOwners(t, store, id)
 				testassert.Require(t, len(owners) == 2 && owners[0] == "probe_a" && owners[1] == "probe_b", "owners = %v, want [probe_a probe_b]", owners)
 				{
-					_, err := r.archiveSession(ctx, id)
+					_, err := r.archiveSession(ctx, protocolCaller(), id)
 					testassert.NoError(t, err)
 				}
 
@@ -1856,7 +1856,7 @@ func TestDataServiceCleanupBatchRetainsOriginalResourcesAcrossReload(t *testing.
 						r.runSweepPass(ctx, time.Now().Add(100*time.Hour))
 						return
 					}
-					_, _ = r.deleteSession(ctx, id)
+					_, _ = r.deleteSession(ctx, protocolCaller(), id)
 				}()
 				select {
 				case <-first.arrived:
@@ -1869,7 +1869,7 @@ func TestDataServiceCleanupBatchRetainsOriginalResourcesAcrossReload(t *testing.
 				}
 				testassert.Require(t, closeOld.Load() == 0 && closeNew.Load() == 0, "resources closed before the parked batch: old=%d new=%d", closeOld.Load(), closeNew.Load())
 				writeServiceFile(t, e.configPath, taggedDataConfig(e.server.URL, "new", true, "old", false))
-				_, err = r.Reload(ctx)
+				_, err = r.reload(ctx, protocolCaller())
 				testassert.NoError(t, err)
 				testassert.Require(t, openOld.Load() == 2 && openNew.Load() == 1, "open instances = old %d new %d, want two original and one reloaded probe", openOld.Load(), openNew.Load())
 				{

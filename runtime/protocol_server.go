@@ -183,7 +183,7 @@ func (ps *ProtocolServer) authorize(handler http.HandlerFunc) http.HandlerFunc {
 		header := r.Header.Get("Authorization")
 		if !strings.HasPrefix(header, prefix) ||
 			subtle.ConstantTimeCompare([]byte(header[len(prefix):]), []byte(ps.credential)) != 1 {
-			writeProtocolError(w, errUnauthorized)
+			writeProtocolAuthError(w)
 			return
 		}
 		handler(w, r)
@@ -235,7 +235,7 @@ func (ps *ProtocolServer) PublishDiscovery(path string) error {
 	record, err := json.Marshal(discoveryRecord{
 		Endpoint:        ps.endpoint,
 		InstanceId:      ps.instance,
-		ProtocolVersion: string(protocol.N12),
+		ProtocolVersion: string(protocol.N13),
 		Credential:      ps.credential,
 	})
 	if err != nil {
@@ -275,7 +275,7 @@ func (ps *ProtocolServer) verifyReady() error {
 	if err := decodeOneDocument(body, &health); err != nil {
 		return fmt.Errorf("decode health response: %w", err)
 	}
-	if health.InstanceId != ps.instance || health.ProtocolVersion != protocol.N12 {
+	if health.InstanceId != ps.instance || health.ProtocolVersion != protocol.N13 {
 		return fmt.Errorf("health response identity %q/%q does not match this server", health.InstanceId, health.ProtocolVersion)
 	}
 	return nil

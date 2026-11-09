@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -24,22 +25,38 @@ const (
 	sseHeartbeatInterval    = 15 * time.Second
 )
 
+// subscribeEvents is the owner-wide event-stream producer: one admitted call
+// authorizes the owner target, then attaches the bounded subscription. The
+// release and subscription both outlive this call and are closed by the
+// handler on every exit.
+func (r *Runtime) subscribeEvents(ctx context.Context, c caller) (*Subscription, func(), error) {
+	release, err := r.enter(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		release()
+		return nil, nil, err
+	}
+	sub, err := r.obs.subscribe(sseSubscriptionCapacity)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return sub, release, nil
+}
+
 // GetEvents serves the one authenticated event stream. The whole stream
 // lifetime is one admitted call, so shutdown joins it after the server's
 // connections close; the writer selects on the owner's cancellation, the
 // caller's disconnect, the subscription's closure, and the heartbeat clock.
 func (rt *protocolHandlers) GetEvents(w http.ResponseWriter, r *http.Request) {
-	release, err := rt.enter(r.Context())
+	sub, release, err := rt.subscribeEvents(r.Context(), protocolCaller())
 	if err != nil {
 		writeProtocolError(w, err)
 		return
 	}
 	defer release()
-	sub, err := rt.obs.subscribe(sseSubscriptionCapacity)
-	if err != nil {
-		writeProtocolError(w, err)
-		return
-	}
 	// The subscription releases on every exit: client disconnect, queue
 	// closure, owner cancellation, or write failure.
 	defer sub.Close()

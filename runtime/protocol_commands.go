@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/model"
@@ -16,7 +17,7 @@ import (
 // coordinator's own publication. A failed fresh read propagates its typed
 // error; the committed creation is never rolled back and no synthetic
 // revision is invented.
-func (r *Runtime) createSessionHeader(ctx context.Context, workspace string, requested *protocol.AgentSelection) (protocol.Session, error) {
+func (r *Runtime) createSessionHeader(ctx context.Context, c caller, workspace string, requested *protocol.AgentSelection) (protocol.Session, error) {
 	selection := r.defaultAgentSelection()
 	if requested != nil {
 		var err error
@@ -25,9 +26,19 @@ func (r *Runtime) createSessionHeader(ctx context.Context, workspace string, req
 			return protocol.Session{}, err
 		}
 	}
+	if workspace == "" {
+		return protocol.Session{}, fmt.Errorf("workspace must be non-empty: %w", harness.ErrInvalid)
+	}
+	normalized, err := filepath.Abs(workspace)
+	if err != nil {
+		return protocol.Session{}, fmt.Errorf("normalize workspace: %w", harness.ErrInvalid)
+	}
 	var header protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
-		record, err := r.createSessionRecord(ctx, h, workspace, selection)
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeWorkspace, workspace: normalized}); err != nil {
+			return err
+		}
+		record, err := r.createSessionRecord(ctx, h, normalized, selection)
 		if err != nil {
 			return err
 		}
@@ -40,22 +51,27 @@ func (r *Runtime) createSessionHeader(ctx context.Context, workspace string, req
 }
 
 // submitSession is the protocol-shaped Session message submission: the wire
-// body is converted once, the origin is the fixed caller origin (the wire
-// carries none), the mode is a plain cast so the existing Harness validator
-// decides the closed set, and the outcome projects the Harness-returned
-// record. A buffered item's result keeps Operation nil even after a later
-// drain admits work under that identity.
-func (r *Runtime) submitSession(ctx context.Context, sessionID string, req protocol.SubmitRequest) (protocol.SubmitResult, error) {
+// body is converted once, trusted caller attribution supplies the origin and
+// extension provenance (the wire carries neither), the mode is a plain cast
+// so the existing Harness validator decides the closed set, and the outcome
+// projects the Harness-returned record. A Session target outside the caller's
+// scope is denied before the Harness sees it. A buffered item's result keeps
+// Operation nil even after a later drain admits work under that identity.
+func (r *Runtime) submitSession(ctx context.Context, c caller, sessionID string, req protocol.SubmitRequest) (protocol.SubmitResult, error) {
 	content, err := convertContentParts(req.Content)
 	if err != nil {
 		return protocol.SubmitResult{}, err
 	}
 	var result protocol.SubmitResult
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		out, err := h.Submit(ctx, harness.SubmitRequest{
 			SessionID:   sessionID,
 			OperationID: req.OperationId,
-			Origin:      harness.InputOriginUser,
+			Origin:      c.origin,
+			ExtensionID: c.extensionID,
 			Content:     content,
 			Mode:        harness.MessageMode(req.Mode),
 		})
@@ -84,9 +100,12 @@ func projectSubmitResult(out harness.SubmitResult) protocol.SubmitResult {
 // compactSession is the protocol-shaped manual compaction over one idle
 // Session: the contiguous admission discipline stays entirely with the
 // Harness, and the returned Operation is its committed record.
-func (r *Runtime) compactSession(ctx context.Context, sessionID string, req protocol.CompactRequest) (protocol.Operation, error) {
+func (r *Runtime) compactSession(ctx context.Context, c caller, sessionID string, req protocol.CompactRequest) (protocol.Operation, error) {
 	var operation protocol.Operation
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		record, err := h.Compact(ctx, harness.CompactRequest{SessionID: sessionID, OperationID: req.OperationId})
 		if err != nil {
 			return err
@@ -104,14 +123,19 @@ func (r *Runtime) compactSession(ctx context.Context, sessionID string, req prot
 // request when one exists, otherwise from the live narrow history capture —
 // then delegates to Harness.Fork with that raw identity, so first-writer/
 // conflict and the normal new-fork transaction stay Harness authority. The
-// destination header comes from the narrow post-transition metadata read.
-func (r *Runtime) forkSession(ctx context.Context, sessionID string, req protocol.ForkRequest) (protocol.ForkResult, error) {
+// caller's replacement attribution is trusted grant data, never wire fields,
+// and a Session target outside its scope is denied. The destination header
+// comes from the narrow post-transition metadata read.
+func (r *Runtime) forkSession(ctx context.Context, c caller, sessionID string, req protocol.ForkRequest) (protocol.ForkResult, error) {
 	content, err := convertContentParts(req.Content)
 	if err != nil {
 		return protocol.ForkResult{}, err
 	}
 	var result protocol.ForkResult
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		boundaryEntryID, err := forkBoundaryEntry(ctx, h, sessionID, req)
 		if err != nil {
 			return err
@@ -120,6 +144,8 @@ func (r *Runtime) forkSession(ctx context.Context, sessionID string, req protoco
 			SourceSessionID: sessionID,
 			BoundaryEntryID: boundaryEntryID,
 			OperationID:     req.OperationId,
+			Origin:          c.origin,
+			ExtensionID:     c.extensionID,
 			Content:         content,
 		})
 		if err != nil {
@@ -195,13 +221,16 @@ func forkBoundaryEntry(ctx context.Context, h *harness.Harness, sourceID string,
 // keeps its nonempty-only selection (an unknown type fails at the next
 // preparation, not here), and the returned header is the narrow
 // post-transition metadata read.
-func (r *Runtime) setSessionAgentType(ctx context.Context, sessionID string, req protocol.SetSessionAgentTypeRequest) (protocol.Session, error) {
+func (r *Runtime) setSessionAgentType(ctx context.Context, c caller, sessionID string, req protocol.SetSessionAgentTypeRequest) (protocol.Session, error) {
 	var header protocol.Session
 	selection, err := selectionFromProtocol(req.AgentSelection)
 	if err != nil {
 		return header, err
 	}
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		if _, err := h.ChangeAgentType(ctx, sessionID, selection); err != nil {
 			return err
 		}
@@ -214,7 +243,7 @@ func (r *Runtime) setSessionAgentType(ctx context.Context, sessionID string, req
 	return header, nil
 }
 
-func (r *Runtime) setSessionModel(ctx context.Context, sessionID string, req protocol.SetSessionModelRequest) (protocol.Session, error) {
+func (r *Runtime) setSessionModel(ctx context.Context, c caller, sessionID string, req protocol.SetSessionModelRequest) (protocol.Session, error) {
 	var ref model.ModelRef
 	if req.Model != "" {
 		var err error
@@ -225,6 +254,9 @@ func (r *Runtime) setSessionModel(ctx context.Context, sessionID string, req pro
 	}
 	var header protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		if _, err := h.SetSessionModel(ctx, sessionID, ref); err != nil {
 			return err
 		}
@@ -240,9 +272,12 @@ func (r *Runtime) setSessionModel(ctx context.Context, sessionID string, req pro
 // archiveSession is the protocol-shaped archive: the Harness-owned
 // idle/live-background gates stay in force, and the archived header is the
 // narrow post-transition metadata read.
-func (r *Runtime) archiveSession(ctx context.Context, sessionID string) (protocol.Session, error) {
+func (r *Runtime) archiveSession(ctx context.Context, c caller, sessionID string) (protocol.Session, error) {
 	var header protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		if _, err := h.ArchiveSession(ctx, sessionID); err != nil {
 			return err
 		}
@@ -258,9 +293,12 @@ func (r *Runtime) archiveSession(ctx context.Context, sessionID string) (protoco
 // reopenSession is the protocol-shaped reopen: an already open Session is the
 // Harness no-write success, and the header is the narrow post-transition
 // metadata read.
-func (r *Runtime) reopenSession(ctx context.Context, sessionID string) (protocol.Session, error) {
+func (r *Runtime) reopenSession(ctx context.Context, c caller, sessionID string) (protocol.Session, error) {
 	var header protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		if _, err := h.ReopenSession(ctx, sessionID); err != nil {
 			return err
 		}
@@ -276,8 +314,11 @@ func (r *Runtime) reopenSession(ctx context.Context, sessionID string) (protocol
 // interruptSession delegates to the Harness interrupt and returns with it:
 // the control is issued immediately and this call never waits for the
 // Operation's later terminal commit.
-func (r *Runtime) interruptSession(ctx context.Context, sessionID string) error {
+func (r *Runtime) interruptSession(ctx context.Context, c caller, sessionID string) error {
 	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		return h.Interrupt(ctx, sessionID)
 	})
 }
@@ -285,8 +326,11 @@ func (r *Runtime) interruptSession(ctx context.Context, sessionID string) error 
 // stopSession delegates to the full background convergence wait owned by
 // Harness.Stop; the root active Operation and pending buffers are not touched
 // by this facade.
-func (r *Runtime) stopSession(ctx context.Context, sessionID string) error {
+func (r *Runtime) stopSession(ctx context.Context, c caller, sessionID string) error {
 	return r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		return h.Stop(ctx, sessionID)
 	})
 }

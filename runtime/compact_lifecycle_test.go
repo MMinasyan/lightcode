@@ -342,9 +342,13 @@ func compactRawSuccessState(now, settlementEntry, sessionID, usage string) strin
 }
 
 func compactRawInputEntry(sessionID, entryID, operationID, origin, text string) string {
+	provenance := ""
+	if origin == "plugin" {
+		provenance = `,"extension_id":"lifecycle.extension"`
+	}
 	return fmt.Sprintf(
-		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":%q,"content":[{"kind":"text","text":%q}]}`,
-		sessionID, entryID, operationID, origin, text)
+		`{"session_id":%q,"entry_id":%q,"operation_id":%q,"origin":%q%s,"content":[{"kind":"text","text":%q}]}`,
+		sessionID, entryID, operationID, origin, provenance, text)
 }
 
 func compactRawAssistantEntry(sessionID, entryID, operationID, boundaryID, text string) string {
@@ -891,7 +895,7 @@ func TestCompactLifecycleManualMaintenanceOpensOnlyMaintenanceInstance(t *testin
 		fixture.conversationOpen, fixture.maintenanceOpen = 0, 0
 		fixture.mu.Unlock()
 
-		_, err = r.compactSession(ctx, sessionID, protocol.CompactRequest{OperationId: "compact-1"})
+		_, err = r.compactSession(ctx, protocolCaller(), sessionID, protocol.CompactRequest{OperationId: "compact-1"})
 		testassert.NoError(t, err)
 		awaitOperation(t, r, sessionID, "compact-1", harness.OperationSuccess)
 		deadline = time.Now().Add(10 * time.Second)
@@ -1013,7 +1017,7 @@ func TestCompactLifecycleCanceledInvocationOpeningDisposesOperation(t *testing.T
 		case <-time.After(10 * time.Second):
 			t.Fatal("the invocation opening never parked")
 		}
-		testassert.NoError(t, r.interruptSession(context.Background(), sessionID))
+		testassert.NoError(t, r.interruptSession(context.Background(), protocolCaller(), sessionID))
 		awaitOperation(t, r, sessionID, "op-canceled", harness.OperationInterruption)
 		deadline := time.Now().Add(10 * time.Second)
 		for {

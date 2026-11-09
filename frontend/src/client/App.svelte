@@ -643,7 +643,7 @@
 
   // --- Replacement Fork and ordered code rewind -------------------------------
 
-  // Replacement Fork opens for one user-origin input; rewind exists only for an owned operation_id.
+  // Replacement Fork opens for one committed input; rewind exists only for an owned operation_id.
   function openFork(item) {
     forkItem = item;
     // Capture the initiating source identity and stamp with the form.

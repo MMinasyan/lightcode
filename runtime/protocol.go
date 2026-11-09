@@ -27,7 +27,7 @@ import (
 // own metadata listing: every row is a fresh header and an unavailable
 // Session is already omitted there, while any other failure propagates with
 // no partial list.
-func (r *Runtime) listSessions(ctx context.Context, params protocol.ListSessionsParams) ([]protocol.Session, error) {
+func (r *Runtime) listSessions(ctx context.Context, c caller, params protocol.ListSessionsParams) ([]protocol.Session, error) {
 	if params.Workspace == "" {
 		return nil, fmt.Errorf("workspace must be non-empty: %w", harness.ErrInvalid)
 	}
@@ -40,6 +40,9 @@ func (r *Runtime) listSessions(ctx context.Context, params protocol.ListSessions
 	}
 	var headers []protocol.Session
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeWorkspace, workspace: workspace}); err != nil {
+			return err
+		}
 		rows, err := h.ListSessions(ctx)
 		if err != nil {
 			return err
@@ -65,9 +68,12 @@ func (r *Runtime) listSessions(ctx context.Context, params protocol.ListSessions
 // Session from one fresh metadata scan, sorted by root, inside a single
 // admitted call. It is derived navigation: no Project record, count, or
 // owning revision.
-func (r *Runtime) listWorkspaces(ctx context.Context) ([]protocol.Workspace, error) {
+func (r *Runtime) listWorkspaces(ctx context.Context, c caller) ([]protocol.Workspace, error) {
 	var out []protocol.Workspace
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, harnessScope); err != nil {
+			return err
+		}
 		rows, err := h.ListSessions(ctx)
 		if err != nil {
 			return err
@@ -266,8 +272,9 @@ func projectConversationItem(sessionID string, fact harness.HistoryFact, results
 		err = item.FromInputItem(protocol.InputItem{
 			ItemId:      id,
 			CommittedAt: fact.CommittedAt.UTC(),
-			OperationId: operationAttribution(fact.OperationID),
+			OperationId: optionalIdentity(fact.OperationID),
 			Origin:      protocol.InputOrigin(fact.Input.Origin),
+			ExtensionId: optionalIdentity(fact.Input.ExtensionID),
 			Content:     content,
 		})
 	case harness.EntryAssistant:
@@ -286,7 +293,7 @@ func projectConversationItem(sessionID string, fact harness.HistoryFact, results
 		err = item.FromCheckpointItem(protocol.CheckpointItem{
 			ItemId:      id,
 			CommittedAt: fact.CommittedAt.UTC(),
-			OperationId: operationAttribution(fact.OperationID),
+			OperationId: optionalIdentity(fact.OperationID),
 			Strategy:    fact.Checkpoint.StrategyID,
 			Model:       checkpointDisplayModel(fact.Checkpoint),
 			Messages:    messages,
@@ -295,7 +302,7 @@ func projectConversationItem(sessionID string, fact harness.HistoryFact, results
 		err = item.FromOperationEndItem(protocol.OperationEndItem{
 			ItemId:      id,
 			CommittedAt: fact.CommittedAt.UTC(),
-			OperationId: operationAttribution(fact.OperationID),
+			OperationId: optionalIdentity(fact.OperationID),
 			Status:      protocol.OperationEndItemStatus(fact.Settlement.Status),
 			Detail:      fact.Settlement.Detail,
 		})
@@ -308,13 +315,14 @@ func projectConversationItem(sessionID string, fact harness.HistoryFact, results
 	return &item, nil
 }
 
-// operationAttribution points at a fact's owning Operation when it has one;
-// a copied fork prefix carries no Operation ownership at all.
-func operationAttribution(operationID string) *string {
-	if operationID == "" {
+// optionalIdentity points at an optional fact identity when it has one; a
+// copied fork prefix carries no Operation ownership and non-plugin input
+// carries no extension attribution.
+func optionalIdentity(identity string) *string {
+	if identity == "" {
 		return nil
 	}
-	return &operationID
+	return &identity
 }
 
 // projectAssistantItem maps one validated assistant entry to its generated
@@ -338,7 +346,7 @@ func projectAssistantItem(id string, fact harness.HistoryFact, results map[strin
 	item := protocol.AssistantItem{
 		ItemId:      id,
 		CommittedAt: fact.CommittedAt.UTC(),
-		OperationId: operationAttribution(fact.OperationID),
+		OperationId: optionalIdentity(fact.OperationID),
 		Status:      protocol.AssistantItemStatus(entry.Status),
 		Source:      entry.Source.String(),
 		Content:     content,
@@ -410,7 +418,7 @@ func projectSignalItem(id string, fact harness.HistoryFact) protocol.SignalItem 
 	item := protocol.SignalItem{
 		ItemId:      id,
 		CommittedAt: fact.CommittedAt.UTC(),
-		OperationId: operationAttribution(fact.OperationID),
+		OperationId: optionalIdentity(fact.OperationID),
 		Subtype:     protocol.SignalItemSubtype(fact.Signal.Signal),
 		Content:     fact.Signal.Content,
 	}
@@ -700,7 +708,7 @@ func projectPendingInputs(items []harness.PendingInput) ([]protocol.PendingInput
 		if err != nil {
 			return nil, fmt.Errorf("project pending input %q: %w", item.OperationID, err)
 		}
-		out = append(out, protocol.PendingInput{OperationId: item.OperationID, Origin: protocol.InputOrigin(item.Origin), Content: content})
+		out = append(out, protocol.PendingInput{OperationId: item.OperationID, Origin: protocol.InputOrigin(item.Origin), ExtensionId: optionalIdentity(item.ExtensionID), Content: content})
 	}
 	return out, nil
 }
@@ -842,9 +850,12 @@ func configurationRevision(captured *configuration) protocol.ConfigurationRevisi
 // getHistory is the private paged history read: one admitted call taking
 // exactly one narrow history capture and selecting the page's items before
 // requesting their facts, so an assistant and its tool result never split.
-func (r *Runtime) getHistory(ctx context.Context, sessionID string, cursor *string) (protocol.HistoryPage, error) {
+func (r *Runtime) getHistory(ctx context.Context, c caller, sessionID string, cursor *string) (protocol.HistoryPage, error) {
 	var page protocol.HistoryPage
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		view, err := h.ReadHistoryView(ctx, sessionID)
 		if err != nil {
 			return err
@@ -863,9 +874,12 @@ func (r *Runtime) getHistory(ctx context.Context, sessionID string, cursor *stri
 // measurement, and one captured warning snapshot supplying the warning
 // presentation with its independently revisioned clock — the warning capture
 // happens exactly once per read and is not another Session read.
-func (r *Runtime) buildHydration(ctx context.Context, sessionID string) (protocol.Hydration, error) {
+func (r *Runtime) buildHydration(ctx context.Context, c caller, sessionID string) (protocol.Hydration, error) {
 	var hydration protocol.Hydration
 	if err := r.withHarness(ctx, func(ctx context.Context, h *harness.Harness) error {
+		if err := c.authorize(ctx, h, callerScope{kind: callerScopeSession, sessionID: sessionID}); err != nil {
+			return err
+		}
 		captured := r.config.current()
 		view, err := h.ReadSessionView(ctx, sessionID)
 		if err != nil {
@@ -885,18 +899,19 @@ func (r *Runtime) buildHydration(ctx context.Context, sessionID string) (protoco
 }
 
 // resolveBoundaryEntry resolves one client boundary item ID against one
-// captured history view's committed user-origin input headers and their
+// captured history view's committed input headers and their
 // namespace-derived projected identities, returning the private entry
 // identity for the Harness Fork command. It is pure over the value metadata,
-// so the admitted fork command and every test share exactly one rule. A
-// foreign, non-user, or nonexistent item — and an empty boundary item — fails
-// with the shared harness.ErrInvalid sentinel.
+// so the admitted fork command and every test share exactly one rule. Source
+// origin is attribution only: every committed canonical input is an eligible
+// boundary, including an independently copied prefix input. A foreign,
+// non-input, or nonexistent item — and an empty boundary item — fails with
+// the shared harness.ErrInvalid sentinel.
 func resolveBoundaryEntry(sessionID string, headers []harness.HistoryEntryHeader, boundaryItemID string) (string, error) {
 	for _, header := range headers {
-		if header.Kind == harness.EntryInput && header.InputOrigin == harness.InputOriginUser &&
-			projectItemID(sessionID, header.EntryID) == boundaryItemID {
+		if header.Kind == harness.EntryInput && projectItemID(sessionID, header.EntryID) == boundaryItemID {
 			return header.EntryID, nil
 		}
 	}
-	return "", fmt.Errorf("boundary item %q is not a committed user input of session %q: %w", boundaryItemID, sessionID, harness.ErrInvalid)
+	return "", fmt.Errorf("boundary item %q is not a committed input of session %q: %w", boundaryItemID, sessionID, harness.ErrInvalid)
 }

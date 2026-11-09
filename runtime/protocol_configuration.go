@@ -23,12 +23,15 @@ import (
 // getConfiguration projects the complete published configuration view: the
 // effective settings beside the raw sections, the Agent roster, and the
 // provider views with their source and key-source labels.
-func (r *Runtime) getConfiguration(ctx context.Context) (protocol.ConfigurationView, error) {
+func (r *Runtime) getConfiguration(ctx context.Context, c caller) (protocol.ConfigurationView, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ConfigurationView{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ConfigurationView{}, err
+	}
 	captured, err := r.config.capture(ctx)
 	if err != nil {
 		return protocol.ConfigurationView{}, err
@@ -44,12 +47,15 @@ func (r *Runtime) getConfiguration(ctx context.Context) (protocol.ConfigurationV
 // listModels projects the flat model picker: the visible (non-hidden) list
 // or, with all, the complete catalog — both restricted to connected
 // providers, the retained picker rule.
-func (r *Runtime) listModels(ctx context.Context, params protocol.ListModelsParams) (protocol.ModelList, error) {
+func (r *Runtime) listModels(ctx context.Context, c caller, params protocol.ListModelsParams) (protocol.ModelList, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ModelList{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ModelList{}, err
+	}
 	captured, err := r.config.capture(ctx)
 	if err != nil {
 		return protocol.ModelList{}, err
@@ -76,12 +82,15 @@ func (r *Runtime) listModels(ctx context.Context, params protocol.ListModelsPara
 
 // listProviders projects every effective provider view, sorted by ID — the
 // shared projection producer with getConfiguration.
-func (r *Runtime) listProviders(ctx context.Context) (protocol.ProviderList, error) {
+func (r *Runtime) listProviders(ctx context.Context, c caller) (protocol.ProviderList, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderList{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ProviderList{}, err
+	}
 	captured, err := r.config.capture(ctx)
 	if err != nil {
 		return protocol.ProviderList{}, err
@@ -95,12 +104,15 @@ func (r *Runtime) listProviders(ctx context.Context) (protocol.ProviderList, err
 // getProvider projects one provider's complete view. An empty identity wraps
 // the shared harness.ErrInvalid sentinel; a valid identity naming no
 // effective provider returns the catalog's typed unknown-provider error.
-func (r *Runtime) getProvider(ctx context.Context, providerID string) (protocol.ProviderDetail, error) {
+func (r *Runtime) getProvider(ctx context.Context, c caller, providerID string) (protocol.ProviderDetail, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderDetail{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ProviderDetail{}, err
+	}
 	captured, err := r.config.capture(ctx)
 	if err != nil {
 		return protocol.ProviderDetail{}, err
@@ -117,12 +129,15 @@ func (r *Runtime) getProvider(ctx context.Context, providerID string) (protocol.
 
 // listProviderModels projects one provider's complete model views. The same
 // identity rules as every per-provider read apply.
-func (r *Runtime) listProviderModels(ctx context.Context, providerID string) (protocol.ProviderModelList, error) {
+func (r *Runtime) listProviderModels(ctx context.Context, c caller, providerID string) (protocol.ProviderModelList, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderModelList{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ProviderModelList{}, err
+	}
 	captured, err := r.config.capture(ctx)
 	if err != nil {
 		return protocol.ProviderModelList{}, err
@@ -140,12 +155,15 @@ func (r *Runtime) listProviderModels(ctx context.Context, providerID string) (pr
 
 // getWarnings is the unfiltered warning read: every group of the
 // Runtime-owned presentation store, with the revision captured once.
-func (r *Runtime) getWarnings(ctx context.Context) (protocol.WarningsSnapshot, error) {
+func (r *Runtime) getWarnings(ctx context.Context, c caller) (protocol.WarningsSnapshot, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.WarningsSnapshot{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.WarningsSnapshot{}, err
+	}
 	revision, warnings := r.warnings.snapshot()
 	return protocol.WarningsSnapshot{
 		WarningsRevision: protocol.WarningsRevision{Revision: formatWarningRevision(revision)},
@@ -164,12 +182,15 @@ func (r *Runtime) getWarnings(ctx context.Context) (protocol.WarningsSnapshot, e
 // generation, identical bytes and absent-member resets included. Unowned
 // top-level root members are untouched. The result projects the returned
 // candidate, never a second current() load that could see a later writer.
-func (r *Runtime) updateSettings(ctx context.Context, request protocol.UpdateSettingsRequest) (protocol.SettingsMutation, error) {
+func (r *Runtime) updateSettings(ctx context.Context, c caller, request protocol.UpdateSettingsRequest) (protocol.SettingsMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.SettingsMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.SettingsMutation{}, err
+	}
 	switch {
 	case (request.Settings == nil) == (request.ExtensionEdit == nil):
 		return protocol.SettingsMutation{}, fmt.Errorf("settings request requires exactly one of settings or extension_edit: %w", harness.ErrInvalid)
@@ -231,12 +252,15 @@ func modelPostState(captured configurationCapture, providerID, modelID string) *
 // candidate validates completely before any write, and the managed key is
 // persisted only after the owning file — a failure there restores the exact
 // prior bytes. The result carries the created provider's actual binding.
-func (r *Runtime) addProvider(ctx context.Context, providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit, key *string) (protocol.ProviderMutation, error) {
+func (r *Runtime) addProvider(ctx context.Context, c caller, providerID string, patch protocol.ProviderEdit, models map[string]protocol.ModelEdit, key *string) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ProviderMutation{}, err
+	}
 	captured, err := r.config.mutate(ctx, r.config.editProviderCreate(ctx, providerID, patch, models, key))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
@@ -253,12 +277,15 @@ func (r *Runtime) addProvider(ctx context.Context, providerID string, patch prot
 // same mutation path: no source-specific lock applies, the wholesale
 // headers rule and the candidate check govern the edit, and the result
 // projects the returned candidate's effective view.
-func (r *Runtime) updateProvider(ctx context.Context, providerID string, patch protocol.ProviderEdit) (protocol.ProviderMutation, error) {
+func (r *Runtime) updateProvider(ctx context.Context, c caller, providerID string, patch protocol.ProviderEdit) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ProviderMutation{}, err
+	}
 	captured, err := r.config.mutate(ctx, r.config.editProviderUpdate(providerID, patch))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
@@ -272,12 +299,15 @@ func (r *Runtime) updateProvider(ctx context.Context, providerID string, patch p
 // deleteProvider removes one provider's owning user node through the same
 // mutation path; the result carries the surviving effective post-state, or
 // null when the candidate no longer contains the subject.
-func (r *Runtime) deleteProvider(ctx context.Context, providerID string) (protocol.ProviderMutation, error) {
+func (r *Runtime) deleteProvider(ctx context.Context, c caller, providerID string) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ProviderMutation{}, err
+	}
 	captured, err := r.config.mutate(ctx, r.config.editProviderDelete(providerID))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
@@ -291,12 +321,15 @@ func (r *Runtime) deleteProvider(ctx context.Context, providerID string) (protoc
 // resetProviderField removes exactly one provider user-layer override under
 // the shared field enum — an absent override publishes the same successful
 // edit — and projects the effective post-state from the returned candidate.
-func (r *Runtime) resetProviderField(ctx context.Context, providerID string, field protocol.ProviderField) (protocol.ProviderMutation, error) {
+func (r *Runtime) resetProviderField(ctx context.Context, c caller, providerID string, field protocol.ProviderField) (protocol.ProviderMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ProviderMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ProviderMutation{}, err
+	}
 	captured, err := r.config.mutate(ctx, r.config.editProviderFieldReset(providerID, field))
 	if err != nil {
 		return protocol.ProviderMutation{}, err
@@ -310,12 +343,15 @@ func (r *Runtime) resetProviderField(ctx context.Context, providerID string, fie
 // saveModel upserts one model's user-layer fields under a known provider —
 // the same PUT as the retained SaveModel, so a missing model creates a user
 // model — through the same mutation path.
-func (r *Runtime) saveModel(ctx context.Context, providerID, modelID string, patch protocol.ModelEdit) (protocol.ModelMutation, error) {
+func (r *Runtime) saveModel(ctx context.Context, c caller, providerID, modelID string, patch protocol.ModelEdit) (protocol.ModelMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ModelMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ModelMutation{}, err
+	}
 	captured, err := r.config.mutate(ctx, r.config.editModelSave(providerID, modelID, patch))
 	if err != nil {
 		return protocol.ModelMutation{}, err
@@ -329,12 +365,15 @@ func (r *Runtime) saveModel(ctx context.Context, providerID, modelID string, pat
 // deleteModel removes one model's owning user node through the same mutation
 // path; the result carries the surviving effective post-state, or null when
 // the candidate no longer contains the subject.
-func (r *Runtime) deleteModel(ctx context.Context, providerID, modelID string) (protocol.ModelMutation, error) {
+func (r *Runtime) deleteModel(ctx context.Context, c caller, providerID, modelID string) (protocol.ModelMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ModelMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ModelMutation{}, err
+	}
 	captured, err := r.config.mutate(ctx, r.config.editModelDelete(providerID, modelID))
 	if err != nil {
 		return protocol.ModelMutation{}, err
@@ -348,12 +387,15 @@ func (r *Runtime) deleteModel(ctx context.Context, providerID, modelID string) (
 // resetModelField removes exactly one model user-layer override under the
 // shared field enum — an absent override publishes the same successful edit
 // — and projects the effective post-state from the returned candidate.
-func (r *Runtime) resetModelField(ctx context.Context, providerID, modelID string, field protocol.ModelField) (protocol.ModelMutation, error) {
+func (r *Runtime) resetModelField(ctx context.Context, c caller, providerID, modelID string, field protocol.ModelField) (protocol.ModelMutation, error) {
 	release, err := r.enter(ctx)
 	if err != nil {
 		return protocol.ModelMutation{}, err
 	}
 	defer release()
+	if err := c.authorize(ctx, nil, harnessScope); err != nil {
+		return protocol.ModelMutation{}, err
+	}
 	captured, err := r.config.mutate(ctx, r.config.editModelFieldReset(providerID, modelID, field))
 	if err != nil {
 		return protocol.ModelMutation{}, err
@@ -366,14 +408,14 @@ func (r *Runtime) resetModelField(ctx context.Context, providerID, modelID strin
 
 // capturedProvider resolves one provider ID against the captured catalog:
 // an empty identity wraps the shared invalid sentinel and an unknown valid
-// one returns the catalog's typed unknown-provider error.
+// one returns the public not-found class with the catalog's typed cause.
 func capturedProvider(captured *configuration, providerID string) (*catalog.Provider, error) {
 	if providerID == "" {
 		return nil, fmt.Errorf("provider id must be non-empty: %w", harness.ErrInvalid)
 	}
 	prov, ok := captured.catalog.Providers[providerID]
 	if !ok || prov == nil {
-		return nil, fmt.Errorf("provider %q: %w", providerID, catalog.ErrUnknownProvider)
+		return nil, fmt.Errorf("provider %q: %w: %w", providerID, catalog.ErrUnknownProvider, harness.ErrNotFound)
 	}
 	return prov, nil
 }

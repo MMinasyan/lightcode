@@ -25,9 +25,10 @@ func invalidEdit(format string, args ...any) error {
 	return fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), harness.ErrInvalid)
 }
 
-// unknownModel reports one model ID the captured catalog does not know.
+// unknownModel reports one model ID the captured catalog does not know under
+// the public not-found class; the catalog's typed cause stays reachable.
 func unknownModel(providerID, modelID string) error {
-	return fmt.Errorf("model %q: %w", providerID+"/"+modelID, catalog.ErrUnknownModel)
+	return fmt.Errorf("model %q: %w: %w", providerID+"/"+modelID, catalog.ErrUnknownModel, harness.ErrNotFound)
 }
 
 // userProvidersMember decodes the config root's providers member into its
@@ -145,7 +146,7 @@ func providerEditTarget(captured configurationCapture, providers map[string]any,
 		return nil, nil, err
 	}
 	if eff == nil && node == nil {
-		return nil, nil, fmt.Errorf("provider %q: %w", providerID, catalog.ErrUnknownProvider)
+		return nil, nil, fmt.Errorf("provider %q: %w: %w", providerID, catalog.ErrUnknownProvider, harness.ErrNotFound)
 	}
 	if node == nil && scaffold && eff != nil && eff.Builtin {
 		node = map[string]any{}
