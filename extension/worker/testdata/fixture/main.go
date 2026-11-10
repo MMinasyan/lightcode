@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/MMinasyan/lightcode/extension"
 	"github.com/MMinasyan/lightcode/extension/worker"
@@ -15,6 +16,18 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "-declaration" {
+		encoded, err := json.Marshal(worker.NewDeclaration(fixtureDeclaration()))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if _, err := os.Stdout.Write(encoded); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := worker.Serve(context.Background(), fixture(), os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -34,7 +47,7 @@ func fixtureDeclaration() extension.Declaration {
 	return extension.Declaration{
 		ID:           "fixture",
 		Version:      "1.0.0",
-		ConfigSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+		ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"}},"additionalProperties":false}`),
 		Components: []extension.Component{{
 			ID:       "fixture.component",
 			Lifetime: extension.LifetimeHarness,
@@ -88,12 +101,15 @@ func (fixtureTool) Normalize(_ extension.ToolContext, call model.ToolCall) (json
 	return call.Arguments, nil
 }
 
-func (fixtureTool) Prepare(context.Context, extension.ToolContext, model.ToolCall) extension.ToolPlan {
-	return extension.ToolPlan{Permissions: []harness.PermissionRequest{{Permission: harness.PermissionFileRead, Target: "*"}}}
+func (fixtureTool) Prepare(_ context.Context, context extension.ToolContext, _ model.ToolCall) extension.ToolPlan {
+	return extension.ToolPlan{
+		Permissions:        []harness.PermissionRequest{{Permission: harness.PermissionFileRead, Target: filepath.Join(context.Workspace, "fixture.txt")}},
+		CanonicalWorkspace: context.Workspace,
+	}
 }
 
-func (fixtureTool) Execute(_ context.Context, _ extension.ToolContext, _ extension.ToolPlan) harness.ToolOutcome {
-	return harness.ToolOutcome{Result: model.ToolResult{CallID: "fixture-call", Status: model.ResultSuccess, Content: "fixture result"}, Evidence: harness.ExecutionObserved}
+func (fixtureTool) Execute(_ context.Context, context extension.ToolContext, _ extension.ToolPlan) harness.ToolOutcome {
+	return harness.ToolOutcome{Result: model.ToolResult{CallID: context.Calls.ToolCallID, Status: model.ResultSuccess, Content: "fixture result"}, Evidence: harness.ExecutionObserved}
 }
 
 func prepareHook(_ context.Context, _ extension.CallContext, _ extension.PreparationInput) (extension.PreparationConsequence, error) {

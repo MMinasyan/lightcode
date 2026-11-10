@@ -1138,3 +1138,50 @@ func TestDecodersRejectNullMembers(t *testing.T) {
 		})
 	}
 }
+
+func TestHostContextEncodersMatchCallbackValues(t *testing.T) {
+	call := extension.CallContext{
+		ExtensionID:  "extension",
+		ComponentID:  "component",
+		InstanceID:   "instance",
+		Lifetime:     extension.LifetimeOperation,
+		Scope:        extension.ScopeIdentity{Kind: extension.LifetimeOperation, Revision: "7", Workspace: "workspace", SessionID: "session", OperationID: "operation", InvocationID: "invocation", Purpose: "conversation"},
+		Revision:     "7",
+		Section:      json.RawMessage(`{"enabled":true}`),
+		SessionID:    "session",
+		OperationID:  "operation",
+		InvocationID: "invocation",
+		Purpose:      "conversation",
+		RequestID:    "request",
+		ToolCallID:   "call",
+		EffectID:     "effect",
+		Caller:       extension.CallerIdentity{ExtensionID: "caller", ComponentID: "caller-component", InstanceID: "caller-instance"},
+	}
+	wire := worker.NewContext("token", call)
+	if wire.Token != "token" {
+		t.Fatalf("token = %q", wire.Token)
+	}
+	if wire.ExtensionID != call.ExtensionID || wire.ComponentID != call.ComponentID || wire.InstanceID != call.InstanceID ||
+		wire.Lifetime != call.Lifetime || !reflect.DeepEqual(wire.Scope, call.Scope) || wire.Revision != call.Revision ||
+		!bytes.Equal(wire.Section, call.Section) || wire.SessionID != call.SessionID || wire.OperationID != call.OperationID ||
+		wire.InvocationID != call.InvocationID || wire.Purpose != call.Purpose || wire.RequestID != call.RequestID ||
+		wire.ToolCallID != call.ToolCallID || wire.EffectID != call.EffectID ||
+		wire.Caller == nil || wire.Caller.ExtensionID != call.Caller.ExtensionID || wire.Caller.ComponentID != call.Caller.ComponentID || wire.Caller.InstanceID != call.Caller.InstanceID {
+		t.Fatalf("wire context = %#v", wire)
+	}
+
+	instance := extension.InstanceContext{
+		ExtensionID: "extension",
+		ComponentID: "component",
+		Version:     "1.0.0",
+		InstanceID:  "instance",
+		Lifetime:    extension.LifetimeHarness,
+		Scope:       extension.ScopeIdentity{Kind: extension.LifetimeHarness, Revision: "3"},
+		Revision:    "3",
+		Section:     json.RawMessage(`{"enabled":true}`),
+	}
+	instanceWire := worker.NewInstanceContext("instance-token", instance)
+	if instanceWire.Token != "instance-token" || instanceWire.InstanceID != "instance" || !bytes.Equal(instanceWire.Section, instance.Section) {
+		t.Fatalf("instance context = %+v", instanceWire)
+	}
+}

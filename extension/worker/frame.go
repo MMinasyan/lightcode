@@ -185,24 +185,45 @@ func NewWriter(w io.Writer) *Writer {
 	return &Writer{w: w}
 }
 
+// Encode returns the exact bounded envelope bytes, excluding the line
+// terminator.
+func (f Frame) Encode() ([]byte, error) {
+	encoded, err := json.Marshal(f)
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) > FrameLimit {
+		return nil, fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, len(encoded))
+	}
+	return encoded, nil
+}
+
 // WriteFrame encodes and writes one frame followed by a newline. It returns a
 // wrapped ErrFrameTooLarge instead of writing an over-limit envelope.
 func (w *Writer) WriteFrame(frame Frame) error {
-	encoded, err := json.Marshal(frame)
+	encoded, err := frame.Encode()
 	if err != nil {
 		return err
 	}
+	return w.WriteEncoded(encoded)
+}
+
+// WriteEncoded writes one already-encoded bounded envelope followed by a
+// newline with serialized writes.
+func (w *Writer) WriteEncoded(encoded []byte) error {
 	if len(encoded) > FrameLimit {
 		return fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, len(encoded))
 	}
-	encoded = append(encoded, '\n')
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	n, err := w.w.Write(encoded)
+	buffer := make([]byte, 0, len(encoded)+1)
+	buffer = append(buffer, encoded...)
+	buffer = append(buffer, '\n')
+	n, err := w.w.Write(buffer)
 	if err != nil {
 		return err
 	}
-	if n != len(encoded) {
+	if n != len(buffer) {
 		return io.ErrShortWrite
 	}
 	return nil

@@ -171,6 +171,13 @@ func (t extensionTool) context(tc ToolContext, calls extension.CallContext) exte
 	}
 }
 
+// contextualTool is one native tool that can receive the host callback
+// context for its pure normalization step. The public Tool contract has no
+// context parameter, so the worker binding implements this private extension.
+type contextualTool interface {
+	NormalizeContext(context.Context, extension.ToolContext, model.ToolCall) (json.RawMessage, error)
+}
+
 func (t extensionTool) Normalize(ctx context.Context, tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	carrier := harness.CallbackIdentityFromContext(ctx)
 	identity := t.baseIdentity(tc, call.ID, nativeGrant{pure: true})
@@ -182,6 +189,9 @@ func (t extensionTool) Normalize(ctx context.Context, tc ToolContext, call model
 	identity.effectID = carrier.EffectID
 	view, calls := t.composition.newView(t.value, ctx, identity)
 	defer view.end()
+	if contextual, ok := t.value.implementation.Tool.(contextualTool); ok {
+		return contextual.NormalizeContext(ctx, t.context(tc, calls), call)
+	}
 	return t.value.implementation.Tool.Normalize(t.context(tc, calls), call)
 }
 

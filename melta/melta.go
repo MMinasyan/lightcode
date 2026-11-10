@@ -95,6 +95,11 @@ type options struct {
 	Agent         *harness.AgentInputs
 	Strategy      *harness.StrategyBinding
 	Extensions    []extension.Native
+
+	// Executables are the installed executable-extension selections. Package
+	// installation supplies them until it owns that lifecycle.
+	Executables []executableExtension
+
 	OpenStore     func(context.Context, string) (harness.Storage, func() error, error)
 	NewEvaluator  func(PolicyInputs) (harness.PermissionEvaluator, error)
 	BeforeRelease func() error
@@ -195,8 +200,19 @@ func open(ctx context.Context, options options) (*Melta, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := registeredComposition(options.Extensions)
-
+	var configService *configurationService
+	supervisor := newExecutableSupervisor(func(ctx context.Context, excluded []string) ([]string, error) {
+		return configService.executableEnvironment(ctx, excluded)
+	})
+	natives := append([]extension.Native(nil), options.Extensions...)
+	for _, executable := range options.Executables {
+		native, err := supervisor.native(executable)
+		if err != nil {
+			return nil, fmt.Errorf("melta: executable extension %q: %w", executable.Declaration.ID, err)
+		}
+		natives = append(natives, native)
+	}
+	c := registeredComposition(natives)
 	lock, ok, err := atomicfs.TryAcquire(filepath.Join(dataDir, "runtime.lock"))
 	if err != nil {
 		return nil, err
@@ -205,6 +221,7 @@ func open(ctx context.Context, options options) (*Melta, error) {
 		return nil, fmt.Errorf("data directory %s: %w", dataDir, ErrOwned)
 	}
 	work, cancelWork := context.WithCancel(ctx)
+	supervisor.setOwner(work)
 
 	obs := newObservation()
 	// The warning store and the passive publication adapter initialize
@@ -218,7 +235,9 @@ func open(ctx context.Context, options options) (*Melta, error) {
 	adapter.instance = instance
 	c.reportWarning = adapter.reportPluginWarning
 	loader := catalog.NewLoader(options.Locations.DiscoveryCacheDir, nil)
-	configService := newConfigurationService(work, c, loader, options.Configuration, options.Credentials, options.Locations, strategy, obs)
+	configService = newConfigurationService(work, c, loader, options.Configuration, options.Credentials, options.Locations, strategy, obs)
+	configService.executables = options.Executables
+	configService.supervisor = supervisor
 	configService.instance = instance
 	configService.attachWarnings(warnings)
 	// The private per-Session artifact interval registry initializes before

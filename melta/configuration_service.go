@@ -44,6 +44,8 @@ type configurationService struct {
 	strategy      *harness.StrategyBinding
 	natives       []extension.Native
 	nativeIDs     map[string]bool
+	executables   []executableExtension
+	supervisor    *executableSupervisor
 
 	owner       context.Context
 	obs         *observation
@@ -244,6 +246,18 @@ func (s *configurationService) heldCredentialNames() []string {
 // survives the source call. An error fails the spawn through the command
 // path.
 func (s *configurationService) subprocessEnvironment(ctx context.Context) ([]string, error) {
+	return s.subprocessEnvironmentExcluding(ctx, nil)
+}
+
+// executableEnvironment is the worker-spawn projection: the same
+// secret-excluded child environment standard commands receive, with the
+// candidate's own captured credential names additionally excluded before
+// publication exposes them as the current revision.
+func (s *configurationService) executableEnvironment(ctx context.Context, excluded []string) ([]string, error) {
+	return s.subprocessEnvironmentExcluding(ctx, excluded)
+}
+
+func (s *configurationService) subprocessEnvironmentExcluding(ctx context.Context, excluded []string) ([]string, error) {
 	var names []string
 	s.heldMu.Lock()
 	for name := range s.heldNames {
@@ -259,6 +273,7 @@ func (s *configurationService) subprocessEnvironment(ctx context.Context) ([]str
 		names = append(names, current.declaredSecretNames()...)
 	}
 	s.heldMu.Unlock()
+	names = append(names, excluded...)
 	return s.credentials.SubprocessEnv(ctx, names)
 }
 

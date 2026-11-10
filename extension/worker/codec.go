@@ -24,6 +24,49 @@ type ActivateResult struct {
 	Described   []string    `json:"described"`
 }
 
+// NewContext encodes one host-issued callback context and its opaque token.
+func NewContext(token string, call extension.CallContext) Context {
+	out := Context{
+		Token:        token,
+		ExtensionID:  call.ExtensionID,
+		ComponentID:  call.ComponentID,
+		InstanceID:   call.InstanceID,
+		Lifetime:     call.Lifetime,
+		Scope:        call.Scope,
+		Revision:     call.Revision,
+		Section:      JSONBytes(call.Section),
+		SessionID:    call.SessionID,
+		OperationID:  call.OperationID,
+		InvocationID: call.InvocationID,
+		Purpose:      call.Purpose,
+		RequestID:    call.RequestID,
+		ToolCallID:   call.ToolCallID,
+		EffectID:     call.EffectID,
+	}
+	if call.Caller != (extension.CallerIdentity{}) {
+		out.Caller = &Caller{ExtensionID: call.Caller.ExtensionID, ComponentID: call.Caller.ComponentID, InstanceID: call.Caller.InstanceID}
+	}
+	return out
+}
+
+// NewInstanceContext encodes one open or close callback view and its token.
+func NewInstanceContext(token string, instance extension.InstanceContext) Context {
+	return Context{
+		Token:        token,
+		ExtensionID:  instance.ExtensionID,
+		ComponentID:  instance.ComponentID,
+		InstanceID:   instance.InstanceID,
+		Lifetime:     instance.Lifetime,
+		Scope:        instance.Scope,
+		Revision:     instance.Revision,
+		Section:      JSONBytes(instance.Section),
+		SessionID:    instance.Scope.SessionID,
+		OperationID:  instance.Scope.OperationID,
+		InvocationID: instance.Scope.InvocationID,
+		Purpose:      instance.Scope.Purpose,
+	}
+}
+
 // Caller is one caller identity with the fixed callerIdentity member names.
 type Caller struct {
 	ExtensionID string `json:"extension_id"`

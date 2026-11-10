@@ -27,6 +27,9 @@ const (
 	ClassInternal      Class = "internal"
 )
 
+// Valid reports whether the class is one of the closed public classes.
+func (c Class) Valid() bool { return c.valid() }
+
 func (c Class) valid() bool {
 	switch c {
 	case ClassInvalid, ClassDenied, ClassNotFound, ClassConflict, ClassClosed,
@@ -75,6 +78,11 @@ func (e *Error) Unwrap() error {
 	}
 	return nil
 }
+
+// Classify renders one Go failure as the closed wire error: an Error's own
+// class, extension.ErrClosed, a Harness sentinel, a context cancellation or
+// deadline, otherwise internal.
+func Classify(err error) *Error { return classifyError(err) }
 
 // classifyError renders one Go failure as the closed wire error: an Error's own
 // class, extension.ErrClosed, a Harness sentinel, a context cancellation or

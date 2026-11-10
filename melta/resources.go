@@ -28,6 +28,10 @@ type resourceSet struct {
 	// its whole candidate/open/retirement lifetime. They are released only
 	// after shutdown and runtime cleanup finish.
 	heldNames []string
+
+	// activations are the executable extensions this set holds for its whole
+	// lifetime. The last release stops them.
+	activations []string
 }
 
 func (s *configurationService) prepareResources(Caller context.Context, snapshot *configuration) error {
@@ -86,10 +90,18 @@ func (s *configurationService) prepareResources(Caller context.Context, snapshot
 	// hold survives failed-prefix cleanup and transfers to the successful set.
 	r.heldNames = snapshot.declaredSecretNames()
 	s.holdCredentialNames(r.heldNames)
+	activations, err := s.acquireExecutables(ctx, snapshot)
+	if err != nil {
+		cancel()
+		s.releaseCredentialNames(r.heldNames)
+		return err
+	}
+	r.activations = activations
 	runtime, err := snapshot.composition.openScopeReporting(ctx, runtimeInfo, nil, report)
 	stopCaller()
 	if err != nil {
 		cancel()
+		s.releaseExecutables(r.activations)
 		s.releaseCredentialNames(r.heldNames)
 		if canceled := s.canceled(Caller); canceled != nil {
 			return errors.Join(canceled, err)
@@ -99,6 +111,7 @@ func (s *configurationService) prepareResources(Caller context.Context, snapshot
 	if err := s.canceled(Caller); err != nil {
 		cancel()
 		cleanupErr := runtime.cleanup()
+		s.releaseExecutables(r.activations)
 		s.releaseCredentialNames(r.heldNames)
 		return errors.Join(err, cleanupErr)
 	}
@@ -106,6 +119,37 @@ func (s *configurationService) prepareResources(Caller context.Context, snapshot
 	r.workspaces = newWorkspaceScopes(ctx, snapshot.composition, []*scope{runtime}, s.obs, snapshot.extensions)
 	snapshot.resources = r
 	return nil
+}
+
+// acquireExecutables retains the activation of every executable extension the
+// candidate enables, starting the ones no set holds.
+func (s *configurationService) acquireExecutables(ctx context.Context, snapshot *configuration) ([]string, error) {
+	if s.supervisor == nil {
+		return nil, nil
+	}
+	var acquired []string
+	for _, executable := range s.executables {
+		if !sectionEnabled(snapshot.extensions[executable.Declaration.ID]) {
+			continue
+		}
+		if err := s.supervisor.acquire(ctx, executable, snapshot.credentialNames); err != nil {
+			s.supervisor.release(executable.Declaration.ID)
+			s.releaseExecutables(acquired)
+			return nil, configurationFailure(err)
+		}
+		acquired = append(acquired, executable.Declaration.ID)
+	}
+	return acquired, nil
+}
+
+// releaseExecutables drops one set's activation holds in reverse order.
+func (s *configurationService) releaseExecutables(ids []string) {
+	if s.supervisor == nil {
+		return
+	}
+	for i := len(ids) - 1; i >= 0; i-- {
+		s.supervisor.release(ids[i])
+	}
 }
 
 func (r *resourceSet) retain() {
@@ -124,6 +168,7 @@ func (r *resourceSet) release() error {
 	}
 	r.cancel() // builders must observe cancellation before shutdown joins them
 	err := errors.Join(r.workspaces.shutdown(), r.runtime.close())
+	r.owner.releaseExecutables(r.activations)
 	r.owner.cleanupMu.Lock()
 	r.owner.cleanupErr = errors.Join(r.owner.cleanupErr, err)
 	r.owner.cleanupMu.Unlock()
