@@ -966,11 +966,11 @@ func TestExecutableOwnerCloseBoundedUnresponsiveCall(t *testing.T) {
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, `{"extensions":{"peer":{"enabled":true}}}`)
+	installExecutablePackage(t, dataDir, executableExtension{Declaration: declaration, EntryPoint: "peer"})
 	owner, err := open(context.Background(), options{
 		DataDir:       dataDir,
 		Configuration: NewFileConfigurationSource(configPath),
 		Credentials:   NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
-		Executables:   []executableExtension{{Declaration: declaration, EntryPoint: "peer"}},
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -1906,41 +1906,14 @@ func TestExecutableTerminationClosesParentPipes(t *testing.T) {
 	}
 }
 
-// readCountingConfiguration records configuration reads before validation.
-type readCountingConfiguration struct {
-	reads atomic.Int64
-	data  []byte
-}
-
-func (s *readCountingConfiguration) Read(context.Context) ([]byte, error) {
-	s.reads.Add(1)
-	return append([]byte(nil), s.data...), nil
-}
-func (s *readCountingConfiguration) Write(context.Context, []byte) error { return nil }
-
-func TestExecutableInvalidDeclarationFailsOpenBeforeIO(t *testing.T) {
+func TestExecutableInvalidDeclarationRejectedAtInstall(t *testing.T) {
 	declaration := toolOnlyDeclaration()
 	declaration.Components = nil
-	source := &readCountingConfiguration{data: []byte(`{"extensions":{"peer":{"enabled":true}}}`)}
-	var spawns atomic.Int64
-	old := spawnExecutable
-	spawnExecutable = func(context.Context, string, []string) (executableProcess, error) {
-		spawns.Add(1)
-		return nil, errors.New("must not spawn")
-	}
-	t.Cleanup(func() { spawnExecutable = old })
-
-	_, err := open(context.Background(), options{
-		DataDir:       t.TempDir(),
-		Configuration: source,
-		Credentials:   NewEnvironmentCredentialSource(filepath.Join(t.TempDir(), ".env")),
-		Executables:   []executableExtension{{Declaration: declaration, EntryPoint: "peer"}},
-	})
-	if err == nil {
-		t.Fatal("invalid executable declaration opened")
-	}
-	testassert.Equal(t, source.reads.Load(), int64(0))
-	testassert.Equal(t, spawns.Load(), int64(0))
+	dataDir := t.TempDir()
+	source := executablePackageSource(t, executableExtension{Declaration: declaration, EntryPoint: "peer"})
+	_, err := newPackageManager(dataDir).install(source)
+	testassert.Require(t, errors.Is(err, harness.ErrInvalid), "install invalid declaration = %v, want invalid", err)
+	mustNotExist(t, filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "selected"), "an invalid declaration created a selection")
 }
 
 func TestExecutableOwnerCloseRunsWorkerClose(t *testing.T) {
@@ -1970,11 +1943,11 @@ func TestExecutableOwnerCloseRunsWorkerClose(t *testing.T) {
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, `{"extensions":{"peer":{"enabled":true}}}`)
+	installExecutablePackage(t, dataDir, executableExtension{Declaration: declaration, EntryPoint: "peer"})
 	owner, err := open(context.Background(), options{
 		DataDir:       dataDir,
 		Configuration: NewFileConfigurationSource(configPath),
 		Credentials:   NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
-		Executables:   []executableExtension{{Declaration: declaration, EntryPoint: "peer"}},
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)

@@ -20,15 +20,28 @@ import (
 	"github.com/MMinasyan/lightcode/model"
 )
 
-// buildExecutableFixture builds the shared Go authoring-adapter fixture.
+// buildExecutableFixture builds the shared Go authoring-adapter fixture at
+// its default declaration version.
 func buildExecutableFixture(t *testing.T) string {
+	t.Helper()
+	return buildExecutableFixtureVersion(t, "")
+}
+
+// buildExecutableFixtureVersion builds the shared fixture with an explicit
+// declaration version stamped through the fixture's one version variable.
+func buildExecutableFixtureVersion(t *testing.T, version string) string {
 	t.Helper()
 	working, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("working directory: %v", err)
 	}
 	binary := filepath.Join(t.TempDir(), "fixture-worker")
-	command := exec.Command("go", "build", "-o", binary, "./testdata/fixture")
+	arguments := []string{"build"}
+	if version != "" {
+		arguments = append(arguments, "-ldflags=-X github.com/MMinasyan/lightcode/extension/worker/testdata/fixture/native.fixtureVersion="+version)
+	}
+	arguments = append(arguments, "-o", binary, "./testdata/fixture")
+	command := exec.Command("go", arguments...)
 	command.Dir = filepath.Join(working, "..", "extension", "worker")
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("building fixture: %v\n%s", err, output)
@@ -49,17 +62,58 @@ func fixtureExecutableDeclaration(t *testing.T, binary string) extension.Declara
 	return declaration.Value()
 }
 
+// executablePackageSource writes one local source package: exactly its
+// manifest and entry point. A real entry-point file is copied; a
+// test-spawned name gets a contained placeholder executable because the
+// process spawn is faked.
+func executablePackageSource(t *testing.T, executable executableExtension) string {
+	t.Helper()
+	source := t.TempDir()
+	entryPoint := executable.EntryPoint
+	data, err := os.ReadFile(executable.EntryPoint)
+	if err != nil {
+		entryPoint = filepath.Base(executable.EntryPoint)
+		data = []byte("#!/bin/sh\nexit 0\n")
+	} else {
+		entryPoint = filepath.Base(entryPoint)
+	}
+	entryPath := filepath.Join(source, entryPoint)
+	if err := os.MkdirAll(filepath.Dir(entryPath), 0o700); err != nil {
+		t.Fatalf("source entry directory: %v", err)
+	}
+	if err := os.WriteFile(entryPath, data, 0o700); err != nil {
+		t.Fatalf("source entry point: %v", err)
+	}
+	manifest, err := worker.EncodeManifest(executable.Declaration, entryPoint)
+	if err != nil {
+		t.Fatalf("encode package manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "manifest.json"), manifest, 0o600); err != nil {
+		t.Fatalf("source manifest: %v", err)
+	}
+	return source
+}
+
+// installExecutablePackage installs one executable selection through the
+// package manager.
+func installExecutablePackage(t *testing.T, dataDir string, executable executableExtension) {
+	t.Helper()
+	if _, err := newPackageManager(dataDir).install(executablePackageSource(t, executable)); err != nil {
+		t.Fatalf("install package %q: %v", executable.Declaration.ID, err)
+	}
+}
+
 func TestExecutableFixtureEndToEnd(t *testing.T) {
 	binary := buildExecutableFixture(t)
 	declaration := fixtureExecutableDeclaration(t, binary)
 	dataDir := t.TempDir()
 	configPath := filepath.Join(dataDir, "config.json")
 	writeServiceFile(t, configPath, `{"extensions":{"fixture":{"enabled":true}}}`)
+	installExecutablePackage(t, dataDir, executableExtension{Declaration: declaration, EntryPoint: binary})
 	owner, err := open(context.Background(), options{
 		DataDir:       dataDir,
 		Configuration: NewFileConfigurationSource(configPath),
 		Credentials:   NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
-		Executables:   []executableExtension{{Declaration: declaration, EntryPoint: binary}},
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -158,6 +212,9 @@ func TestExecutableFixtureEndToEnd(t *testing.T) {
 // openExecutables opens the production fixture with one executable extension
 // and the real Agents definition resolver over its declared tools.
 func (e *productionEnv) openExecutables(ctx context.Context, executables []executableExtension, declaration extension.Declaration) (*Melta, error) {
+	for _, executable := range executables {
+		installExecutablePackage(e.t, e.dataDir, executable)
+	}
 	useFixtureStore(e.t, e.store)
 	return open(ctx, options{
 		DataDir:       e.dataDir,
@@ -166,7 +223,6 @@ func (e *productionEnv) openExecutables(ctx context.Context, executables []execu
 		Locations:     e.locations(),
 		Identity:      e.identity,
 		Extensions:    []extension.Native{fixtureAgentPlugin(extension.Native{Declaration: declaration})},
-		Executables:   executables,
 	})
 }
 
@@ -456,6 +512,9 @@ func TestExecutableOperationToolDescribeHostcallsAndMetadata(t *testing.T) {
 // openExecutablesWith opens the production fixture with executable extensions
 // and supplied native plugins.
 func (e *productionEnv) openExecutablesWith(ctx context.Context, executables []executableExtension, extras ...extension.Native) (*Melta, error) {
+	for _, executable := range executables {
+		installExecutablePackage(e.t, e.dataDir, executable)
+	}
 	useFixtureStore(e.t, e.store)
 	return open(ctx, options{
 		DataDir:       e.dataDir,
@@ -464,7 +523,6 @@ func (e *productionEnv) openExecutablesWith(ctx context.Context, executables []e
 		Locations:     e.locations(),
 		Identity:      e.identity,
 		Extensions:    extras,
-		Executables:   executables,
 	})
 }
 

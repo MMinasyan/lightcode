@@ -79,7 +79,7 @@ func TestProtocolMountedProjectionAndOwnership(t *testing.T) {
 
 	health, err := client.GetHealthWithResponse(ctx)
 	testassert.Require(t, err == nil && health.JSON200 != nil, "GetHealth = (%+v, %v)", health, err)
-	testassert.Require(t, health.JSON200.InstanceId == owner.InstanceID() && health.JSON200.ProtocolVersion == protocol.N13, "health = %+v, want the owner instance and N13", health.JSON200)
+	testassert.Require(t, health.JSON200.InstanceId == owner.InstanceID() && health.JSON200.ProtocolVersion == protocol.N14, "health = %+v, want the owner instance and N14", health.JSON200)
 	warnings, err := client.GetWarningsWithResponse(ctx)
 	testassert.Require(t, err == nil && warnings.JSON200 != nil && warnings.JSON200.WarningsRevision.InstanceId == owner.InstanceID(), "warnings = (%+v, %v), want the owner-qualified warning revision", warnings, err)
 

@@ -217,13 +217,13 @@ func (e ExecutionEvidence) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N13 HealthProtocolVersion = "13"
+	N14 HealthProtocolVersion = "14"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N13:
+	case N14:
 		return true
 	default:
 		return false
@@ -1175,6 +1175,17 @@ type ExtensionEdit struct {
 	ExtensionId string `json:"extension_id"`
 }
 
+// ExtensionPackage One installed executable extension's live loaded implementation version and the package selected for the next start. Package installation never changes the live loaded set.
+type ExtensionPackage struct {
+	Id string `json:"id"`
+
+	// LoadedVersion The live loaded implementation version; empty when no package is loaded for the extension.
+	LoadedVersion string `json:"loaded_version"`
+
+	// SelectedVersion The selected next-start implementation version; empty when no package is selected or installed.
+	SelectedVersion string `json:"selected_version"`
+}
+
 // ExtensionsSettings Extension sections as JSON document strings, keyed by extension ID.
 type ExtensionsSettings map[string]ExtensionConfigDocument
 
@@ -1253,6 +1264,11 @@ type InputModality string
 
 // InputOrigin defines model for InputOrigin.
 type InputOrigin string
+
+// InstallExtensionPackageRequest defines model for InstallExtensionPackageRequest.
+type InstallExtensionPackageRequest struct {
+	SourceDir string `json:"source_dir"`
+}
 
 // InvocationScope defines model for InvocationScope.
 type InvocationScope struct {
@@ -1959,6 +1975,11 @@ type SessionID = string
 // WorkspaceQuery defines model for WorkspaceQuery.
 type WorkspaceQuery = string
 
+// RemoveExtensionPackageParams defines parameters for RemoveExtensionPackage.
+type RemoveExtensionPackageParams struct {
+	Id string `form:"id" json:"id"`
+}
+
 // ListModelsParams defines parameters for ListModels.
 type ListModelsParams struct {
 	All bool `form:"all" json:"all"`
@@ -2035,6 +2056,9 @@ type GetSessionHistoryParams struct {
 
 // UpdateConfigurationSettingsJSONRequestBody defines body for UpdateConfigurationSettings for application/json ContentType.
 type UpdateConfigurationSettingsJSONRequestBody = UpdateSettingsRequest
+
+// InstallExtensionPackageJSONRequestBody defines body for InstallExtensionPackage for application/json ContentType.
+type InstallExtensionPackageJSONRequestBody = InstallExtensionPackageRequest
 
 // CreateProviderJSONRequestBody defines body for CreateProvider for application/json ContentType.
 type CreateProviderJSONRequestBody = CreateProviderRequest
@@ -3074,6 +3098,20 @@ type ClientInterface interface {
 	// GetEvents performs a GET /v1/events (the `GetEvents` operationId) request.
 	GetEvents(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// RemoveExtensionPackage performs a DELETE /v1/extensions/packages (the `RemoveExtensionPackage` operationId) request.
+	RemoveExtensionPackage(ctx context.Context, params *RemoveExtensionPackageParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ListExtensionPackages performs a GET /v1/extensions/packages (the `ListExtensionPackages` operationId) request.
+	ListExtensionPackages(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// InstallExtensionPackageWithBody performs a POST /v1/extensions/packages (the `InstallExtensionPackage` operationId) request,
+	// with any type of body and a specified content type.
+	InstallExtensionPackageWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// InstallExtensionPackage performs a POST /v1/extensions/packages (the `InstallExtensionPackage` operationId) request.
+	// Takes a body of the `application/json` content type.
+	InstallExtensionPackage(ctx context.Context, body InstallExtensionPackageJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// GetHealth performs a GET /v1/health (the `GetHealth` operationId) request.
 	GetHealth(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -3302,6 +3340,60 @@ func (c *Client) UpdateConfigurationSettings(ctx context.Context, body UpdateCon
 // GetEvents performs a GET /v1/events (the `GetEvents` operationId) request.
 func (c *Client) GetEvents(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetEventsRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RemoveExtensionPackage performs a DELETE /v1/extensions/packages (the `RemoveExtensionPackage` operationId) request.
+func (c *Client) RemoveExtensionPackage(ctx context.Context, params *RemoveExtensionPackageParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRemoveExtensionPackageRequest(c.Server, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ListExtensionPackages performs a GET /v1/extensions/packages (the `ListExtensionPackages` operationId) request.
+func (c *Client) ListExtensionPackages(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListExtensionPackagesRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// InstallExtensionPackageWithBody performs a POST /v1/extensions/packages (the `InstallExtensionPackage` operationId) request,
+// with any type of body and a specified content type.
+func (c *Client) InstallExtensionPackageWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewInstallExtensionPackageRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// InstallExtensionPackage performs a POST /v1/extensions/packages (the `InstallExtensionPackage` operationId) request.
+// Takes a body of the `application/json` content type.
+func (c *Client) InstallExtensionPackage(ctx context.Context, body InstallExtensionPackageJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewInstallExtensionPackageRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
@@ -4079,6 +4171,123 @@ func NewGetEventsRequest(server string) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	return req, nil
+}
+
+// NewRemoveExtensionPackageRequest constructs an http.Request for the RemoveExtensionPackage method
+func NewRemoveExtensionPackageRequest(server string, params *RemoveExtensionPackageParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/extensions/packages")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "id", params.Id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewListExtensionPackagesRequest constructs an http.Request for the ListExtensionPackages method
+func NewListExtensionPackagesRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/extensions/packages")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewInstallExtensionPackageRequest calls the generic InstallExtensionPackage builder with application/json body
+func NewInstallExtensionPackageRequest(server string, body InstallExtensionPackageJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewInstallExtensionPackageRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewInstallExtensionPackageRequestWithBody constructs an http.Request for the InstallExtensionPackage method, with any body, and a specified content type
+func NewInstallExtensionPackageRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/extensions/packages")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -5736,6 +5945,26 @@ type ClientWithResponsesInterface interface {
 	// Returns a wrapper object for the known response body format(s).
 	GetEventsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetEventsResponse, error)
 
+	// RemoveExtensionPackageWithResponse performs a DELETE /v1/extensions/packages (the `RemoveExtensionPackage` operationId) request.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	RemoveExtensionPackageWithResponse(ctx context.Context, params *RemoveExtensionPackageParams, reqEditors ...RequestEditorFn) (*RemoveExtensionPackageResponse, error)
+
+	// ListExtensionPackagesWithResponse performs a GET /v1/extensions/packages (the `ListExtensionPackages` operationId) request.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	ListExtensionPackagesWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListExtensionPackagesResponse, error)
+
+	// InstallExtensionPackageWithBodyWithResponse performs a POST /v1/extensions/packages (the `InstallExtensionPackage` operationId) request,
+	// with any type of body and a specified content type.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	InstallExtensionPackageWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*InstallExtensionPackageResponse, error)
+
+	// InstallExtensionPackageWithResponse performs a POST /v1/extensions/packages (the `InstallExtensionPackage` operationId) request.
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	InstallExtensionPackageWithResponse(ctx context.Context, body InstallExtensionPackageJSONRequestBody, reqEditors ...RequestEditorFn) (*InstallExtensionPackageResponse, error)
+
 	// GetHealthWithResponse performs a GET /v1/health (the `GetHealth` operationId) request.
 	//
 	// Returns a wrapper object for the known response body format(s).
@@ -6156,6 +6385,143 @@ func (r GetEventsResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r GetEventsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type RemoveExtensionPackageResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r RemoveExtensionPackageResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r RemoveExtensionPackageResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RemoveExtensionPackageResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RemoveExtensionPackageResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RemoveExtensionPackageResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ListExtensionPackagesResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]ExtensionPackage
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ListExtensionPackagesResponse) GetJSON200() *[]ExtensionPackage {
+	return r.JSON200
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r ListExtensionPackagesResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r ListExtensionPackagesResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ListExtensionPackagesResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListExtensionPackagesResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ListExtensionPackagesResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type InstallExtensionPackageResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *ExtensionPackage
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r InstallExtensionPackageResponse) GetJSON200() *ExtensionPackage {
+	return r.JSON200
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r InstallExtensionPackageResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r InstallExtensionPackageResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r InstallExtensionPackageResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r InstallExtensionPackageResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r InstallExtensionPackageResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -7883,6 +8249,50 @@ func (c *ClientWithResponses) GetEventsWithResponse(ctx context.Context, reqEdit
 	return ParseGetEventsResponse(rsp)
 }
 
+// RemoveExtensionPackageWithResponse performs a DELETE /v1/extensions/packages (the `RemoveExtensionPackage` operationId) request.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) RemoveExtensionPackageWithResponse(ctx context.Context, params *RemoveExtensionPackageParams, reqEditors ...RequestEditorFn) (*RemoveExtensionPackageResponse, error) {
+	rsp, err := c.RemoveExtensionPackage(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRemoveExtensionPackageResponse(rsp)
+}
+
+// ListExtensionPackagesWithResponse performs a GET /v1/extensions/packages (the `ListExtensionPackages` operationId) request.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) ListExtensionPackagesWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListExtensionPackagesResponse, error) {
+	rsp, err := c.ListExtensionPackages(ctx, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListExtensionPackagesResponse(rsp)
+}
+
+// InstallExtensionPackageWithBodyWithResponse performs a POST /v1/extensions/packages (the `InstallExtensionPackage` operationId) request,
+// with any type of body and a specified content type.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) InstallExtensionPackageWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*InstallExtensionPackageResponse, error) {
+	rsp, err := c.InstallExtensionPackageWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseInstallExtensionPackageResponse(rsp)
+}
+
+// InstallExtensionPackageWithResponse performs a POST /v1/extensions/packages (the `InstallExtensionPackage` operationId) request.
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) InstallExtensionPackageWithResponse(ctx context.Context, body InstallExtensionPackageJSONRequestBody, reqEditors ...RequestEditorFn) (*InstallExtensionPackageResponse, error) {
+	rsp, err := c.InstallExtensionPackage(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseInstallExtensionPackageResponse(rsp)
+}
+
 // GetHealthWithResponse performs a GET /v1/health (the `GetHealth` operationId) request.
 //
 // Returns a wrapper object for the known response body format(s).
@@ -8524,6 +8934,101 @@ func ParseGetEventsResponse(rsp *http.Response) (*GetEventsResponse, error) {
 	}
 
 	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseRemoveExtensionPackageResponse parses an HTTP response from a RemoveExtensionPackageWithResponse call
+func ParseRemoveExtensionPackageResponse(rsp *http.Response) (*RemoveExtensionPackageResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RemoveExtensionPackageResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseListExtensionPackagesResponse parses an HTTP response from a ListExtensionPackagesWithResponse call
+func ParseListExtensionPackagesResponse(rsp *http.Response) (*ListExtensionPackagesResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListExtensionPackagesResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []ExtensionPackage
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseInstallExtensionPackageResponse parses an HTTP response from a InstallExtensionPackageWithResponse call
+func ParseInstallExtensionPackageResponse(rsp *http.Response) (*InstallExtensionPackageResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &InstallExtensionPackageResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ExtensionPackage
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
 		var dest Error
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -9698,6 +10203,15 @@ type ServerInterface interface {
 	// (GET /v1/events)
 	GetEvents(w http.ResponseWriter, r *http.Request)
 
+	// (DELETE /v1/extensions/packages)
+	RemoveExtensionPackage(w http.ResponseWriter, r *http.Request, params RemoveExtensionPackageParams)
+
+	// (GET /v1/extensions/packages)
+	ListExtensionPackages(w http.ResponseWriter, r *http.Request)
+
+	// (POST /v1/extensions/packages)
+	InstallExtensionPackage(w http.ResponseWriter, r *http.Request)
+
 	// (GET /v1/health)
 	GetHealth(w http.ResponseWriter, r *http.Request)
 
@@ -9860,6 +10374,67 @@ func (siw *ServerInterfaceWrapper) GetEvents(w http.ResponseWriter, r *http.Requ
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetEvents(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RemoveExtensionPackage operation middleware
+func (siw *ServerInterfaceWrapper) RemoveExtensionPackage(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params RemoveExtensionPackageParams
+
+	// ------------- Required query parameter "id" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, true, "id", r.URL.Query(), &params.Id, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "id"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RemoveExtensionPackage(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListExtensionPackages operation middleware
+func (siw *ServerInterfaceWrapper) ListExtensionPackages(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListExtensionPackages(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// InstallExtensionPackage operation middleware
+func (siw *ServerInterfaceWrapper) InstallExtensionPackage(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.InstallExtensionPackage(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -11003,6 +11578,9 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/configuration", wrapper.GetConfiguration)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/configuration/reload", wrapper.ReloadConfiguration)
 	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/configuration/settings", wrapper.UpdateConfigurationSettings)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/v1/extensions/packages", wrapper.RemoveExtensionPackage)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/extensions/packages", wrapper.ListExtensionPackages)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/extensions/packages", wrapper.InstallExtensionPackage)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/models", wrapper.ListModels)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/providers", wrapper.ListProviders)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/providers", wrapper.CreateProvider)

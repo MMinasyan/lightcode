@@ -171,8 +171,22 @@
     "body": "forbidden",
     "query_members": {}
   },
+  "InstallExtensionPackage": {
+    "session_id": "forbidden",
+    "field": "forbidden",
+    "query": "forbidden",
+    "body": "required",
+    "query_members": {}
+  },
   "InterruptSession": {
     "session_id": "required",
+    "field": "forbidden",
+    "query": "forbidden",
+    "body": "forbidden",
+    "query_members": {}
+  },
+  "ListExtensionPackages": {
+    "session_id": "forbidden",
     "field": "forbidden",
     "query": "forbidden",
     "body": "forbidden",
@@ -245,6 +259,18 @@
     "query": "forbidden",
     "body": "forbidden",
     "query_members": {}
+  },
+  "RemoveExtensionPackage": {
+    "session_id": "forbidden",
+    "field": "forbidden",
+    "query": "required",
+    "body": "forbidden",
+    "query_members": {
+      "id": {
+        "required": true,
+        "type": "string"
+      }
+    }
   },
   "ReopenSession": {
     "session_id": "required",

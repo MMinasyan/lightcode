@@ -96,10 +96,6 @@ type options struct {
 	Strategy      *harness.StrategyBinding
 	Extensions    []extension.Native
 
-	// Executables are the installed executable-extension selections. Package
-	// installation supplies them until it owns that lifecycle.
-	Executables []executableExtension
-
 	OpenStore     func(context.Context, string) (harness.Storage, func() error, error)
 	NewEvaluator  func(PolicyInputs) (harness.PermissionEvaluator, error)
 	BeforeRelease func() error
@@ -125,6 +121,7 @@ type Melta struct {
 	dataDir       string
 	instance      string
 	beforeRelease func() error
+	packages      *packageManager
 
 	// jobs and closeStore are the directly constructed baseline services:
 	// the jobs service (also the Harness job-stop seam) and the acquired
@@ -204,15 +201,6 @@ func open(ctx context.Context, options options) (*Melta, error) {
 	supervisor := newExecutableSupervisor(func(ctx context.Context, excluded []string) ([]string, error) {
 		return configService.executableEnvironment(ctx, excluded)
 	})
-	natives := append([]extension.Native(nil), options.Extensions...)
-	for _, executable := range options.Executables {
-		native, err := supervisor.native(executable)
-		if err != nil {
-			return nil, fmt.Errorf("melta: executable extension %q: %w", executable.Declaration.ID, err)
-		}
-		natives = append(natives, native)
-	}
-	c := registeredComposition(natives)
 	lock, ok, err := atomicfs.TryAcquire(filepath.Join(dataDir, "runtime.lock"))
 	if err != nil {
 		return nil, err
@@ -222,6 +210,22 @@ func open(ctx context.Context, options options) (*Melta, error) {
 	}
 	work, cancelWork := context.WithCancel(ctx)
 	supervisor.setOwner(work)
+	packages := newPackageManager(dataDir)
+	if err := packages.load(); err != nil {
+		cancelWork()
+		return nil, errors.Join(err, lock.Release())
+	}
+	natives := append([]extension.Native(nil), options.Extensions...)
+	executables := packages.loadedExecutables()
+	for _, executable := range executables {
+		native, err := supervisor.native(executable)
+		if err != nil {
+			cancelWork()
+			return nil, errors.Join(fmt.Errorf("melta: executable extension %q: %w", executable.Declaration.ID, err), lock.Release())
+		}
+		natives = append(natives, native)
+	}
+	c := registeredComposition(natives)
 
 	obs := newObservation()
 	// The warning store and the passive publication adapter initialize
@@ -236,7 +240,8 @@ func open(ctx context.Context, options options) (*Melta, error) {
 	c.reportWarning = adapter.reportPluginWarning
 	loader := catalog.NewLoader(options.Locations.DiscoveryCacheDir, nil)
 	configService = newConfigurationService(work, c, loader, options.Configuration, options.Credentials, options.Locations, strategy, obs)
-	configService.executables = options.Executables
+	configService.executables = executables
+	configService.unusablePackages = packages.unusable
 	configService.supervisor = supervisor
 	configService.instance = instance
 	configService.attachWarnings(warnings)
@@ -349,6 +354,7 @@ func open(ctx context.Context, options options) (*Melta, error) {
 		dataDir:       dataDir,
 		instance:      instance,
 		beforeRelease: options.BeforeRelease,
+		packages:      packages,
 		jobs:          jobsService,
 		closeStore:    closeStorage,
 		shutdownDone:  make(chan struct{}),

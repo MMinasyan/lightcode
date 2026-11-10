@@ -46,6 +46,10 @@ type configurationService struct {
 	nativeIDs     map[string]bool
 	executables   []executableExtension
 	supervisor    *executableSupervisor
+	// unusablePackages records selected packages that failed to load, keyed by
+	// their hash directory. An enabled section whose ID hashes to one of them
+	// rejects the candidate; a disabled section stays ignored.
+	unusablePackages map[string]error
 
 	owner       context.Context
 	obs         *observation
@@ -567,6 +571,14 @@ func (s *configurationService) buildCaptured(ctx context.Context, generation uin
 	doc, err := decodeCapturedConfig(configData)
 	if err != nil {
 		return nil, configurationFailure(err)
+	}
+	for id, raw := range doc.Extensions {
+		if !sectionEnabled(raw) {
+			continue
+		}
+		if unusable := s.unusablePackages[extensionDataHash(id)]; unusable != nil {
+			return nil, configurationFailure(fmt.Errorf("extension %q: selected package is unusable: %w", id, unusable))
+		}
 	}
 	var active []extension.Native
 	for _, native := range s.natives {

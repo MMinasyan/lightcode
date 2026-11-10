@@ -50,6 +50,11 @@ const (
 
 var eventMu sync.Mutex
 
+// fixtureVersion is the fixture declaration's release version. Tests may
+// stamp a distinct version with -ldflags to observe loaded-versus-selected
+// package lifecycles.
+var fixtureVersion = "1.0.0"
+
 func record(format string, arguments ...any) {
 	path := os.Getenv(EventLogEnv)
 	if path == "" {
@@ -91,7 +96,7 @@ func Declaration() extension.Declaration {
 	childLaunch, _ := extension.HostCapability(extension.ContractChildLaunch)
 	return extension.Declaration{
 		ID:           "fixture",
-		Version:      "1.0.0",
+		Version:      fixtureVersion,
 		ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"},"token":{"type":"string"}},"additionalProperties":false}`),
 		Secrets:      []extension.SecretRef{{Field: "/token", Lifetime: extension.SecretOperation}},
 		Components: []extension.Component{
