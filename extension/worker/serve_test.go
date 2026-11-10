@@ -323,7 +323,7 @@ func TestServeActivationDescribeThenOpen(t *testing.T) {
 	})
 	p := startPeer(t, native)
 	activation := p.activate()
-	if activation.Declaration.ID != "ext" || len(activation.Described) != 1 || activation.Described[0] != "tool-1" {
+	if activation.Declaration.ID != "ext" {
 		t.Fatalf("activation = %+v", activation)
 	}
 

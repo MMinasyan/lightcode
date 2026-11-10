@@ -8,7 +8,6 @@ import (
 	"io"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -288,15 +287,8 @@ func executableTestCallContext(instanceID string) extension.CallContext {
 
 func activatePeer(t *testing.T, peer *testExecutablePeer, declaration extension.Declaration) {
 	t.Helper()
-	var described []string
-	for _, capability := range declaration.Capabilities {
-		if capability.Kind == extension.KindTool {
-			described = append(described, capability.ID)
-		}
-	}
-	sort.Strings(described)
 	frame := peer.expectRequest(worker.MethodActivate)
-	peer.sendValue(frame.ID, worker.ActivateResult{Declaration: worker.NewDeclaration(declaration), Described: described})
+	peer.sendValue(frame.ID, worker.ActivateResult{Declaration: worker.NewDeclaration(declaration)})
 }
 
 func respondNull(peer *testExecutablePeer, method string) worker.Frame {
@@ -535,7 +527,7 @@ func TestExecutableDeclarationMismatchFailsActivation(t *testing.T) {
 	frame := peer.expectRequest(worker.MethodActivate)
 	other := declaration
 	other.Version = "2.0.0"
-	peer.sendValue(frame.ID, worker.ActivateResult{Declaration: worker.NewDeclaration(other), Described: []string{"peer.tool"}})
+	peer.sendValue(frame.ID, worker.ActivateResult{Declaration: worker.NewDeclaration(other)})
 	err := <-acquired
 	if err == nil || !strings.Contains(err.Error(), "declaration") {
 		t.Fatalf("mismatched declaration error = %v", err)
@@ -626,6 +618,43 @@ func TestExecutableHostcallTokenAndClosedRefusal(t *testing.T) {
 	if forgedResponse.Error == nil || forgedResponse.Error.Class != worker.ClassClosed {
 		t.Fatalf("forged hostcall response = %+v", forgedResponse)
 	}
+
+	// A metadata-only describe token grants no binding authority while its
+	// call is live, even though the same token routes hostcall responses.
+	native, err := supervisor.native(executable)
+	if err != nil {
+		t.Fatalf("native: %v", err)
+	}
+	described := make(chan error, 1)
+	go func() {
+		description, err := native.Describe["peer.tool"](context.Background(), extension.DescribeInput{
+			Session: harness.SessionIdentity{SessionID: "session-1", Workspace: "/workspace"},
+			Model:   model.ModelRef{Provider: "provider", Model: "model"},
+		})
+		if err == nil && description.Definition.Name != "peer.tool" {
+			err = errors.New("description name = " + description.Definition.Name)
+		}
+		described <- err
+	}()
+	describeFrame := peer.next()
+	var describeParams worker.CallParams
+	if err := json.Unmarshal(describeFrame.Params, &describeParams); err != nil {
+		t.Fatalf("describe params: %v", err)
+	}
+	metadata := worker.Frame{Kind: worker.KindRequest, ID: "w4", Method: worker.MethodHostcall}
+	metadata.Params, _ = json.Marshal(worker.HostcallParams{
+		Context: worker.Context{Token: describeParams.Context.Token}, Binding: "credentials", Method: "get", Arguments: worker.JSONBytes(`{}`),
+	})
+	peer.send(metadata)
+	metadataResponse := peer.next()
+	if metadataResponse.Error == nil || metadataResponse.Error.Class != worker.ClassClosed {
+		t.Fatalf("metadata hostcall response = %+v", metadataResponse)
+	}
+	peer.sendValue(describeFrame.ID, encodeValue(t, worker.EncodeDescribeResult, extension.ToolDescription{
+		Definition: model.ToolDefinition{Name: "peer.tool", Parameters: json.RawMessage(`{"type":"object"}`)},
+		Available:  true,
+	}))
+	testassert.NoError(t, <-described)
 	select {
 	case extra := <-invoked:
 		t.Fatalf("closed hostcall still invoked %+v", extra)
@@ -1354,25 +1383,6 @@ func TestExecutableInvalidServiceResultFailsActivation(t *testing.T) {
 	}
 }
 
-func TestExecutableReorderedDescribedActivates(t *testing.T) {
-	declaration := toolOnlyDeclaration()
-	declaration.Components[0].Provides = []string{"peer.alpha", "peer.zeta"}
-	declaration.Capabilities = []extension.Capability{extension.ToolCapability("peer.alpha"), extension.ToolCapability("peer.zeta")}
-	peer := newTestExecutablePeer(t, false, nil)
-	spawner := &testPeerSpawner{t: t, factory: func() *testExecutablePeer { return peer }}
-	spawner.install()
-	supervisor := newExecutableSupervisor(func(context.Context, []string) ([]string, error) { return nil, nil })
-	executable := executableExtension{Declaration: declaration, EntryPoint: "peer"}
-	acquired := make(chan error, 1)
-	go func() { acquired <- supervisor.acquire(context.Background(), executable, nil) }()
-	frame := peer.expectRequest(worker.MethodActivate)
-	peer.sendValue(frame.ID, worker.ActivateResult{Declaration: worker.NewDeclaration(declaration), Described: []string{"peer.zeta", "peer.alpha"}})
-	if err := <-acquired; err != nil {
-		t.Fatalf("reordered described list did not activate: %v", err)
-	}
-	supervisor.release(declaration.ID)
-}
-
 func TestExecutableTerminalBeforeFailureKeepsOutcome(t *testing.T) {
 	declaration := toolOnlyDeclaration()
 	peer := newTestExecutablePeer(t, false, nil)
@@ -1854,7 +1864,7 @@ func TestExecutableUnsentCancelSettlesNotStarted(t *testing.T) {
 	<-first
 }
 
-func TestExecutableCancelledClassTerminal(t *testing.T) {
+func TestExecutableCancelledClassTerminalWithoutHostCancellationIsAuthorError(t *testing.T) {
 	declaration := toolOnlyDeclaration()
 	peer := newTestExecutablePeer(t, false, nil)
 	spawner := &testPeerSpawner{t: t, factory: func() *testExecutablePeer { return peer }}
@@ -1868,8 +1878,9 @@ func TestExecutableCancelledClassTerminal(t *testing.T) {
 	call := peer.next()
 	peer.send(worker.Frame{Kind: worker.KindResponse, ID: call.ID, Error: &worker.Error{Class: worker.ClassCancelled, Message: "cancelled"}})
 	got := <-outcome
-	testassert.Equal(t, got.Result.Status, model.ResultInterrupted)
+	testassert.Equal(t, got.Result.Status, model.ResultError)
 	testassert.Equal(t, got.Evidence, harness.ExecutionUnknown)
+	testassert.Require(t, strings.Contains(got.Result.Content, "cancelled"), "tool error = %q, want the author's cancelled-class error", got.Result.Content)
 }
 
 // closeRecordingProcess records the parent-pipe close.
@@ -1963,17 +1974,177 @@ func TestExecutableOwnerCloseRunsWorkerClose(t *testing.T) {
 	}
 }
 
-func TestWorkerHookFailureMatchesNativeSettlement(t *testing.T) {
-	for _, evidence := range []harness.ExecutionEvidence{harness.ExecutionNotStarted, harness.ExecutionUnknown} {
-		native := &harness.EffectError{Interrupted: true, Evidence: evidence, Err: errors.New("hook interrupted")}
-		failure := worker.HookFailureFromError(native)
-		if failure == nil {
-			t.Fatalf("%s: HookFailureFromError returned nil", evidence)
-		}
-		mapped := hookFailureError(failure)
-		testassert.Equal(t, harness.EffectInterrupted(mapped), harness.EffectInterrupted(native))
-		testassert.Equal(t, harness.DeclaredExecutionKnowledge(mapped), harness.DeclaredExecutionKnowledge(native))
+func TestExecutableCallbackEffectKnowledgeMatchesNative(t *testing.T) {
+	declaration := extension.Declaration{
+		ID:           "peer",
+		Version:      "1.0.0",
+		ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"}},"additionalProperties":false}`),
+		Components: []extension.Component{{
+			ID:       "peer.component",
+			Lifetime: extension.LifetimeHarness,
+			Provides: []string{"peer.pure_request", "peer.pure_before", "peer.effectful_request", "peer.strategy"},
+		}},
+		Capabilities: []extension.Capability{
+			extension.HookCapability("peer.pure_request", extension.SingleHook(extension.BoundaryRequest, extension.HookModePure)),
+			extension.HookCapability("peer.pure_before", extension.SingleHook(extension.BoundaryBeforeTool, extension.HookModePure)),
+			extension.HookCapability("peer.effectful_request", extension.SingleHook(extension.BoundaryRequest, extension.HookModeEffectful)),
+			extension.StrategyCapability("peer.strategy", false),
+		},
 	}
+	interrupted := &harness.EffectError{Interrupted: true, Err: errors.New("author interrupted")}
+	effectful := &harness.EffectError{Interrupted: true, Evidence: harness.ExecutionUnknown, Err: errors.New("author interrupted")}
+	native := extension.Native{
+		Declaration: declaration,
+		Open: func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"peer.pure_request": {Request: func(context.Context, extension.CallContext, harness.RequestHookInput) (harness.RequestConsequence, error) {
+					return harness.RequestConsequence{}, interrupted
+				}},
+				"peer.pure_before": {BeforeTool: func(context.Context, extension.CallContext, model.ToolCall) (json.RawMessage, error) {
+					return nil, interrupted
+				}},
+				"peer.effectful_request": {Request: func(context.Context, extension.CallContext, harness.RequestHookInput) (harness.RequestConsequence, error) {
+					return harness.RequestConsequence{}, effectful
+				}},
+				"peer.strategy": {Strategy: interruptedStrategy{err: interrupted}},
+			}}, nil
+		},
+	}
+	spawner := &adapterSpawner{t: t, factory: func() (extension.Native, func()) { return native, nil }}
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, `{"extensions":{"peer":{"enabled":true}}}`)
+	service, _ := newExecutableConfigurationService(t, h, declaration, spawner)
+	if _, err := service.publish(context.Background()); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	defer service.current().resources.release()
+	raw, err := native.Open(context.Background(), extension.InstanceContext{
+		ExtensionID: declaration.ID, ComponentID: "peer.component", InstanceID: "native", Lifetime: extension.LifetimeHarness,
+	})
+	if err != nil {
+		t.Fatalf("native open: %v", err)
+	}
+	snapshot := service.current()
+	for _, capabilityID := range []string{"peer.pure_request", "peer.pure_before", "peer.effectful_request", "peer.strategy"} {
+		value, ok := snapshot.resources.runtime.capabilities[capabilityID]
+		if !ok {
+			t.Fatalf("capability %q is not open", capabilityID)
+		}
+		workerSide := value.implementation
+		nativeSide := raw.Capabilities[capabilityID]
+		compare := func(t *testing.T, got, want error) {
+			t.Helper()
+			if got == nil || want == nil {
+				t.Fatalf("error = %v, want %v", got, want)
+			}
+			testassert.Equal(t, harness.EffectInterrupted(got), harness.EffectInterrupted(want))
+			testassert.Equal(t, harness.DeclaredExecutionKnowledge(got), harness.DeclaredExecutionKnowledge(want))
+		}
+		switch capabilityID {
+		case "peer.pure_request", "peer.effectful_request":
+			call := extension.CallContext{ExtensionID: declaration.ID, ComponentID: "peer.component", InstanceID: "instance", Lifetime: extension.LifetimeHarness}
+			input := harness.RequestHookInput{RequestID: "request-1"}
+			_, got := workerSide.Request(context.Background(), call, input)
+			_, want := nativeSide.Request(context.Background(), call, input)
+			compare(t, got, want)
+		case "peer.pure_before":
+			call := extension.CallContext{ExtensionID: declaration.ID, ComponentID: "peer.component", InstanceID: "instance", Lifetime: extension.LifetimeHarness}
+			toolCall := model.ToolCall{ID: "call-1", Name: "tool", Arguments: json.RawMessage(`{}`)}
+			_, got := workerSide.BeforeTool(context.Background(), call, toolCall)
+			_, want := nativeSide.BeforeTool(context.Background(), call, toolCall)
+			compare(t, got, want)
+		case "peer.strategy":
+			_, got := workerSide.Strategy.Plan(harness.PlanInput{})
+			_, want := nativeSide.Strategy.Plan(harness.PlanInput{})
+			compare(t, got, want)
+		}
+	}
+}
+
+type interruptedStrategy struct{ err error }
+
+func (s interruptedStrategy) Plan(harness.PlanInput) (harness.PlanOutput, error) {
+	return harness.PlanOutput{}, s.err
+}
+
+func (s interruptedStrategy) Consume(harness.ConsumeInput) (harness.PlanOutput, error) {
+	return harness.PlanOutput{}, s.err
+}
+
+func TestExecutableEffectfulHookCancelledAuthorEvidence(t *testing.T) {
+	declaration := extension.Declaration{
+		ID:           "peer",
+		Version:      "1.0.0",
+		ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"}},"additionalProperties":false}`),
+		Components: []extension.Component{{
+			ID:       "peer.component",
+			Lifetime: extension.LifetimeHarness,
+			Provides: []string{"peer.effectful"},
+		}},
+		Capabilities: []extension.Capability{
+			extension.HookCapability("peer.effectful", extension.SingleHook(extension.BoundaryRequest, extension.HookModeEffectful)),
+		},
+	}
+	entered := make(chan struct{})
+	var once sync.Once
+	callback := func(ctx context.Context, _ extension.CallContext, _ harness.RequestHookInput) (harness.RequestConsequence, error) {
+		once.Do(func() { close(entered) })
+		<-ctx.Done()
+		return harness.RequestConsequence{}, &harness.EffectError{Interrupted: true, Evidence: harness.ExecutionObserved, Err: context.Canceled}
+	}
+	native := extension.Native{
+		Declaration: declaration,
+		Open: func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+			return extension.Instance{Capabilities: map[string]extension.Implementation{
+				"peer.effectful": {Request: callback},
+			}}, nil
+		},
+	}
+	spawner := &adapterSpawner{t: t, factory: func() (extension.Native, func()) { return native, nil }}
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, `{"extensions":{"peer":{"enabled":true}}}`)
+	service, _ := newExecutableConfigurationService(t, h, declaration, spawner)
+	if _, err := service.publish(context.Background()); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	defer service.current().resources.release()
+	value, ok := service.current().resources.runtime.capabilities["peer.effectful"]
+	if !ok {
+		t.Fatal("effectful hook capability is not open")
+	}
+	call := extension.CallContext{ExtensionID: declaration.ID, ComponentID: "peer.component", InstanceID: "instance", Lifetime: extension.LifetimeHarness}
+	input := harness.RequestHookInput{RequestID: "request-1"}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := value.implementation.Request(ctx, call, input)
+		result <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker effectful hook never started")
+	}
+	cancel()
+	var got error
+	select {
+	case got = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker effectful hook did not settle after cancellation")
+	}
+	raw, err := native.Open(context.Background(), extension.InstanceContext{
+		ExtensionID: declaration.ID, ComponentID: "peer.component", InstanceID: "native", Lifetime: extension.LifetimeHarness,
+	})
+	if err != nil {
+		t.Fatalf("native open: %v", err)
+	}
+	nativeCtx, nativeCancel := context.WithCancel(context.Background())
+	nativeCancel()
+	_, want := raw.Capabilities["peer.effectful"].Request(nativeCtx, call, input)
+	testassert.Equal(t, harness.EffectInterrupted(got), true)
+	testassert.Equal(t, harness.DeclaredExecutionKnowledge(got), harness.ExecutionObserved)
+	testassert.Equal(t, harness.DeclaredExecutionKnowledge(got), harness.DeclaredExecutionKnowledge(want))
+	testassert.Require(t, errors.Is(got, context.Canceled), "worker hook error = %v, want the author's cancellation cause", got)
 }
 
 func TestWorkerServiceErrorClassReachesClassifier(t *testing.T) {

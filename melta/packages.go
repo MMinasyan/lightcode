@@ -2,9 +2,6 @@ package melta
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,11 +21,11 @@ import (
 )
 
 // packageSelection is the atomic selected-package record: the extension ID,
-// its implementation version, and the immutable package digest it names.
+// its implementation version, and the copy directory that holds its bytes.
 type packageSelection struct {
 	ID      string `json:"id"`
 	Version string `json:"version"`
-	Digest  string `json:"digest"`
+	Copy    string `json:"copy"`
 }
 
 // loadedPackage is one selected package's read executable selection and its
@@ -137,10 +134,10 @@ func (m *packageManager) loadedNatives() []extension.Native {
 	return out
 }
 
-// install reads one local source package's manifest and entry point, stages
-// exactly those bytes at a content digest, publishes the immutable package,
-// and atomically replaces the selected record. It never edits configuration
-// or deletes an earlier package copy.
+// install reads one local source package's manifest and entry point, writes
+// exactly those bytes into a new copy directory, syncs it, and atomically
+// replaces the selected record. It never edits configuration or deletes an
+// earlier package copy.
 func (m *packageManager) install(sourceDir string) (protocol.ExtensionPackage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -189,39 +186,40 @@ func (m *packageManager) install(sourceDir string) (protocol.ExtensionPackage, e
 	if err := safefs.EnsureDirectory(packagesDir, 0o700); err != nil {
 		return protocol.ExtensionPackage{}, err
 	}
-	stagingID, err := newInstanceID()
+	copyID, err := newInstanceID()
 	if err != nil {
 		return protocol.ExtensionPackage{}, err
 	}
-	stagingDir := filepath.Join(packagesDir, ".staging-"+stagingID)
-	if err := safefs.EnsureDirectory(stagingDir, 0o700); err != nil {
+	packageDir := filepath.Join(packagesDir, copyID)
+	if err := safefs.EnsureDirectory(packageDir, 0o700); err != nil {
 		return protocol.ExtensionPackage{}, err
 	}
-	defer func() { _ = os.RemoveAll(stagingDir) }()
-	if err := writeStagedFile(filepath.Join(stagingDir, "manifest.json"), manifestBytes, 0o600); err != nil {
+	installed := false
+	defer func() {
+		if !installed {
+			_ = os.RemoveAll(packageDir)
+		}
+	}()
+	if err := writePackageFile(filepath.Join(packageDir, "manifest.json"), manifestBytes, 0o600); err != nil {
 		return protocol.ExtensionPackage{}, err
 	}
-	if err := writeStagedFile(filepath.Join(stagingDir, manifest.EntryPoint), entryBytes, 0o700); err != nil {
+	if err := writePackageFile(filepath.Join(packageDir, manifest.EntryPoint), entryBytes, 0o700); err != nil {
 		return protocol.ExtensionPackage{}, err
 	}
-	if err := syncStagedDirectories(stagingDir, manifest.EntryPoint); err != nil {
-		return protocol.ExtensionPackage{}, err
-	}
-	digest := packageDigest(manifestBytes, entryBytes)
-	packageDir := filepath.Join(packagesDir, digest)
-	if err := publishPackage(stagingDir, packageDir); err != nil {
+	if err := syncPackageDirectories(packageDir, manifest.EntryPoint); err != nil {
 		return protocol.ExtensionPackage{}, err
 	}
 	if err := syncParentChain(m.dataDir, packagesDir); err != nil {
 		return protocol.ExtensionPackage{}, err
 	}
-	selected, err := json.Marshal(packageSelection{ID: declaration.ID, Version: declaration.Version, Digest: digest})
+	selected, err := json.Marshal(packageSelection{ID: declaration.ID, Version: declaration.Version, Copy: copyID})
 	if err != nil {
 		return protocol.ExtensionPackage{}, err
 	}
 	if err := atomicfs.Write(filepath.Join(extensionDir, "selected"), selected, 0o600); err != nil {
 		return protocol.ExtensionPackage{}, err
 	}
+	installed = true
 	return protocol.ExtensionPackage{
 		Id:              declaration.ID,
 		LoadedVersion:   m.loaded[declaration.ID],
@@ -352,7 +350,7 @@ func (r *Melta) RemoveExtensionPackage(ctx context.Context, c Caller, extensionI
 // its hash directory, validates that the manifest names exactly the selected
 // identity, and returns its executable selection.
 func loadPackage(dataDir, hash string, selected packageSelection) (executableExtension, error) {
-	packageDir := filepath.Join(dataDir, "extensions", hash, "packages", selected.Digest)
+	packageDir := filepath.Join(dataDir, "extensions", hash, "packages", selected.Copy)
 	manifestFile, err := safefs.OpenExisting(filepath.Join(packageDir, "manifest.json"), os.O_RDONLY)
 	if err != nil {
 		return executableExtension{}, fmt.Errorf("open package manifest: %v", err)
@@ -463,15 +461,15 @@ func readSelection(extensionDir string) (packageSelection, bool, error) {
 	if err := json.NewDecoder(file).Decode(&selected); err != nil {
 		return packageSelection{}, false, fmt.Errorf("decode selected package: %w", err)
 	}
-	if selected.ID == "" || selected.Version == "" || !canonicalPackageDigest(selected.Digest) {
+	if selected.ID == "" || selected.Version == "" || !canonicalCopyID(selected.Copy) {
 		return packageSelection{}, false, errors.New("selected package record is incomplete")
 	}
 	return selected, true, nil
 }
 
-// writeStagedFile writes and syncs one staged package file through the
-// checked no-follow traversal.
-func writeStagedFile(path string, data []byte, perm os.FileMode) error {
+// writePackageFile writes and syncs one package file through the checked
+// no-follow traversal.
+func writePackageFile(path string, data []byte, perm os.FileMode) error {
 	file, _, err := safefs.OpenForWrite(path, perm)
 	if err != nil {
 		return err
@@ -487,33 +485,18 @@ func writeStagedFile(path string, data []byte, perm os.FileMode) error {
 	return file.Close()
 }
 
-// syncStagedDirectories syncs the staging root and every directory created
-// for the entry point's parents, deepest first, so a nested entry point's
-// directory chain is durable before the staging rename.
-func syncStagedDirectories(stagingDir, entryPoint string) error {
-	for dir := filepath.Dir(filepath.Join(stagingDir, entryPoint)); ; dir = filepath.Dir(dir) {
+// syncPackageDirectories syncs one copy's directory and every directory
+// created for the entry point's parents, deepest first, so a nested entry
+// point's directory chain is durable before the selection write.
+func syncPackageDirectories(packageDir, entryPoint string) error {
+	for dir := filepath.Dir(filepath.Join(packageDir, entryPoint)); ; dir = filepath.Dir(dir) {
 		if err := atomicfs.SyncDir(dir); err != nil {
 			return err
 		}
-		if dir == stagingDir {
+		if dir == packageDir {
 			return nil
 		}
 	}
-}
-
-// publishPackage renames the staged copy onto its content digest, reusing an
-// existing immutable copy as is. A planted symlink or non-directory at the
-// destination is refused instead of followed.
-func publishPackage(stagingDir, packageDir string) error {
-	published, err := safefs.OpenDirectory(packageDir)
-	if err == nil {
-		_ = published.Close()
-		return nil
-	}
-	if !os.IsNotExist(err) {
-		return err
-	}
-	return os.Rename(stagingDir, packageDir)
 }
 
 // syncParentChain makes one published package directory entry durable by
@@ -530,28 +513,14 @@ func syncParentChain(dataDir, dir string) error {
 	}
 }
 
-// packageDigest is the content digest of the two staged package files. Length
-// framing keeps the manifest and entry point bytes unambiguous.
-func packageDigest(manifest, entry []byte) string {
-	digest := sha256.New()
-	var size [8]byte
-	binary.BigEndian.PutUint64(size[:], uint64(len(manifest)))
-	_, _ = digest.Write(size[:])
-	_, _ = digest.Write(manifest)
-	binary.BigEndian.PutUint64(size[:], uint64(len(entry)))
-	_, _ = digest.Write(size[:])
-	_, _ = digest.Write(entry)
-	return hex.EncodeToString(digest.Sum(nil))
-}
-
 // canonicalPackageHash reports whether one extension directory name is the
 // lowercase hex SHA-256 identity.
 func canonicalPackageHash(value string) bool {
 	return len(value) == 64 && strings.Trim(value, "0123456789abcdef") == ""
 }
 
-// canonicalPackageDigest reports whether one selected digest is the
-// lowercase hex SHA-256 content digest.
-func canonicalPackageDigest(value string) bool {
-	return canonicalPackageHash(value)
+// canonicalCopyID reports whether one selected copy ID is the lowercase hex
+// identity minted for a package copy.
+func canonicalCopyID(value string) bool {
+	return len(value) == 32 && strings.Trim(value, "0123456789abcdef") == ""
 }

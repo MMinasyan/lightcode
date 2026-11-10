@@ -2,7 +2,6 @@ package worker_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -930,28 +929,6 @@ func TestServiceResultRequiresExactlyOneArm(t *testing.T) {
 	for _, raw := range []string{`{"failure":{"code":"","message":"y"}}`, `{"failure":{"code":"x","message":""}}`} {
 		if _, err := worker.DecodeServiceResult(json.RawMessage(raw)); err == nil {
 			t.Fatalf("service result %s decoded without error", raw)
-		}
-	}
-}
-
-func TestHookFailureFromError(t *testing.T) {
-	if worker.HookFailureFromError(nil) != nil {
-		t.Fatal("nil error produced a hook failure")
-	}
-	for _, row := range []struct {
-		name     string
-		err      error
-		status   worker.HookStatus
-		evidence harness.ExecutionEvidence
-	}{
-		{"plain", errors.New("boom"), worker.HookStatusError, harness.ExecutionObserved},
-		{"canceled", context.Canceled, worker.HookStatusError, harness.ExecutionObserved},
-		{"deadline", context.DeadlineExceeded, worker.HookStatusError, harness.ExecutionObserved},
-		{"wrapped canceled", errors.Join(errors.New("wrapped"), context.Canceled), worker.HookStatusError, harness.ExecutionObserved},
-	} {
-		failure := worker.HookFailureFromError(row.err)
-		if failure.Status != row.status || failure.Evidence != row.evidence {
-			t.Fatalf("%s failure = %+v, want status %s evidence %s", row.name, failure, row.status, row.evidence)
 		}
 	}
 }

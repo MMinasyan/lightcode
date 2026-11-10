@@ -17,11 +17,9 @@ type ActivateParams struct {
 	ContractVersion string `json:"contract_version"`
 }
 
-// ActivateResult is the activation response: the wire declaration and the
-// sorted IDs of the declared tool capabilities with a metadata callback.
+// ActivateResult is the activation response: the wire declaration.
 type ActivateResult struct {
 	Declaration Declaration `json:"declaration"`
-	Described   []string    `json:"described"`
 }
 
 // NewContext encodes one host-issued callback context and its opaque token.
@@ -1397,88 +1395,6 @@ func DecodeServiceResult(raw json.RawMessage) (extension.Result, error) {
 		return extension.Result{}, fmt.Errorf("worker: result: %w", err)
 	}
 	return out, nil
-}
-
-// HookStatus is one effectful hook failure's closed status.
-type HookStatus string
-
-// The closed effectful hook failure statuses.
-const (
-	HookStatusError       HookStatus = "error"
-	HookStatusInterrupted HookStatus = "interrupted"
-)
-
-// HookFailure is one effectful hook's typed failure arm: the closed status, the
-// author's execution knowledge, and the non-secret message the host turns into
-// the native EffectError knowledge mapping.
-type HookFailure struct {
-	Status   HookStatus
-	Evidence harness.ExecutionEvidence
-	Message  string
-}
-
-type hookFailureJSON struct {
-	Status   HookStatus                `json:"status"`
-	Evidence harness.ExecutionEvidence `json:"evidence"`
-}
-
-// DecodeHookResult decodes one effectful hook result envelope: either the
-// success value or a typed failure with its status, evidence and message.
-func DecodeHookResult(raw json.RawMessage) (json.RawMessage, *HookFailure, error) {
-	result, err := DecodeServiceResult(raw)
-	if err != nil {
-		return nil, nil, err
-	}
-	if result.Failure == nil {
-		return result.Value, nil, nil
-	}
-	var data hookFailureJSON
-	if err := unmarshalValue(result.Failure.Data, &data); err != nil {
-		return nil, nil, fmt.Errorf("worker: hook failure data: %w", err)
-	}
-	return nil, &HookFailure{Status: data.Status, Evidence: data.Evidence, Message: result.Failure.Message}, nil
-}
-
-// DecodeRequestHookOutcome decodes one effectful request hook's result
-// envelope into its typed consequence or typed failure.
-func DecodeRequestHookOutcome(raw json.RawMessage) (harness.RequestConsequence, *HookFailure, error) {
-	value, failure, err := DecodeHookResult(raw)
-	if err != nil || failure != nil {
-		return harness.RequestConsequence{}, failure, err
-	}
-	consequence, err := DecodeRequestHookResult(value)
-	if err != nil {
-		return harness.RequestConsequence{}, nil, err
-	}
-	return consequence, nil, nil
-}
-
-// DecodeBeforeToolHookOutcome decodes one effectful before-tool hook's result
-// envelope into its typed argument replacement or typed failure.
-func DecodeBeforeToolHookOutcome(raw json.RawMessage) (json.RawMessage, *HookFailure, error) {
-	value, failure, err := DecodeHookResult(raw)
-	if err != nil || failure != nil {
-		return nil, failure, err
-	}
-	arguments, err := DecodeArguments(value)
-	if err != nil {
-		return nil, nil, err
-	}
-	return arguments, nil, nil
-}
-
-// HookFailureFromError maps one effectful hook author error through the
-// harness's closed interruption/knowledge predicates, so a worker hook settles
-// exactly like the same native hook.
-func HookFailureFromError(err error) *HookFailure {
-	if err == nil {
-		return nil
-	}
-	status := HookStatusError
-	if harness.EffectInterrupted(err) {
-		status = HookStatusInterrupted
-	}
-	return &HookFailure{Status: status, Evidence: harness.DeclaredExecutionKnowledge(err), Message: err.Error()}
 }
 
 func usageFrom(v *model.Usage) *harness.UsageCount {

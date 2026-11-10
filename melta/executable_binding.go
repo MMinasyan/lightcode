@@ -78,13 +78,11 @@ func (s *executableSupervisor) describe(declaration extension.Declaration, compi
 			Arguments: worker.JSONBytes(params),
 		}, nil
 	}, closedCall, validator)
-	if outcome.err != nil {
-		return extension.ToolDescription{}, outcome.err
+	value, err := decodeOutcome(outcome)
+	if err != nil {
+		return extension.ToolDescription{}, err
 	}
-	if outcome.failure != nil {
-		return extension.ToolDescription{}, outcome.failure
-	}
-	return outcome.value.(extension.ToolDescription), nil
+	return value.(extension.ToolDescription), nil
 }
 
 // open confirms one component's worker instance and supplies the fixed typed
@@ -103,7 +101,7 @@ func (s *executableSupervisor) open(executable executableExtension, compiled *ex
 			Section:     worker.JSONBytes(instance.Section),
 		}, nil
 	}, executableCall(instance.Call), validateNull)
-	if err := requestError(outcome); err != nil {
+	if _, err := decodeOutcome(outcome); err != nil {
 		return extension.Instance{}, err
 	}
 	component, ok := componentFor(executable.Declaration, instance.ComponentID)
@@ -240,10 +238,11 @@ func (b *executableBinding) implementation(capability extension.Capability) exte
 			handlers[methodName] = func(ctx context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
 				validator := envelopeResult(methods, methodName, func(result extension.Result) (any, error) { return result, nil })
 				outcome := b.instanceCall(ctx, call, capability.ID, methodName, arguments, validator)
-				if err := requestError(outcome); err != nil {
+				value, err := decodeOutcome(outcome)
+				if err != nil {
 					return extension.Result{}, err
 				}
-				return outcome.value.(extension.Result), nil
+				return value.(extension.Result), nil
 			}
 		}
 		return extension.Implementation{Service: handlers}
@@ -261,92 +260,39 @@ func (b *executableBinding) implementation(capability extension.Capability) exte
 					}
 					validator := fixedResult(methods, string(extension.BoundaryPrepare), typed(worker.DecodePrepareHookResult))
 					outcome := b.instanceCall(ctx, call, capability.ID, string(extension.BoundaryPrepare), params, validator)
-					if err := requestError(outcome); err != nil {
+					value, err := decodeOutcome(outcome)
+					if err != nil {
 						return extension.PreparationConsequence{}, err
 					}
-					return outcome.value.(extension.PreparationConsequence), nil
+					return value.(extension.PreparationConsequence), nil
 				}
 			case extension.BoundaryRequest:
-				effectful := hook.Mode == extension.HookModeEffectful
 				implementation.Request = func(ctx context.Context, call extension.CallContext, input harness.RequestHookInput) (harness.RequestConsequence, error) {
 					params, err := worker.EncodeRequestHookParams(input)
 					if err != nil {
 						return harness.RequestConsequence{}, err
 					}
-					if effectful {
-						validator := func(raw json.RawMessage) (any, error) {
-							result, err := worker.DecodeServiceResult(raw)
-							if err != nil {
-								return nil, err
-							}
-							if err := extension.ValidateResult(methods, string(extension.BoundaryRequest), result); err != nil {
-								return nil, err
-							}
-							consequence, failure, err := worker.DecodeRequestHookOutcome(raw)
-							if err != nil {
-								return nil, err
-							}
-							if failure != nil {
-								return *failure, nil
-							}
-							return consequence, nil
-						}
-						outcome := b.instanceCall(ctx, call, capability.ID, string(extension.BoundaryRequest), params, validator)
-						if err := effectfulError(outcome); err != nil {
-							return harness.RequestConsequence{}, err
-						}
-						if failure, ok := outcome.value.(worker.HookFailure); ok {
-							return harness.RequestConsequence{}, hookFailureError(&failure)
-						}
-						return outcome.value.(harness.RequestConsequence), nil
-					}
 					validator := fixedResult(methods, string(extension.BoundaryRequest), typed(worker.DecodeRequestHookResult))
 					outcome := b.instanceCall(ctx, call, capability.ID, string(extension.BoundaryRequest), params, validator)
-					if err := requestError(outcome); err != nil {
+					value, err := decodeOutcome(outcome)
+					if err != nil {
 						return harness.RequestConsequence{}, err
 					}
-					return outcome.value.(harness.RequestConsequence), nil
+					return value.(harness.RequestConsequence), nil
 				}
 			case extension.BoundaryBeforeTool:
-				effectful := hook.Mode == extension.HookModeEffectful
 				implementation.BeforeTool = func(ctx context.Context, call extension.CallContext, toolCall model.ToolCall) (json.RawMessage, error) {
 					params, err := worker.EncodeBeforeToolHookParams(toolCall)
 					if err != nil {
 						return nil, err
 					}
-					if effectful {
-						validator := func(raw json.RawMessage) (any, error) {
-							result, err := worker.DecodeServiceResult(raw)
-							if err != nil {
-								return nil, err
-							}
-							if err := extension.ValidateResult(methods, string(extension.BoundaryBeforeTool), result); err != nil {
-								return nil, err
-							}
-							arguments, failure, err := worker.DecodeBeforeToolHookOutcome(raw)
-							if err != nil {
-								return nil, err
-							}
-							if failure != nil {
-								return *failure, nil
-							}
-							return arguments, nil
-						}
-						outcome := b.instanceCall(ctx, call, capability.ID, string(extension.BoundaryBeforeTool), params, validator)
-						if err := effectfulError(outcome); err != nil {
-							return nil, err
-						}
-						if failure, ok := outcome.value.(worker.HookFailure); ok {
-							return nil, hookFailureError(&failure)
-						}
-						return outcome.value.(json.RawMessage), nil
-					}
 					validator := fixedResult(methods, string(extension.BoundaryBeforeTool), typed(worker.DecodeArguments))
 					outcome := b.instanceCall(ctx, call, capability.ID, string(extension.BoundaryBeforeTool), params, validator)
-					if err := requestError(outcome); err != nil {
+					value, err := decodeOutcome(outcome)
+					if err != nil {
 						return nil, err
 					}
-					return outcome.value.(json.RawMessage), nil
+					return value.(json.RawMessage), nil
 				}
 			case extension.BoundaryAfterTool:
 				implementation.AfterTool = func(ctx context.Context, call extension.CallContext, input harness.ToolOutputInput) (string, error) {
@@ -356,10 +302,11 @@ func (b *executableBinding) implementation(capability extension.Capability) exte
 					}
 					validator := fixedResult(methods, string(extension.BoundaryAfterTool), typed(worker.DecodeAfterToolHookResult))
 					outcome := b.instanceCall(ctx, call, capability.ID, string(extension.BoundaryAfterTool), params, validator)
-					if err := requestError(outcome); err != nil {
+					value, err := decodeOutcome(outcome)
+					if err != nil {
 						return "", err
 					}
-					return outcome.value.(string), nil
+					return value.(string), nil
 				}
 			}
 		}
@@ -398,7 +345,7 @@ func (b *executableBinding) dispose(ctx context.Context, call extension.CallCont
 	outcome := activation.request(ctx, worker.MethodDispose, func(token string) (any, error) {
 		return worker.DisposeParams{InstanceID: b.instanceID, Context: worker.NewContext(token, call)}, nil
 	}, executableCall(call.Call), validateNull)
-	err = requestError(outcome)
+	_, err = decodeOutcome(outcome)
 	if errors.Is(err, extension.ErrClosed) {
 		return nil
 	}
@@ -423,10 +370,11 @@ func (t *executableTool) NormalizeContext(ctx context.Context, context extension
 	}
 	validator := fixedResult(t.methods, "normalize", typed(worker.DecodeArguments))
 	outcome := t.binding.instanceCall(ctx, context.Calls, t.capabilityID, "normalize", params, validator)
-	if err := requestError(outcome); err != nil {
+	value, err := decodeOutcome(outcome)
+	if err != nil {
 		return nil, err
 	}
-	return outcome.value.(json.RawMessage), nil
+	return value.(json.RawMessage), nil
 }
 
 func (t *executableTool) Prepare(ctx context.Context, context extension.ToolContext, call model.ToolCall) extension.ToolPlan {
@@ -436,10 +384,11 @@ func (t *executableTool) Prepare(ctx context.Context, context extension.ToolCont
 	}
 	validator := fixedResult(t.methods, "prepare", typed(worker.DecodePrepareResult))
 	outcome := t.binding.instanceCall(ctx, context.Calls, t.capabilityID, "prepare", params, validator)
-	if err := requestError(outcome); err != nil {
-		return t.failedPlan(context, err, outcome.cancelled)
+	value, err := decodeOutcome(outcome)
+	if err != nil {
+		return t.failedPlan(context, err, harness.EffectInterrupted(err))
 	}
-	return outcome.value.(extension.ToolPlan)
+	return value.(extension.ToolPlan)
 }
 
 // failedPlan turns one pure preparation transport failure into its not-started
@@ -458,10 +407,11 @@ func (t *executableTool) Execute(ctx context.Context, context extension.ToolCont
 	}
 	validator := fixedResult(t.methods, "execute", typed(worker.DecodeExecuteResult))
 	outcome := t.binding.instanceCall(ctx, context.Calls, t.capabilityID, "execute", params, validator)
-	if err := requestError(outcome); err != nil {
-		return failedExecution(context, outcome.evidence, err, outcome.cancelled)
+	value, err := decodeOutcome(outcome)
+	if err != nil {
+		return failedExecution(context, outcome.evidence, err, harness.EffectInterrupted(err))
 	}
-	return outcome.value.(harness.ToolOutcome)
+	return value.(harness.ToolOutcome)
 }
 
 // failedExecution renders one binding failure as the tool's own outcome with
@@ -501,13 +451,11 @@ func (s *executableStrategy) Plan(input harness.PlanInput) (harness.PlanOutput, 
 	}
 	validator := fixedResult(s.methods, "plan", typed(worker.DecodePlanResult))
 	outcome := s.binding.instanceCall(s.context(), s.binding.callContext(), s.capabilityID, "plan", params, validator)
-	if err := requestError(outcome); err != nil {
-		if outcome.failure == nil && (outcome.cancelled || isCancellation(outcome.err)) {
-			return harness.PlanOutput{}, &harness.EffectError{Interrupted: true, Err: err}
-		}
+	value, err := decodeOutcome(outcome)
+	if err != nil {
 		return harness.PlanOutput{}, err
 	}
-	return outcome.value.(harness.PlanOutput), nil
+	return value.(harness.PlanOutput), nil
 }
 
 func (s *executableStrategy) Consume(input harness.ConsumeInput) (harness.PlanOutput, error) {
@@ -517,13 +465,11 @@ func (s *executableStrategy) Consume(input harness.ConsumeInput) (harness.PlanOu
 	}
 	validator := fixedResult(s.methods, "consume", typed(worker.DecodePlanResult))
 	outcome := s.binding.instanceCall(s.context(), s.binding.callContext(), s.capabilityID, "consume", params, validator)
-	if err := requestError(outcome); err != nil {
-		if outcome.failure == nil && (outcome.cancelled || isCancellation(outcome.err)) {
-			return harness.PlanOutput{}, &harness.EffectError{Interrupted: true, Err: err}
-		}
+	value, err := decodeOutcome(outcome)
+	if err != nil {
 		return harness.PlanOutput{}, err
 	}
-	return outcome.value.(harness.PlanOutput), nil
+	return value.(harness.PlanOutput), nil
 }
 
 func (s *executableStrategy) context() context.Context {
@@ -537,39 +483,31 @@ func (s *executableStrategy) context() context.Context {
 // carries no context.
 func executableBackground() context.Context { return context.Background() }
 
-// requestError returns the request's failure or nil.
-func requestError(outcome requestOutcome) error {
-	if outcome.err != nil {
-		return outcome.err
+// decodeOutcome is the one decode of every request outcome. A success
+// terminal is its value. An author error terminal is the author's error,
+// carrying the frame's declared effect knowledge when present. A missing
+// terminal, or the worker's cancelled-class answer without declared knowledge
+// to a request the host cancelled, is the binding-infrastructure failure with
+// delivery knowledge.
+func decodeOutcome(outcome requestOutcome) (any, error) {
+	if outcome.err == nil && outcome.failure == nil {
+		return outcome.value, nil
 	}
 	if outcome.failure != nil {
-		return outcome.failure
+		known := outcome.failure.Interrupted || outcome.failure.Evidence != ""
+		if known {
+			return nil, &harness.EffectError{Evidence: outcome.failure.Evidence, Interrupted: outcome.failure.Interrupted, Err: outcome.failure}
+		}
+		if !(outcome.hostCancelled && outcome.failure.Class == worker.ClassCancelled) {
+			return nil, outcome.failure
+		}
 	}
-	return nil
-}
-
-// effectfulError carries one effectful callback's binding failure as the
-// shared typed knowledge value.
-func effectfulError(outcome requestOutcome) error {
-	err := requestError(outcome)
+	err := outcome.err
+	if outcome.failure != nil {
+		err = outcome.failure
+	}
 	if err == nil {
-		return nil
+		err = extension.ErrClosed
 	}
-	return &harness.EffectError{Evidence: outcome.evidence, Err: err, Interrupted: outcome.cancelled || isCancellation(err)}
-}
-
-func isCancellation(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-// hookFailureError maps one accepted inbound hook failure arm.
-func hookFailureError(failure *worker.HookFailure) error {
-	if failure == nil {
-		return nil
-	}
-	return &harness.EffectError{
-		Evidence:    failure.Evidence,
-		Err:         errors.New(failure.Message),
-		Interrupted: failure.Status == worker.HookStatusInterrupted,
-	}
+	return nil, &harness.EffectError{Evidence: outcome.evidence, Interrupted: outcome.hostCancelled, Err: err}
 }

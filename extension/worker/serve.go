@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -46,7 +45,6 @@ func Serve(ctx context.Context, native extension.Native, in io.Reader, out io.Wr
 		done:      make(chan struct{}),
 		fatal:     make(chan error, 1),
 	}
-	s.index()
 	return s.run()
 }
 
@@ -57,8 +55,7 @@ type server struct {
 	reader   *Reader
 	writer   *Writer
 
-	described []string
-	next      atomic.Uint64
+	next atomic.Uint64
 
 	mu        sync.Mutex
 	stopped   bool
@@ -104,25 +101,6 @@ func badRoute(format string, args ...any) error {
 
 func decodeFailure(what string, err error) error {
 	return protocolFailure{err: fmt.Errorf("worker: %s: %w", what, err)}
-}
-
-// index builds the metadata capability list. Capability, component and owner
-// lookups reuse the retained compiled declaration.
-func (s *server) index() {
-	described := []string{}
-	declaration, ok := s.compiled.Declaration(s.native.Declaration.ID)
-	if ok {
-		for id, capability := range declaration.Capabilities {
-			if capability.Kind != extension.KindTool {
-				continue
-			}
-			if _, ok := s.native.Describe[id]; ok {
-				described = append(described, id)
-			}
-		}
-	}
-	sort.Strings(described)
-	s.described = described
 }
 
 func (s *server) run() error {
@@ -217,7 +195,7 @@ func (s *server) activate(frame Frame) error {
 	if params.ContractVersion != extension.ContractVersion {
 		return s.rejectActivation(frame.ID, fmt.Errorf("worker: contract version %q is not %q", params.ContractVersion, extension.ContractVersion))
 	}
-	encoded, err := json.Marshal(ActivateResult{Declaration: NewDeclaration(s.native.Declaration), Described: s.described})
+	encoded, err := json.Marshal(ActivateResult{Declaration: NewDeclaration(s.native.Declaration)})
 	if err != nil {
 		s.writeError(frame.ID, &Error{Class: ClassInternal, Message: "activation result could not be encoded"})
 		return err
@@ -662,13 +640,6 @@ func (s *server) dispatchTool(ctx context.Context, capability *extension.Compile
 
 func (s *server) dispatchHook(ctx context.Context, capability *extension.CompiledCapability, implementation extension.Implementation, request CallParams) (json.RawMessage, error) {
 	boundary := extension.HookBoundary(request.Method)
-	effectful := false
-	for _, hook := range capability.Hooks {
-		if hook.Boundary == boundary {
-			effectful = hook.Mode == extension.HookModeEffectful
-			break
-		}
-	}
 	scopeCtx, endScope := context.WithCancel(ctx)
 	callContext := request.Context.callContext()
 	callContext.Call = s.callFunc(scopeCtx, request.Context)
@@ -703,20 +674,10 @@ func (s *server) dispatchHook(ctx context.Context, capability *extension.Compile
 			endScope()
 			return nil, decodeFailure("request hook arguments", err)
 		}
-		consequence, hookErr := implementation.Request(scopeCtx, callContext, input)
+		consequence, err := implementation.Request(scopeCtx, callContext, input)
 		endScope()
-		if effectful {
-			if hookErr != nil {
-				return s.effectfulHookFailure(capability, request.Method, hookErr)
-			}
-			value, err = EncodeRequestHookResult(consequence)
-			if err != nil {
-				return nil, err
-			}
-			return s.callResult(capability, request.Method, extension.Result{Value: value})
-		}
-		if hookErr != nil {
-			return nil, hookErr
+		if err != nil {
+			return nil, err
 		}
 		value, err = EncodeRequestHookResult(consequence)
 		if err != nil {
@@ -732,20 +693,10 @@ func (s *server) dispatchHook(ctx context.Context, capability *extension.Compile
 			endScope()
 			return nil, decodeFailure("before-tool hook arguments", err)
 		}
-		arguments, hookErr := implementation.BeforeTool(scopeCtx, callContext, call)
+		arguments, err := implementation.BeforeTool(scopeCtx, callContext, call)
 		endScope()
-		if effectful {
-			if hookErr != nil {
-				return s.effectfulHookFailure(capability, request.Method, hookErr)
-			}
-			value, err = EncodeArguments(arguments)
-			if err != nil {
-				return nil, err
-			}
-			return s.callResult(capability, request.Method, extension.Result{Value: value})
-		}
-		if hookErr != nil {
-			return nil, hookErr
+		if err != nil {
+			return nil, err
 		}
 		value, err = EncodeArguments(arguments)
 		if err != nil {
@@ -775,21 +726,6 @@ func (s *server) dispatchHook(ctx context.Context, capability *extension.Compile
 		return nil, badRoute("worker: hook %q has unknown boundary %q", capability.ID, request.Method)
 	}
 	return s.bareResult(capability, request.Method, value)
-}
-
-// effectfulHookFailure encodes one effectful hook author error as the declared
-// hookFailure result arm.
-func (s *server) effectfulHookFailure(capability *extension.CompiledCapability, method string, err error) (json.RawMessage, error) {
-	failure := HookFailureFromError(err)
-	data, err := marshalValue(hookFailureJSON{Status: failure.Status, Evidence: failure.Evidence})
-	if err != nil {
-		return nil, err
-	}
-	return s.callResult(capability, method, extension.Result{Failure: &extension.Failure{
-		Code:    string(failure.Status),
-		Message: failure.Message,
-		Data:    data,
-	}})
 }
 
 func (s *server) dispatchStrategy(capability *extension.CompiledCapability, strategy harness.ContextStrategy, request CallParams) (json.RawMessage, error) {

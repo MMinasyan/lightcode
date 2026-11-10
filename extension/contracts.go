@@ -31,7 +31,6 @@ const fixedDefs = `
 "toolOutcome":{"type":"object","required":["result","evidence"],"properties":{"result":{"$ref":"#/$defs/toolResult"},"metadata":{"$ref":"#/$defs/jsonBytes"},"evidence":{"type":"string","enum":["","not_started","observed","unknown"]}},"additionalProperties":false},
 "permission":{"type":"object","required":["permission","target"],"properties":{"permission":{"type":"string","minLength":1},"target":{"type":"string","minLength":1}},"additionalProperties":false},
 "toolPlan":{"type":"object","required":["permissions"],"properties":{"permissions":{"type":"array","items":{"$ref":"#/$defs/permission"}},"canonical_workspace":{"type":"string"},"canonical_write_dir":{"type":"string"},"immediate":{"$ref":"#/$defs/toolOutcome"},"data":{"$ref":"#/$defs/jsonBytes"}},"additionalProperties":false},
-"hookFailure":{"type":"object","required":["status","evidence"],"properties":{"status":{"type":"string","enum":["error","interrupted"]},"evidence":{"type":"string","enum":["not_started","observed","unknown"]}},"additionalProperties":false},
 "entryRef":{"type":"object","required":["session_id","entry_id"],"properties":{"session_id":{"type":"string","minLength":1},"entry_id":{"type":"string","minLength":1}},"additionalProperties":false},
 "sessionIdentity":{"type":"object","required":["session_id","workspace"],"properties":{"session_id":{"type":"string","minLength":1},"workspace":{"type":"string"},"created_at":{"type":"string"},"source_session_id":{"type":"string"},"source_boundary_entry_id":{"type":"string"},"parent_session_id":{"type":"string"}},"additionalProperties":false},
 "constraints":{"type":"object","required":["readonly","write_dir"],"properties":{"readonly":{"type":"boolean"},"write_dir":{"type":"string"}},"additionalProperties":false},
@@ -106,23 +105,19 @@ func hookMethods(hooks []Hook) []Method {
 				string(defsSchema(`{"$ref":"#/$defs/preparationInput"}`)),
 				string(defsSchema(`{"$ref":"#/$defs/preparationConsequence"}`)), "", ""))
 		case BoundaryRequest:
-			failure := ""
 			if hook.Mode == HookModeEffectful {
 				mode = ModeServiceIO
-				failure = string(defsSchema(`{"$ref":"#/$defs/hookFailure"}`))
 			}
 			methods = append(methods, method(string(hook.Boundary), mode,
 				string(defsSchema(`{"$ref":"#/$defs/requestHookInput"}`)),
-				string(defsSchema(`{"$ref":"#/$defs/requestConsequence"}`)), failure, ""))
+				string(defsSchema(`{"$ref":"#/$defs/requestConsequence"}`)), "", ""))
 		case BoundaryBeforeTool:
-			failure := ""
 			if hook.Mode == HookModeEffectful {
 				mode = ModeServiceIO
-				failure = string(defsSchema(`{"$ref":"#/$defs/hookFailure"}`))
 			}
 			methods = append(methods, method(string(hook.Boundary), mode,
 				string(defsSchema(`{"$ref":"#/$defs/toolCall"}`)),
-				string(defsSchema(`{"type":"object","required":["arguments"],"properties":{"arguments":{"$ref":"#/$defs/jsonBytes"}},"additionalProperties":false}`)), failure, ""))
+				string(defsSchema(`{"type":"object","required":["arguments"],"properties":{"arguments":{"$ref":"#/$defs/jsonBytes"}},"additionalProperties":false}`)), "", ""))
 		case BoundaryAfterTool:
 			methods = append(methods, method(string(hook.Boundary), ModePure,
 				string(defsSchema(`{"type":"object","required":["outcome","content"],"properties":{"outcome":{"$ref":"#/$defs/toolOutcome"},"content":{"type":"string"}},"additionalProperties":false}`)),

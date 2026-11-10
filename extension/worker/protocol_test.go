@@ -608,85 +608,7 @@ func TestErrClosedClassBothDirections(t *testing.T) {
 	}
 }
 
-func TestEffectfulHookResultUnionCodec(t *testing.T) {
-	capability := extension.HookCapability("hook-effectful",
-		extension.SingleHook(extension.BoundaryRequest, extension.HookModeEffectful),
-		extension.SingleHook(extension.BoundaryBeforeTool, extension.HookModeEffectful))
-	successSchema := methodSchema(t, capability, "request", "success")
-	failureSchema := methodError(t, capability, "request")
-
-	consequence := harness.RequestConsequence{
-		Prompt:    stringPointer("request prompt"),
-		Messages:  []model.Message{},
-		ToolNames: []string{"tool-a"},
-	}
-	encodedConsequence, err := worker.EncodeRequestHookResult(consequence)
-	if err != nil {
-		t.Fatalf("encoding request hook success: %v", err)
-	}
-	raw, err := worker.EncodeServiceResult(extension.Result{Value: encodedConsequence})
-	if err != nil {
-		t.Fatalf("encoding request hook success envelope: %v", err)
-	}
-	var successEnvelope struct {
-		Value worker.JSONBytes `json:"value"`
-	}
-	if err := json.Unmarshal(raw, &successEnvelope); err != nil {
-		t.Fatalf("decoding request hook success envelope: %v", err)
-	}
-	validateAgainstSchema(t, successSchema, json.RawMessage(successEnvelope.Value))
-	decoded, failure, err := worker.DecodeRequestHookOutcome(raw)
-	if err != nil || failure != nil || !reflect.DeepEqual(decoded, consequence) {
-		t.Fatalf("request hook success decoded as %#v / %+v / %v", decoded, failure, err)
-	}
-
-	failureValue := &worker.HookFailure{Status: worker.HookStatusInterrupted, Evidence: harness.ExecutionObserved, Message: "interrupted hook failure"}
-	failureData, err := json.Marshal(struct {
-		Status   worker.HookStatus         `json:"status"`
-		Evidence harness.ExecutionEvidence `json:"evidence"`
-	}{Status: failureValue.Status, Evidence: failureValue.Evidence})
-	if err != nil {
-		t.Fatalf("encoding request hook failure data: %v", err)
-	}
-	raw, err = worker.EncodeServiceResult(extension.Result{Failure: &extension.Failure{Code: string(failureValue.Status), Message: failureValue.Message, Data: failureData}})
-	if err != nil {
-		t.Fatalf("encoding request hook failure envelope: %v", err)
-	}
-	var failureEnvelope struct {
-		Failure struct {
-			Code    string           `json:"code"`
-			Message string           `json:"message"`
-			Data    worker.JSONBytes `json:"data"`
-		} `json:"failure"`
-	}
-	if err := json.Unmarshal(raw, &failureEnvelope); err != nil {
-		t.Fatalf("decoding request hook failure envelope: %v", err)
-	}
-	if failureEnvelope.Failure.Code != "interrupted" || failureEnvelope.Failure.Message != failureValue.Message {
-		t.Fatalf("request hook failure envelope = %+v", failureEnvelope.Failure)
-	}
-	validateAgainstSchema(t, failureSchema, json.RawMessage(failureEnvelope.Failure.Data))
-	_, decodedFailure, err := worker.DecodeRequestHookOutcome(raw)
-	if err != nil || !reflect.DeepEqual(decodedFailure, failureValue) {
-		t.Fatalf("request hook failure decoded as %+v / %v", decodedFailure, err)
-	}
-
-	arguments := json.RawMessage("{\n  \"text\": \"<a>&b\"\n}")
-	encodedArguments, err := worker.EncodeArguments(arguments)
-	if err != nil {
-		t.Fatalf("encoding before-tool hook success: %v", err)
-	}
-	raw, err = worker.EncodeServiceResult(extension.Result{Value: encodedArguments})
-	if err != nil {
-		t.Fatalf("encoding before-tool hook success envelope: %v", err)
-	}
-	decodedArguments, failure, err := worker.DecodeBeforeToolHookOutcome(raw)
-	if err != nil || failure != nil || !bytes.Equal(decodedArguments, arguments) {
-		t.Fatalf("before-tool hook success decoded as %q / %+v / %v", decodedArguments, failure, err)
-	}
-}
-
-func TestServeEffectfulHookResultUnion(t *testing.T) {
+func TestServeHookErrorsCarryEffectKnowledge(t *testing.T) {
 	effectful := extension.HookCapability("hook-effectful",
 		extension.SingleHook(extension.BoundaryRequest, extension.HookModeEffectful),
 		extension.SingleHook(extension.BoundaryBeforeTool, extension.HookModeEffectful))
@@ -695,27 +617,32 @@ func TestServeEffectfulHookResultUnion(t *testing.T) {
 	requestConsequence := harness.RequestConsequence{Prompt: stringPointer("request prompt"), Messages: []model.Message{}}
 	requestHook := func(context.Context, extension.CallContext, harness.RequestHookInput) (harness.RequestConsequence, error) {
 		switch mode.Load() {
-		case 1:
+		case 0:
 			return requestConsequence, nil
-		case 2:
+		case 1:
 			return harness.RequestConsequence{}, errors.New("plain hook failure")
+		case 2:
+			return harness.RequestConsequence{}, &harness.EffectError{Interrupted: true, Err: errors.New("interrupted hook failure")}
 		case 3:
-			return harness.RequestConsequence{}, context.Canceled
+			return harness.RequestConsequence{}, &harness.EffectError{Interrupted: true, Evidence: harness.ExecutionUnknown, Err: errors.New("interrupted hook failure")}
 		}
 		return harness.RequestConsequence{}, nil
 	}
 	beforeToolHook := func(context.Context, extension.CallContext, model.ToolCall) (json.RawMessage, error) {
 		switch mode.Load() {
-		case 2:
+		case 1:
 			return nil, errors.New("plain before-tool failure")
-		case 3:
-			return nil, context.Canceled
+		case 2:
+			return nil, &harness.EffectError{Interrupted: true, Err: errors.New("interrupted before-tool failure")}
 		}
 		return json.RawMessage(`{"repaired":true}`), nil
 	}
 	pureHook := func(context.Context, extension.CallContext, harness.RequestHookInput) (harness.RequestConsequence, error) {
-		if mode.Load() == 2 {
+		switch mode.Load() {
+		case 1:
 			return harness.RequestConsequence{}, errors.New("plain pure failure")
+		case 2:
+			return harness.RequestConsequence{}, &harness.EffectError{Interrupted: true, Err: errors.New("interrupted pure failure")}
 		}
 		return harness.RequestConsequence{Prompt: stringPointer("pure prompt")}, nil
 	}
@@ -737,110 +664,52 @@ func TestServeEffectfulHookResultUnion(t *testing.T) {
 		t.Fatalf("encoding before-tool hook input: %v", err)
 	}
 
-	mode.Store(1)
+	mode.Store(0)
 	success := p.call("request-success", instanceTarget("hook-effectful"), "call-token", "request", requestInput)
 	if success.Error != nil {
 		t.Fatalf("successful request hook failed: %v", success.Error)
 	}
-	decoded, failure, err := worker.DecodeRequestHookOutcome(success.Result)
-	if err != nil || failure != nil || !reflect.DeepEqual(decoded, requestConsequence) {
-		t.Fatalf("request hook success = %#v / %+v / %v", decoded, failure, err)
-	}
-	var successEnvelope struct {
-		Value worker.JSONBytes `json:"value"`
-	}
-	if err := json.Unmarshal(success.Result, &successEnvelope); err != nil {
-		t.Fatalf("decoding request hook success envelope: %v", err)
-	}
-	validateAgainstSchema(t, methodSchema(t, effectful, "request", "success"), json.RawMessage(successEnvelope.Value))
-
-	mode.Store(2)
-	plain := p.call("request-plain", instanceTarget("hook-effectful"), "call-token", "request", requestInput)
-	if plain.Error != nil {
-		t.Fatalf("plain hook failure was answered as infrastructure: %v", plain.Error)
-	}
-	var plainEnvelope struct {
-		Failure struct {
-			Code    string           `json:"code"`
-			Message string           `json:"message"`
-			Data    worker.JSONBytes `json:"data"`
-		} `json:"failure"`
-	}
-	if err := json.Unmarshal(plain.Result, &plainEnvelope); err != nil {
-		t.Fatalf("decoding plain hook failure: %v", err)
-	}
-	if plainEnvelope.Failure.Code != "error" || plainEnvelope.Failure.Message != "plain hook failure" {
-		t.Fatalf("plain hook failure = %+v", plainEnvelope.Failure)
-	}
-	var plainData struct {
-		Status   string `json:"status"`
-		Evidence string `json:"evidence"`
-	}
-	if err := json.Unmarshal(plainEnvelope.Failure.Data, &plainData); err != nil {
-		t.Fatalf("decoding plain hook failure data: %v", err)
-	}
-	if plainData.Status != "error" || plainData.Evidence != "observed" {
-		t.Fatalf("plain hook failure data = %+v", plainData)
-	}
-	validateAgainstSchema(t, methodError(t, effectful, "request"), json.RawMessage(plainEnvelope.Failure.Data))
-
-	mode.Store(3)
-	canceled := p.call("request-canceled", instanceTarget("hook-effectful"), "call-token", "request", requestInput)
-	if canceled.Error != nil {
-		t.Fatalf("canceled hook failure was answered as infrastructure: %v", canceled.Error)
-	}
-	var canceledEnvelope struct {
-		Failure struct {
-			Code    string           `json:"code"`
-			Message string           `json:"message"`
-			Data    worker.JSONBytes `json:"data"`
-		} `json:"failure"`
-	}
-	if err := json.Unmarshal(canceled.Result, &canceledEnvelope); err != nil {
-		t.Fatalf("decoding canceled hook failure: %v", err)
-	}
-	if canceledEnvelope.Failure.Code != "error" || canceledEnvelope.Failure.Message != "context canceled" {
-		t.Fatalf("canceled hook failure = %+v", canceledEnvelope.Failure)
-	}
-	var canceledData struct {
-		Status   string `json:"status"`
-		Evidence string `json:"evidence"`
-	}
-	if err := json.Unmarshal(canceledEnvelope.Failure.Data, &canceledData); err != nil {
-		t.Fatalf("decoding canceled hook failure data: %v", err)
-	}
-	if canceledData.Status != "error" || canceledData.Evidence != "observed" {
-		t.Fatalf("canceled hook failure data = %+v", canceledData)
-	}
-
-	mode.Store(2)
-	beforeTool := p.call("before-tool-plain", instanceTarget("hook-effectful"), "call-token", "before_tool", beforeToolInput)
-	if beforeTool.Error != nil {
-		t.Fatalf("plain before-tool failure was answered as infrastructure: %v", beforeTool.Error)
-	}
-	_, beforeFailure, err := worker.DecodeBeforeToolHookOutcome(beforeTool.Result)
-	if err != nil || beforeFailure == nil || beforeFailure.Status != worker.HookStatusError || beforeFailure.Evidence != harness.ExecutionObserved || beforeFailure.Message != "plain before-tool failure" {
-		t.Fatalf("before-tool failure = %+v / %v", beforeFailure, err)
+	assertBareResult(t, success.Result)
+	decoded, err := worker.DecodeRequestHookResult(success.Result)
+	if err != nil || !reflect.DeepEqual(decoded, requestConsequence) {
+		t.Fatalf("request hook success = %#v / %v", decoded, err)
 	}
 
 	mode.Store(1)
-	pureSuccess := p.call("pure-success", instanceTarget("hook-pure"), "call-token", "request", requestInput)
-	if pureSuccess.Error != nil {
-		t.Fatalf("pure hook failed: %v", pureSuccess.Error)
+	plain := p.call("request-plain", instanceTarget("hook-effectful"), "call-token", "request", requestInput)
+	if plain.Error == nil || plain.Error.Class != worker.ClassInternal || plain.Error.Message != "plain hook failure" || plain.Error.Interrupted || plain.Error.Evidence != "" {
+		t.Fatalf("plain hook failure = %+v, want the ordinary error frame", plain.Error)
 	}
-	assertBareResult(t, pureSuccess.Result)
-	if _, err := worker.DecodeRequestHookResult(pureSuccess.Result); err != nil {
-		t.Fatalf("decoding pure hook result: %v", err)
+	if len(plain.Result) != 0 {
+		t.Fatalf("plain hook failure carried a result: %s", plain.Result)
 	}
 
 	mode.Store(2)
-	pureFailure := p.call("pure-failure", instanceTarget("hook-pure"), "call-token", "request", requestInput)
-	if pureFailure.Error == nil || pureFailure.Error.Class != worker.ClassInternal || pureFailure.Error.Message != "plain pure failure" {
-		t.Fatalf("pure hook failure = %+v, want the infrastructure error", pureFailure)
+	interrupted := p.call("request-interrupted", instanceTarget("hook-effectful"), "call-token", "request", requestInput)
+	if interrupted.Error == nil || !interrupted.Error.Interrupted || interrupted.Error.Evidence != "" {
+		t.Fatalf("interrupted hook failure = %+v, want declared interruption", interrupted.Error)
 	}
-	if len(pureFailure.Result) != 0 {
-		t.Fatalf("pure hook failure carried a result: %s", pureFailure.Result)
+	pureInterrupted := p.call("pure-interrupted", instanceTarget("hook-pure"), "call-token", "request", requestInput)
+	if pureInterrupted.Error == nil || !pureInterrupted.Error.Interrupted || pureInterrupted.Error.Evidence != "" {
+		t.Fatalf("interrupted pure hook failure = %+v, want declared interruption", pureInterrupted.Error)
 	}
+	beforeInterrupted := p.call("before-interrupted", instanceTarget("hook-effectful"), "call-token", "before_tool", beforeToolInput)
+	if beforeInterrupted.Error == nil || !beforeInterrupted.Error.Interrupted || beforeInterrupted.Error.Evidence != "" {
+		t.Fatalf("interrupted before-tool failure = %+v, want declared interruption", beforeInterrupted.Error)
+	}
+
+	mode.Store(3)
+	known := p.call("request-known", instanceTarget("hook-effectful"), "call-token", "request", requestInput)
+	if known.Error == nil || !known.Error.Interrupted || known.Error.Evidence != harness.ExecutionUnknown {
+		t.Fatalf("effectful hook failure = %+v, want unknown execution knowledge", known.Error)
+	}
+
+	mode.Store(1)
+	beforePlain := p.call("before-plain", instanceTarget("hook-effectful"), "call-token", "before_tool", beforeToolInput)
+	if beforePlain.Error == nil || beforePlain.Error.Class != worker.ClassInternal || beforePlain.Error.Message != "plain before-tool failure" || beforePlain.Error.Interrupted {
+		t.Fatalf("plain before-tool failure = %+v, want the ordinary error frame", beforePlain.Error)
+	}
+
 	if err := p.finish(); err != nil {
 		t.Fatalf("Serve = %v", err)
 	}

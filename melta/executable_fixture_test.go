@@ -644,6 +644,89 @@ func TestExecutableStrategyInterruptBounded(t *testing.T) {
 	})
 }
 
+// TestExecutableStrategyCancelledFrameInterrupts proves the worker's
+// cancelled-class answer to a host-cancelled strategy request settles the
+// Operation as an interruption.
+func TestExecutableStrategyCancelledFrameInterrupts(t *testing.T) {
+	declaration := extension.Declaration{
+		ID:           "strategyprobe",
+		Version:      "1",
+		ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"}},"required":["enabled"],"additionalProperties":false}`),
+		Components: []extension.Component{{
+			ID:       "strategyprobe-c",
+			Lifetime: extension.LifetimeOperation,
+			Provides: []string{"probe.strategy"},
+		}},
+		Capabilities: []extension.Capability{extension.StrategyCapability("probe.strategy", true)},
+	}
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember(e.server.URL, "",
+			`{"m":{"name":"M","context_window":8192,"max_output_tokens":4096},"k":{"name":"K","context_window":32768,"max_output_tokens":4096}}`)+`},"compaction":{"model":"prov/k"},"extensions":{"guestdefs":{"enabled":true},"strategyprobe":{"enabled":true}}}`)
+		e.server.setScript(func(_ context.Context, body string) []string {
+			if lastUserText(body) == "seed" {
+				return textTurnEvents("seeded answer")
+			}
+			return textTurnEvents("trigger")
+		})
+		guest := namedResolverExtension("guestdefs", map[string]harness.AgentInputs{
+			"named": {
+				Model:        model.ModelRef{Provider: "prov", Model: "m"},
+				Instructions: "named prompt",
+				AssemblyMode: "simple",
+				Tools:        []string{},
+				Strategy:     harness.StrategySelection{ID: "probe.strategy"},
+			},
+		})
+		entered := make(chan struct{})
+		var planCalls atomic.Int32
+		peer := newTestExecutablePeer(t, true, nil)
+		peer.handler = func(p *testExecutablePeer, frame worker.Frame) {
+			switch {
+			case frame.Kind == worker.KindRequest && frame.Method == worker.MethodActivate:
+				p.sendValue(frame.ID, worker.ActivateResult{Declaration: worker.NewDeclaration(declaration)})
+			case frame.Kind == worker.KindRequest && (frame.Method == worker.MethodOpen || frame.Method == worker.MethodDispose):
+				p.sendNull(frame.ID)
+			case frame.Kind == worker.KindRequest && frame.Method == worker.MethodCall:
+				var params worker.CallParams
+				if err := json.Unmarshal(frame.Params, &params); err != nil {
+					p.t.Errorf("strategy call params: %v", err)
+					return
+				}
+				if params.Method != "plan" {
+					p.t.Errorf("strategy call method = %q", params.Method)
+					return
+				}
+				if planCalls.Add(1) == 1 {
+					p.sendValue(frame.ID, encodeValue(t, worker.EncodePlanResult, harness.PlanOutput{Kind: harness.PlanNone}))
+					return
+				}
+				close(entered) // the trigger plan waits for the host's cancel
+			case frame.Kind == worker.KindCancel:
+				p.send(worker.Frame{Kind: worker.KindResponse, ID: frame.ID, Error: &worker.Error{Class: worker.ClassCancelled, Message: "cancelled"}})
+			}
+		}
+		spawner := &testPeerSpawner{t: t, factory: func() *testExecutablePeer { return peer }}
+		spawner.install()
+		owner, err := e.openExecutablesWith(ctx, []executableExtension{{Declaration: declaration, EntryPoint: "strategyprobe"}}, guest)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		session := createNamedSession(t, owner, e.dataDir, "guestdefs", "guestdefs.definitions", "named")
+		submitThroughRuntime(t, owner, session.Identity.SessionID, "seed-op", "seed")
+		awaitOperation(t, owner, session.Identity.SessionID, "seed-op", harness.OperationSuccess)
+		submitThroughRuntime(t, owner, session.Identity.SessionID, "trigger-op", "trigger")
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker strategy Plan never started")
+		}
+		testassert.NoError(t, owner.InterruptSession(context.Background(), testCaller(owner), session.Identity.SessionID))
+		awaitOperation(t, owner, session.Identity.SessionID, "trigger-op", harness.OperationInterruption)
+		testassert.NoError(t, owner.Close(context.Background()))
+	})
+}
+
 // messageText returns one message's first text part.
 func messageText(message model.Message) string {
 	for _, part := range message.Content {

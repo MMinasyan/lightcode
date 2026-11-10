@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -167,13 +166,13 @@ type pendingRequest struct {
 }
 
 // requestOutcome is one request's terminal result or failure, together with the
-// delivery and cancellation knowledge the caller needs for settlement.
+// delivery and host-cancellation knowledge the caller needs for settlement.
 type requestOutcome struct {
-	value     any
-	failure   *worker.Error
-	err       error
-	evidence  harness.ExecutionEvidence
-	cancelled bool
+	value         any
+	failure       *worker.Error
+	err           error
+	evidence      harness.ExecutionEvidence
+	hostCancelled bool
 }
 
 // executableActivation is one supervised worker process and its protocol state.
@@ -302,7 +301,7 @@ func (a *executableActivation) activationError(outcome requestOutcome) error {
 	return failed
 }
 
-// activateResponse validates the activation declaration and metadata set.
+// activateResponse validates the activation declaration.
 func (a *executableActivation) activateResponse(raw json.RawMessage) (any, error) {
 	var result worker.ActivateResult
 	if err := json.Unmarshal(raw, &result); err != nil {
@@ -319,34 +318,7 @@ func (a *executableActivation) activateResponse(raw json.RawMessage) (any, error
 	if !bytes.Equal(gotDeclaration, wantDeclaration) {
 		return nil, errors.New("activation declaration differs from the supplied declaration")
 	}
-	declared := make(map[string]bool)
-	for _, capability := range a.declaration.Capabilities {
-		if capability.Kind == extension.KindTool {
-			declared[capability.ID] = true
-		}
-	}
-	if len(result.Described) != len(declared) {
-		return nil, fmt.Errorf("activation describes %v, want %v", result.Described, sortedTools(declared))
-	}
-	described := make(map[string]bool, len(result.Described))
-	for _, id := range result.Described {
-		described[id] = true
-	}
-	for id := range declared {
-		if !described[id] {
-			return nil, fmt.Errorf("activation describes %v, want %v", result.Described, sortedTools(declared))
-		}
-	}
 	return result, nil
-}
-
-func sortedTools(tools map[string]bool) []string {
-	out := make([]string, 0, len(tools))
-	for id := range tools {
-		out = append(out, id)
-	}
-	slices.Sort(out)
-	return out
 }
 
 // request sends one host request and waits for its validated terminal. build
@@ -437,7 +409,7 @@ func (a *executableActivation) request(ctx context.Context, method string, build
 				return outcome
 			}
 			if request.cancelUnclaimed(ctx.Err()) {
-				a.settle(request, requestOutcome{err: ctx.Err(), evidence: harness.ExecutionNotStarted, cancelled: true})
+				a.settle(request, requestOutcome{err: ctx.Err(), evidence: harness.ExecutionNotStarted, hostCancelled: true})
 				outcome, _ := request.stored()
 				return outcome
 			}
@@ -564,7 +536,7 @@ func (a *executableActivation) abortOutcome(request *pendingRequest, cause error
 		evidence = harness.ExecutionUnknown
 	}
 	if cancelErr != nil {
-		return requestOutcome{err: cancelErr, evidence: evidence, cancelled: true}
+		return requestOutcome{err: cancelErr, evidence: evidence, hostCancelled: true}
 	}
 	if cause == nil {
 		cause = extension.ErrClosed
@@ -589,7 +561,7 @@ func (a *executableActivation) writeLoop() {
 					if cancelErr == nil {
 						cancelErr = context.Canceled
 					}
-					a.settle(request, requestOutcome{err: cancelErr, evidence: harness.ExecutionNotStarted, cancelled: true})
+					a.settle(request, requestOutcome{err: cancelErr, evidence: harness.ExecutionNotStarted, hostCancelled: true})
 					continue
 				}
 				// The writer claims the frame and records its transmission
@@ -684,7 +656,10 @@ func (a *executableActivation) response(frame worker.Frame) error {
 		if !frame.Error.Class.Valid() {
 			return fmt.Errorf("worker: response %q carries unknown error class %q", frame.ID, frame.Error.Class)
 		}
-		a.settle(request, requestOutcome{failure: frame.Error, evidence: harness.ExecutionUnknown, cancelled: frame.Error.Class == worker.ClassCancelled})
+		request.mu.Lock()
+		hostCancelled := request.cancelErr != nil
+		request.mu.Unlock()
+		a.settle(request, requestOutcome{failure: frame.Error, evidence: harness.ExecutionUnknown, hostCancelled: hostCancelled})
 		return nil
 	}
 	value, err := request.validate(frame.Result)

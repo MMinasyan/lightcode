@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 
@@ -283,7 +282,7 @@ func TestPackageSelectedDeclarationFailureIsUnusable(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 	selected := readSelectedRecord(t, dataDir, declaration.ID)
-	manifestPath := filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "packages", selected.Digest, "manifest.json")
+	manifestPath := filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "packages", selected.Copy, "manifest.json")
 	manifestBytes, err := os.ReadFile(manifestPath)
 	if err != nil {
 		t.Fatalf("read installed manifest: %v", err)
@@ -351,7 +350,8 @@ func TestPackageInstallRejectsPlantedDestinationSymlink(t *testing.T) {
 }
 
 // TestPackageInstallPublicationFailureKeepsPreviousSelection proves a failed
-// selected-record publication leaves the previous selection intact.
+// selected-record publication leaves the previous selection intact and removes
+// the partial copy.
 func TestPackageInstallPublicationFailureKeepsPreviousSelection(t *testing.T) {
 	declaration := toolOnlyDeclaration()
 	dataDir := t.TempDir()
@@ -384,7 +384,11 @@ func TestPackageInstallPublicationFailureKeepsPreviousSelection(t *testing.T) {
 	if string(before) != string(after) {
 		t.Fatalf("selected record = %s, want the previous %s", after, before)
 	}
-	testassert.Equal(t, readSelectedRecord(t, dataDir, declaration.ID).Version, "1.0.0")
+	first := readSelectedRecord(t, dataDir, declaration.ID)
+	testassert.Equal(t, first.Version, "1.0.0")
+	entries, readErr := os.ReadDir(filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "packages"))
+	testassert.NoError(t, readErr)
+	testassert.Require(t, len(entries) == 1 && entries[0].Name() == first.Copy, "package copies = %v, want only the selected copy %q", entries, first.Copy)
 
 	if _, err := newPackageManager(dataDir).install(v2); err != nil {
 		t.Fatalf("install v2 after restoring publication: %v", err)
@@ -392,10 +396,49 @@ func TestPackageInstallPublicationFailureKeepsPreviousSelection(t *testing.T) {
 	testassert.Equal(t, readSelectedRecord(t, dataDir, declaration.ID).Version, "2.0.0")
 }
 
-// TestPackageInstallSyncsStagingDirectoriesAndParentChain proves a nested
-// entry point's created directories are each synced before the staging rename,
-// and the published parent chain is always synced before the selection write.
-func TestPackageInstallSyncsStagingDirectoriesAndParentChain(t *testing.T) {
+// TestPackageInstallCreatesDistinctCopies proves install, update and
+// reinstall each write their own copy and select the latest one.
+func TestPackageInstallCreatesDistinctCopies(t *testing.T) {
+	declaration := toolOnlyDeclaration()
+	dataDir := t.TempDir()
+	v1 := t.TempDir()
+	if err := writePackageSourceFiles(t, v1, declaration, "1.0.0", "v1-worker"); err != nil {
+		t.Fatalf("write v1 source: %v", err)
+	}
+	v2 := t.TempDir()
+	if err := writePackageSourceFiles(t, v2, declaration, "2.0.0", "v2-worker"); err != nil {
+		t.Fatalf("write v2 source: %v", err)
+	}
+	manager := newPackageManager(dataDir)
+	copies := map[string]bool{}
+	for _, step := range []struct {
+		source  string
+		version string
+	}{
+		{v1, "1.0.0"},
+		{v2, "2.0.0"},
+		{v2, "2.0.0"},
+	} {
+		if _, err := manager.install(step.source); err != nil {
+			t.Fatalf("install %s: %v", step.version, err)
+		}
+		selected := readSelectedRecord(t, dataDir, declaration.ID)
+		testassert.Equal(t, selected.Version, step.version)
+		testassert.Require(t, !copies[selected.Copy], "install reused copy %q", selected.Copy)
+		copies[selected.Copy] = true
+	}
+	entries, err := os.ReadDir(filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "packages"))
+	testassert.NoError(t, err)
+	testassert.Require(t, len(entries) == len(copies), "package copies = %v, want one per install", entries)
+	for _, entry := range entries {
+		testassert.Require(t, copies[entry.Name()], "unexpected copy directory %q", entry.Name())
+	}
+}
+
+// TestPackageInstallSyncsCopyDirectoriesAndParentChain proves a nested entry
+// point's created directories and its copy directory are each synced before
+// the parent chain and the selection write.
+func TestPackageInstallSyncsCopyDirectoriesAndParentChain(t *testing.T) {
 	declaration := toolOnlyDeclaration()
 	dataDir := t.TempDir()
 	source := t.TempDir()
@@ -412,23 +455,29 @@ func TestPackageInstallSyncsStagingDirectoriesAndParentChain(t *testing.T) {
 		return nil
 	}
 	defer func() { atomicfs.SyncDirFunc = previous }()
+	check := func(t *testing.T, trace []string, copyID string) {
+		t.Helper()
+		extensionDir := filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID))
+		packagesDir := filepath.Join(extensionDir, "packages")
+		packageDir := filepath.Join(packagesDir, copyID)
+		testassert.Require(t, len(trace) == 8, "syncs = %v, want the entry point's directories, the copy directory, the parent chain, and the selection directory", trace)
+		testassert.Equal(t, trace[0], filepath.Join(packageDir, "bin", "nested"))
+		testassert.Equal(t, trace[1], filepath.Join(packageDir, "bin"))
+		testassert.Equal(t, trace[2], packageDir)
+		testassert.Equal(t, trace[3], packagesDir)
+		testassert.Equal(t, trace[4], extensionDir)
+		testassert.Equal(t, trace[5], filepath.Join(dataDir, "extensions"))
+		testassert.Equal(t, trace[6], dataDir)
+		testassert.Equal(t, trace[7], extensionDir)
+	}
 	if _, err := newPackageManager(dataDir).install(source); err != nil {
 		t.Fatalf("install: %v", err)
 	}
+	first := readSelectedRecord(t, dataDir, declaration.ID)
 	mu.Lock()
 	trace := append([]string(nil), synced...)
 	mu.Unlock()
-	extensionDir := filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID))
-	packagesDir := filepath.Join(extensionDir, "packages")
-	testassert.Require(t, len(trace) == 8, "syncs = %v, want three staging directories, the parent chain, and the selection directory", trace)
-	testassert.Require(t, strings.HasPrefix(trace[0], packagesDir+string(filepath.Separator)+".staging-") && strings.HasSuffix(trace[0], filepath.Join("bin", "nested")), "first sync = %q, want the nested staging directory", trace[0])
-	testassert.Equal(t, trace[1], filepath.Dir(trace[0]))
-	testassert.Equal(t, trace[2], filepath.Dir(trace[1]))
-	testassert.Equal(t, trace[3], packagesDir)
-	testassert.Equal(t, trace[4], extensionDir)
-	testassert.Equal(t, trace[5], filepath.Join(dataDir, "extensions"))
-	testassert.Equal(t, trace[6], dataDir)
-	testassert.Equal(t, trace[7], extensionDir)
+	check(t, trace, first.Copy)
 
 	mu.Lock()
 	synced = nil
@@ -436,18 +485,12 @@ func TestPackageInstallSyncsStagingDirectoriesAndParentChain(t *testing.T) {
 	if _, err := newPackageManager(dataDir).install(source); err != nil {
 		t.Fatalf("reinstall: %v", err)
 	}
+	second := readSelectedRecord(t, dataDir, declaration.ID)
 	mu.Lock()
 	trace = append([]string(nil), synced...)
 	mu.Unlock()
-	testassert.Require(t, len(trace) == 8, "reused-copy syncs = %v, want the staging chain and the parent chain regardless of reuse", trace)
-	testassert.Require(t, strings.HasPrefix(trace[0], packagesDir+string(filepath.Separator)+".staging-") && strings.HasSuffix(trace[0], filepath.Join("bin", "nested")), "reinstall first sync = %q, want the nested staging directory", trace[0])
-	testassert.Equal(t, trace[1], filepath.Dir(trace[0]))
-	testassert.Equal(t, trace[2], filepath.Dir(trace[1]))
-	testassert.Equal(t, trace[3], packagesDir)
-	testassert.Equal(t, trace[4], extensionDir)
-	testassert.Equal(t, trace[5], filepath.Join(dataDir, "extensions"))
-	testassert.Equal(t, trace[6], dataDir)
-	testassert.Equal(t, trace[7], extensionDir)
+	testassert.Require(t, first.Copy != second.Copy, "reinstall reused copy %q", second.Copy)
+	check(t, trace, second.Copy)
 }
 
 // TestPackageRemoveSyncsExtensionDirectory proves a successful selection
@@ -628,7 +671,7 @@ func TestPackageUnusableSelectionRejectsEnabledBuild(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 	selected := readSelectedRecord(t, dataDir, declaration.ID)
-	entryPath := filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "packages", selected.Digest, "worker")
+	entryPath := filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "packages", selected.Copy, "worker")
 	if err := os.Remove(entryPath); err != nil {
 		t.Fatalf("remove package entry point: %v", err)
 	}

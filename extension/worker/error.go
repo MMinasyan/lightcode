@@ -40,12 +40,16 @@ func (c Class) valid() bool {
 	return false
 }
 
-// Error is one infrastructure failure carried as the closed public class plus
-// a non-secret message. Unwrap exposes the matching Harness sentinel where the
-// class has one, so decoded failures classify with errors.Is.
+// Error is one author or infrastructure failure carried as the closed public
+// class plus a non-secret message. Unwrap exposes the matching Harness
+// sentinel where the class has one, so decoded failures classify with
+// errors.Is. Interrupted and Evidence carry the author's declared effect
+// knowledge when the author error is a *harness.EffectError.
 type Error struct {
-	Class   Class  `json:"class"`
-	Message string `json:"message"`
+	Class       Class                     `json:"class"`
+	Message     string                    `json:"message"`
+	Interrupted bool                      `json:"interrupted,omitempty"`
+	Evidence    harness.ExecutionEvidence `json:"evidence,omitempty"`
 }
 
 // Error returns the class and message.
@@ -91,6 +95,16 @@ func classifyError(err error) *Error {
 	if err == nil {
 		return nil
 	}
+	failure := classOfError(err)
+	var effect *harness.EffectError
+	if errors.As(err, &effect) {
+		failure.Interrupted = harness.EffectInterrupted(err)
+		failure.Evidence = harness.DeclaredExecutionKnowledge(err)
+	}
+	return failure
+}
+
+func classOfError(err error) *Error {
 	var typed *Error
 	if errors.As(err, &typed) {
 		class := typed.Class

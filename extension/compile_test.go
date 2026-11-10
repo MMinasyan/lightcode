@@ -507,10 +507,10 @@ func TestWhitespaceOptionalSchemaDocumentsAreMalformed(t *testing.T) {
 	}
 }
 
-// TestFixedEffectfulHookSchemaCoversTerminalFailure proves the effectful hook
-// methods describe their complete input and their fixed terminal failure
-// payload: status/evidence values, wrong-type and undeclared siblings reject.
-func TestFixedEffectfulHookSchemaCoversTerminalFailure(t *testing.T) {
+// TestFixedEffectfulHookSchemaCoversInputAndSuccess proves the effectful hook
+// methods describe their complete input and bare success value, with no
+// separately declared terminal failure payload.
+func TestFixedEffectfulHookSchemaCoversInputAndSuccess(t *testing.T) {
 	before := fixedCapabilityMethods(t, HookCapability("before", SingleHook(BoundaryBeforeTool, HookModeEffectful)))
 	call := json.RawMessage(`{"id":"call-1","name":"tool","arguments":"e30="}`)
 	if err := ValidateArguments(before, "before_tool", call); err != nil {
@@ -525,30 +525,14 @@ func TestFixedEffectfulHookSchemaCoversTerminalFailure(t *testing.T) {
 	if err := ValidateArguments(before, "before_tool", json.RawMessage(`{"id":"call-1","name":"tool","arguments":"e30=","extra":1}`)); err == nil {
 		t.Fatal("before_tool accepted an undeclared member")
 	}
-	for _, row := range []struct {
-		name   string
-		result Result
-	}{
-		{"terminal error", Result{Failure: &Failure{Code: "hook", Message: "failed", Data: json.RawMessage(`{"status":"error","evidence":"observed"}`)}}},
-		{"terminal interruption", Result{Failure: &Failure{Code: "hook", Message: "stopped", Data: json.RawMessage(`{"status":"interrupted","evidence":"not_started"}`)}}},
-	} {
-		if err := ValidateResult(before, "before_tool", row.result); err != nil {
-			t.Fatalf("%s: %v", row.name, err)
-		}
+	if before["before_tool"].Error != nil {
+		t.Fatal("effectful before-tool hook declares a terminal failure schema")
 	}
-	for _, row := range []struct {
-		name string
-		data string
-	}{
-		{"status outside enum", `{"status":"success","evidence":"observed"}`},
-		{"missing evidence", `{"status":"error"}`},
-		{"evidence outside enum", `{"status":"error","evidence":"maybe"}`},
-		{"undeclared member", `{"status":"error","evidence":"observed","extra":1}`},
-	} {
-		result := Result{Failure: &Failure{Code: "hook", Message: "failed", Data: json.RawMessage(row.data)}}
-		if err := ValidateResult(before, "before_tool", result); err == nil {
-			t.Fatalf("%s accepted", row.name)
-		}
+	if err := ValidateResult(before, "before_tool", Result{Value: json.RawMessage(`{"arguments":"e30="}`)}); err != nil {
+		t.Fatalf("before_tool success: %v", err)
+	}
+	if err := ValidateResult(before, "before_tool", Result{Failure: &Failure{Code: "hook", Message: "failed", Data: json.RawMessage(`{"status":"error"}`)}}); err == nil {
+		t.Fatal("before_tool accepted undeclared terminal failure data")
 	}
 	request := fixedCapabilityMethods(t, HookCapability("request", SingleHook(BoundaryRequest, HookModeEffectful)))
 	input := json.RawMessage(`{"request_id":"req-1","canonical_messages":[],"messages":[],"captured_prompt":"","prompt":"","catalog":[],"tools":[]}`)
