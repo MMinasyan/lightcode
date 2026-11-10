@@ -21,6 +21,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/model"
 	"github.com/MMinasyan/lightcode/prompt"
+	"github.com/MMinasyan/lightcode/protocol"
 )
 
 const executableTestTimeout = 10 * time.Second
@@ -1960,4 +1961,45 @@ func TestExecutableOwnerCloseRunsWorkerClose(t *testing.T) {
 	default:
 		t.Fatal("owner close skipped the worker Close callback")
 	}
+}
+
+func TestWorkerHookFailureMatchesNativeSettlement(t *testing.T) {
+	for _, evidence := range []harness.ExecutionEvidence{harness.ExecutionNotStarted, harness.ExecutionUnknown} {
+		native := &harness.EffectError{Interrupted: true, Evidence: evidence, Err: errors.New("hook interrupted")}
+		failure := worker.HookFailureFromError(native)
+		if failure == nil {
+			t.Fatalf("%s: HookFailureFromError returned nil", evidence)
+		}
+		mapped := hookFailureError(failure)
+		testassert.Equal(t, harness.EffectInterrupted(mapped), harness.EffectInterrupted(native))
+		testassert.Equal(t, harness.DeclaredExecutionKnowledge(mapped), harness.DeclaredExecutionKnowledge(native))
+	}
+}
+
+func TestWorkerServiceErrorClassReachesClassifier(t *testing.T) {
+	declaration := executableTestDeclaration()
+	handler := func(context.Context, extension.CallContext, json.RawMessage) (extension.Result, error) {
+		return extension.Result{}, &worker.Error{Class: worker.ClassDenied, Message: "denied by worker"}
+	}
+	spawner := &adapterSpawner{t: t, factory: func() (extension.Native, func()) {
+		return adapterSimpleNative(declaration, simpleTool{}, map[string]map[string]extension.Handler{
+			"peer.service": {"echo": handler},
+		}), nil
+	}}
+	h := newServiceHarness(t)
+	writeServiceFile(t, h.configPath, `{"extensions":{"peer":{"enabled":true}}}`)
+	service, _ := newExecutableConfigurationService(t, h, declaration, spawner)
+	if _, err := service.publish(context.Background()); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	defer service.current().resources.release()
+	value, ok := service.current().resources.runtime.capabilities["peer.service"]
+	if !ok {
+		t.Fatal("service capability is not open")
+	}
+	_, err := service.current().composition.invokeProvider(context.Background(), value, value.capability.Methods, "echo", json.RawMessage(`{}`), nil, callIdentity{revision: "1"}, false)
+	if err == nil {
+		t.Fatal("worker service denial returned no error")
+	}
+	testassert.Equal(t, ErrorCode(err), protocol.ErrorCodeDenied)
 }

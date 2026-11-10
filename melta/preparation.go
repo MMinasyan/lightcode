@@ -403,7 +403,7 @@ func (p *preparation) open(ctx context.Context, admission harness.OperationAdmis
 	// progress.
 	warnings.publish(p.passive, admission.SessionID)
 	*artifactRelease = releaseArtifacts
-	strategyBinding, err := resolveStrategyBinding(snapshot.composition, []*scope{runtimeScope, workspaceScope, operation}, inputs.Strategy)
+	strategyBinding, err := resolveStrategyBinding(snapshot.composition, []*scope{runtimeScope, workspaceScope, operation}, inputs.Strategy, ctx)
 	if err != nil {
 		releaseOperation()
 		err = errors.Join(err, operation.close())

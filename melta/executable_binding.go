@@ -491,6 +491,7 @@ type executableStrategy struct {
 	binding      *executableBinding
 	capabilityID string
 	methods      extension.MethodSet
+	ctx          context.Context
 }
 
 func (s *executableStrategy) Plan(input harness.PlanInput) (harness.PlanOutput, error) {
@@ -499,8 +500,11 @@ func (s *executableStrategy) Plan(input harness.PlanInput) (harness.PlanOutput, 
 		return harness.PlanOutput{}, err
 	}
 	validator := fixedResult(s.methods, "plan", typed(worker.DecodePlanResult))
-	outcome := s.binding.instanceCall(s.binding.supervisor.requestContext(), s.binding.callContext(), s.capabilityID, "plan", params, validator)
+	outcome := s.binding.instanceCall(s.context(), s.binding.callContext(), s.capabilityID, "plan", params, validator)
 	if err := requestError(outcome); err != nil {
+		if outcome.failure == nil && (outcome.cancelled || isCancellation(outcome.err)) {
+			return harness.PlanOutput{}, &harness.EffectError{Interrupted: true, Err: err}
+		}
 		return harness.PlanOutput{}, err
 	}
 	return outcome.value.(harness.PlanOutput), nil
@@ -512,11 +516,21 @@ func (s *executableStrategy) Consume(input harness.ConsumeInput) (harness.PlanOu
 		return harness.PlanOutput{}, err
 	}
 	validator := fixedResult(s.methods, "consume", typed(worker.DecodePlanResult))
-	outcome := s.binding.instanceCall(s.binding.supervisor.requestContext(), s.binding.callContext(), s.capabilityID, "consume", params, validator)
+	outcome := s.binding.instanceCall(s.context(), s.binding.callContext(), s.capabilityID, "consume", params, validator)
 	if err := requestError(outcome); err != nil {
+		if outcome.failure == nil && (outcome.cancelled || isCancellation(outcome.err)) {
+			return harness.PlanOutput{}, &harness.EffectError{Interrupted: true, Err: err}
+		}
 		return harness.PlanOutput{}, err
 	}
 	return outcome.value.(harness.PlanOutput), nil
+}
+
+func (s *executableStrategy) context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
 }
 
 // executableBackground is the context for callbacks whose native signature

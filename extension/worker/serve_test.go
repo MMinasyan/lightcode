@@ -203,15 +203,14 @@ func testScope() extension.ScopeIdentity {
 }
 
 func testRoutingContext(token string) worker.Context {
-	return worker.Context{
-		Token:        token,
+	return worker.NewContext(token, extension.CallContext{
 		ExtensionID:  "ext",
 		ComponentID:  "component",
 		InstanceID:   "instance",
 		Lifetime:     extension.LifetimeHarness,
 		Scope:        testScope(),
 		Revision:     "rev-1",
-		Section:      worker.JSONBytes("{\n  \"section\": true\n}"),
+		Section:      json.RawMessage("{\n  \"section\": true\n}"),
 		SessionID:    "session-1",
 		OperationID:  "op-1",
 		InvocationID: "inv-1",
@@ -219,8 +218,8 @@ func testRoutingContext(token string) worker.Context {
 		RequestID:    "request-1",
 		ToolCallID:   "call-1",
 		EffectID:     "effect-1",
-		Caller:       &worker.Caller{ExtensionID: "caller", ComponentID: "caller-component", InstanceID: "caller-instance"},
-	}
+		Caller:       extension.CallerIdentity{ExtensionID: "caller", ComponentID: "caller-component", InstanceID: "caller-instance"},
+	})
 }
 
 func (p *peer) open(token string) {

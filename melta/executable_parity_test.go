@@ -573,7 +573,7 @@ func TestExecutableParityCorpusAndCallbacks(t *testing.T) {
 			observation.set(fmt.Sprintf("service-%d", index), hashHex(result.Value))
 		}
 
-		binding, err := resolveStrategyBinding(snapshot.composition, []*scope{snapshot.resources.runtime}, harness.StrategySelection{ID: "fixture.strategy"})
+		binding, err := resolveStrategyBinding(snapshot.composition, []*scope{snapshot.resources.runtime}, harness.StrategySelection{ID: "fixture.strategy"}, context.Background())
 		if err != nil {
 			t.Fatalf("strategy binding: %v", err)
 		}

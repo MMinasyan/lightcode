@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/MMinasyan/lightcode/extension"
+	"github.com/MMinasyan/lightcode/extension/worker"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/internal/testassert"
 	"github.com/MMinasyan/lightcode/melta"
@@ -32,6 +34,8 @@ func TestProtocolErrorStatusTable(t *testing.T) {
 		{"conflict", fmt.Errorf("revision: %w", harness.ErrConflict), protocol.ErrorCodeConflict, http.StatusConflict},
 		{"incompatible", fmt.Errorf("contract: %w", harness.ErrIncompatible), protocol.ErrorCodeIncompatible, http.StatusConflict},
 		{"closed", fmt.Errorf("owner: %w", melta.ErrClosed), protocol.ErrorCodeClosed, http.StatusGone},
+		{"extension closed", fmt.Errorf("binding: %w", extension.ErrClosed), protocol.ErrorCodeClosed, http.StatusGone},
+		{"worker denied", fmt.Errorf("worker call: %w", &worker.Error{Class: worker.ClassDenied, Message: "denied by handler"}), protocol.ErrorCodeDenied, http.StatusForbidden},
 		{"corrupt", fmt.Errorf("store: %w", harness.ErrCorrupt), protocol.ErrorCodeCorrupt, http.StatusUnprocessableEntity},
 		{"configuration", fmt.Errorf("candidate: %w", melta.ErrConfiguration), protocol.ErrorCodeConfiguration, http.StatusUnprocessableEntity},
 		{"storage", fmt.Errorf("store: %w", harness.ErrStorage), protocol.ErrorCodeStorage, http.StatusInternalServerError},

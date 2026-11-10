@@ -65,8 +65,9 @@ func selectedCapability(scopes []*scope, id string) (*capabilityValue, bool) {
 	return nil, false
 }
 
-// resolveStrategyBinding selects the execution's strategy.
-func resolveStrategyBinding(c *composition, scopes []*scope, selected harness.StrategySelection) (*harness.StrategyBinding, error) {
+// resolveStrategyBinding selects the execution's strategy and binds an
+// executable implementation to the admitted execution context.
+func resolveStrategyBinding(c *composition, scopes []*scope, selected harness.StrategySelection, ctx context.Context) (*harness.StrategyBinding, error) {
 	if selected.ID == "" {
 		return c.defaultStrategy, nil
 	}
@@ -81,7 +82,13 @@ func resolveStrategyBinding(c *composition, scopes []*scope, selected harness.St
 	if value.implementation.Strategy == nil {
 		return nil, fmt.Errorf("strategy %q has no implementation: %w", selected.ID, ErrComposition)
 	}
-	return &harness.StrategyBinding{ID: capability.ID, RequiresContextWindow: capability.Strategy.RequiresContextWindow, Strategy: value.implementation.Strategy}, nil
+	strategy := value.implementation.Strategy
+	if executable, ok := strategy.(*executableStrategy); ok {
+		bound := *executable
+		bound.ctx = ctx
+		strategy = &bound
+	}
+	return &harness.StrategyBinding{ID: capability.ID, RequiresContextWindow: capability.Strategy.RequiresContextWindow, Strategy: strategy}, nil
 }
 
 func (c *composition) toolSpec(id string) (toolDeclaration, bool) {

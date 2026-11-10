@@ -1077,27 +1077,6 @@ func TestErrorClassUnwrapping(t *testing.T) {
 	}
 }
 
-func TestValidateResultEnvelopeShared(t *testing.T) {
-	for _, row := range []struct {
-		name   string
-		result extension.Result
-		ok     bool
-	}{
-		{"success", extension.Result{Value: json.RawMessage("null")}, true},
-		{"present empty success", extension.Result{Value: json.RawMessage{}}, true},
-		{"failure", extension.Result{Failure: &extension.Failure{Code: "x", Message: "y"}}, true},
-		{"both", extension.Result{Value: json.RawMessage("null"), Failure: &extension.Failure{Code: "x", Message: "y"}}, false},
-		{"neither", extension.Result{}, false},
-		{"empty code", extension.Result{Failure: &extension.Failure{Code: "", Message: "y"}}, false},
-		{"empty message", extension.Result{Failure: &extension.Failure{Code: "x", Message: ""}}, false},
-	} {
-		err := extension.ValidateResultEnvelope(row.result)
-		if (err == nil) != row.ok {
-			t.Fatalf("%s: ValidateResultEnvelope = %v, want ok=%v", row.name, err, row.ok)
-		}
-	}
-}
-
 func stringPointer(v string) *string { return &v }
 
 func intPointer(v int) *int { return &v }

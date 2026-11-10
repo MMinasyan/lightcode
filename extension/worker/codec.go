@@ -26,44 +26,26 @@ type ActivateResult struct {
 
 // NewContext encodes one host-issued callback context and its opaque token.
 func NewContext(token string, call extension.CallContext) Context {
-	out := Context{
-		Token:        token,
-		ExtensionID:  call.ExtensionID,
-		ComponentID:  call.ComponentID,
-		InstanceID:   call.InstanceID,
-		Lifetime:     call.Lifetime,
-		Scope:        call.Scope,
-		Revision:     call.Revision,
-		Section:      JSONBytes(call.Section),
-		SessionID:    call.SessionID,
-		OperationID:  call.OperationID,
-		InvocationID: call.InvocationID,
-		Purpose:      call.Purpose,
-		RequestID:    call.RequestID,
-		ToolCallID:   call.ToolCallID,
-		EffectID:     call.EffectID,
-	}
-	if call.Caller != (extension.CallerIdentity{}) {
-		out.Caller = &Caller{ExtensionID: call.Caller.ExtensionID, ComponentID: call.Caller.ComponentID, InstanceID: call.Caller.InstanceID}
-	}
-	return out
+	return Context{Token: token, callContextJSON: callContextFrom(call)}
 }
 
 // NewInstanceContext encodes one open or close callback view and its token.
 func NewInstanceContext(token string, instance extension.InstanceContext) Context {
 	return Context{
-		Token:        token,
-		ExtensionID:  instance.ExtensionID,
-		ComponentID:  instance.ComponentID,
-		InstanceID:   instance.InstanceID,
-		Lifetime:     instance.Lifetime,
-		Scope:        instance.Scope,
-		Revision:     instance.Revision,
-		Section:      JSONBytes(instance.Section),
-		SessionID:    instance.Scope.SessionID,
-		OperationID:  instance.Scope.OperationID,
-		InvocationID: instance.Scope.InvocationID,
-		Purpose:      instance.Scope.Purpose,
+		Token: token,
+		callContextJSON: callContextJSON{
+			ExtensionID:  instance.ExtensionID,
+			ComponentID:  instance.ComponentID,
+			InstanceID:   instance.InstanceID,
+			Lifetime:     instance.Lifetime,
+			Scope:        instance.Scope,
+			Revision:     instance.Revision,
+			Section:      JSONBytes(instance.Section),
+			SessionID:    instance.Scope.SessionID,
+			OperationID:  instance.Scope.OperationID,
+			InvocationID: instance.Scope.InvocationID,
+			Purpose:      instance.Scope.Purpose,
+		},
 	}
 }
 
@@ -81,46 +63,15 @@ func (c *Caller) value() extension.CallerIdentity {
 	return extension.CallerIdentity{ExtensionID: c.ExtensionID, ComponentID: c.ComponentID, InstanceID: c.InstanceID}
 }
 
-// Context is one host-issued callback routing context: the identities of the
-// originating activation/call and the opaque token that alone grants binding
-// access.
+// Context is one host-issued callback routing context: the shared call
+// identities plus the opaque token that alone grants binding access.
 type Context struct {
-	Token        string                  `json:"token"`
-	ExtensionID  string                  `json:"extension_id"`
-	ComponentID  string                  `json:"component_id"`
-	InstanceID   string                  `json:"instance_id"`
-	Lifetime     extension.Lifetime      `json:"lifetime"`
-	Scope        extension.ScopeIdentity `json:"scope"`
-	Revision     string                  `json:"revision"`
-	Section      JSONBytes               `json:"section,omitempty"`
-	SessionID    string                  `json:"session_id,omitempty"`
-	OperationID  string                  `json:"operation_id,omitempty"`
-	InvocationID string                  `json:"invocation_id,omitempty"`
-	Purpose      string                  `json:"purpose,omitempty"`
-	RequestID    string                  `json:"request_id,omitempty"`
-	ToolCallID   string                  `json:"tool_call_id,omitempty"`
-	EffectID     string                  `json:"effect_id,omitempty"`
-	Caller       *Caller                 `json:"caller,omitempty"`
+	Token string `json:"token"`
+	callContextJSON
 }
 
 func (c Context) callContext() extension.CallContext {
-	return extension.CallContext{
-		ExtensionID:  c.ExtensionID,
-		ComponentID:  c.ComponentID,
-		InstanceID:   c.InstanceID,
-		Lifetime:     c.Lifetime,
-		Scope:        c.Scope,
-		Revision:     c.Revision,
-		Section:      append(json.RawMessage(nil), c.Section...),
-		SessionID:    c.SessionID,
-		OperationID:  c.OperationID,
-		InvocationID: c.InvocationID,
-		Purpose:      c.Purpose,
-		RequestID:    c.RequestID,
-		ToolCallID:   c.ToolCallID,
-		EffectID:     c.EffectID,
-		Caller:       c.Caller.value(),
-	}
+	return callContextValue(c.callContextJSON)
 }
 
 // Target addresses a metadata capability or one opened instance capability.
@@ -1471,24 +1422,6 @@ type hookFailureJSON struct {
 	Evidence harness.ExecutionEvidence `json:"evidence"`
 }
 
-// EncodeHookResult encodes one effectful hook result envelope through the
-// common result codec: a success value or a failure carrying the hook failure
-// data.
-func EncodeHookResult(value json.RawMessage, failure *HookFailure) (json.RawMessage, error) {
-	if failure == nil {
-		return EncodeServiceResult(extension.Result{Value: value})
-	}
-	data, err := marshalValue(hookFailureJSON{Status: failure.Status, Evidence: failure.Evidence})
-	if err != nil {
-		return nil, err
-	}
-	return EncodeServiceResult(extension.Result{Failure: &extension.Failure{
-		Code:    string(failure.Status),
-		Message: failure.Message,
-		Data:    data,
-	}})
-}
-
 // DecodeHookResult decodes one effectful hook result envelope: either the
 // success value or a typed failure with its status, evidence and message.
 func DecodeHookResult(raw json.RawMessage) (json.RawMessage, *HookFailure, error) {
@@ -1506,19 +1439,6 @@ func DecodeHookResult(raw json.RawMessage) (json.RawMessage, *HookFailure, error
 	return nil, &HookFailure{Status: data.Status, Evidence: data.Evidence, Message: result.Failure.Message}, nil
 }
 
-// EncodeRequestHookOutcome encodes one effectful request hook's result
-// envelope.
-func EncodeRequestHookOutcome(value harness.RequestConsequence, failure *HookFailure) (json.RawMessage, error) {
-	if failure != nil {
-		return EncodeHookResult(nil, failure)
-	}
-	encoded, err := EncodeRequestHookResult(value)
-	if err != nil {
-		return nil, err
-	}
-	return EncodeHookResult(encoded, nil)
-}
-
 // DecodeRequestHookOutcome decodes one effectful request hook's result
 // envelope into its typed consequence or typed failure.
 func DecodeRequestHookOutcome(raw json.RawMessage) (harness.RequestConsequence, *HookFailure, error) {
@@ -1531,19 +1451,6 @@ func DecodeRequestHookOutcome(raw json.RawMessage) (harness.RequestConsequence, 
 		return harness.RequestConsequence{}, nil, err
 	}
 	return consequence, nil, nil
-}
-
-// EncodeBeforeToolHookOutcome encodes one effectful before-tool hook's result
-// envelope.
-func EncodeBeforeToolHookOutcome(value json.RawMessage, failure *HookFailure) (json.RawMessage, error) {
-	if failure != nil {
-		return EncodeHookResult(nil, failure)
-	}
-	encoded, err := EncodeArguments(value)
-	if err != nil {
-		return nil, err
-	}
-	return EncodeHookResult(encoded, nil)
 }
 
 // DecodeBeforeToolHookOutcome decodes one effectful before-tool hook's result
@@ -1560,14 +1467,18 @@ func DecodeBeforeToolHookOutcome(raw json.RawMessage) (json.RawMessage, *HookFai
 	return arguments, nil, nil
 }
 
-// HookFailureFromError maps one effectful hook author error to its ordinary
-// observed failure. Author errors are never interpreted as harness
-// infrastructure knowledge.
+// HookFailureFromError maps one effectful hook author error through the
+// harness's closed interruption/knowledge predicates, so a worker hook settles
+// exactly like the same native hook.
 func HookFailureFromError(err error) *HookFailure {
 	if err == nil {
 		return nil
 	}
-	return &HookFailure{Status: HookStatusError, Evidence: harness.ExecutionObserved, Message: err.Error()}
+	status := HookStatusError
+	if harness.EffectInterrupted(err) {
+		status = HookStatusInterrupted
+	}
+	return &HookFailure{Status: status, Evidence: harness.DeclaredExecutionKnowledge(err), Message: err.Error()}
 }
 
 func usageFrom(v *model.Usage) *harness.UsageCount {

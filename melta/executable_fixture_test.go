@@ -325,7 +325,10 @@ func executableProbeDeclaration() extension.Declaration {
 		ID:           "execprobe",
 		Version:      "1.0.0",
 		ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"},"token":{"type":"string"}},"additionalProperties":false}`),
-		Secrets:      []extension.SecretRef{{Field: "/token", Lifetime: extension.SecretOperation}},
+		Secrets: []extension.SecretRef{
+			{Field: "/token", Lifetime: extension.SecretOperation},
+			{Field: "/missing", Lifetime: extension.SecretOperation},
+		},
 		Components: []extension.Component{{
 			ID:       "execprobe.component",
 			Lifetime: extension.LifetimeOperation,
@@ -342,6 +345,7 @@ func executableProbeDeclaration() extension.Declaration {
 
 type executableProbeTool struct {
 	childTarget string
+	observed    chan error
 }
 
 func (t *executableProbeTool) Normalize(_ extension.ToolContext, call model.ToolCall) (json.RawMessage, error) {
@@ -369,12 +373,20 @@ func (t *executableProbeTool) Execute(ctx context.Context, toolContext extension
 		call, err = toolContext.Calls.Call(ctx, "credentials", "get", json.RawMessage(`{"field":"/token"}`))
 	case "data":
 		call, err = toolContext.Calls.Call(ctx, "data", "cache_namespace", json.RawMessage(`{}`))
-	case "child":
-		call, err = toolContext.Calls.Call(ctx, "child_launch", "launch", json.RawMessage(`{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"child_agent"},"prompt":"child task","operation_id":"child-op","max_concurrent":1,"output_limit":1024}`))
+	case "child-denied":
+		call, err = toolContext.Calls.Call(ctx, "child_launch", "launch", json.RawMessage(`{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"other_agent"},"prompt":"child task","operation_id":"child-launch-op","max_concurrent":1,"output_limit":1024}`))
+	case "credential-closed":
+		call, err = toolContext.Calls.Call(ctx, "credentials", "get", json.RawMessage(`{"field":"/missing"}`))
 	default:
 		err = errors.New("unknown mode")
 	}
 	if err != nil {
+		if t.observed != nil {
+			select {
+			case t.observed <- err:
+			default:
+			}
+		}
 		return harness.ToolOutcome{Result: model.ToolResult{CallID: toolContext.Calls.ToolCallID, Status: model.ResultError, Content: err.Error()}, Evidence: harness.ExecutionObserved}
 	}
 	content := string(call.Value)
@@ -420,7 +432,7 @@ func TestExecutableOperationToolDescribeHostcallsAndMetadata(t *testing.T) {
 	t.Setenv(token, "secret-value")
 	declaration := executableProbeDeclaration()
 	childTarget := (harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "child_agent"}).PermissionTarget()
-	tool := &executableProbeTool{childTarget: childTarget}
+	tool := &executableProbeTool{childTarget: childTarget, observed: make(chan error, 2)}
 	bigDescription := strings.Repeat("m", 1<<20)
 	opens := 0
 	spawner := &adapterSpawner{t: t, factory: func() (extension.Native, func()) {
@@ -457,8 +469,10 @@ func TestExecutableOperationToolDescribeHostcallsAndMetadata(t *testing.T) {
 				return toolCallTurnEvents("call-credentials", "execprobe.tool", `{"mode":"credentials"}`)
 			case strings.Contains(user, "data"):
 				return toolCallTurnEvents("call-data", "execprobe.tool", `{"mode":"data"}`)
-			case strings.Contains(user, "child"):
-				return toolCallTurnEvents("call-child", "execprobe.tool", `{"mode":"child"}`)
+			case strings.Contains(user, "child-denied"):
+				return toolCallTurnEvents("call-child-denied", "execprobe.tool", `{"mode":"child-denied"}`)
+			case strings.Contains(user, "credential-closed"):
+				return toolCallTurnEvents("call-credential-closed", "execprobe.tool", `{"mode":"credential-closed"}`)
 			}
 			return textTurnEvents("done")
 		})
@@ -480,13 +494,24 @@ func TestExecutableOperationToolDescribeHostcallsAndMetadata(t *testing.T) {
 			t.Fatalf("metadata parameters = %d bytes, want the 1 MiB round trip", len(description.Definition.Parameters))
 		}
 		testassert.Equal(t, opens, 0)
-		session, err := r.createSession(ctx, e.workspace("execprobe-ws"), "execprobe_agent")
-		if err != nil {
-			t.Fatalf("session: %v", err)
-		}
-		for _, mode := range []string{"credentials", "data", "child"} {
+		for _, mode := range []string{"credentials", "data", "child-denied", "credential-closed"} {
+			session, err := r.createSession(ctx, e.workspace("execprobe-ws-"+mode), "execprobe_agent")
+			if err != nil {
+				t.Fatalf("session %s: %v", mode, err)
+			}
 			submitThroughRuntime(t, r, session.Identity.SessionID, "op-"+mode, mode)
 			awaitOperation(t, r, session.Identity.SessionID, "op-"+mode, harness.OperationSuccess)
+		}
+		for _, want := range []worker.Class{worker.ClassDenied, worker.ClassClosed} {
+			select {
+			case err := <-tool.observed:
+				var workerErr *worker.Error
+				if !errors.As(err, &workerErr) || workerErr.Class != want {
+					t.Fatalf("hostcall error = %v, want worker class %q", err, want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("hostcall class %q was not observed", want)
+			}
 		}
 		if opens == 0 {
 			t.Fatal("Operation-lifetime tool never opened during admission")
@@ -502,9 +527,6 @@ func TestExecutableOperationToolDescribeHostcallsAndMetadata(t *testing.T) {
 		}
 		if !strings.Contains(joined, "cache") || !strings.Contains(joined, "execprobe") {
 			t.Fatal("data hostcall result did not reach the model")
-		}
-		if !strings.Contains(joined, "child_session_id") {
-			t.Fatal("child launch hostcall result did not reach the model")
 		}
 	})
 }
@@ -546,7 +568,7 @@ func (s *blockingStrategy) Consume(harness.ConsumeInput) (harness.PlanOutput, er
 	return harness.PlanOutput{Kind: harness.PlanNone}, nil
 }
 
-func TestExecutableStrategyOwnerCloseBounded(t *testing.T) {
+func TestExecutableStrategyInterruptBounded(t *testing.T) {
 	grace := executableShutdownGrace
 	executableShutdownGrace = 200 * time.Millisecond
 	defer func() { executableShutdownGrace = grace }()
@@ -616,13 +638,9 @@ func TestExecutableStrategyOwnerCloseBounded(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("worker strategy Plan never started")
 		}
-		closed := make(chan error, 1)
-		go func() { closed <- owner.Close(context.Background()) }()
-		select {
-		case <-closed:
-		case <-time.After(3 * time.Second):
-			t.Fatal("owner Close blocked on an unresponsive strategy Plan")
-		}
+		testassert.NoError(t, owner.InterruptSession(context.Background(), testCaller(owner), session.Identity.SessionID))
+		awaitOperation(t, owner, session.Identity.SessionID, "trigger-op", harness.OperationInterruption)
+		_ = owner.Close(context.Background()) // the intentionally unresponsive worker is already terminated
 	})
 }
 

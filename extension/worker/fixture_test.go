@@ -136,8 +136,11 @@ func TestFixtureWorkerActivateAndDescribeOverPipes(t *testing.T) {
 		t.Fatalf("encoding describe input: %v", err)
 	}
 	call, err := json.Marshal(worker.CallParams{
-		Target:    worker.Target{Kind: worker.TargetMetadata, CapabilityID: "fixture.tool"},
-		Context:   worker.Context{Token: "metadata-token", ExtensionID: "fixture", ComponentID: "fixture.component", InstanceID: "metadata", Lifetime: extension.LifetimeHarness, Scope: extension.ScopeIdentity{Kind: extension.LifetimeHarness, Revision: "rev-1"}, Revision: "rev-1"},
+		Target: worker.Target{Kind: worker.TargetMetadata, CapabilityID: "fixture.tool"},
+		Context: worker.NewContext("metadata-token", extension.CallContext{
+			ExtensionID: "fixture", ComponentID: "fixture.component", InstanceID: "metadata",
+			Lifetime: extension.LifetimeHarness, Scope: extension.ScopeIdentity{Kind: extension.LifetimeHarness, Revision: "rev-1"}, Revision: "rev-1",
+		}),
 		Method:    "describe",
 		Arguments: worker.JSONBytes(arguments),
 	})

@@ -74,23 +74,8 @@ var spawnExecutable = func(_ context.Context, path string, environment []string)
 type executableSupervisor struct {
 	environment func(context.Context, []string) ([]string, error)
 
-	// owner is the Melta work context, cancelled when shutdown begins. It is
-	// the cancellation source for context-free strategy requests.
-	owner context.Context
-
 	mu          sync.Mutex
 	activations map[string]*executableActivation
-}
-
-// setOwner records the owner work context before any activation is used.
-func (s *executableSupervisor) setOwner(owner context.Context) { s.owner = owner }
-
-// requestContext is the owner lifetime's cancellation source.
-func (s *executableSupervisor) requestContext() context.Context {
-	if s.owner != nil {
-		return s.owner
-	}
-	return context.Background()
 }
 
 func newExecutableSupervisor(environment func(context.Context, []string) ([]string, error)) *executableSupervisor {
@@ -752,7 +737,7 @@ func (a *executableActivation) hostcall(frame worker.Frame) error {
 		a.mu.Unlock()
 		cancel()
 		if err != nil {
-			a.respondError(frame.ID, worker.Classify(err))
+			a.respondError(frame.ID, executableFailure(err))
 			return
 		}
 		a.respondResult(frame.ID, result)
@@ -764,10 +749,17 @@ func (a *executableActivation) hostcall(frame worker.Frame) error {
 func (a *executableActivation) respondResult(id string, result extension.Result) {
 	encoded, err := worker.EncodeServiceResult(result)
 	if err != nil {
-		a.respondError(id, worker.Classify(err))
+		a.respondError(id, executableFailure(err))
 		return
 	}
 	a.respondFrame(worker.Frame{Kind: worker.KindResponse, ID: id, Result: encoded})
+}
+
+// executableFailure renders one host failure with the same closed class both
+// sides use: melta.ErrorCode is the one classifier, and worker classes are the
+// public error codes.
+func executableFailure(err error) *worker.Error {
+	return &worker.Error{Class: worker.Class(ErrorCode(err)), Message: err.Error()}
 }
 
 func (a *executableActivation) respondError(id string, failure *worker.Error) {

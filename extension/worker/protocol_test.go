@@ -620,9 +620,13 @@ func TestEffectfulHookResultUnionCodec(t *testing.T) {
 		Messages:  []model.Message{},
 		ToolNames: []string{"tool-a"},
 	}
-	raw, err := worker.EncodeRequestHookOutcome(consequence, nil)
+	encodedConsequence, err := worker.EncodeRequestHookResult(consequence)
 	if err != nil {
 		t.Fatalf("encoding request hook success: %v", err)
+	}
+	raw, err := worker.EncodeServiceResult(extension.Result{Value: encodedConsequence})
+	if err != nil {
+		t.Fatalf("encoding request hook success envelope: %v", err)
 	}
 	var successEnvelope struct {
 		Value worker.JSONBytes `json:"value"`
@@ -637,9 +641,16 @@ func TestEffectfulHookResultUnionCodec(t *testing.T) {
 	}
 
 	failureValue := &worker.HookFailure{Status: worker.HookStatusInterrupted, Evidence: harness.ExecutionObserved, Message: "interrupted hook failure"}
-	raw, err = worker.EncodeRequestHookOutcome(harness.RequestConsequence{}, failureValue)
+	failureData, err := json.Marshal(struct {
+		Status   worker.HookStatus         `json:"status"`
+		Evidence harness.ExecutionEvidence `json:"evidence"`
+	}{Status: failureValue.Status, Evidence: failureValue.Evidence})
 	if err != nil {
-		t.Fatalf("encoding request hook failure: %v", err)
+		t.Fatalf("encoding request hook failure data: %v", err)
+	}
+	raw, err = worker.EncodeServiceResult(extension.Result{Failure: &extension.Failure{Code: string(failureValue.Status), Message: failureValue.Message, Data: failureData}})
+	if err != nil {
+		t.Fatalf("encoding request hook failure envelope: %v", err)
 	}
 	var failureEnvelope struct {
 		Failure struct {
@@ -661,9 +672,13 @@ func TestEffectfulHookResultUnionCodec(t *testing.T) {
 	}
 
 	arguments := json.RawMessage("{\n  \"text\": \"<a>&b\"\n}")
-	raw, err = worker.EncodeBeforeToolHookOutcome(arguments, nil)
+	encodedArguments, err := worker.EncodeArguments(arguments)
 	if err != nil {
 		t.Fatalf("encoding before-tool hook success: %v", err)
+	}
+	raw, err = worker.EncodeServiceResult(extension.Result{Value: encodedArguments})
+	if err != nil {
+		t.Fatalf("encoding before-tool hook success envelope: %v", err)
 	}
 	decodedArguments, failure, err := worker.DecodeBeforeToolHookOutcome(raw)
 	if err != nil || failure != nil || !bytes.Equal(decodedArguments, arguments) {

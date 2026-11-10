@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 
+	"github.com/MMinasyan/lightcode/extension"
+	"github.com/MMinasyan/lightcode/extension/worker"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -15,6 +17,14 @@ import (
 // unclassified error is internal. Producer-owned partial results use the same
 // mapping, so HTTP never uniquely supplies classification of a private error.
 func ErrorCode(err error) protocol.ErrorCode {
+	var workerErr *worker.Error
+	if errors.As(err, &workerErr) {
+		code := protocol.ErrorCode(workerErr.Class)
+		if code.Valid() {
+			return code
+		}
+		return protocol.ErrorCodeInternal
+	}
 	switch {
 	case errors.Is(err, ErrDenied):
 		return protocol.ErrorCodeDenied
@@ -28,7 +38,7 @@ func ErrorCode(err error) protocol.ErrorCode {
 		return protocol.ErrorCodeConflict
 	case errors.Is(err, harness.ErrIncompatible):
 		return protocol.ErrorCodeIncompatible
-	case errors.Is(err, ErrClosed):
+	case errors.Is(err, ErrClosed), errors.Is(err, extension.ErrClosed):
 		return protocol.ErrorCodeClosed
 	case errors.Is(err, harness.ErrCorrupt):
 		return protocol.ErrorCodeCorrupt

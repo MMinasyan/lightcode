@@ -209,7 +209,6 @@ func open(ctx context.Context, options options) (*Melta, error) {
 		return nil, fmt.Errorf("data directory %s: %w", dataDir, ErrOwned)
 	}
 	work, cancelWork := context.WithCancel(ctx)
-	supervisor.setOwner(work)
 	packages := newPackageManager(dataDir)
 	if err := packages.load(supervisor.native); err != nil {
 		cancelWork()
