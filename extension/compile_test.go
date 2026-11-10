@@ -438,6 +438,12 @@ func TestFailurePayloadPresenceSemantics(t *testing.T) {
 	if err := ValidateResult(methods, "bare", bare); err != nil {
 		t.Fatalf("bare failure: %v", err)
 	}
+	if err := ValidateResult(methods, "data", Result{Failure: &Failure{Code: "invalid", Message: "bad", Data: json.RawMessage{}}}); err != nil {
+		t.Fatalf("zero-length failure data should be absent: %v", err)
+	}
+	if err := ValidateResult(methods, "partial", Result{Failure: &Failure{Code: "invalid", Message: "bad", Partial: json.RawMessage{}}}); err != nil {
+		t.Fatalf("zero-length partial result should be absent: %v", err)
+	}
 	if err := ValidateResult(methods, "data", Result{Failure: &Failure{Code: "invalid", Message: "bad", Data: json.RawMessage(`{"reason":"x"}`)}}); err != nil {
 		t.Fatalf("declared data: %v", err)
 	}
@@ -1015,5 +1021,83 @@ func TestCompileDoesNotReuseSchemaForSameLabelDifferentBytes(t *testing.T) {
 	}
 	if err := ValidateArguments(secondService.Methods, "call", json.RawMessage(`"x"`)); err != nil {
 		t.Fatalf("string input schema rejected \"x\": %v", err)
+	}
+}
+
+func TestCompileNativeSkipsBindingResolution(t *testing.T) {
+	foreign := ServiceCapability("foreign", "test.foreign/v1", ServiceIOMethod("call", `{"type":"object"}`, `{"type":"null"}`))
+	local := ServiceCapability("local", "test.local/v1", ServiceIOMethod("call", `{"type":"object"}`, `{"type":"null"}`))
+	native := testNative("ext", LifetimeHarness, []Capability{local}, []Binding{{
+		Name:         "dep",
+		Provider:     "other",
+		CapabilityID: "foreign",
+		Definition:   foreign.Definition(),
+	}}, func(context.Context, InstanceContext) (Instance, error) {
+		return Instance{Capabilities: map[string]Implementation{
+			"local": {Service: map[string]Handler{"call": func(context.Context, CallContext, json.RawMessage) (Result, error) {
+				return Result{Value: json.RawMessage("null")}, nil
+			}}},
+		}}, nil
+	})
+	if _, err := Compile([]Native{native}); err == nil {
+		t.Fatal("full compilation resolved a provider outside the native set")
+	}
+	compiled, err := CompileNative(native)
+	if err != nil {
+		t.Fatalf("CompileNative rejected a declaration binding another extension: %v", err)
+	}
+	declaration, ok := compiled.Declaration("ext")
+	if !ok {
+		t.Fatal("CompileNative dropped the declaration")
+	}
+	complete := Instance{Capabilities: map[string]Implementation{
+		"local": {Service: map[string]Handler{"call": func(context.Context, CallContext, json.RawMessage) (Result, error) {
+			return Result{Value: json.RawMessage("null")}, nil
+		}}},
+	}}
+	if err := declaration.ValidateInstance("ext-c", complete); err != nil {
+		t.Fatalf("complete instance rejected: %v", err)
+	}
+	if err := declaration.ValidateInstance("ext-c", Instance{}); err == nil {
+		t.Fatal("incomplete instance accepted")
+	}
+	if err := compiled.ValidateInstance("ext", "ext-c", complete); err != nil {
+		t.Fatalf("compiled ValidateInstance rejected the same complete instance: %v", err)
+	}
+}
+
+func TestCompileNativeValidatesMetadataCallbacks(t *testing.T) {
+	native := Native{
+		Declaration: Declaration{
+			ID:           "ext",
+			Version:      "1",
+			ConfigSchema: json.RawMessage(`{"type":"object"}`),
+			Components:   []Component{{ID: "c", Lifetime: LifetimeHarness, Provides: []string{"tool"}}},
+			Capabilities: []Capability{ToolCapability("tool")},
+		},
+		Open: func(context.Context, InstanceContext) (Instance, error) { return Instance{}, nil },
+	}
+	if _, err := CompileNative(native); err == nil {
+		t.Fatal("CompileNative accepted a tool without a describe callback")
+	}
+}
+
+func TestValidateResultEnvelopeShared(t *testing.T) {
+	for _, row := range []struct {
+		name   string
+		result Result
+		ok     bool
+	}{
+		{"success", Result{Value: json.RawMessage("null")}, true},
+		{"present empty success", Result{Value: json.RawMessage{}}, true},
+		{"failure", Result{Failure: &Failure{Code: "x", Message: "y"}}, true},
+		{"both", Result{Value: json.RawMessage("null"), Failure: &Failure{Code: "x", Message: "y"}}, false},
+		{"neither", Result{}, false},
+		{"empty code", Result{Failure: &Failure{Code: "", Message: "y"}}, false},
+		{"empty message", Result{Failure: &Failure{Code: "x", Message: ""}}, false},
+	} {
+		if err := ValidateResultEnvelope(row.result); (err == nil) != row.ok {
+			t.Fatalf("%s: ValidateResultEnvelope = %v, want ok=%v", row.name, err, row.ok)
+		}
 	}
 }
