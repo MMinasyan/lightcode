@@ -126,25 +126,28 @@ func TestExecutableFixtureEndToEnd(t *testing.T) {
 		Model:    model.ModelRef{Provider: "provider", Model: "model"},
 		Assembly: promptAssembly(),
 	})
-	if err != nil || consequence.Prompt != nil {
-		t.Fatalf("preparation hook = %+v, %v", consequence, err)
+	wantPrompt := "fixture-preparation:" + hashHex([]byte("provider/model:"))
+	if err != nil || consequence.Prompt == nil || *consequence.Prompt != wantPrompt {
+		t.Fatalf("preparation hook = %+v, %v, want %q", consequence, err, wantPrompt)
 	}
 	request, err := hooks.Request(context.Background(), hookContext, harness.RequestHookInput{RequestID: "request-1"})
-	if err != nil || request.Prompt != nil {
-		t.Fatalf("request hook = %+v, %v", request, err)
+	if err != nil || request.Prompt != nil || request.ToolNames == nil || len(request.ToolNames) != 0 {
+		t.Fatalf("request hook = %+v, %v, want the empty visible subset", request, err)
 	}
+	wantArguments := json.RawMessage(`{"hooked":"{\"value\":1}"}`)
 	arguments, err := hooks.BeforeTool(context.Background(), hookContext, call)
-	if err != nil || string(arguments) != string(call.Arguments) {
-		t.Fatalf("before-tool hook = %q, %v", arguments, err)
+	if err != nil || string(arguments) != string(wantArguments) {
+		t.Fatalf("before-tool hook = %q, %v, want %q", arguments, err, wantArguments)
 	}
+	wantShaped := "fixture-shaped:" + hashHex([]byte("raw")) + ":raw"
 	shaped, err := hooks.AfterTool(context.Background(), hookContext, harness.ToolOutputInput{Content: "raw"})
-	if err != nil || shaped != "raw" {
-		t.Fatalf("after-tool hook = %q, %v", shaped, err)
+	if err != nil || shaped != wantShaped {
+		t.Fatalf("after-tool hook = %q, %v, want %q", shaped, err, wantShaped)
 	}
 	strategy := snapshot.resources.runtime.capabilities["fixture.strategy"].implementation.Strategy
 	planOutput, err := strategy.Plan(harness.PlanInput{})
-	if err != nil || planOutput.Kind != harness.PlanNone {
-		t.Fatalf("strategy plan = %+v, %v", planOutput, err)
+	if err != nil || planOutput.Kind != harness.PlanModel || planOutput.Model == nil || len(planOutput.Model.State) == 0 || len(planOutput.Model.Request.Messages) != 1 || !strings.HasPrefix(messageText(planOutput.Model.Request.Messages[0]), "fixture-plan:") {
+		t.Fatalf("strategy plan = %+v, %v, want an input-derived model plan with state", planOutput, err)
 	}
 
 	// The fixture declaration and its process participate in the ordinary
@@ -563,4 +566,14 @@ func TestExecutableStrategyOwnerCloseBounded(t *testing.T) {
 			t.Fatal("owner Close blocked on an unresponsive strategy Plan")
 		}
 	})
+}
+
+// messageText returns one message's first text part.
+func messageText(message model.Message) string {
+	for _, part := range message.Content {
+		if part.Kind == model.PartText {
+			return part.Text
+		}
+	}
+	return ""
 }

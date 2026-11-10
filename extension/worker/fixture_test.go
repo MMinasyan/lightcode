@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -70,8 +71,9 @@ func TestFixtureWorkerActivateAndDescribeOverPipes(t *testing.T) {
 	if activation.Declaration.ID != "fixture" || activation.Declaration.Version != "1.0.0" {
 		t.Fatalf("activation declaration = %+v", activation.Declaration)
 	}
-	if len(activation.Described) != 1 || activation.Described[0] != "fixture.tool" {
-		t.Fatalf("described = %v, want the fixture tool", activation.Described)
+	wantDescribed := []string{"fixture.tool", "fixture.tool.invocation", "fixture.tool.operation", "fixture.tool.workspace"}
+	if !slices.Equal(activation.Described, wantDescribed) {
+		t.Fatalf("described = %v, want the shared fixture tools", activation.Described)
 	}
 	if len(activation.Declaration.ConfigSchema) == 0 {
 		t.Fatal("fixture declaration has no config schema")

@@ -18,6 +18,10 @@ import (
 
 const publicModule = "github.com/MMinasyan/lightcode"
 
+// fixturePkg is the one test-support package an executable fixture may
+// import; it holds the shared native definition both transports serve.
+const fixturePkg = publicModule + "/extension/worker/testdata/fixture/native"
+
 // sqliteDriverPkg is the one third-party dependency the foundation permits:
 // the SQLite driver is confined to internal/storage.
 const sqliteDriverPkg = "github.com/mattn/go-sqlite3"
@@ -191,6 +195,11 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 	// concrete implementation package.
 	if dir == "extension/worker" || strings.HasPrefix(dir, "extension/worker/") {
 		for _, imp := range imports {
+			// The executable fixture is the one test-support consumer of the
+			// shared native definition; no protocol file may reach it.
+			if imp == fixturePkg && dir == "extension/worker/testdata/fixture" {
+				continue
+			}
 			if imp != modelPkg && imp != harnessPkg && imp != promptPkg && imp != protocolPkg && imp != extensionPkg && imp != workerPkg && !std[imp] {
 				problems = append(problems, rel+": extension/worker imports "+imp+"; the shared worker protocol may import only the standard library and the public "+modelPkg+", "+harnessPkg+", "+promptPkg+", "+protocolPkg+" and "+extensionPkg+" contracts, never the Runtime/MELTA owner or a concrete implementation package")
 			}
@@ -423,6 +432,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 		publicModule + "/internal/agent", publicModule + "/internal/storage", sqliteDriverPkg,
 		publicModule + "/internal/plugins", publicModule + "/extensions/agents",
 		publicModule + "/extensions/adaptation", "github.com/santhosh-tekuri/jsonschema/v6",
+		fixturePkg,
 	} {
 		{
 			problems := checkTrackedGoFile("extension/worker/x.go", []string{imp}, std)
@@ -433,7 +443,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 		problems := checkTrackedGoFile("extension/worker/testdata/fixture/main.go", []string{
 			"context", "encoding/json", "fmt", "os",
 			publicModule + "/extension", publicModule + "/extension/worker",
-			publicModule + "/harness", publicModule + "/model",
+			fixturePkg, publicModule + "/harness", publicModule + "/model",
 		}, std)
 		testassert.Check(t, len(problems) == 0, "allowed fixture imports flagged: %v", problems)
 	}
