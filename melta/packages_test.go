@@ -125,6 +125,25 @@ func TestPackageInstallRejectsEscapingAndSymlinkedEntryPoints(t *testing.T) {
 		}
 	})
 
+	t.Run("symlinked intermediate directory outside", func(t *testing.T) {
+		dataDir := t.TempDir()
+		source := writeSource(t, filepath.Join("bin", "worker"))
+		outsideDir := t.TempDir()
+		outside := filepath.Join(outsideDir, "outside-worker")
+		if err := os.WriteFile(outside, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+			t.Fatalf("outside executable: %v", err)
+		}
+		if err := os.Symlink(outsideDir, filepath.Join(source, "bin")); err != nil {
+			t.Fatalf("symlink intermediate directory: %v", err)
+		}
+		_, err := newPackageManager(dataDir).install(source)
+		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "install symlinked intermediate directory = %v, want invalid", err)
+		mustNotExist(t, filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "selected"), "a symlinked intermediate directory created a selection")
+		if data, err := os.ReadFile(outside); err != nil || string(data) != "#!/bin/sh\nexit 0\n" {
+			t.Fatalf("outside executable = %q, %v", data, err)
+		}
+	})
+
 	t.Run("not executable", func(t *testing.T) {
 		dataDir := t.TempDir()
 		source := writeSource(t, "worker")
@@ -149,6 +168,154 @@ func manifestWithEntry(t *testing.T, declaration extension.Declaration, entryPoi
 		t.Fatalf("encode manifest: %v", err)
 	}
 	return encoded
+}
+
+// TestPackageInstallAcceptsSymlinkedSourceAncestor proves the operator's
+// source root is opened once as a root, so a symlinked path to the package
+// directory is accepted while the two consumed files stay root-confined.
+func TestPackageInstallAcceptsSymlinkedSourceAncestor(t *testing.T) {
+	declaration := toolOnlyDeclaration()
+	realRoot := t.TempDir()
+	source := filepath.Join(realRoot, "package")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	if err := writePackageSourceFiles(t, source, declaration, "1.0.0", "worker"); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	aliasRoot := t.TempDir()
+	alias := filepath.Join(aliasRoot, "alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Fatalf("symlink source ancestor: %v", err)
+	}
+	dataDir := t.TempDir()
+	if _, err := newPackageManager(dataDir).install(filepath.Join(alias, "package")); err != nil {
+		t.Fatalf("install through a symlinked source ancestor: %v", err)
+	}
+	testassert.Equal(t, readSelectedRecord(t, dataDir, declaration.ID).Version, "1.0.0")
+}
+
+// TestPackageInstallAcceptsHardlinkedEntryPoint proves a hardlinked source
+// entry point is not given a second refusal rule beyond the root's path
+// containment.
+func TestPackageInstallAcceptsHardlinkedEntryPoint(t *testing.T) {
+	declaration := toolOnlyDeclaration()
+	outside := filepath.Join(t.TempDir(), "outside-worker")
+	if err := os.WriteFile(outside, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("outside executable: %v", err)
+	}
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "manifest.json"), manifestWithEntry(t, declaration, "worker"), 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := os.Link(outside, filepath.Join(source, "worker")); err != nil {
+		t.Fatalf("hardlink entry point: %v", err)
+	}
+	dataDir := t.TempDir()
+	if _, err := newPackageManager(dataDir).install(source); err != nil {
+		t.Fatalf("install hardlinked entry point: %v", err)
+	}
+	testassert.Equal(t, readSelectedRecord(t, dataDir, declaration.ID).Version, "1.0.0")
+}
+
+// TestPackageInstallAcceptsEntrySymlinkInsideSource proves a source entry
+// symlink that resolves inside the opened root is accepted.
+func TestPackageInstallAcceptsEntrySymlinkInsideSource(t *testing.T) {
+	declaration := toolOnlyDeclaration()
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "manifest.json"), manifestWithEntry(t, declaration, "worker"), 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "real-worker"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("real entry point: %v", err)
+	}
+	if err := os.Symlink("real-worker", filepath.Join(source, "worker")); err != nil {
+		t.Fatalf("inside entry symlink: %v", err)
+	}
+	dataDir := t.TempDir()
+	if _, err := newPackageManager(dataDir).install(source); err != nil {
+		t.Fatalf("install entry symlink inside source: %v", err)
+	}
+	testassert.Equal(t, readSelectedRecord(t, dataDir, declaration.ID).Version, "1.0.0")
+}
+
+// TestPackageInstallRejectsBindingSchemaExternalReference proves installation
+// compiles every binding-definition schema, so a non-local $ref is refused
+// before any selection exists.
+func TestPackageInstallRejectsBindingSchemaExternalReference(t *testing.T) {
+	credentials, ok := extension.HostCapability(extension.ContractCredentials)
+	testassert.Require(t, ok, "credentials host capability is missing")
+	credentials.Methods[0].Input = json.RawMessage(`{"$ref":"https://example.invalid/schema.json"}`)
+	declaration := extension.Declaration{
+		ID:           "bindingref",
+		Version:      "1.0.0",
+		ConfigSchema: json.RawMessage(`{"type":"object"}`),
+		Components: []extension.Component{{
+			ID:       "bindingref.component",
+			Lifetime: extension.LifetimeHarness,
+			Requires: []extension.Binding{{
+				Name:         "credentials",
+				Provider:     extension.HostProvider,
+				CapabilityID: extension.ContractCredentials,
+				Definition:   credentials,
+			}},
+		}},
+	}
+	dataDir := t.TempDir()
+	source := executablePackageSource(t, executableExtension{Declaration: declaration, EntryPoint: "worker"})
+	_, err := newPackageManager(dataDir).install(source)
+	testassert.Require(t, errors.Is(err, harness.ErrInvalid), "install binding schema external reference = %v, want invalid", err)
+	mustNotExist(t, filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "selected"), "a binding schema external reference created a selection")
+}
+
+// TestPackageSelectedDeclarationFailureIsUnusable proves a selected copy
+// whose declaration fails compilation at load is recorded unusable: an
+// enabled section rejects the build and a disabled one is ignored.
+func TestPackageSelectedDeclarationFailureIsUnusable(t *testing.T) {
+	declaration := toolOnlyDeclaration()
+	dataDir := t.TempDir()
+	configPath := filepath.Join(dataDir, "config.json")
+	source := t.TempDir()
+	if err := writePackageSourceFiles(t, source, declaration, "1.0.0", "worker"); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if _, err := newPackageManager(dataDir).install(source); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	selected := readSelectedRecord(t, dataDir, declaration.ID)
+	manifestPath := filepath.Join(dataDir, "extensions", extensionDataHash(declaration.ID), "packages", selected.Digest, "manifest.json")
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read installed manifest: %v", err)
+	}
+	var manifest worker.Manifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		t.Fatalf("decode installed manifest: %v", err)
+	}
+	manifest.Declaration.ConfigSchema = worker.JSONBytes("not-json")
+	corrupt, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("encode corrupt manifest: %v", err)
+	}
+	if err := os.WriteFile(manifestPath, corrupt, 0o600); err != nil {
+		t.Fatalf("write corrupt manifest: %v", err)
+	}
+
+	writeServiceFile(t, configPath, `{"extensions":{"peer":{"enabled":true}}}`)
+	_, err = open(context.Background(), options{
+		DataDir:       dataDir,
+		Configuration: NewFileConfigurationSource(configPath),
+		Credentials:   NewEnvironmentCredentialSource(filepath.Join(dataDir, ".env")),
+	})
+	testassert.Require(t, errors.Is(err, ErrConfiguration), "open with an enabled uncompilable package = %v, want configuration failure", err)
+
+	writeServiceFile(t, configPath, `{"extensions":{"peer":{"enabled":false}}}`)
+	owner := openPackageOwner(t, dataDir, configPath)
+	caller := packageCaller(t, owner)
+	row := packageRow(t, owner, caller, declaration.ID)
+	testassert.Equal(t, row.LoadedVersion, "")
+	testassert.Equal(t, row.SelectedVersion, "1.0.0")
+	testassert.NoError(t, owner.Close(context.Background()))
 }
 
 // TestPackageInstallRejectsPlantedDestinationSymlink proves a symlinked

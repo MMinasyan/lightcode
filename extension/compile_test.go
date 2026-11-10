@@ -125,6 +125,20 @@ func TestCompileRejectsContractViolations(t *testing.T) {
 	}
 }
 
+func TestCompileNativeRejectsBindingSchemaExternalReference(t *testing.T) {
+	definition, ok := HostCapability(ContractCredentials)
+	if !ok {
+		t.Fatal("credentials host capability is missing")
+	}
+	definition.Methods[0].Input = json.RawMessage(`{"$ref":"https://example.invalid/schema.json"}`)
+	binding := Binding{Name: "credentials", Provider: HostProvider, CapabilityID: ContractCredentials, Definition: definition}
+	native := testNative("bindingref", LifetimeHarness, nil, []Binding{binding}, nil)
+	_, err := CompileNative(native)
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "external schema reference") {
+		t.Fatalf("CompileNative error = %v, want the binding schema's external reference rejection", err)
+	}
+}
+
 func TestCompileRejectsShorterLivedDependencyAndCycle(t *testing.T) {
 	short := ServiceCapability("short", "test.short", PureMethod("call", `{}`, `{}`))
 	long := ServiceCapability("long", "test.long", PureMethod("call", `{}`, `{}`))

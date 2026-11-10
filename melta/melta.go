@@ -211,20 +211,12 @@ func open(ctx context.Context, options options) (*Melta, error) {
 	work, cancelWork := context.WithCancel(ctx)
 	supervisor.setOwner(work)
 	packages := newPackageManager(dataDir)
-	if err := packages.load(); err != nil {
+	if err := packages.load(supervisor.native); err != nil {
 		cancelWork()
 		return nil, errors.Join(err, lock.Release())
 	}
 	natives := append([]extension.Native(nil), options.Extensions...)
-	executables := packages.loadedExecutables()
-	for _, executable := range executables {
-		native, err := supervisor.native(executable)
-		if err != nil {
-			cancelWork()
-			return nil, errors.Join(fmt.Errorf("melta: executable extension %q: %w", executable.Declaration.ID, err), lock.Release())
-		}
-		natives = append(natives, native)
-	}
+	natives = append(natives, packages.loadedNatives()...)
 	c := registeredComposition(natives)
 
 	obs := newObservation()
@@ -240,7 +232,7 @@ func open(ctx context.Context, options options) (*Melta, error) {
 	c.reportWarning = adapter.reportPluginWarning
 	loader := catalog.NewLoader(options.Locations.DiscoveryCacheDir, nil)
 	configService = newConfigurationService(work, c, loader, options.Configuration, options.Credentials, options.Locations, strategy, obs)
-	configService.executables = executables
+	configService.executables = packages.loadedExecutables()
 	configService.unusablePackages = packages.unusable
 	configService.supervisor = supervisor
 	configService.instance = instance

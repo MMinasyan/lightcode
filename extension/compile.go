@@ -65,6 +65,10 @@ type CompiledComponent struct {
 	Component
 	Provides []*CompiledCapability
 	Requires []*CompiledBinding
+
+	// bindingMethods holds each declaration-stage binding definition's
+	// compiled method set, keyed by the local binding name.
+	bindingMethods map[string]MethodSet
 }
 
 // CompiledBinding is one resolved local dependency name.
@@ -399,8 +403,9 @@ func validateCapabilityShape(declaration *CompiledDeclaration, capability *Compi
 }
 
 func validateComponentRequires(declaration *CompiledDeclaration, component *CompiledComponent) error {
-	seen := make(map[string]bool, len(component.Requires))
-	for _, binding := range component.Requires {
+	component.bindingMethods = make(map[string]MethodSet, len(component.Component.Requires))
+	seen := make(map[string]bool, len(component.Component.Requires))
+	for _, binding := range component.Component.Requires {
 		if binding.Name == "" {
 			return invalid("extension %q component %q: empty binding name", declaration.Declaration.ID, component.ID)
 		}
@@ -417,6 +422,11 @@ func validateComponentRequires(declaration *CompiledDeclaration, component *Comp
 		if !sameMethodsFromDefinition(binding.Definition) {
 			return invalid("extension %q component %q binding %q: method definitions are inconsistent", declaration.Declaration.ID, component.ID, binding.Name)
 		}
+		methods, err := compileDefinitionMethods(binding.CapabilityID, binding.Definition)
+		if err != nil {
+			return err
+		}
+		component.bindingMethods[binding.Name] = methods
 	}
 	return nil
 }
@@ -453,11 +463,7 @@ func (c *Compiled) resolveBinding(declaration *CompiledDeclaration, component *C
 			return nil, invalid("extension %q component %q binding %q: expected host contract differs from the supplied %s", declaration.Declaration.ID, component.ID, binding.Name, contractName(definition.ContractID, definition.ContractVersion))
 		}
 		resolved.Host = true
-		methods, err := compileDefinitionMethods(binding.CapabilityID, definition)
-		if err != nil {
-			return nil, err
-		}
-		resolved.Methods = methods
+		resolved.Methods = component.bindingMethods[binding.Name]
 		return resolved, nil
 	}
 	target, ok := c.capabilities[binding.CapabilityID]

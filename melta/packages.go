@@ -31,6 +31,13 @@ type packageSelection struct {
 	Digest  string `json:"digest"`
 }
 
+// loadedPackage is one selected package's read executable selection and its
+// constructed executable native.
+type loadedPackage struct {
+	executable executableExtension
+	native     extension.Native
+}
+
 // packageManager owns the local executable-package layout beneath the one
 // data directory. One loaded code set is fixed for the owner lifetime;
 // install, list and remove only read or replace next-start selections. Every
@@ -38,10 +45,10 @@ type packageSelection struct {
 type packageManager struct {
 	dataDir string
 
-	mu          sync.Mutex
-	loaded      map[string]string
-	unusable    map[string]error
-	executables []executableExtension
+	mu             sync.Mutex
+	loaded         map[string]string
+	unusable       map[string]error
+	loadedPackages []loadedPackage
 }
 
 // newPackageManager constructs the manager before the first load. The loaded
@@ -55,10 +62,11 @@ func newPackageManager(dataDir string) *packageManager {
 }
 
 // load reads every selected package once into the owner's fixed loaded set.
-// A selected package that fails to load leaves no executable selection and is
-// recorded unusable by its hash directory; the owner still opens so that a
-// disabled or uninstalled section stays silent.
-func (m *packageManager) load() error {
+// The supplied constructor builds each package's executable native; any
+// per-package failure, native construction included, leaves no executable
+// selection and is recorded unusable by its hash directory. The owner still
+// opens so that a disabled or uninstalled section stays silent.
+func (m *packageManager) load(buildNative func(executableExtension) (extension.Native, error)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	root := filepath.Join(m.dataDir, "extensions")
@@ -96,18 +104,37 @@ func (m *packageManager) load() error {
 			m.unusable[name] = err
 			continue
 		}
+		native, err := buildNative(executable)
+		if err != nil {
+			m.unusable[name] = err
+			continue
+		}
 		m.loaded[selected.ID] = selected.Version
-		m.executables = append(m.executables, executable)
+		m.loadedPackages = append(m.loadedPackages, loadedPackage{executable: executable, native: native})
 	}
-	sort.Slice(m.executables, func(i, j int) bool {
-		return m.executables[i].Declaration.ID < m.executables[j].Declaration.ID
+	sort.Slice(m.loadedPackages, func(i, j int) bool {
+		return m.loadedPackages[i].executable.Declaration.ID < m.loadedPackages[j].executable.Declaration.ID
 	})
 	return nil
 }
 
 // loadedExecutables returns the loaded code set in stable extension-ID order.
 func (m *packageManager) loadedExecutables() []executableExtension {
-	return append([]executableExtension(nil), m.executables...)
+	out := make([]executableExtension, len(m.loadedPackages))
+	for i, loaded := range m.loadedPackages {
+		out[i] = loaded.executable
+	}
+	return out
+}
+
+// loadedNatives returns the constructed executable natives in stable
+// extension-ID order.
+func (m *packageManager) loadedNatives() []extension.Native {
+	out := make([]extension.Native, len(m.loadedPackages))
+	for i, loaded := range m.loadedPackages {
+		out[i] = loaded.native
+	}
+	return out
 }
 
 // install reads one local source package's manifest and entry point, stages
@@ -120,16 +147,12 @@ func (m *packageManager) install(sourceDir string) (protocol.ExtensionPackage, e
 	if sourceDir == "" {
 		return protocol.ExtensionPackage{}, fmt.Errorf("package source directory must be non-empty: %w", harness.ErrInvalid)
 	}
-	source, err := filepath.Abs(sourceDir)
+	sourceRoot, err := os.OpenRoot(sourceDir)
 	if err != nil {
-		return protocol.ExtensionPackage{}, fmt.Errorf("normalize package source directory: %w", harness.ErrInvalid)
+		return protocol.ExtensionPackage{}, fmt.Errorf("open package source directory: %v: %w", err, harness.ErrInvalid)
 	}
-	manifestFile, err := safefs.OpenExisting(filepath.Join(source, "manifest.json"), os.O_RDONLY)
-	if err != nil {
-		return protocol.ExtensionPackage{}, fmt.Errorf("open package manifest: %v: %w", err, harness.ErrInvalid)
-	}
-	manifestBytes, err := io.ReadAll(manifestFile)
-	_ = manifestFile.Close()
+	defer func() { _ = sourceRoot.Close() }()
+	manifestBytes, err := sourceRoot.ReadFile("manifest.json")
 	if err != nil {
 		return protocol.ExtensionPackage{}, fmt.Errorf("read package manifest: %v: %w", err, harness.ErrInvalid)
 	}
@@ -144,8 +167,15 @@ func (m *packageManager) install(sourceDir string) (protocol.ExtensionPackage, e
 	if err := validatePackageDeclaration(declaration); err != nil {
 		return protocol.ExtensionPackage{}, fmt.Errorf("package declaration: %v: %w", err, harness.ErrInvalid)
 	}
-	entryFile, err := openPackageEntry(source, manifest.EntryPoint)
+	if !containedPackageEntryPoint(manifest.EntryPoint) {
+		return protocol.ExtensionPackage{}, fmt.Errorf("entry point %q is not a contained package-relative path: %w", manifest.EntryPoint, harness.ErrInvalid)
+	}
+	entryFile, err := sourceRoot.Open(manifest.EntryPoint)
 	if err != nil {
+		return protocol.ExtensionPackage{}, fmt.Errorf("open package entry point: %v: %w", err, harness.ErrInvalid)
+	}
+	if err := validatePackageEntryFile(entryFile, manifest.EntryPoint); err != nil {
+		_ = entryFile.Close()
 		return protocol.ExtensionPackage{}, err
 	}
 	entryBytes, err := io.ReadAll(entryFile)
@@ -343,9 +373,6 @@ func loadPackage(dataDir, hash string, selected packageSelection) (executableExt
 	if declaration.ID != selected.ID || declaration.Version != selected.Version {
 		return executableExtension{}, fmt.Errorf("package declaration %s@%s does not match selected %s@%s", declaration.ID, declaration.Version, selected.ID, selected.Version)
 	}
-	if err := validatePackageDeclaration(declaration); err != nil {
-		return executableExtension{}, fmt.Errorf("package declaration: %v", err)
-	}
 	entryFile, err := openPackageEntry(packageDir, manifest.EntryPoint)
 	if err != nil {
 		return executableExtension{}, err
@@ -381,8 +408,8 @@ func validatePackageDeclaration(declaration extension.Declaration) error {
 }
 
 // openPackageEntry opens one contained package-relative entry point without
-// following a symlink in any component, and requires a regular executable
-// file.
+// following a symlink in any component, and applies the shared regular
+// executable check.
 func openPackageEntry(packageDir, entryPoint string) (*os.File, error) {
 	if !containedPackageEntryPoint(entryPoint) {
 		return nil, fmt.Errorf("entry point %q is not a contained package-relative path: %w", entryPoint, harness.ErrInvalid)
@@ -391,16 +418,28 @@ func openPackageEntry(packageDir, entryPoint string) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open package entry point: %v: %w", err, harness.ErrInvalid)
 	}
-	info, err := file.Stat()
-	if err != nil {
+	if err := validatePackageEntryFile(file, entryPoint); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
-	if info.Mode().Perm()&0o111 == 0 {
-		_ = file.Close()
-		return nil, fmt.Errorf("entry point %q is not executable: %w", entryPoint, harness.ErrInvalid)
-	}
 	return file, nil
+}
+
+// validatePackageEntryFile applies the one entry-point shape rule to an
+// already-opened file from either the install source root or the owned
+// package directory: it must be a regular executable file.
+func validatePackageEntryFile(file *os.File, entryPoint string) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("entry point %q is not a regular file: %w", entryPoint, harness.ErrInvalid)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("entry point %q is not executable: %w", entryPoint, harness.ErrInvalid)
+	}
+	return nil
 }
 
 // containedPackageEntryPoint reports whether one manifest entry point is a
