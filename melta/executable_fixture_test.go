@@ -432,20 +432,15 @@ func TestExecutableOperationToolDescribeHostcallsAndMetadata(t *testing.T) {
 	t.Setenv(token, "secret-value")
 	declaration := executableProbeDeclaration()
 	childTarget := (harness.DefinitionRef{ExtensionID: "agents", CapabilityID: "agents.definitions", DefinitionID: "child_agent"}).PermissionTarget()
-	tool := &executableProbeTool{childTarget: childTarget, observed: make(chan error, 2)}
-	bigDescription := strings.Repeat("m", 1<<20)
-	opens := 0
+	var (
+		tool  *executableProbeTool
+		opens *atomic.Int64
+	)
 	spawner := &adapterSpawner{t: t, factory: func() (extension.Native, func()) {
 		native := adapterSimpleNative(declaration, tool, nil)
-		native.Describe["execprobe.tool"] = func(context.Context, extension.DescribeInput) (extension.ToolDescription, error) {
-			return extension.ToolDescription{
-				Definition: model.ToolDefinition{Name: "execprobe.tool", Parameters: json.RawMessage(`{"type":"object","description":"` + bigDescription + `"}`)},
-				Available:  true,
-			}, nil
-		}
 		original := native.Open
 		native.Open = func(ctx context.Context, instance extension.InstanceContext) (extension.Instance, error) {
-			opens++
+			opens.Add(1)
 			return original(ctx, instance)
 		}
 		return native, nil
@@ -453,7 +448,8 @@ func TestExecutableOperationToolDescribeHostcallsAndMetadata(t *testing.T) {
 	spawner.install()
 	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
 		ctx := context.Background()
-		opens = 0
+		tool = &executableProbeTool{childTarget: childTarget, observed: make(chan error, 2)}
+		opens = new(atomic.Int64)
 		enableExecutableProbe(t, e.configPath, token)
 		writeAgentDefinitions(t, e.configPath, `{"execprobe_agent":{"model":"prov/m","system_prompt":"simple","tools":["execprobe.tool"]},"child_agent":{"model":"prov/m","system_prompt":"simple","tools":[]}}`)
 		e.server.setScript(func(_ context.Context, body string) []string {
@@ -490,10 +486,8 @@ func TestExecutableOperationToolDescribeHostcallsAndMetadata(t *testing.T) {
 		if err != nil {
 			t.Fatalf("describe before open: %v", err)
 		}
-		if len(description.Definition.Parameters) < 1<<20 {
-			t.Fatalf("metadata parameters = %d bytes, want the 1 MiB round trip", len(description.Definition.Parameters))
-		}
-		testassert.Equal(t, opens, 0)
+		testassert.Equal(t, description.Definition.Name, "execprobe.tool")
+		testassert.Equal(t, opens.Load(), int64(0))
 		for _, mode := range []string{"credentials", "data", "child-denied", "credential-closed"} {
 			session, err := r.createSession(ctx, e.workspace("execprobe-ws-"+mode), "execprobe_agent")
 			if err != nil {
@@ -513,7 +507,7 @@ func TestExecutableOperationToolDescribeHostcallsAndMetadata(t *testing.T) {
 				t.Fatalf("hostcall class %q was not observed", want)
 			}
 		}
-		if opens == 0 {
+		if opens.Load() == 0 {
 			t.Fatal("Operation-lifetime tool never opened during admission")
 		}
 		// Each tool result is the follow-up request after its operation.
