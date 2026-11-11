@@ -618,6 +618,73 @@ func TestPackageLoadedSelectedVersionsAcrossRestart(t *testing.T) {
 	testassert.NoError(t, restarted.Close(context.Background()))
 }
 
+// TestPackageLifecycleUsesCanonicalDataRoot proves package load, install,
+// list, restart and remove all use the canonical root captured at open when
+// the operator-supplied DataDir is a symlink: the real and alias paths contend
+// for one owner, and repointing the alias cannot redirect later selections.
+func TestPackageLifecycleUsesCanonicalDataRoot(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("package paths use the Linux protected filesystem traversal")
+	}
+	realRoot := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "data")
+	testassert.NoError(t, os.Symlink(realRoot, alias))
+	replacement := t.TempDir()
+	configPath := filepath.Join(realRoot, "config.json")
+	writeServiceFile(t, configPath, `{"extensions":{"fixture":{"enabled":false}}}`)
+	v1 := buildExecutableFixtureVersion(t, "1.0.0")
+	installExecutablePackage(t, realRoot, executableExtension{Declaration: fixtureExecutableDeclaration(t, v1), EntryPoint: v1})
+
+	owner := openPackageOwner(t, alias, configPath)
+	want := canonicalFixturePath(t, realRoot)
+	testassert.Equal(t, owner.dataDir, want)
+	caller := packageCaller(t, owner)
+	row := packageRow(t, owner, caller, "fixture")
+	testassert.Equal(t, row.LoadedVersion, "1.0.0")
+	testassert.Equal(t, row.SelectedVersion, "1.0.0")
+
+	// The real path and the alias are one ownership identity.
+	{
+		_, err := open(context.Background(), options{
+			DataDir:       realRoot,
+			Configuration: NewFileConfigurationSource(configPath),
+			Credentials:   NewEnvironmentCredentialSource(filepath.Join(realRoot, ".env")),
+		})
+		testassert.Require(t, errors.Is(err, ErrOwned), "real-path contender open = %v, want ErrOwned", err)
+	}
+
+	// Repointing the operator's alias cannot redirect the open owner's writes.
+	testassert.NoError(t, os.Remove(alias))
+	testassert.NoError(t, os.Symlink(replacement, alias))
+	v2 := buildExecutableFixtureVersion(t, "2.0.0")
+	installed, err := owner.InstallExtensionPackage(context.Background(), caller, executablePackageSource(t, executableExtension{Declaration: fixtureExecutableDeclaration(t, v2), EntryPoint: v2}))
+	testassert.NoError(t, err)
+	testassert.Equal(t, installed.LoadedVersion, "1.0.0")
+	testassert.Equal(t, installed.SelectedVersion, "2.0.0")
+	testassert.Equal(t, owner.dataDir, want)
+	testassert.Equal(t, readSelectedRecord(t, realRoot, "fixture").Version, "2.0.0")
+	{
+		entries, err := os.ReadDir(replacement)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(entries) == 0, "repointed alias target = %v, want no redirected package writes", entries)
+	}
+	testassert.NoError(t, owner.Close(context.Background()))
+
+	restarted := openPackageOwner(t, realRoot, configPath)
+	restartedCaller := packageCaller(t, restarted)
+	row = packageRow(t, restarted, restartedCaller, "fixture")
+	testassert.Equal(t, row.LoadedVersion, "2.0.0")
+	testassert.Equal(t, row.SelectedVersion, "2.0.0")
+	testassert.NoError(t, restarted.RemoveExtensionPackage(context.Background(), restartedCaller, "fixture"))
+	mustNotExist(t, filepath.Join(realRoot, "extensions", extensionDataHash("fixture"), "selected"), "remove retained the selected record")
+	{
+		entries, err := os.ReadDir(replacement)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(entries) == 0, "repointed alias target = %v, want no redirected selection writes", entries)
+	}
+	testassert.NoError(t, restarted.Close(context.Background()))
+}
+
 // TestPackageDisabledLoadedUpdateThenReloadUsesLoadedCopy proves a reload
 // after an update activates the loaded code, not the newly selected bytes.
 func TestPackageDisabledLoadedUpdateThenReloadUsesLoadedCopy(t *testing.T) {

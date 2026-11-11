@@ -299,6 +299,56 @@ func TestDataServiceRefusesPlantedSymlinks(t *testing.T) {
 	testassert.Require(t, err == nil && string(data) == "keep", "outside sentinel = (%q, %v), want it untouched", data, err)
 }
 
+// TestDataServiceUsesCanonicalCapturedRoot proves the Session and cache
+// namespaces derive from the canonical root captured at open: an alias-rooted
+// owner works, and repointing the operator alias after open cannot redirect
+// later namespace creation into the replacement target.
+func TestDataServiceUsesCanonicalCapturedRoot(t *testing.T) {
+	realRoot := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "data")
+	testassert.NoError(t, os.Symlink(realRoot, alias))
+	replacement := t.TempDir()
+	e := newOwnerEnvIn(t, t.TempDir(), alias)
+	a := newDataProbe("probe_a", nil)
+	writeServiceFile(t, e.configPath, dataConfig(e.server.URL, "probe_a"))
+	e.fixtureStore(storage.NewMemory())
+	ctx := context.Background()
+	r, err := e.open(ctx, a.native)
+	testassert.NoError(t, err)
+	defer r.Close(ctx)
+	want := canonicalFixturePath(t, realRoot)
+	testassert.Equal(t, r.dataDir, want)
+
+	workspace := filepath.Join(want, "data-ws")
+	testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+	session, err := r.createSession(ctx, workspace, "solo")
+	testassert.NoError(t, err)
+	id := session.Identity.SessionID
+	view, calls := dataView(t, r, a.capability, id, nativeGrant{})
+	testassert.Equal(t, namespaceDirectory(t, calls, "session_namespace"), filepath.Join(want, "code", id, "extensions", extensionDataHash("probe_a")))
+	cacheView, cacheCalls := dataView(t, r, a.capability, id, nativeGrant{})
+	testassert.Equal(t, namespaceDirectory(t, cacheCalls, "cache_namespace"), filepath.Join(want, "extensions", extensionDataHash("probe_a"), "cache"))
+	view.end()
+	cacheView.end()
+
+	testassert.NoError(t, os.Remove(alias))
+	testassert.NoError(t, os.Symlink(replacement, alias))
+	second, err := r.createSession(ctx, workspace, "solo")
+	testassert.NoError(t, err)
+	secondID := second.Identity.SessionID
+	secondView, secondCalls := dataView(t, r, a.capability, secondID, nativeGrant{})
+	testassert.Equal(t, namespaceDirectory(t, secondCalls, "session_namespace"), filepath.Join(want, "code", secondID, "extensions", extensionDataHash("probe_a")))
+	secondCacheView, secondCacheCalls := dataView(t, r, a.capability, secondID, nativeGrant{})
+	testassert.Equal(t, namespaceDirectory(t, secondCacheCalls, "cache_namespace"), filepath.Join(want, "extensions", extensionDataHash("probe_a"), "cache"))
+	secondView.end()
+	secondCacheView.end()
+	{
+		entries, err := os.ReadDir(replacement)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(entries) == 0, "repointed alias target = %v, want no redirected namespace writes", entries)
+	}
+}
+
 // TestDataServiceStandaloneWriterHoldsInterval proves a standalone callback
 // owns the Session interval from its first namespace call through its terminal
 // response: deletion and sweep skip it, and cache-only access never takes the
