@@ -7,7 +7,7 @@
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "13"
+  version: "14"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -387,6 +387,51 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SettingsMutation"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/extensions/packages:
+    get:
+      operationId: ListExtensionPackages
+      responses:
+        "200":
+          description: Every loaded extension and every selected next-start package.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ExtensionPackage"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      operationId: InstallExtensionPackage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InstallExtensionPackageRequest"
+      responses:
+        "200":
+          description: The installed extension's loaded and next-start selection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtensionPackage"
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      operationId: RemoveExtensionPackage
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "204":
+          description: The selection was removed; package copies and configuration are retained.
         default:
           $ref: "#/components/responses/Error"
   /v1/models:
@@ -774,6 +819,40 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/CleanupFailure"
+    ExtensionPackage:
+      description: >
+        One installed executable extension's live loaded implementation
+        version and the package selected for the next start. Package
+        installation never changes the live loaded set.
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - loaded_version
+        - selected_version
+      properties:
+        id:
+          type: string
+          minLength: 1
+        loaded_version:
+          type: string
+          description: >
+            The live loaded implementation version; empty when no package is
+            loaded for the extension.
+        selected_version:
+          type: string
+          description: >
+            The selected next-start implementation version; empty when no
+            package is selected or installed.
+    InstallExtensionPackageRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - source_dir
+      properties:
+        source_dir:
+          type: string
+          minLength: 1
     SessionLifecycle:
       type: string
       enum:
@@ -879,7 +958,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "13"
+            - "14"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every

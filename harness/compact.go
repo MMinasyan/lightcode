@@ -607,7 +607,7 @@ func (d *executionDriver) completeMaintenance(execCtx context.Context, input Pla
 	plan, err := binding.Strategy.Plan(clonePlanInput(input))
 	if err != nil {
 		terminal := OperationFailure
-		if effectInterrupted(err) {
+		if EffectInterrupted(err) {
 			terminal = OperationInterruption
 		}
 		return false, d.settleMaintenance(terminal, err, facts)
@@ -666,7 +666,7 @@ func (d *executionDriver) completeMaintenance(execCtx context.Context, input Pla
 		next, err := binding.Strategy.Consume(ConsumeInput{Input: clonePlanInput(input), State: plan.Model.State, Output: output})
 		if err != nil {
 			terminal := OperationFailure
-			if effectInterrupted(err) {
+			if EffectInterrupted(err) {
 				terminal = OperationInterruption
 			}
 			return false, d.settleMaintenance(terminal, err, facts)

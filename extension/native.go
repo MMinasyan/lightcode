@@ -43,6 +43,28 @@ type Instance struct {
 	Close        func(context.Context, CallContext) error
 }
 
+// Owned returns an independent copy of the instance's capability and service
+// map containers. Implementation values and closure state remain the caller's
+// opaque objects; only the containers that name accepted implementations are
+// owned by the composition.
+func (i Instance) Owned() Instance {
+	out := i
+	if i.Capabilities != nil {
+		out.Capabilities = make(map[string]Implementation, len(i.Capabilities))
+		for id, implementation := range i.Capabilities {
+			if implementation.Service != nil {
+				services := make(map[string]Handler, len(implementation.Service))
+				for name, handler := range implementation.Service {
+					services[name] = handler
+				}
+				implementation.Service = services
+			}
+			out.Capabilities[id] = implementation
+		}
+	}
+	return out
+}
+
 // Implementation is one capability's fixed typed contribution. Exactly the
 // fields matching the declaration's kind and declared hook boundaries are
 // non-nil.

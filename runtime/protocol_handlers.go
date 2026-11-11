@@ -46,6 +46,43 @@ func (rt *protocolHandlers) ReloadConfiguration(w http.ResponseWriter, r *http.R
 	rt.writeJSON(w, http.StatusOK, &response)
 }
 
+// ListExtensionPackages serves every loaded extension and selected next-start
+// package; absence is the schema's ordinary not-selected state.
+func (rt *protocolHandlers) ListExtensionPackages(w http.ResponseWriter, r *http.Request) {
+	packages, err := rt.owner.ListExtensionPackages(r.Context(), rt.server.caller)
+	if err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	rt.writeJSON(w, http.StatusOK, packages)
+}
+
+// InstallExtensionPackage serves one local source package's next-start
+// selection. The request names only the operator-supplied source directory.
+func (rt *protocolHandlers) InstallExtensionPackage(w http.ResponseWriter, r *http.Request) {
+	var body protocol.InstallExtensionPackageRequest
+	if err := decodeRequestBody(r, &body); err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	extensionPackage, err := rt.owner.InstallExtensionPackage(r.Context(), rt.server.caller, body.SourceDir)
+	if err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	rt.writeJSON(w, http.StatusOK, &extensionPackage)
+}
+
+// RemoveExtensionPackage serves the selection removal; package copies and
+// configuration are retained.
+func (rt *protocolHandlers) RemoveExtensionPackage(w http.ResponseWriter, r *http.Request, params protocol.RemoveExtensionPackageParams) {
+	if err := rt.owner.RemoveExtensionPackage(r.Context(), rt.server.caller, params.Id); err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // GetConfiguration serves the revisioned configuration view.
 func (rt *protocolHandlers) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 	view, err := rt.owner.GetConfiguration(r.Context(), rt.server.caller)

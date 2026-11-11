@@ -2922,10 +2922,10 @@ func TestHookResultKnowledgeAndBindingDomains(t *testing.T) {
 	})
 	t.Run("declared knowledge reaches the validator unchanged and is never coerced", func(t *testing.T) {
 		declared := &EffectError{Evidence: ExecutionEvidence("all"), Err: errors.New("binding broke")}
-		testassert.Equal(t, declaredExecutionKnowledge(declared), ExecutionEvidence("all"))
+		testassert.Equal(t, DeclaredExecutionKnowledge(declared), ExecutionEvidence("all"))
 		unknown := &EffectError{Evidence: ExecutionUnknown, Err: errors.New("binding broke")}
-		testassert.Equal(t, declaredExecutionKnowledge(unknown), ExecutionUnknown)
-		testassert.Equal(t, declaredExecutionKnowledge(errors.New("native failure")), ExecutionObserved)
+		testassert.Equal(t, DeclaredExecutionKnowledge(unknown), ExecutionUnknown)
+		testassert.Equal(t, DeclaredExecutionKnowledge(errors.New("native failure")), ExecutionObserved)
 	})
 }
 

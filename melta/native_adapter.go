@@ -65,8 +65,9 @@ func selectedCapability(scopes []*scope, id string) (*capabilityValue, bool) {
 	return nil, false
 }
 
-// resolveStrategyBinding selects the execution's strategy.
-func resolveStrategyBinding(c *composition, scopes []*scope, selected harness.StrategySelection) (*harness.StrategyBinding, error) {
+// resolveStrategyBinding selects the execution's strategy and binds an
+// executable implementation to the admitted execution context.
+func resolveStrategyBinding(c *composition, scopes []*scope, selected harness.StrategySelection, ctx context.Context) (*harness.StrategyBinding, error) {
 	if selected.ID == "" {
 		return c.defaultStrategy, nil
 	}
@@ -81,7 +82,13 @@ func resolveStrategyBinding(c *composition, scopes []*scope, selected harness.St
 	if value.implementation.Strategy == nil {
 		return nil, fmt.Errorf("strategy %q has no implementation: %w", selected.ID, ErrComposition)
 	}
-	return &harness.StrategyBinding{ID: capability.ID, RequiresContextWindow: capability.Strategy.RequiresContextWindow, Strategy: value.implementation.Strategy}, nil
+	strategy := value.implementation.Strategy
+	if executable, ok := strategy.(*executableStrategy); ok {
+		bound := *executable
+		bound.ctx = ctx
+		strategy = &bound
+	}
+	return &harness.StrategyBinding{ID: capability.ID, RequiresContextWindow: capability.Strategy.RequiresContextWindow, Strategy: strategy}, nil
 }
 
 func (c *composition) toolSpec(id string) (toolDeclaration, bool) {
@@ -171,6 +178,13 @@ func (t extensionTool) context(tc ToolContext, calls extension.CallContext) exte
 	}
 }
 
+// contextualTool is one native tool that can receive the host callback
+// context for its pure normalization step. The public Tool contract has no
+// context parameter, so the worker binding implements this private extension.
+type contextualTool interface {
+	NormalizeContext(context.Context, extension.ToolContext, model.ToolCall) (json.RawMessage, error)
+}
+
 func (t extensionTool) Normalize(ctx context.Context, tc ToolContext, call model.ToolCall) (json.RawMessage, error) {
 	carrier := harness.CallbackIdentityFromContext(ctx)
 	identity := t.baseIdentity(tc, call.ID, nativeGrant{pure: true})
@@ -182,6 +196,9 @@ func (t extensionTool) Normalize(ctx context.Context, tc ToolContext, call model
 	identity.effectID = carrier.EffectID
 	view, calls := t.composition.newView(t.value, ctx, identity)
 	defer view.end()
+	if contextual, ok := t.value.implementation.Tool.(contextualTool); ok {
+		return contextual.NormalizeContext(ctx, t.context(tc, calls), call)
+	}
 	return t.value.implementation.Tool.Normalize(t.context(tc, calls), call)
 }
 

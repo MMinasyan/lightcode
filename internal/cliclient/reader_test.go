@@ -119,13 +119,13 @@ func discovery(t *testing.T, handler http.Handler) (clienthost.Options, *client.
 
 // discoveryRecord builds one private discovery document for the given owner.
 func discoveryRecord(endpoint, owner string) []byte {
-	raw, _ := json.Marshal(map[string]string{"endpoint": endpoint, "instance_id": owner, "protocol_version": string(protocol.N13), "credential": strings.Repeat("1", 64)})
+	raw, _ := json.Marshal(map[string]string{"endpoint": endpoint, "instance_id": owner, "protocol_version": string(protocol.N14), "credential": strings.Repeat("1", 64)})
 	return raw
 }
 
 func health(w http.ResponseWriter, owner string) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N13})
+	_ = json.NewEncoder(w).Encode(protocol.Health{InstanceId: owner, ProtocolVersion: protocol.N14})
 }
 
 func fixture(t *testing.T) (*CLI, *scriptedTransport) {
@@ -322,11 +322,11 @@ func TestReaderNavigationSupersedesSuccessAndError(t *testing.T) {
 			c.selectRoot(rootB)
 			receive(t, transport.requests).respond(hydration(rootB, "1", nil, nil))
 			fresh := receive(t, transport.requests)
-			fresh.respond(hydration(rootB, "1", inputs(1, 1), nil))
 			c.mu.Lock()
 			selected := c.root
 			done := selected.chain.done
 			c.mu.Unlock()
+			fresh.respond(hydration(rootB, "1", inputs(1, 1), nil))
 			barrier(t, done)
 			if fail {
 				parked.reject(404, protocol.Error{Code: "not_found", Message: "late error"})
@@ -399,11 +399,11 @@ func TestRootResetDisposesInspectorAndSameRootIntent(t *testing.T) {
 	c.selectRoot(rootA)
 	receive(t, transport.requests).respond(hydration(rootA, "1", nil, nil))
 	fresh := receive(t, transport.requests)
-	fresh.respond(hydration(rootA, "2", nil, nil))
 	c.mu.Lock()
 	newRoot := c.root
 	newDone := newRoot.chain.done
 	c.mu.Unlock()
+	fresh.respond(hydration(rootA, "2", nil, nil))
 	barrier(t, newDone)
 	// The replaced root clears the previous range's recall.
 	setDraft(c, "keep")

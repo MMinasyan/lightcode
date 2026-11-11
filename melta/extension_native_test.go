@@ -275,10 +275,10 @@ func TestNativeStrategyBindingUsesDeclaredMetadata(t *testing.T) {
 	defer func() { testassert.NoError(t, rt.close()) }()
 	op := mustOpenScope(t, c, context.Background(), ScopeInfo{Kind: ScopeOperation, DataDir: "/d", Workspace: "/w", SessionID: testSessionID, OperationID: "op"}, []*scope{rt})
 	defer func() { testassert.NoError(t, op.close()) }()
-	binding, err := resolveStrategyBinding(c, []*scope{rt, op}, harness.StrategySelection{ID: "native_strategy"})
+	binding, err := resolveStrategyBinding(c, []*scope{rt, op}, harness.StrategySelection{ID: "native_strategy"}, context.Background())
 	testassert.NoError(t, err)
 	testassert.Require(t, binding.ID == "native_strategy" && !binding.RequiresContextWindow && binding.Strategy != nil, "binding = %+v, want the declared metadata and implementation", binding)
-	if _, err := resolveStrategyBinding(c, []*scope{rt, op}, harness.StrategySelection{ID: "ghost"}); err == nil {
+	if _, err := resolveStrategyBinding(c, []*scope{rt, op}, harness.StrategySelection{ID: "ghost"}, context.Background()); err == nil {
 		t.Fatal("resolveStrategyBinding accepted an undeclared strategy")
 	}
 }

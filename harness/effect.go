@@ -141,7 +141,8 @@ func isPublicationFailure(err error) bool {
 
 var errExecutionInterrupted = errors.New("execution interrupted")
 
-func effectInterrupted(err error) bool {
+// EffectInterrupted reports whether one callback failure declared interruption.
+func EffectInterrupted(err error) bool {
 	var effect *EffectError
 	return errors.As(err, &effect) && effect.Interrupted
 }
@@ -2262,10 +2263,10 @@ func (d *executionDriver) evaluateArgumentHook(ctx context.Context, resolved pen
 	replacement, runErr := hook.Run(ctx, owned)
 	if runErr != nil {
 		failure := validationToolResult(record.ID, runErr)
-		if effectInterrupted(runErr) {
+		if EffectInterrupted(runErr) {
 			failure = interruptedToolResult(record.ID)
 		}
-		return nil, &failure, declaredExecutionKnowledge(runErr)
+		return nil, &failure, DeclaredExecutionKnowledge(runErr)
 	}
 	if bytes.Equal(replacement, current) && (acceptedFailure != "" || len(accepted) > 0) { // an unchanged return consumes the current accepted outcome: its normalized
 		// bytes, or — when the predecessor normalization failed — the stored failure diagnostic,
@@ -2352,12 +2353,12 @@ func (d *executionDriver) runOneHook(ctx, settleCtx context.Context, resolved pe
 	return committed, nil, nil
 }
 
-// declaredExecutionKnowledge resolves one hook callback failure's execution
+// DeclaredExecutionKnowledge resolves one hook callback failure's execution
 // knowledge: a typed EffectError carries its declared knowledge through a
 // binding-infrastructure failure unchanged (an invalid declaration reaches the
 // shared accepting validator and rejects, never a guessed value), and an
 // ordinary native terminal callback failure is an observed execution.
-func declaredExecutionKnowledge(runErr error) ExecutionEvidence {
+func DeclaredExecutionKnowledge(runErr error) ExecutionEvidence {
 	var typed *EffectError
 	if errors.As(runErr, &typed) {
 		return typed.Evidence
@@ -2616,7 +2617,7 @@ func (d *executionDriver) runOneRequestHookPure(ctx context.Context, requestID s
 	}
 	consequence, err := hook.Run(WithCallbackIdentity(ctx, CallbackIdentity{RequestID: requestID}), input)
 	if err != nil {
-		if effectInterrupted(err) {
+		if EffectInterrupted(err) {
 			return RequestConsequence{}, errExecutionInterrupted
 		}
 		return RequestConsequence{}, err
@@ -2665,9 +2666,9 @@ func (d *executionDriver) runRequestHookEffect(ctx context.Context, hook Request
 	consequence, runErr := hook.Run(WithCallbackIdentity(ctx, CallbackIdentity{RequestID: requestID, EffectID: resultID}), input)
 	settleCtx := context.WithoutCancel(h.ctx)
 	if runErr != nil {
-		knowledge := declaredExecutionKnowledge(runErr)
+		knowledge := DeclaredExecutionKnowledge(runErr)
 		status := hookFailed
-		if effectInterrupted(runErr) {
+		if EffectInterrupted(runErr) {
 			status = hookInterrupted
 		}
 		if _, cerr := h.commitHookResult(settleCtx, c, operationID,

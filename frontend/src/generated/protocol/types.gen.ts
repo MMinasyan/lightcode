@@ -32,6 +32,28 @@ export type DeletionResult = {
     cleanup_failures: Array<CleanupFailure>;
 };
 
+/**
+ * One installed executable extension's live loaded implementation version and the package selected for the next start. Package installation never changes the live loaded set.
+ *
+ */
+export type ExtensionPackage = {
+    id: string;
+    /**
+     * The live loaded implementation version; empty when no package is loaded for the extension.
+     *
+     */
+    loaded_version: string;
+    /**
+     * The selected next-start implementation version; empty when no package is selected or installed.
+     *
+     */
+    selected_version: string;
+};
+
+export type InstallExtensionPackageRequest = {
+    source_dir: string;
+};
+
 export type SessionLifecycle = 'open' | 'archived';
 
 export type InputOrigin = 'user' | 'runtime' | 'plugin';
@@ -73,7 +95,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '13';
+    protocol_version: '14';
 };
 
 /**
@@ -1483,6 +1505,83 @@ export type UpdateConfigurationSettingsResponses = {
 };
 
 export type UpdateConfigurationSettingsResponse = UpdateConfigurationSettingsResponses[keyof UpdateConfigurationSettingsResponses];
+
+export type RemoveExtensionPackageData = {
+    body?: never;
+    path?: never;
+    query: {
+        id: string;
+    };
+    url: '/v1/extensions/packages';
+};
+
+export type RemoveExtensionPackageErrors = {
+    /**
+     * One schema-defined typed error.
+     */
+    default: Error;
+};
+
+export type RemoveExtensionPackageError = RemoveExtensionPackageErrors[keyof RemoveExtensionPackageErrors];
+
+export type RemoveExtensionPackageResponses = {
+    /**
+     * The selection was removed; package copies and configuration are retained.
+     */
+    204: void;
+};
+
+export type RemoveExtensionPackageResponse = RemoveExtensionPackageResponses[keyof RemoveExtensionPackageResponses];
+
+export type ListExtensionPackagesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/extensions/packages';
+};
+
+export type ListExtensionPackagesErrors = {
+    /**
+     * One schema-defined typed error.
+     */
+    default: Error;
+};
+
+export type ListExtensionPackagesError = ListExtensionPackagesErrors[keyof ListExtensionPackagesErrors];
+
+export type ListExtensionPackagesResponses = {
+    /**
+     * Every loaded extension and every selected next-start package.
+     */
+    200: Array<ExtensionPackage>;
+};
+
+export type ListExtensionPackagesResponse = ListExtensionPackagesResponses[keyof ListExtensionPackagesResponses];
+
+export type InstallExtensionPackageData = {
+    body: InstallExtensionPackageRequest;
+    path?: never;
+    query?: never;
+    url: '/v1/extensions/packages';
+};
+
+export type InstallExtensionPackageErrors = {
+    /**
+     * One schema-defined typed error.
+     */
+    default: Error;
+};
+
+export type InstallExtensionPackageError = InstallExtensionPackageErrors[keyof InstallExtensionPackageErrors];
+
+export type InstallExtensionPackageResponses = {
+    /**
+     * The installed extension's loaded and next-start selection.
+     */
+    200: ExtensionPackage;
+};
+
+export type InstallExtensionPackageResponse = InstallExtensionPackageResponses[keyof InstallExtensionPackageResponses];
 
 export type ListModelsData = {
     body?: never;

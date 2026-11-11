@@ -705,7 +705,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"13\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"14\"}"
     }
    ],
    "reject": [
@@ -715,16 +715,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"13\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"14\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"13\"}"
+     "json": "{\"protocol_version\":\"14\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"13\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"14\",\"extra\":true}"
     }
    ]
   },
@@ -2288,6 +2288,41 @@
     }
    ],
    "reject": []
+  },
+  {
+   "schema": "ExtensionPackage",
+   "accept": [
+    {
+     "name": "selected",
+     "json": "{\"id\":\"fixture\",\"loaded_version\":\"1.0.0\",\"selected_version\":\"2.0.0\"}"
+    },
+    {
+     "name": "empty-selected",
+     "json": "{\"id\":\"fixture\",\"loaded_version\":\"1.0.0\",\"selected_version\":\"\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "missing-selected-version",
+     "json": "{\"id\":\"fixture\",\"loaded_version\":\"1.0.0\"}"
+    }
+   ]
+  },
+  {
+   "schema": "InstallExtensionPackageRequest",
+   "accept": [
+    {
+     "name": "minimal",
+     "json": "{\"source_dir\":\"/tmp/fixture-package\"}"
+    }
+   ],
+   "reject": [
+    {
+     "name": "empty-source",
+     "json": "{\"source_dir\":\"\"}",
+     "typescript": false
+    }
+   ]
   }
  ],
  "operations": [
@@ -2491,11 +2526,31 @@
    }
   },
   {
+   "operation_id": "InstallExtensionPackage",
+   "method": "post",
+   "path": "/v1/extensions/packages",
+   "request": "InstallExtensionPackageRequest",
+   "responses": {
+    "200": "ExtensionPackage",
+    "default": "Error"
+   }
+  },
+  {
    "operation_id": "InterruptSession",
    "method": "post",
    "path": "/v1/sessions/{id}/interrupt",
    "request": null,
    "responses": {
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ListExtensionPackages",
+   "method": "get",
+   "path": "/v1/extensions/packages",
+   "request": null,
+   "responses": {
+    "200": "ExtensionPackage[]",
     "default": "Error"
    }
   },
@@ -2566,6 +2621,15 @@
    "request": null,
    "responses": {
     "200": "RevisionResponse",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "RemoveExtensionPackage",
+   "method": "delete",
+   "path": "/v1/extensions/packages",
+   "request": null,
+   "responses": {
     "default": "Error"
    }
   },

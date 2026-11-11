@@ -65,6 +65,10 @@ type CompiledComponent struct {
 	Component
 	Provides []*CompiledCapability
 	Requires []*CompiledBinding
+
+	// bindingMethods holds each declaration-stage binding definition's
+	// compiled method set, keyed by the local binding name.
+	bindingMethods map[string]MethodSet
 }
 
 // CompiledBinding is one resolved local dependency name.
@@ -399,8 +403,9 @@ func validateCapabilityShape(declaration *CompiledDeclaration, capability *Compi
 }
 
 func validateComponentRequires(declaration *CompiledDeclaration, component *CompiledComponent) error {
-	seen := make(map[string]bool, len(component.Requires))
-	for _, binding := range component.Requires {
+	component.bindingMethods = make(map[string]MethodSet, len(component.Component.Requires))
+	seen := make(map[string]bool, len(component.Component.Requires))
+	for _, binding := range component.Component.Requires {
 		if binding.Name == "" {
 			return invalid("extension %q component %q: empty binding name", declaration.Declaration.ID, component.ID)
 		}
@@ -417,6 +422,11 @@ func validateComponentRequires(declaration *CompiledDeclaration, component *Comp
 		if !sameMethodsFromDefinition(binding.Definition) {
 			return invalid("extension %q component %q binding %q: method definitions are inconsistent", declaration.Declaration.ID, component.ID, binding.Name)
 		}
+		methods, err := compileDefinitionMethods(binding.CapabilityID, binding.Definition)
+		if err != nil {
+			return err
+		}
+		component.bindingMethods[binding.Name] = methods
 	}
 	return nil
 }
@@ -453,11 +463,7 @@ func (c *Compiled) resolveBinding(declaration *CompiledDeclaration, component *C
 			return nil, invalid("extension %q component %q binding %q: expected host contract differs from the supplied %s", declaration.Declaration.ID, component.ID, binding.Name, contractName(definition.ContractID, definition.ContractVersion))
 		}
 		resolved.Host = true
-		methods, err := compileDefinitionMethods(binding.CapabilityID, definition)
-		if err != nil {
-			return nil, err
-		}
-		resolved.Methods = methods
+		resolved.Methods = component.bindingMethods[binding.Name]
 		return resolved, nil
 	}
 	target, ok := c.capabilities[binding.CapabilityID]
@@ -704,9 +710,33 @@ func (c *Compiled) ValidateSection(id string, section json.RawMessage) error {
 	return nil
 }
 
-// ValidateInstance checks one opened component's exact declared binding shape.
-func (c *Compiled) ValidateInstance(extensionID, componentID string, instance Instance) error {
-	component, ok := c.component(extensionID, componentID)
+// CompileNative compiles one native declaration's capabilities, components and
+// metadata callbacks without resolving the surrounding composition's bindings.
+// It applies the per-declaration stage Compile performs before binding
+// resolution, so an implementation whose declaration binds another extension
+// can validate its own construction without owning the dependency graph.
+func CompileNative(native Native) (*Compiled, error) {
+	c := &Compiled{
+		byID:         make(map[string]*CompiledDeclaration, 1),
+		capabilities: make(map[string]*CompiledCapability),
+		byLifetime:   make(map[Lifetime][]*CompiledComponent),
+		natives:      make(map[string]Native, 1),
+	}
+	owned := native.Owned()
+	if err := c.addDeclaration(owned.Declaration, 0); err != nil {
+		return nil, err
+	}
+	c.natives[owned.Declaration.ID] = owned
+	if err := c.validateNative(owned.Declaration.ID, owned); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// ValidateInstance checks one opened component's exact declared binding shape
+// against this declaration.
+func (d *CompiledDeclaration) ValidateInstance(componentID string, instance Instance) error {
+	component, ok := d.Components[componentID]
 	if !ok {
 		return invalid("component %q is not declared", componentID)
 	}
@@ -734,13 +764,13 @@ func (c *Compiled) ValidateInstance(extensionID, componentID string, instance In
 	return nil
 }
 
-func (c *Compiled) component(extensionID, componentID string) (*CompiledComponent, bool) {
+// ValidateInstance checks one opened component's exact declared binding shape.
+func (c *Compiled) ValidateInstance(extensionID, componentID string, instance Instance) error {
 	declaration, ok := c.byID[extensionID]
 	if !ok {
-		return nil, false
+		return invalid("component %q is not declared", componentID)
 	}
-	component, ok := declaration.Components[componentID]
-	return component, ok
+	return declaration.ValidateInstance(componentID, instance)
 }
 
 // ValidateArguments validates one named-service call input against the exact
@@ -753,6 +783,19 @@ func ValidateArguments(methods MethodSet, method string, arguments json.RawMessa
 	return validateValue(contract.input, arguments, "arguments")
 }
 
+// ValidateResultEnvelope checks one result's common union envelope: exactly
+// one success value or failure arm and nonempty failure code/message. Payload
+// bytes stay opaque; their schema owners validate the enclosed values.
+func ValidateResultEnvelope(result Result) error {
+	if (result.Failure == nil) == (result.Value == nil) {
+		return errors.New("result must carry exactly one success value or failure")
+	}
+	if result.Failure != nil && (result.Failure.Code == "" || result.Failure.Message == "") {
+		return errors.New("failure requires nonempty code and message")
+	}
+	return nil
+}
+
 // ValidateResult validates one named-service result union against the exact
 // declared schemas.
 func ValidateResult(methods MethodSet, method string, result Result) error {
@@ -760,13 +803,10 @@ func ValidateResult(methods MethodSet, method string, result Result) error {
 	if !ok {
 		return invalid("method %q is not declared", method)
 	}
-	if (result.Failure == nil) == (result.Value == nil) {
-		return invalid("method %q result must carry exactly one success value or failure", method)
+	if err := ValidateResultEnvelope(result); err != nil {
+		return invalid("method %q: %v", method, err)
 	}
 	if result.Failure != nil {
-		if result.Failure.Code == "" || result.Failure.Message == "" {
-			return invalid("method %q failure requires nonempty code and message", method)
-		}
 		if len(result.Failure.Data) != 0 {
 			if contract.failure == nil {
 				return invalid("method %q failure data is not declared", method)

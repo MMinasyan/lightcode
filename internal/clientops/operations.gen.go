@@ -211,6 +211,13 @@ var operationDescriptors = map[string]descriptor{
 			return c.GetWarnings(ctx)
 		},
 	},
+	"InstallExtensionPackage": {
+		body:   memberRequired,
+		status: 200,
+		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
+			return c.InstallExtensionPackageWithBody(ctx, contentTypeJSON, bytes.NewReader(env.body))
+		},
+	},
 	"InterruptSession": {
 		session: memberRequired,
 		status:  204,
@@ -220,6 +227,12 @@ var operationDescriptors = map[string]descriptor{
 				return nil, err
 			}
 			return c.InterruptSession(ctx, pathValue)
+		},
+	},
+	"ListExtensionPackages": {
+		status: 200,
+		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
+			return c.ListExtensionPackages(ctx)
 		},
 	},
 	"ListModels": {
@@ -278,6 +291,17 @@ var operationDescriptors = map[string]descriptor{
 		status: 200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
 			return c.ReloadConfiguration(ctx)
+		},
+	},
+	"RemoveExtensionPackage": {
+		query:  memberRequired,
+		status: 204,
+		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
+			var query protocol.RemoveExtensionPackageParams
+			if err := bindQuery(env.query, []string{"id"}, &query); err != nil {
+				return nil, err
+			}
+			return c.RemoveExtensionPackage(ctx, &query)
 		},
 	},
 	"ReopenSession": {

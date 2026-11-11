@@ -184,6 +184,23 @@ var dispatchCases = []dispatchCase{
 		method: "POST", path: "/v1/sessions/s1/interrupt",
 	},
 	{
+		name: "ListExtensionPackages", operation: "ListExtensionPackages",
+		status: 200, response: `[{"id":"fixture","loaded_version":"1.0.0","selected_version":"2.0.0"}]`,
+		method: "GET", path: "/v1/extensions/packages",
+	},
+	{
+		name: "InstallExtensionPackage", operation: "InstallExtensionPackage",
+		params: `{"body":{"source_dir":"/tmp/package"}}`,
+		status: 200, response: `{"id":"fixture","loaded_version":"","selected_version":"1.0.0"}`,
+		method: "POST", path: "/v1/extensions/packages", body: `{"source_dir":"/tmp/package"}`,
+	},
+	{
+		name: "RemoveExtensionPackage", operation: "RemoveExtensionPackage",
+		params: `{"query":{"id":"fixture"}}`,
+		status: 204, response: "",
+		method: "DELETE", path: "/v1/extensions/packages", rawQuery: "id=fixture",
+	},
+	{
 		name: "StopSession", operation: "StopSession",
 		params: `{"session_id":"s1"}`,
 		status: 204, response: "",

@@ -95,6 +95,7 @@ type options struct {
 	Agent         *harness.AgentInputs
 	Strategy      *harness.StrategyBinding
 	Extensions    []extension.Native
+
 	OpenStore     func(context.Context, string) (harness.Storage, func() error, error)
 	NewEvaluator  func(PolicyInputs) (harness.PermissionEvaluator, error)
 	BeforeRelease func() error
@@ -120,6 +121,7 @@ type Melta struct {
 	dataDir       string
 	instance      string
 	beforeRelease func() error
+	packages      *packageManager
 
 	// jobs and closeStore are the directly constructed baseline services:
 	// the jobs service (also the Harness job-stop seam) and the acquired
@@ -195,8 +197,10 @@ func open(ctx context.Context, options options) (*Melta, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := registeredComposition(options.Extensions)
-
+	var configService *configurationService
+	supervisor := newExecutableSupervisor(func(ctx context.Context, excluded []string) ([]string, error) {
+		return configService.executableEnvironment(ctx, excluded)
+	})
 	lock, ok, err := atomicfs.TryAcquire(filepath.Join(dataDir, "runtime.lock"))
 	if err != nil {
 		return nil, err
@@ -205,6 +209,14 @@ func open(ctx context.Context, options options) (*Melta, error) {
 		return nil, fmt.Errorf("data directory %s: %w", dataDir, ErrOwned)
 	}
 	work, cancelWork := context.WithCancel(ctx)
+	packages := newPackageManager(dataDir)
+	if err := packages.load(supervisor.native); err != nil {
+		cancelWork()
+		return nil, errors.Join(err, lock.Release())
+	}
+	natives := append([]extension.Native(nil), options.Extensions...)
+	natives = append(natives, packages.loadedNatives()...)
+	c := registeredComposition(natives)
 
 	obs := newObservation()
 	// The warning store and the passive publication adapter initialize
@@ -218,7 +230,10 @@ func open(ctx context.Context, options options) (*Melta, error) {
 	adapter.instance = instance
 	c.reportWarning = adapter.reportPluginWarning
 	loader := catalog.NewLoader(options.Locations.DiscoveryCacheDir, nil)
-	configService := newConfigurationService(work, c, loader, options.Configuration, options.Credentials, options.Locations, strategy, obs)
+	configService = newConfigurationService(work, c, loader, options.Configuration, options.Credentials, options.Locations, strategy, obs)
+	configService.executables = packages.loadedExecutables()
+	configService.unusablePackages = packages.unusable
+	configService.supervisor = supervisor
 	configService.instance = instance
 	configService.attachWarnings(warnings)
 	// The private per-Session artifact interval registry initializes before
@@ -330,6 +345,7 @@ func open(ctx context.Context, options options) (*Melta, error) {
 		dataDir:       dataDir,
 		instance:      instance,
 		beforeRelease: options.BeforeRelease,
+		packages:      packages,
 		jobs:          jobsService,
 		closeStore:    closeStorage,
 		shutdownDone:  make(chan struct{}),

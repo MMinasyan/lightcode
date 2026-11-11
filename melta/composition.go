@@ -445,7 +445,7 @@ func (c *composition) openScopeReporting(ctx context.Context, info ScopeInfo, an
 			view.end()
 			return fail(fmt.Errorf("component %q: open: %w", component.ID, err))
 		}
-		instance = ownInstanceMaps(instance)
+		instance = instance.Owned()
 		if instance.Close != nil {
 			closeInstance := instance.Close
 			sc.closers = append(sc.closers, func() error {
@@ -497,28 +497,6 @@ func (c *composition) openScopeReporting(ctx context.Context, info ScopeInfo, an
 // callback. It is a cancellation opportunity, not forced termination: trusted
 // native code that ignores its context can still block cleanup.
 var nativeCloseDeadline = 5 * time.Second
-
-// ownInstanceMaps copies the accepted instance's Capability and Service map
-// containers. Implementation values and closure state remain the Caller's
-// opaque objects; only the containers that name accepted implementations are
-// owned by the composition.
-func ownInstanceMaps(instance extension.Instance) extension.Instance {
-	out := instance
-	if instance.Capabilities != nil {
-		out.Capabilities = make(map[string]extension.Implementation, len(instance.Capabilities))
-		for id, implementation := range instance.Capabilities {
-			if implementation.Service != nil {
-				services := make(map[string]extension.Handler, len(implementation.Service))
-				for name, handler := range implementation.Service {
-					services[name] = handler
-				}
-				implementation.Service = services
-			}
-			out.Capabilities[id] = implementation
-		}
-	}
-	return out
-}
 
 // hostHandler returns one fixed host named service.
 func (c *composition) hostHandler(id, method string) (extension.Handler, bool) {
