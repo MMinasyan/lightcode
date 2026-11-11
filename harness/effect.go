@@ -2366,8 +2366,9 @@ func DeclaredExecutionKnowledge(runErr error) ExecutionEvidence {
 	return ExecutionObserved
 }
 
-// isExecutionCancellation classifies pre-Engine opening errors and the
-// existing pre-publication cancellation gates.
+// isExecutionCancellation classifies pre-Engine boundary errors: the opening
+// errors, the existing pre-publication cancellation gates, and the pure
+// request-hook return.
 func isExecutionCancellation(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
@@ -2618,6 +2619,13 @@ func (d *executionDriver) runOneRequestHookPure(ctx context.Context, requestID s
 	consequence, err := hook.Run(WithCallbackIdentity(ctx, CallbackIdentity{RequestID: requestID}), input)
 	if err != nil {
 		if EffectInterrupted(err) {
+			return RequestConsequence{}, errExecutionInterrupted
+		}
+		// An untyped cancellation-shaped return is the callback's cooperative
+		// interruption only while its execution context is done; a typed
+		// EffectError remains authoritative even when it declares false.
+		var declared *EffectError
+		if !errors.As(err, &declared) && ctx.Err() != nil && isExecutionCancellation(err) {
 			return RequestConsequence{}, errExecutionInterrupted
 		}
 		return RequestConsequence{}, err

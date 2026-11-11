@@ -1442,6 +1442,73 @@ func TestRequestHookOutcomesThroughExecute(t *testing.T) {
 	}
 }
 
+// TestPureRequestHookCancellationClassification pins the pure request-hook
+// return boundary: an untyped cancellation-shaped error is an execution
+// interruption only while its execution context is done. A typed EffectError
+// keeps its declared Interrupted flag authoritative even when false and
+// wrapping cancellation; ordinary causes stay failures. A done context
+// dispatches no model and writes no pure-hook effect row.
+func TestPureRequestHookCancellationClassification(t *testing.T) {
+	wrapped := func(cause error) error { return fmt.Errorf("hook transport: %w", cause) }
+	for _, tc := range []struct {
+		name        string
+		cause       error
+		typed       *EffectError
+		cancel      bool
+		interrupted bool
+	}{
+		{name: "bare cancellation under done context", cause: context.Canceled, cancel: true, interrupted: true},
+		{name: "wrapped cancellation under done context", cause: wrapped(context.Canceled), cancel: true, interrupted: true},
+		{name: "bare deadline under done context", cause: context.DeadlineExceeded, cancel: true, interrupted: true},
+		{name: "wrapped deadline under done context", cause: wrapped(context.DeadlineExceeded), cancel: true, interrupted: true},
+		{name: "bare cancellation under live context", cause: context.Canceled},
+		{name: "wrapped deadline under live context", cause: wrapped(context.DeadlineExceeded)},
+		{name: "ordinary failure under done context", cause: errors.New("hook failed"), cancel: true},
+		{name: "typed failure wrapping cancellation under done context", typed: &EffectError{Evidence: ExecutionObserved, Err: context.Canceled}, cancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			modelCalls := 0
+			hook := RequestHook{ID: "req.pure", ExtensionID: "req-ext", Mode: HookModePure, Run: func(context.Context, RequestHookInput) (RequestConsequence, error) {
+				if tc.cancel {
+					cancel()
+				}
+				if tc.typed != nil {
+					return RequestConsequence{}, tc.typed
+				}
+				return RequestConsequence{}, tc.cause
+			}}
+			exec := requestHookFixtureExecution(func(context.Context, model.Request) (model.Stream, error) {
+				modelCalls++
+				return completedTurnStream(), nil
+			}, nil, hook)
+			h, store, c, sessionID := newHookHarness(t, exec)
+			_, err := runAdmittedExecution(t, h, c, ctx, testOpID, testCapture(), exec)
+
+			want := OperationFailure
+			if tc.interrupted {
+				want = OperationInterruption
+			}
+			settlement := graphSettlementOf(t, store, sessionID)
+			testassert.Require(t, settlement.Status == want, "settlement = %+v, want %s", settlement, want)
+			testassert.Require(t, modelCalls == 0, "model calls = %d, want no dispatch from a failed pure request hook", modelCalls)
+			if tc.interrupted {
+				testassert.Require(t, err == nil, "execution = %v, want nil after the settled interruption", err)
+			} else {
+				cause := tc.cause
+				if tc.typed != nil {
+					cause = tc.typed
+				}
+				testassert.Require(t, err == cause, "execution = %v, want the original cause %v", err, cause)
+			}
+			if hooks := hookGraphHookResults(t, store, sessionID); len(hooks) != 0 {
+				t.Fatalf("pure hook wrote effect rows: %+v", hooks)
+			}
+		})
+	}
+}
+
 // TestArgumentHookCancellationKnowledgeRows keeps status independent of evidence.
 func TestArgumentHookCancellationKnowledgeRows(t *testing.T) {
 	runCancellation := func(t *testing.T, knowledge ExecutionEvidence, cause error, typed, interrupted bool) {

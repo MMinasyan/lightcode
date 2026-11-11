@@ -14,6 +14,7 @@ import (
 	"github.com/MMinasyan/lightcode/internal/atomicfs"
 	"github.com/MMinasyan/lightcode/internal/catalog"
 	"github.com/MMinasyan/lightcode/internal/jobs"
+	"github.com/MMinasyan/lightcode/internal/pathutil"
 	"github.com/MMinasyan/lightcode/internal/storage"
 	"github.com/MMinasyan/lightcode/protocol"
 )
@@ -141,8 +142,9 @@ type Melta struct {
 }
 
 // open constructs the complete owner and publishes nothing until it has
-// finished. It requires nonempty construction inputs, normalizes the data
-// directory once with filepath.Abs, and validates the context before any
+// finished. It requires nonempty construction inputs, resolves the data
+// directory once to its canonical path (existing symlinks included and a
+// missing tail preserved), and validates the context before any
 // initialization. Startup acquires the process-lifetime lock at
 // <DataDir>/runtime.lock, validates the active composition and initial
 // configuration from the supplied sources, directly constructs the included
@@ -189,10 +191,11 @@ func open(ctx context.Context, options options) (*Melta, error) {
 		owned := *options.Strategy
 		strategy = &owned
 	}
-	dataDir, err := filepath.Abs(options.DataDir)
+	resolved, err := pathutil.ResolveFilePath(options.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("normalize data directory: %w", err)
 	}
+	dataDir := resolved.CanonicalPath
 	instance, err := mintInstance()
 	if err != nil {
 		return nil, err

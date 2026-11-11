@@ -577,7 +577,7 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		e.assertNoOwnershipSideEffects(t)
 	})
 
-	t.Run("relative paths normalize through one filepath.Abs pass", func(t *testing.T) {
+	t.Run("relative paths normalize through one canonical resolution pass", func(t *testing.T) {
 		e := newOwnerEnv(t)
 		enableFixturePlugin(t, e.configPath, "db")
 		cwd, err := os.Getwd()
@@ -623,6 +623,130 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 		}
 		testassert.NoError(t, r.Close(context.Background()))
 	})
+}
+
+// TestRuntimeOpenResolvesOneCanonicalDataRoot proves the common constructor
+// resolves the application-supplied root once: an existing root behind a
+// symlinked leaf or ancestor and a missing descendant all construct over one
+// canonical captured root, while dangling, looped and non-directory roots fail
+// before ownership or a factory exists.
+func TestRuntimeOpenResolvesOneCanonicalDataRoot(t *testing.T) {
+	server := newProductionModelServer(t, "", "")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	writeServiceFile(t, configPath, ownerConfigDocument(server.URL))
+	writeAgentDefinitions(t, configPath, ownerAgentsDocument)
+	home := t.TempDir()
+	ensureDotEnv(t, home)
+	openAt := func(t *testing.T, dataDir string) (*Melta, string, error) {
+		t.Helper()
+		var storeDataDir string
+		previous := openStore
+		openStore = func(ctx context.Context, dir string) (harness.Storage, func() error, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			storeDataDir = dir
+			return storage.NewMemory(), func() error { return nil }, nil
+		}
+		t.Cleanup(func() { openStore = previous })
+		owner, err := Open(context.Background(), Options{
+			DataDir:       dataDir,
+			Configuration: NewFileConfigurationSource(configPath),
+			Credentials:   NewEnvironmentCredentialSource(filepath.Join(home, ".lightcode", ".env")),
+		})
+		return owner, storeDataDir, err
+	}
+	assertCanonical := func(t *testing.T, owner *Melta, storeDataDir, want string) {
+		t.Helper()
+		testassert.Equal(t, owner.dataDir, want)
+		testassert.Equal(t, owner.packages.dataDir, want)
+		testassert.Equal(t, owner.config.dataDir, want)
+		testassert.Equal(t, owner.config.composition.hosts.dataDir, want)
+		testassert.Equal(t, storeDataDir, want)
+		_, err := os.Stat(filepath.Join(want, "runtime.lock"))
+		testassert.NoError(t, err)
+	}
+
+	t.Run("symlinked data directory", func(t *testing.T) {
+		realRoot := t.TempDir()
+		alias := filepath.Join(t.TempDir(), "data")
+		testassert.NoError(t, os.Symlink(realRoot, alias))
+		owner, storeDataDir, err := openAt(t, alias)
+		testassert.NoError(t, err)
+		defer owner.Close(context.Background())
+		assertCanonical(t, owner, storeDataDir, canonicalFixturePath(t, realRoot))
+	})
+
+	t.Run("symlinked ancestor", func(t *testing.T) {
+		realParent := t.TempDir()
+		realRoot := filepath.Join(realParent, "data")
+		testassert.NoError(t, os.MkdirAll(realRoot, 0o700))
+		aliasParent := filepath.Join(t.TempDir(), "alias")
+		testassert.NoError(t, os.Symlink(realParent, aliasParent))
+		owner, storeDataDir, err := openAt(t, filepath.Join(aliasParent, "data"))
+		testassert.NoError(t, err)
+		defer owner.Close(context.Background())
+		assertCanonical(t, owner, storeDataDir, canonicalFixturePath(t, realRoot))
+	})
+
+	t.Run("missing descendant under a symlinked ancestor", func(t *testing.T) {
+		realParent := t.TempDir()
+		aliasParent := filepath.Join(t.TempDir(), "alias")
+		testassert.NoError(t, os.Symlink(realParent, aliasParent))
+		owner, storeDataDir, err := openAt(t, filepath.Join(aliasParent, "missing", "root"))
+		testassert.NoError(t, err)
+		defer owner.Close(context.Background())
+		want := filepath.Join(canonicalFixturePath(t, realParent), "missing", "root")
+		assertCanonical(t, owner, storeDataDir, want)
+		_, err = os.Stat(want)
+		testassert.NoError(t, err)
+	})
+
+	t.Run("dangling root fails before publication", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "absent")
+		alias := filepath.Join(dir, "dangling")
+		testassert.NoError(t, os.Symlink(target, alias))
+		owner, storeDataDir, err := openAt(t, alias)
+		testassert.Require(t, owner == nil && err != nil, "open = (%v, %v), want a nil owner and the resolution failure", owner, err)
+		testassert.Require(t, strings.Contains(err.Error(), "normalize data directory"), "open error = %v, want the data-directory normalization wrapper", err)
+		testassert.Equal(t, storeDataDir, "")
+		_, statErr := os.Stat(filepath.Join(target, "runtime.lock"))
+		testassert.Require(t, os.IsNotExist(statErr), "dangling root published a lock: %v", statErr)
+	})
+
+	t.Run("looped root fails before publication", func(t *testing.T) {
+		dir := t.TempDir()
+		first := filepath.Join(dir, "first")
+		second := filepath.Join(dir, "second")
+		testassert.NoError(t, os.Symlink(second, first))
+		testassert.NoError(t, os.Symlink(first, second))
+		owner, storeDataDir, err := openAt(t, first)
+		testassert.Require(t, owner == nil && err != nil, "open = (%v, %v), want a nil owner and the resolution failure", owner, err)
+		testassert.Equal(t, storeDataDir, "")
+		_, statErr := os.Stat(filepath.Join(dir, "runtime.lock"))
+		testassert.Require(t, os.IsNotExist(statErr), "looped root published a lock: %v", statErr)
+	})
+
+	t.Run("non-directory root fails before publication", func(t *testing.T) {
+		dir := t.TempDir()
+		file := filepath.Join(dir, "file")
+		testassert.NoError(t, os.WriteFile(file, []byte("not a directory"), 0o600))
+		owner, storeDataDir, err := openAt(t, filepath.Join(file, "data"))
+		testassert.Require(t, owner == nil && err != nil, "open = (%v, %v), want a nil owner and the resolution failure", owner, err)
+		testassert.Equal(t, storeDataDir, "")
+		entries, readErr := os.ReadDir(dir)
+		testassert.NoError(t, readErr)
+		testassert.Require(t, len(entries) == 1 && entries[0].Name() == "file", "data root attempts created %v, want only the planted file", entries)
+	})
+}
+
+// canonicalFixturePath returns path with every existing symlink resolved.
+func canonicalFixturePath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	testassert.NoError(t, err)
+	return resolved
 }
 
 // --- ownership lock ---
