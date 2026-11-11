@@ -453,8 +453,19 @@ func TestPublicBaselineEndToEnd(t *testing.T) {
 		t.Fatalf("background members = %+v, want the started job", hydration.Background)
 	}
 
-	if _, err := owner.CompactSession(ctx, bound, sessionID, protocol.CompactRequest{OperationId: "op-compact"}); err != nil {
-		t.Fatalf("CompactSession: %v", err)
+	compactDeadline := time.Now().Add(20 * time.Second)
+	for {
+		_, err := owner.CompactSession(ctx, bound, sessionID, protocol.CompactRequest{OperationId: "op-compact"})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, harness.ErrInvalid) || !strings.Contains(err.Error(), "is not idle; admission requires an idle Session") {
+			t.Fatalf("CompactSession: %v", err)
+		}
+		if time.Now().After(compactDeadline) {
+			t.Fatalf("CompactSession never admitted within the wait bound: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	awaitOperation(t, owner, bound, sessionID, "op-compact", protocol.OperationStatusSuccess)
 
