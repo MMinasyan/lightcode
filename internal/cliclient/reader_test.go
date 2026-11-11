@@ -322,11 +322,11 @@ func TestReaderNavigationSupersedesSuccessAndError(t *testing.T) {
 			c.selectRoot(rootB)
 			receive(t, transport.requests).respond(hydration(rootB, "1", nil, nil))
 			fresh := receive(t, transport.requests)
-			fresh.respond(hydration(rootB, "1", inputs(1, 1), nil))
 			c.mu.Lock()
 			selected := c.root
 			done := selected.chain.done
 			c.mu.Unlock()
+			fresh.respond(hydration(rootB, "1", inputs(1, 1), nil))
 			barrier(t, done)
 			if fail {
 				parked.reject(404, protocol.Error{Code: "not_found", Message: "late error"})
@@ -399,11 +399,11 @@ func TestRootResetDisposesInspectorAndSameRootIntent(t *testing.T) {
 	c.selectRoot(rootA)
 	receive(t, transport.requests).respond(hydration(rootA, "1", nil, nil))
 	fresh := receive(t, transport.requests)
-	fresh.respond(hydration(rootA, "2", nil, nil))
 	c.mu.Lock()
 	newRoot := c.root
 	newDone := newRoot.chain.done
 	c.mu.Unlock()
+	fresh.respond(hydration(rootA, "2", nil, nil))
 	barrier(t, newDone)
 	// The replaced root clears the previous range's recall.
 	setDraft(c, "keep")
