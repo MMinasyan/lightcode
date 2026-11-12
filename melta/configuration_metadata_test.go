@@ -49,7 +49,7 @@ func metadataBundledFS() fstest.MapFS {
 	return fstest.MapFS{
 		"builtin/bstatic.json": {Data: []byte(`{
 			"id": "bstatic",
-			"transport": {"base_url": "http://bstatic.test/v1", "api_key_env": "", "headers": {"HTTP-Referer": "https://lightcode.test", "X-Title": "Lightcode"}},
+			"transport": {"base_url": "http://bstatic.test/v1", "api_key_env": "", "headers": {"HTTP-Referer": "https://melta.test", "X-Title": "Melta"}},
 			"discovery": false,
 			"models": {"bm": {"context_window": 1000}}
 		}`)},
@@ -60,7 +60,7 @@ func metadataBundledFS() fstest.MapFS {
 		}`)},
 		"builtin/openrouter.json": {Data: []byte(`{
 			"id": "openrouter",
-			"transport": {"base_url": "https://openrouter.test/v1", "api_key_env": "", "headers": {"HTTP-Referer": "https://lightcode.test", "X-Title": "Lightcode"}},
+			"transport": {"base_url": "https://openrouter.test/v1", "api_key_env": "", "headers": {"HTTP-Referer": "https://melta.test", "X-Title": "Melta"}},
 			"discovery": false,
 			"models": {"om": {"context_window": 1000}}
 		}`)},

@@ -16,7 +16,7 @@ type Segment struct {
 }
 
 // Parse scans a /bin/sh-style command line into command segments.
-// It intentionally models only the shell surface Lightcode needs for
+// It intentionally models only the shell surface Melta needs for
 // permission checks: command boundaries, argv normalization, substitutions,
 // expansions, and redirection operators.
 func Parse(command string) ([]Segment, error) {

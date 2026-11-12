@@ -1,7 +1,7 @@
 import { get } from 'svelte/store';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const KEY = 'lightcode.settings';
+const KEY = 'melta.settings';
 
 async function loadSettings(initialStore = {}) {
   vi.resetModules();
@@ -21,6 +21,15 @@ afterEach(() => {
 });
 
 describe('settings store', () => {
+  it('ignores settings under the old product key', async () => {
+    const oldValue = JSON.stringify({ wrapCode: true, fontScale: 200, viewerFraction: 0.75 });
+    const { settings, backing } = await loadSettings({ 'lightcode.settings': oldValue });
+    expect(get(settings)).toEqual({ wrapCode: false, fontScale: 100, viewerFraction: 0.5 });
+    settings.set({ wrapCode: true, fontScale: 125, viewerFraction: 0.75 });
+    expect(backing['lightcode.settings']).toBe(oldValue);
+    expect(JSON.parse(backing[KEY])).toEqual({ wrapCode: true, fontScale: 125, viewerFraction: 0.75 });
+  });
+
   it('loads default values when storage is empty', async () => {
     const { settings } = await loadSettings();
     expect(get(settings)).toEqual({ wrapCode: false, fontScale: 100, viewerFraction: 0.5 });

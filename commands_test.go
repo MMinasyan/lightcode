@@ -1078,11 +1078,11 @@ func TestEscapeSingleQuoted(t *testing.T) {
 func TestDispatchRuntimeUsage(t *testing.T) {
 	for _, argv := range [][]string{
 		{"melta", "runtime"},
-		{"melta", "runtime", "--data-dir", "/tmp/lightcode-runtime-usage-data"},
-		{"melta", "runtime", "--config", "/tmp/lightcode-runtime-usage-config.json"},
-		{"melta", "runtime", "--data-dir", "", "--config", "/tmp/lightcode-runtime-usage-config.json"},
-		{"melta", "runtime", "--data-dir", "/tmp/lightcode-runtime-usage-data", "--config", ""},
-		{"melta", "runtime", "--data-dir", "/tmp/lightcode-runtime-usage-data", "--config", "/tmp/lightcode-runtime-usage-config.json", "extra"},
+		{"melta", "runtime", "--data-dir", "/tmp/melta-runtime-usage-data"},
+		{"melta", "runtime", "--config", "/tmp/melta-runtime-usage-config.json"},
+		{"melta", "runtime", "--data-dir", "", "--config", "/tmp/melta-runtime-usage-config.json"},
+		{"melta", "runtime", "--data-dir", "/tmp/melta-runtime-usage-data", "--config", ""},
+		{"melta", "runtime", "--data-dir", "/tmp/melta-runtime-usage-data", "--config", "/tmp/melta-runtime-usage-config.json", "extra"},
 		{"melta", "runtime", "--bogus"},
 	} {
 		gui, code, stdout, stderr := capture(t, argv)

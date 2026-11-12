@@ -5,8 +5,8 @@
     "base_url": "https://openrouter.ai/api/v1",
     "api_key_env": "OPENROUTER_API_KEY",
     "headers": {
-      "HTTP-Referer": "https://github.com/MMinasyan/lightcode",
-      "X-Title": "Lightcode"
+      "HTTP-Referer": "https://github.com/Syntheresis/melta",
+      "X-Title": "Melta"
     }
   },
   "system_role": "system",

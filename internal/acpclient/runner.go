@@ -400,7 +400,7 @@ func (r *Runner) initialize(ctx context.Context, params json.RawMessage) (json.R
 		}
 	}
 	encoded, err := json.Marshal(initializeResult{
-		ServerInfo: serverInfo{Name: "lightcode", Version: version.String()},
+		ServerInfo: serverInfo{Name: "melta", Version: version.String()},
 		Runtime:    conn.health,
 		Methods:    supportedMethods(),
 	})

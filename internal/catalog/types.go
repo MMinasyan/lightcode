@@ -1,4 +1,4 @@
-// Package catalog builds and validates Lightcode's provider/model catalog.
+// Package catalog builds and validates Melta's provider/model catalog.
 package catalog
 
 import "github.com/Syntheresis/melta/model"

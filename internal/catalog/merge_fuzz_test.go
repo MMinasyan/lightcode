@@ -27,7 +27,7 @@ func FuzzDeepMergeCatalog(f *testing.F) {
 			},
 			{
 				"transport": map[string]any{
-					"headers": map[string]any{"HTTP-Referer": "https://lightcode.local"},
+					"headers": map[string]any{"HTTP-Referer": "https://melta.local"},
 				},
 				"models": map[string]any{
 					"gpt-5.4-mini": map[string]any{

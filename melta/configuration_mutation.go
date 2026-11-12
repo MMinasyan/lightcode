@@ -88,7 +88,7 @@ type configurationEdit struct {
 // mutate applies one edit to the latest raw user layer and publishes the
 // complete validated candidate through the shared construction and
 // publication path. It holds the build mutex from input read through
-// publication, so Lightcode-side edits and reloads serialize. One capture of
+// publication, so Melta-side edits and reloads serialize. One capture of
 // the ready revision is taken without a reader-visible lock and released
 // again before the candidate build, so the edit's subject and credential
 // decisions never compose live getters and a slow build never blocks readers.

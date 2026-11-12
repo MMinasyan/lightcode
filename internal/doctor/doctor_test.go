@@ -46,7 +46,7 @@ func params(home string) Params {
 		Home:                home,
 		ConfigPath:          filepath.Join(home, ".melta", "config.json"),
 		WorkDir:             "/nonexistent-workdir",
-		BinaryPath:          "/test/lightcode",
+		BinaryPath:          "/test/melta",
 		Version:             "dev",
 		Platform:            "linux/amd64",
 		LookupEnv:           func(string) (string, bool) { return "", false },

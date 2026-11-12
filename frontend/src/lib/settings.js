@@ -1,6 +1,6 @@
 import { writable } from 'svelte/store';
 
-const KEY = 'lightcode.settings';
+const KEY = 'melta.settings';
 
 const defaults = { wrapCode: false, fontScale: 100, viewerFraction: 0.5 };
 

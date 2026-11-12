@@ -191,7 +191,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 	}
 	// The shared executable-extension protocol holds the frame, declaration
 	// and typed method codecs both sides use. It may consume only the public
-	// contracts it encodes and must never reach the Runtime/MELTA owner or a
+	// contracts it encodes and must never reach the Runtime/Melta owner or a
 	// concrete implementation package.
 	if dir == "extension/worker" || strings.HasPrefix(dir, "extension/worker/") {
 		for _, imp := range imports {
@@ -201,7 +201,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 				continue
 			}
 			if imp != modelPkg && imp != harnessPkg && imp != promptPkg && imp != protocolPkg && imp != extensionPkg && imp != workerPkg && !std[imp] {
-				problems = append(problems, rel+": extension/worker imports "+imp+"; the shared worker protocol may import only the standard library and the public "+modelPkg+", "+harnessPkg+", "+promptPkg+", "+protocolPkg+" and "+extensionPkg+" contracts, never the Runtime/MELTA owner or a concrete implementation package")
+				problems = append(problems, rel+": extension/worker imports "+imp+"; the shared worker protocol may import only the standard library and the public "+modelPkg+", "+harnessPkg+", "+promptPkg+", "+protocolPkg+" and "+extensionPkg+" contracts, never the Runtime/Melta owner or a concrete implementation package")
 			}
 		}
 		return problems
@@ -258,7 +258,7 @@ func checkTrackedGoFile(rel string, imports []string, std map[string]bool) []str
 			}
 		case "extension":
 			if imp != modelPkg && imp != harnessPkg && imp != promptPkg && imp != protocolPkg && imp != jsonschemaPkg && !std[imp] {
-				problems = append(problems, rel+": extension package imports "+imp+"; extension may import only the standard library, the shared "+modelPkg+", "+harnessPkg+", "+promptPkg+" and "+protocolPkg+" contracts, and "+jsonschemaPkg+", never the Runtime/MELTA owner or a concrete/internal implementation package")
+				problems = append(problems, rel+": extension package imports "+imp+"; extension may import only the standard library, the shared "+modelPkg+", "+harnessPkg+", "+promptPkg+" and "+protocolPkg+" contracts, and "+jsonschemaPkg+", never the Runtime/Melta owner or a concrete/internal implementation package")
 			}
 		case "melta":
 			if imp != modelPkg && imp != harnessPkg && imp != protocolPkg && imp != extensionPkg && imp != workerPkg && imp != promptPkg && imp != configPkg && imp != catalogPkg && imp != atomicfsPkg && imp != snapshotPkg && imp != safefsPkg && imp != pathutilPkg && imp != storagePkg && imp != toolPkg && imp != editprePkg && imp != shellparsePkg && imp != toolargsPkg && imp != jobsPkg && !std[imp] {
@@ -418,7 +418,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	}
 	// The shared worker protocol encodes the public extension, model,
 	// harness, prompt and protocol values over the standard library; the
-	// Runtime/MELTA owner, the generated implementation packages, the driver,
+	// Runtime/Melta owner, the generated implementation packages, the driver,
 	// and its testdata fixture's reverse edges stay rejected.
 	{
 		problems := checkTrackedGoFile("extension/worker/x.go", []string{
@@ -449,7 +449,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	}
 	{
 		problems := checkTrackedGoFile("extension/worker/testdata/fixture/main.go", []string{publicModule + "/melta"}, std)
-		testassert.Check(t, len(problems) == 1, "fixture importing the MELTA owner: %d problems, want 1: %v", len(problems), problems)
+		testassert.Check(t, len(problems) == 1, "fixture importing the Melta owner: %d problems, want 1: %v", len(problems), problems)
 	}
 	// The Adaptation extension declares one Harness-scoped PreparationHook
 	// over the public model and prompt contracts and the native extension
@@ -590,7 +590,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 	}
 	// The native extension contract carries only the shared model, harness,
 	// prompt and protocol data contracts plus the installed schema compiler;
-	// the Runtime/MELTA owner, concrete plugins and extensions, storage,
+	// the Runtime/Melta owner, concrete plugins and extensions, storage,
 	// agent package and the SQLite driver are the nearest forbidden
 	// implementation siblings.
 	{
@@ -627,7 +627,7 @@ func TestDependencyRulesRejectNonStdlibDotlessImports(t *testing.T) {
 			testassert.Check(t, len(problems) == 1, "runtime importing %q: %d problems, want 1: %v", imp, len(problems), problems)
 		}
 	}
-	// The public MELTA owner composes the model and harness foundation, the
+	// The public Melta owner composes the model and harness foundation, the
 	// extension and prompt contracts, generated protocol data values, and the
 	// retained baseline helpers it constructs directly. Concrete extensions,
 	// the supplied registration set, the HTTP protocol host, and the SQLite

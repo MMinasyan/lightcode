@@ -1,4 +1,4 @@
-// Package config loads the Lightcode config file and resolves process-level
+// Package config loads the Melta config file and resolves process-level
 // settings. Provider/model metadata is owned by internal/catalog and
 // extensions/agents; this package keeps only non-model runtime sections.
 //
@@ -24,7 +24,7 @@ import (
 // ErrMissingEnvVar) to surface a friendlier hint that points at the .env file.
 var ErrMissingEnvVar = errors.New("provider API key env var is unset")
 
-// ConfigPath returns the path where Lightcode expects its main config file.
+// ConfigPath returns the path where Melta expects its main config file.
 // The user owns this file; it is auto-created as an empty skeleton on first
 // run if it does not exist.
 func ConfigPath() (string, error) {

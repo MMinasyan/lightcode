@@ -109,7 +109,7 @@ func encodeOwned(rt ResolvedTransport, request Request, runtimeLayer Extra) (jso
 		}
 	}
 
-	body := map[string]any{ // base body exactly as specified; optional keys appear only with their trigger data. The wire model field is the bare target name (the endpoint's own vocabulary), not Lightcode's provider-prefixed identity rendering.
+	body := map[string]any{ // base body exactly as specified; optional keys appear only with their trigger data. The wire model field is the bare target name (the endpoint's own vocabulary), not Melta's provider-prefixed identity rendering.
 		"model":    rt.Model.Model,
 		"messages": bodyMessages,
 		"stream":   true,

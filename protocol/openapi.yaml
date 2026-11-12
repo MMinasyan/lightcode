@@ -1,4 +1,4 @@
-# Lightcode Runtime protocol — the single source of truth for HTTP paths,
+# Melta Runtime protocol — the single source of truth for HTTP paths,
 # request/response DTOs, closed enums, error payloads, and SSE event frames.
 # The wire version is the protocol identity, independent of the binary
 # release version. This file is hand-maintained; the Go and TypeScript
@@ -6,7 +6,7 @@
 # generated from it and are never hand-edited.
 openapi: "3.0.3"
 info:
-  title: lightcode-protocol
+  title: melta-protocol
   version: "16"
 servers:
   - url: "http://127.0.0.1"

@@ -1,4 +1,4 @@
-// Package client connects one Go caller to an authenticated Lightcode
+// Package client connects one Go caller to an authenticated Melta
 // Runtime over the generated protocol: strict startup-file discovery,
 // authenticated health, authenticated protocol byte requests, and the one SSE
 // notification stream. It imports only the standard library and the generated

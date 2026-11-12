@@ -1,4 +1,4 @@
-// Package model defines provider-neutral values for Lightcode's agent
+// Package model defines provider-neutral values for Melta's agent
 // foundation: model identities, conversation roles and messages, content
 // parts, tool definitions, calls and results, logical requests, usage counts,
 // protocol warnings, stream deltas, and final outputs.

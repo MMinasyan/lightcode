@@ -214,7 +214,7 @@ func projectUsage(totals harness.UsageTotals) protocol.UsageTotals {
 
 // itemIDDomain is the item identity's domain separator: the protocol item ID
 // binds the Session identity and the entry identity, never a payload value.
-const itemIDDomain = "lightcode-item\x00"
+const itemIDDomain = "melta-item\x00"
 
 // projectItemID derives one stable client item identity: the unpadded
 // base64url of the first 16 bytes of SHA-256 over the Session/entry binding.

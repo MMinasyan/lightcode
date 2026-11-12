@@ -28,7 +28,7 @@ import (
 type sseConnectionKey struct{}
 
 // ProtocolHost owns one host's listener attachment and supplies the
-// BeforeRelease callback to the MELTA owner that must run after admitted work
+// BeforeRelease callback to the Melta owner that must run after admitted work
 // and scopes settle and before storage or the ownership lock is released.
 type ProtocolHost struct {
 	mu       sync.Mutex

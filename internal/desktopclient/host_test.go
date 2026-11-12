@@ -615,7 +615,7 @@ func TestDesktopHostNativeInvocation(t *testing.T) {
 			// The initial window title and every subsequent SetTitle apply
 			// the one shared algorithm: the plain basename join, no
 			// special case.
-			want := "Lightcode — " + filepath.Base(workspace)
+			want := "Melta — " + filepath.Base(workspace)
 			{
 				got := windowTitle(workspace)
 				testassert.Require(t, got == want, "initial title for %q = %q, want %q", workspace, got, want)
@@ -1152,7 +1152,7 @@ func TestDesktopHostAppOptions(t *testing.T) {
 	opts := appOptions(host, assets)
 	testassert.Require(t, opts.Width == 900 && opts.Height == 700, "window size = %dx%d, want 900x700", opts.Width, opts.Height)
 	{
-		want := "Lightcode — WorkspaceDir"
+		want := "Melta — WorkspaceDir"
 		testassert.Equal(t, opts.Title, want)
 	}
 	testassert.Require(t, opts.AssetServer != nil && opts.AssetServer.Assets == assets, "AssetServer.Assets = %v, want the given filesystem", opts.AssetServer)

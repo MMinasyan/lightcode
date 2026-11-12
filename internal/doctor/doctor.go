@@ -1,4 +1,4 @@
-// Package doctor runs read-only diagnostics over a Lightcode install. It
+// Package doctor runs read-only diagnostics over a Melta install. It
 // composes only read-only seams — config.Parse/ReadDotEnvKeys/
 // ClassifyKeySource, catalog.BuildOffline/ProviderConnected, the
 // package-level project lookups, and lockfile reads — and performs zero

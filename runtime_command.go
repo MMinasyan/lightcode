@@ -23,7 +23,7 @@ func installedExtensions() ([]string, []string) {
 	return ids, builtin.DefaultCapabilityIDs()
 }
 
-// runRuntime runs the shared managed MELTA owner and its thin protocol host in
+// runRuntime runs the shared managed Melta owner and its thin protocol host in
 // the foreground for the lifetime of the signal context. It supplies the
 // current application paths and the first-run configuration document, opens
 // the owner with the host withdrawal callback, attaches the protocol and

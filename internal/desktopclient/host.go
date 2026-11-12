@@ -110,7 +110,7 @@ func appOptions(host *Host, assets fs.FS) *options.App {
 // root host's naming: the native title is always the selected Workspace
 // basename under the product prefix.
 func windowTitle(workspace string) string {
-	return "Lightcode — " + filepath.Base(workspace)
+	return "Melta — " + filepath.Base(workspace)
 }
 
 // startup is the Wails startup hook. Wails launches it once and

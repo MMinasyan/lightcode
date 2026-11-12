@@ -1,4 +1,4 @@
-// Package extension defines the data contract of a native MELTA extension:
+// Package extension defines the data contract of a native Melta extension:
 // one owned declaration, its compiled schemas and capability graph, the fixed
 // typed contributions an implementation supplies, and the mediated call
 // contexts through which declared bindings are reached.

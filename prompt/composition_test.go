@@ -241,7 +241,7 @@ func TestAssembleUsesOnlyExplicitInputs(t *testing.T) {
 	input.Shell = "caller-shell"
 	assembled := assembleInput(t, input)
 
-	for _, forbidden := range []string{"AMBIENT_HOME_RULES", "Lightcode, an agentic coding assistant", "/ambient-shell"} {
+	for _, forbidden := range []string{"AMBIENT_HOME_RULES", "Melta, an agentic coding assistant", "/ambient-shell"} {
 		testassert.Require(t, !strings.Contains(assembled, forbidden), "assembly carried implicit input %q\n%s", forbidden, assembled)
 	}
 	testassert.Require(t, strings.Contains(assembled, "Shell: caller-shell") && strings.Contains(assembled, "EXPLICIT_RULES"), "assembly lost an explicit input\n%s", assembled)

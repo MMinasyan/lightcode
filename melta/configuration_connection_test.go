@@ -471,7 +471,7 @@ func TestConnectProviderExternalKeyNeverPersisted(t *testing.T) {
 		r, _ := openConnectionRuntime(t, store, server.URL)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
-		// The shell key is set outside Lightcode and stays unmanaged. The
+		// The shell key is set outside Melta and stays unmanaged. The
 		// published revision observes it at the next build.
 		t.Setenv("CONNECTION_DISC_KEY", "shell-exported-value")
 		_, err := r.Reload(ctx, testCaller(r))
@@ -1478,7 +1478,7 @@ func TestDisconnectProviderRefusals(t *testing.T) {
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, harness.ErrInvalid)
 
 		// An external set key refuses, naming the env variable alone — no
-		// value exists in a Lightcode store, and none is invented.
+		// value exists in a Melta store, and none is invented.
 		_, err = r.DisconnectProvider(ctx, testCaller(r), "staticp")
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "CONNECTION_STATIC_KEY") && !strings.Contains(err.Error(), "shell-exported-value"), "external disconnect error %q, want the env name without any value", err)
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)

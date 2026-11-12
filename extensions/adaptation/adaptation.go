@@ -1,4 +1,4 @@
-// Package adaptation owns Lightcode's ordinary native per-model adaptation
+// Package adaptation owns Melta's ordinary native per-model adaptation
 // extension. Ordered configured match entries precede the bundled data rows;
 // the first match decides. A matched entry may replace the complete prompt,
 // append ordered paragraphs, exclude currently visible tools, and rewrite

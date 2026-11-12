@@ -3092,7 +3092,7 @@ describe('host-local appearance and version', () => {
     // surface leaves no appearance state for its neighbours.
     const { settings } = await import('../lib/settings.js');
     settings.set({ ...DEFAULTS });
-    localStorage.removeItem('lightcode.settings');
+    localStorage.removeItem('melta.settings');
   });
 
   it('edits and persists the shared store with the 50-200 clamp and never touches the Runtime document', async () => {
@@ -3102,14 +3102,14 @@ describe('host-local appearance and version', () => {
     expect((target.querySelector('[aria-label="Version"]') as HTMLElement).textContent).toBe('dev (test)');
     await toggleCheckbox(target, 'Wrap code blocks', true);
     await changeInput(target, 'Font scale', '900');
-    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string))
+    expect(JSON.parse(localStorage.getItem('melta.settings') as string))
       .toEqual({ wrapCode: true, fontScale: 200, viewerFraction: 0.5 });
     await changeInput(target, 'Font scale', '10');
-    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string))
+    expect(JSON.parse(localStorage.getItem('melta.settings') as string))
       .toEqual({ wrapCode: true, fontScale: 50, viewerFraction: 0.5 });
     expect((target.querySelector('[aria-label="Font scale"]') as HTMLInputElement).value).toBe('50');
     await toggleCheckbox(target, 'Wrap code blocks', false);
-    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string).wrapCode).toBe(false);
+    expect(JSON.parse(localStorage.getItem('melta.settings') as string).wrapCode).toBe(false);
     // Appearance is client-owned UI state: no configuration write.
     expect(vi.mocked(sdk.UpdateConfigurationSettings)).not.toHaveBeenCalled();
   });
@@ -3131,7 +3131,7 @@ describe('host-local appearance and version', () => {
     // ...while the host-local rows are already live.
     expect((target.querySelector('[aria-label="Version"]') as HTMLElement).textContent).toBe('dev (test)');
     await toggleCheckbox(target, 'Wrap code blocks', true);
-    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string).wrapCode).toBe(true);
+    expect(JSON.parse(localStorage.getItem('melta.settings') as string).wrapCode).toBe(true);
     release(native(200, RAW_CONFIGURATION, false));
     await settle();
     await settle();
@@ -3156,7 +3156,7 @@ describe('host-local appearance and version', () => {
     expect((target.querySelector('[aria-label="Version"]') as HTMLElement).textContent).toBe('dev (test)');
     await toggleCheckbox(target, 'Wrap code blocks', true);
     await changeInput(target, 'Font scale', '150');
-    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string))
+    expect(JSON.parse(localStorage.getItem('melta.settings') as string))
       .toEqual({ wrapCode: true, fontScale: 150, viewerFraction: 0.5 });
   });
 
@@ -3170,7 +3170,7 @@ describe('host-local appearance and version', () => {
     // ...and the actual failure reaches the existing visible note surface.
     expect(target.querySelector('.note.outcome')?.textContent).toContain('version unavailable');
     await toggleCheckbox(target, 'Wrap code blocks', true);
-    expect(JSON.parse(localStorage.getItem('lightcode.settings') as string).wrapCode).toBe(true);
+    expect(JSON.parse(localStorage.getItem('melta.settings') as string).wrapCode).toBe(true);
   });
 });
 
