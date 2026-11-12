@@ -161,6 +161,7 @@ func Declaration() extension.Declaration {
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "command"}, Kind: extension.ExposedSessionWork, Target: extension.ExposedTargetSession},
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "command_harness"}, Kind: extension.ExposedSessionWork, Target: extension.ExposedTargetHarness},
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "query_hold"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetSession},
+			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "namespaces"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetSession},
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "management_command"}, Kind: extension.ExposedManagement, Target: extension.ExposedTargetHarness},
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "pure_command"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
 			{Method: extension.MethodKey{CapabilityID: serviceCapability, Method: "raw"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
@@ -207,6 +208,9 @@ func commandMethods() []extension.Method {
 		extension.ServiceMethod("query_hold", extension.ModeServiceIO,
 			`{"type":"object","required":["hold","release"],"properties":{"hold":{"type":"string","minLength":1},"release":{"type":"string","minLength":1},"block":{"type":"string"}},"additionalProperties":false}`,
 			`{}`, "", ""),
+		extension.ServiceMethod("namespaces", extension.ModeServiceIO,
+			`{"type":"object","additionalProperties":false}`,
+			`{"type":"object","required":["session_directory","cache_directory"],"properties":{"session_directory":{"type":"string","minLength":1},"cache_directory":{"type":"string","minLength":1}},"additionalProperties":false}`, "", ""),
 	}
 }
 
@@ -364,6 +368,7 @@ func commandHandlers() map[string]extension.Handler {
 		"management_command": managementCommandHandler,
 		"pure_command":       pureCommandHandler,
 		"query_hold":         queryHoldHandler,
+		"namespaces":         namespacesHandler,
 	}
 }
 
@@ -423,6 +428,36 @@ func pureCommandHandler(ctx context.Context, call extension.CallContext, argumen
 	}
 	record("pure:%s:attempt", request.Method)
 	return call.Call(ctx, "commands", request.Method, request.Arguments)
+}
+
+// namespacesHandler returns the extension's own Session and cache directories
+// through the declared host data service, so host tests can place sentinels
+// without reproducing the private namespace layout.
+func namespacesHandler(ctx context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
+	session, err := call.Call(ctx, "data", "session_namespace", json.RawMessage(`{}`))
+	if err != nil {
+		return extension.Result{}, err
+	}
+	cache, err := call.Call(ctx, "data", "cache_namespace", json.RawMessage(`{}`))
+	if err != nil {
+		return extension.Result{}, err
+	}
+	sessionDirectory, err := namespaceDirectory(session)
+	if err != nil {
+		return extension.Result{}, err
+	}
+	cacheDirectory, err := namespaceDirectory(cache)
+	if err != nil {
+		return extension.Result{}, err
+	}
+	value, err := json.Marshal(map[string]string{
+		"session_directory": sessionDirectory,
+		"cache_directory":   cacheDirectory,
+	})
+	if err != nil {
+		return extension.Result{}, err
+	}
+	return extension.Result{Value: value}, nil
 }
 
 func queryHoldHandler(ctx context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
