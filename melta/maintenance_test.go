@@ -471,7 +471,7 @@ func TestMaintenanceControlledTicksSweepUnderTheCurrentPolicy(t *testing.T) {
 		assertNoOperationRegisters(t, wrapped, id)
 		{
 			out := stderr()
-			testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "boundary passes reported diagnostics: %q", out)
+			testassert.Require(t, !strings.Contains(out, "melta: sweep:"), "boundary passes reported diagnostics: %q", out)
 		}
 	})
 }
@@ -509,7 +509,7 @@ func TestMaintenanceFailedPassReportsAndWaitsForTheNextTick(t *testing.T) {
 				testassert.NoError(t, r.Close(context.Background()))
 				out := stderr()
 				{
-					n := strings.Count(out, "lightcode: sweep: "+tc.failure.Error())
+					n := strings.Count(out, "melta: sweep: "+tc.failure.Error())
 					testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want the failed pass reported exactly once", n, out)
 				}
 				testassert.Equal(t, wrapped.listCount(), 4)
@@ -562,7 +562,7 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			testassert.NoError(t, r.Close(context.Background()))
 			{
 				out := stderr()
-				testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the canceled pass reported to stderr: %q, want cancellation joined silently", out)
+				testassert.Require(t, !strings.Contains(out, "melta: sweep:"), "the canceled pass reported to stderr: %q, want cancellation joined silently", out)
 			}
 			e.assertLockReleased(t)
 		}
@@ -614,7 +614,7 @@ func TestMaintenanceShutdownJoinsTheBlockedPassBeforeStorageTeardown(t *testing.
 			testassert.NoError(t, r.Close(context.Background()))
 			{
 				out := stderr()
-				testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the deadline-canceled pass reported to stderr: %q, want deadline expiry silent like cancellation", out)
+				testassert.Require(t, !strings.Contains(out, "melta: sweep:"), "the deadline-canceled pass reported to stderr: %q, want deadline expiry silent like cancellation", out)
 			}
 			e.assertLockReleased(t)
 		})
@@ -661,7 +661,7 @@ func TestMaintenanceUnrelatedFailureIsQuietOnceShutdownIsObserved(t *testing.T) 
 		testassert.NoError(t, r.Close(context.Background()))
 		{
 			out := stderr()
-			testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the shutdown-observed unrelated failure reported to stderr: %q, want silence once shutdown is observed", out)
+			testassert.Require(t, !strings.Contains(out, "melta: sweep:"), "the shutdown-observed unrelated failure reported to stderr: %q, want silence once shutdown is observed", out)
 		}
 		e.assertLockReleased(t)
 	})
@@ -686,7 +686,7 @@ func TestMaintenanceGateRejectionIsQuiet(t *testing.T) {
 		testassert.Equal(t, wrapped.listCount(), before)
 		{
 			out := stderr()
-			testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the gate-rejected pass reported to stderr: %q, want ErrClosed quiet", out)
+			testassert.Require(t, !strings.Contains(out, "melta: sweep:"), "the gate-rejected pass reported to stderr: %q, want ErrClosed quiet", out)
 		}
 	})
 }
@@ -792,7 +792,7 @@ func TestMaintenancePassSweepsValidSiblingsAroundCorruption(t *testing.T) {
 		}
 		{
 			out := stderr()
-			testassert.Require(t, !strings.Contains(out, "lightcode: sweep:"), "the corrupt sibling was reported as a pass failure: %q", out)
+			testassert.Require(t, !strings.Contains(out, "melta: sweep:"), "the corrupt sibling was reported as a pass failure: %q", out)
 		}
 	})
 }
@@ -1158,7 +1158,7 @@ func TestMaintenanceSweepCleansCommittedSessions(t *testing.T) {
 
 		out := stderr()
 		{
-			n := strings.Count(out, "lightcode: sweep: "+errSweepRollback.Error())
+			n := strings.Count(out, "melta: sweep: "+errSweepRollback.Error())
 			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want one line reporting the stopping pass error", n, out)
 		}
 		testassert.NoError(t, r.Close(context.Background()))
@@ -1198,7 +1198,7 @@ func TestMaintenanceSweepJoinsPassAndCleanupErrorsInOneDiagnostic(t *testing.T) 
 
 		out := stderr()
 		{
-			n := strings.Count(out, "lightcode: sweep:")
+			n := strings.Count(out, "melta: sweep:")
 			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want exactly one line for the whole pass", n, out)
 		}
 		testassert.Require(t, strings.Contains(out, errSweepRollback.Error()) && strings.Contains(out, firstCode), "stderr sweep diagnostic %q, want it to carry both the stopping pass error and the failing cleanup", out)
@@ -1241,7 +1241,7 @@ func TestMaintenanceSweepReportsCleanupErrorsAndAttemptsEveryID(t *testing.T) {
 
 		out := stderr()
 		{
-			n := strings.Count(out, "lightcode: sweep:")
+			n := strings.Count(out, "melta: sweep:")
 			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
 		}
 		testassert.Require(t, strings.Contains(out, filepath.Join(aCode, "snapshots")), "stderr sweep diagnostic %q, want it to report the failing cleanup's path", out)
@@ -1406,12 +1406,12 @@ func TestMaintenanceSweepRemovesWarningsForEveryCommittedDeletion(t *testing.T) 
 		// The pass error's one retained diagnostic may land just after the
 		// hint; poll it under a bounded budget.
 		deadline := time.Now().Add(5 * time.Second)
-		for strings.Count(stderr(), "lightcode: sweep:") == 0 && time.Now().Before(deadline) {
+		for strings.Count(stderr(), "melta: sweep:") == 0 && time.Now().Before(deadline) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		out := stderr()
 		{
-			n := strings.Count(out, "lightcode: sweep:")
+			n := strings.Count(out, "melta: sweep:")
 			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want one line for the whole pass", n, out)
 		}
 	})
@@ -1522,12 +1522,12 @@ func TestMaintenanceSweepStopsOnCandidateReadFailure(t *testing.T) {
 		// The pass error's one retained diagnostic may land just after the
 		// hint; poll it under a bounded budget.
 		deadline := time.Now().Add(5 * time.Second)
-		for strings.Count(stderr(), "lightcode: sweep: "+readFailure.Error()) == 0 && time.Now().Before(deadline) {
+		for strings.Count(stderr(), "melta: sweep: "+readFailure.Error()) == 0 && time.Now().Before(deadline) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		out := stderr()
 		{
-			n := strings.Count(out, "lightcode: sweep: "+readFailure.Error())
+			n := strings.Count(out, "melta: sweep: "+readFailure.Error())
 			testassert.Require(t, n == 1, "stderr sweep diagnostics = %d in %q, want one line reporting the stopping read failure", n, out)
 		}
 	})

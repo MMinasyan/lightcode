@@ -134,7 +134,7 @@ func (r *Melta) runSweepPass(ctx context.Context, now time.Time) {
 		return errors.Join(append([]error{passErr}, cleanErrs...)...)
 	})
 	if err != nil && ctx.Err() == nil && !errors.Is(err, ErrClosed) {
-		fmt.Fprintf(os.Stderr, "lightcode: sweep: %v\n", err)
+		fmt.Fprintf(os.Stderr, "melta: sweep: %v\n", err)
 	}
 }
 

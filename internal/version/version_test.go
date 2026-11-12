@@ -118,9 +118,9 @@ func TestLineShapes(t *testing.T) {
 		v, commit string
 		want      string
 	}{
-		{"v0.0.3", "abc1234", "lightcode v0.0.3 (" + plat + ")"},
-		{"dev", "abc1234", "lightcode dev (abc1234, " + plat + ")"},
-		{"dev", "", "lightcode dev (" + plat + ")"},
+		{"v0.0.3", "abc1234", "melta v0.0.3 (" + plat + ")"},
+		{"dev", "abc1234", "melta dev (abc1234, " + plat + ")"},
+		{"dev", "", "melta dev (" + plat + ")"},
 	}
 	for _, c := range cases {
 		setIdentity(t, c.v, c.commit)

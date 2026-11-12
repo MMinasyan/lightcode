@@ -26,10 +26,10 @@ import (
 )
 
 const (
-	repoURL = "https://github.com/MMinasyan/lightcode"
+	repoURL = "https://github.com/Syntheresis/melta"
 
 	// AssetName is the single published binary asset per release tag.
-	AssetName = "lightcode-linux-amd64.tar.gz"
+	AssetName = "melta-linux-amd64.tar.gz"
 
 	// MinInstallable is the oldest release tag upgrade will install: the
 	// first tag whose binary answers --version, which the smoke check and
@@ -161,7 +161,7 @@ func VerifySHA256(data, sums []byte, assetName string) error {
 }
 
 // ExtractBinary returns the bytes of the archive member named exactly
-// "lightcode". Only a regular-file member is accepted; symlinks,
+// "melta". Only a regular-file member is accepted; symlinks,
 // directories, and anything else are rejected.
 func ExtractBinary(tarball []byte) ([]byte, error) {
 	gz, err := gzip.NewReader(bytes.NewReader(tarball))
@@ -178,11 +178,11 @@ func ExtractBinary(tarball []byte) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read release archive: %w", err)
 		}
-		if hdr.Name != "lightcode" {
+		if hdr.Name != "melta" {
 			continue
 		}
 		if hdr.Typeflag != tar.TypeReg {
-			return nil, fmt.Errorf("release archive member lightcode is not a regular file")
+			return nil, fmt.Errorf("release archive member melta is not a regular file")
 		}
 		data, err := io.ReadAll(tr)
 		if err != nil {
@@ -190,16 +190,16 @@ func ExtractBinary(tarball []byte) ([]byte, error) {
 		}
 		return data, nil
 	}
-	return nil, fmt.Errorf("release archive has no lightcode member")
+	return nil, fmt.Errorf("release archive has no melta member")
 }
 
 // Stage writes the verified binary into the target directory under a random
-// .lightcode.tmp.* name, mode 0755. Staging next to the target gives the
+// .melta.tmp.* name, mode 0755. Staging next to the target gives the
 // same filesystem for the atomic rename, an exec-capable location, and the
 // guarantee that the smoke check executes the same inode the rename
 // promotes. A crash strands one dotfile; uninstall sweeps them.
 func Stage(dir string, binary []byte) (string, error) {
-	f, err := os.CreateTemp(dir, ".lightcode.tmp.*")
+	f, err := os.CreateTemp(dir, ".melta.tmp.*")
 	if err != nil {
 		return "", fmt.Errorf("stage new binary: %w", err)
 	}

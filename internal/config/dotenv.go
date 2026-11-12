@@ -62,7 +62,7 @@ func (m *ManagedEnv) Capture(names []string) (map[string]CredentialValue, error)
 		return nil, err
 	}
 	for _, message := range malformed {
-		fmt.Fprintf(os.Stderr, "lightcode: .env %s: skipping %s\n", m.Path(), message)
+		fmt.Fprintf(os.Stderr, "melta: .env %s: skipping %s\n", m.Path(), message)
 	}
 	environment := parseEnviron(os.Environ())
 	out := make(map[string]CredentialValue, len(names))

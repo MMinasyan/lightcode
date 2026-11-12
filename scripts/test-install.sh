@@ -44,7 +44,7 @@ assert_mode() {
 
 assert_no_staging_residue() {
     dir=$1
-    for candidate in "$dir"/.lightcode.tmp.*; do
+    for candidate in "$dir"/.melta.tmp.*; do
         if [ -e "$candidate" ]; then
             fail "temporary staging file left behind: $candidate"
         fi
@@ -57,10 +57,10 @@ make_release() {
 exit 0
 '}
     mkdir -p "$dir/pkg"
-    printf '%s' "$binary_content" >"$dir/pkg/lightcode"
-    chmod 755 "$dir/pkg/lightcode"
-    (cd "$dir/pkg" && tar -czf "$dir/lightcode-linux-amd64.tar.gz" lightcode)
-    (cd "$dir" && sha256sum install.sh lightcode-linux-amd64.tar.gz >SHA256SUMS)
+    printf '%s' "$binary_content" >"$dir/pkg/melta"
+    chmod 755 "$dir/pkg/melta"
+    (cd "$dir/pkg" && tar -czf "$dir/melta-linux-amd64.tar.gz" melta)
+    (cd "$dir" && sha256sum install.sh melta-linux-amd64.tar.gz >SHA256SUMS)
 }
 
 make_shims() {
@@ -359,7 +359,7 @@ deps_marker=$test_root/deps-installed
 rm -f "$deps_marker"
 run_expect_success "$test_root/auto-deps.out" env MELTA_TEST_LDD_MODE=auto-install MELTA_TEST_DEPS_MARKER="$deps_marker"
 [ -f "$deps_marker" ] || fail "runtime package installer was not invoked"
-[ -x "$install_dir/lightcode" ] || fail "installed lightcode is missing or not executable after dependency install"
+[ -x "$install_dir/melta" ] || fail "installed melta is missing or not executable after dependency install"
 assert_file_contains "$test_root/auto-deps.out" "Installing WebKitGTK/GTK runtime packages"
 
 rm -rf "$release_dir"
@@ -367,72 +367,87 @@ mkdir -p "$release_dir"
 cp "$installer" "$release_dir/install.sh"
 make_release "$release_dir"
 
-printf 'old-binary' >"$install_dir/lightcode"
-chmod 700 "$install_dir/lightcode"
+printf 'old-binary' >"$install_dir/melta"
+chmod 700 "$install_dir/melta"
 run_expect_success "$test_root/success.out" env MELTA_TEST_LDD_MODE=ok
-[ -x "$install_dir/lightcode" ] || fail "installed lightcode is missing or not executable"
-cmp "$install_dir/lightcode" "$release_dir/pkg/lightcode" >/dev/null || fail "installed binary does not match the release binary"
-assert_mode "$install_dir/lightcode" 755
+[ -x "$install_dir/melta" ] || fail "installed melta is missing or not executable"
+cmp "$install_dir/melta" "$release_dir/pkg/melta" >/dev/null || fail "installed binary does not match the release binary"
+assert_mode "$install_dir/melta" 755
 assert_no_staging_residue "$install_dir"
-assert_file_contains "$test_root/success.out" "Installed Lightcode"
+assert_file_contains "$test_root/success.out" "Installed Melta"
 [ ! -e "$home_dir/.melta/config.json" ] || fail "installer wrote config.json"
 [ ! -e "$home_dir/.melta/.env" ] || fail "installer wrote .env"
 
 privileged_dir=$test_root/privileged-bin
 mkdir -p "$privileged_dir"
-printf 'old-binary' >"$privileged_dir/lightcode"
+printf 'old-binary' >"$privileged_dir/melta"
 chmod 555 "$privileged_dir"
 install_dir=$privileged_dir
 run_expect_failure "$test_root/privileged-copy-fail.out" env MELTA_TEST_LDD_MODE=ok MELTA_TEST_SUDO_CP_FAIL=1
 chmod 755 "$privileged_dir"
-assert_equal_file "$privileged_dir/lightcode" "old-binary"
+assert_equal_file "$privileged_dir/melta" "old-binary"
 install_dir=$test_root/bin
 
-printf 'old-binary' >"$install_dir/lightcode"
-chmod 700 "$install_dir/lightcode"
+printf 'old-binary' >"$install_dir/melta"
+chmod 700 "$install_dir/melta"
 run_expect_failure "$test_root/writable-copy-fail.out" env MELTA_TEST_LDD_MODE=ok MELTA_TEST_CP_FAIL=1
-assert_equal_file "$install_dir/lightcode" "old-binary"
-assert_mode "$install_dir/lightcode" 700
+assert_equal_file "$install_dir/melta" "old-binary"
+assert_mode "$install_dir/melta" 700
 assert_file_contains "$test_root/writable-copy-fail.out" "could not copy binary into"
 assert_no_staging_residue "$install_dir"
 
-printf 'old-binary' >"$install_dir/lightcode"
-chmod 700 "$install_dir/lightcode"
+printf 'old-binary' >"$install_dir/melta"
+chmod 700 "$install_dir/melta"
 run_expect_failure "$test_root/writable-move-fail.out" env MELTA_TEST_LDD_MODE=ok MELTA_TEST_MV_FAIL=1
-assert_equal_file "$install_dir/lightcode" "old-binary"
-assert_mode "$install_dir/lightcode" 700
+assert_equal_file "$install_dir/melta" "old-binary"
+assert_mode "$install_dir/melta" 700
 assert_file_contains "$test_root/writable-move-fail.out" "could not move binary into place"
 assert_no_staging_residue "$install_dir"
 
-printf 'old-binary' >"$install_dir/lightcode"
-echo "bad checksum lightcode-linux-amd64.tar.gz" >"$release_dir/SHA256SUMS"
+printf 'old-binary' >"$install_dir/melta"
+echo "bad checksum melta-linux-amd64.tar.gz" >"$release_dir/SHA256SUMS"
 run_expect_failure "$test_root/checksum.out" env MELTA_TEST_LDD_MODE=ok
-assert_equal_file "$install_dir/lightcode" "old-binary"
+assert_equal_file "$install_dir/melta" "old-binary"
 assert_file_contains "$test_root/checksum.out" "checksum verification failed"
+
+rm -rf "$release_dir"
+mkdir -p "$release_dir/pkg"
+cp "$installer" "$release_dir/install.sh"
+printf 'wrong binary' >"$release_dir/pkg/lightcode"
+(cd "$release_dir/pkg" && tar -czf "$release_dir/melta-linux-amd64.tar.gz" lightcode)
+(cd "$release_dir" && sha256sum install.sh melta-linux-amd64.tar.gz >SHA256SUMS)
+printf 'old-binary' >"$install_dir/melta"
+chmod 700 "$install_dir/melta"
+run_expect_failure "$test_root/wrong-member.out" env MELTA_TEST_LDD_MODE=ok
+assert_file_contains "$test_root/wrong-member.out" "archive did not contain melta"
+assert_equal_file "$install_dir/melta" "old-binary"
+assert_mode "$install_dir/melta" 700
+assert_no_staging_residue "$install_dir"
 
 rm -rf "$release_dir"
 mkdir -p "$release_dir"
 cp "$installer" "$release_dir/install.sh"
 make_release "$release_dir"
-printf 'old-binary' >"$install_dir/lightcode"
-rm -f "$release_dir/lightcode-linux-amd64.tar.gz"
+printf 'old-binary' >"$install_dir/melta"
+mv "$release_dir/melta-linux-amd64.tar.gz" "$release_dir/lightcode-linux-amd64.tar.gz"
+(cd "$release_dir" && sha256sum install.sh lightcode-linux-amd64.tar.gz >SHA256SUMS)
 run_expect_failure "$test_root/download.out" env MELTA_TEST_LDD_MODE=ok
-assert_equal_file "$install_dir/lightcode" "old-binary"
+assert_equal_file "$install_dir/melta" "old-binary"
 assert_file_contains "$test_root/download.out" "download failed"
 
 rm -rf "$release_dir"
 mkdir -p "$release_dir"
 cp "$installer" "$release_dir/install.sh"
 make_release "$release_dir"
-printf 'old-binary' >"$install_dir/lightcode"
+printf 'old-binary' >"$install_dir/melta"
 run_expect_failure "$test_root/deps.out" env MELTA_TEST_LDD_MODE=missing
-assert_equal_file "$install_dir/lightcode" "old-binary"
+assert_equal_file "$install_dir/melta" "old-binary"
 assert_file_contains "$test_root/deps.out" "Missing required runtime libraries"
 assert_file_contains "$test_root/deps.out" "libwebkit2gtk-4.1.so.0"
 
 isolated_dir=$test_root/isolated-no-ldd
 make_isolated_path_without_ldd "$isolated_dir"
-printf 'old-binary' >"$install_dir/lightcode"
+printf 'old-binary' >"$install_dir/melta"
 (
     PATH="$isolated_dir"
     MELTA_RELEASE_BASE="file://$release_dir"
@@ -441,7 +456,7 @@ printf 'old-binary' >"$install_dir/lightcode"
     export PATH MELTA_RELEASE_BASE MELTA_INSTALL_DIR HOME
     "$shell_sh" "$installer"
 ) >"$test_root/no-ldd.out" 2>&1 && fail "expected missing ldd failure"
-assert_equal_file "$install_dir/lightcode" "old-binary"
+assert_equal_file "$install_dir/melta" "old-binary"
 assert_file_contains "$test_root/no-ldd.out" "required command not found: ldd"
 
 isolated_no_ldconfig=$test_root/isolated-no-ldconfig
@@ -457,7 +472,7 @@ make_isolated_path_without_ldconfig "$isolated_no_ldconfig"
     cat "$test_root/no-ldconfig.out" >&2 || true
     fail "expected installer success without ldconfig"
 }
-[ -x "$install_dir/lightcode" ] || fail "install without ldconfig failed"
+[ -x "$install_dir/melta" ] || fail "install without ldconfig failed"
 
 rm -rf "$shim_dir"
 mkdir -p "$shim_dir"
@@ -472,9 +487,9 @@ case "$1" in
 esac
 EOF
 chmod 755 "$shim_dir/uname"
-printf 'old-binary' >"$install_dir/lightcode"
+printf 'old-binary' >"$install_dir/melta"
 run_expect_failure "$test_root/os.out" env MELTA_TEST_LDD_MODE=ok
-assert_equal_file "$install_dir/lightcode" "old-binary"
+assert_equal_file "$install_dir/melta" "old-binary"
 assert_file_contains "$test_root/os.out" "unsupported operating system"
 
 cat >"$shim_dir/uname" <<'EOF'
@@ -486,9 +501,9 @@ case "$1" in
 esac
 EOF
 chmod 755 "$shim_dir/uname"
-printf 'old-binary' >"$install_dir/lightcode"
+printf 'old-binary' >"$install_dir/melta"
 run_expect_failure "$test_root/arch.out" env MELTA_TEST_LDD_MODE=ok
-assert_equal_file "$install_dir/lightcode" "old-binary"
+assert_equal_file "$install_dir/melta" "old-binary"
 assert_file_contains "$test_root/arch.out" "unsupported architecture"
 
 log_file=$test_root/help.out
@@ -499,40 +514,40 @@ make_source_tree=$test_root/make-src
 make_companion=$test_root/make-companion.mk
 make_home=$test_root/make-home
 mkdir -p "$make_source_tree/build/bin" "$make_home"
-printf '%s' 'make-fixture-binary' >"$make_source_tree/build/bin/lightcode"
-chmod 644 "$make_source_tree/build/bin/lightcode"
+printf '%s' 'make-fixture-binary' >"$make_source_tree/build/bin/melta"
+chmod 644 "$make_source_tree/build/bin/melta"
 printf 'build:\n\t@:\n' >"$make_companion"
 
 make_copy_fail_prefix=$test_root/make-copy-fail
 mkdir -p "$make_copy_fail_prefix/bin"
-printf 'old-binary' >"$make_copy_fail_prefix/bin/lightcode"
-chmod 700 "$make_copy_fail_prefix/bin/lightcode"
+printf 'old-binary' >"$make_copy_fail_prefix/bin/melta"
+chmod 700 "$make_copy_fail_prefix/bin/melta"
 run_make_expect_failure "$test_root/make-copy-fail.out" "$make_copy_fail_prefix" env MELTA_TEST_CP_FAIL=1
-assert_equal_file "$make_copy_fail_prefix/bin/lightcode" "old-binary"
-assert_mode "$make_copy_fail_prefix/bin/lightcode" 700
+assert_equal_file "$make_copy_fail_prefix/bin/melta" "old-binary"
+assert_mode "$make_copy_fail_prefix/bin/melta" 700
 assert_no_staging_residue "$make_copy_fail_prefix/bin"
 
 make_move_fail_prefix=$test_root/make-move-fail
 mkdir -p "$make_move_fail_prefix/bin"
-printf 'old-binary' >"$make_move_fail_prefix/bin/lightcode"
-chmod 700 "$make_move_fail_prefix/bin/lightcode"
+printf 'old-binary' >"$make_move_fail_prefix/bin/melta"
+chmod 700 "$make_move_fail_prefix/bin/melta"
 run_make_expect_failure "$test_root/make-move-fail.out" "$make_move_fail_prefix" env MELTA_TEST_MV_FAIL=1
-assert_equal_file "$make_move_fail_prefix/bin/lightcode" "old-binary"
-assert_mode "$make_move_fail_prefix/bin/lightcode" 700
+assert_equal_file "$make_move_fail_prefix/bin/melta" "old-binary"
+assert_mode "$make_move_fail_prefix/bin/melta" 700
 assert_no_staging_residue "$make_move_fail_prefix/bin"
 
 mkdir -p "$make_home/.local/bin"
-printf 'old-binary' >"$make_home/.local/bin/lightcode"
-chmod 700 "$make_home/.local/bin/lightcode"
+printf 'old-binary' >"$make_home/.local/bin/melta"
+chmod 700 "$make_home/.local/bin/melta"
 run_make_expect_success "$test_root/make-default.out" ""
-assert_equal_file "$make_home/.local/bin/lightcode" "make-fixture-binary"
-assert_mode "$make_home/.local/bin/lightcode" 755
+assert_equal_file "$make_home/.local/bin/melta" "make-fixture-binary"
+assert_mode "$make_home/.local/bin/melta" 755
 assert_no_staging_residue "$make_home/.local/bin"
 
 spaced_prefix="$test_root/prefix with space"
 run_make_expect_success "$test_root/make-spaced.out" "$spaced_prefix"
-assert_equal_file "$spaced_prefix/bin/lightcode" "make-fixture-binary"
-assert_mode "$spaced_prefix/bin/lightcode" 755
+assert_equal_file "$spaced_prefix/bin/melta" "make-fixture-binary"
+assert_mode "$spaced_prefix/bin/melta" 755
 assert_no_staging_residue "$spaced_prefix/bin"
 
 # Captured Wails argv: the real root Makefile build and install recipes run
@@ -591,8 +606,8 @@ assert_wails_argv
 rm -f "$make_wails_argv"
 run_make_real_expect_success "$test_root/make-real-install.out" VERSION=v1.2.3 COMMIT=abc1234 PREFIX="$make_real_prefix" install
 assert_wails_argv
-assert_equal_file "$make_real_prefix/bin/lightcode" "make-fixture-binary"
-assert_mode "$make_real_prefix/bin/lightcode" 755
+assert_equal_file "$make_real_prefix/bin/melta" "make-fixture-binary"
+assert_mode "$make_real_prefix/bin/melta" 755
 assert_no_staging_residue "$make_real_prefix/bin"
 
 printf 'installer tests passed\n'

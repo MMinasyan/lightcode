@@ -567,7 +567,7 @@ func TestRootRuntimeStartupFailures(t *testing.T) {
 		testassert.NoError(t, os.WriteFile(badPath, []byte(`{"providers": [`), 0o600))
 		stdout, stderr, code := s.runOne(s.runtimeArgs(badPath)...)
 		testassert.Require(t, code == 1, "exit = %d, want 1\nstdout=%s\nstderr=%s", code, stdout, stderr)
-		testassert.Require(t, strings.HasPrefix(stderr, "lightcode: "), "stderr = %q, want the dispatcher diagnostic", stderr)
+		testassert.Require(t, strings.HasPrefix(stderr, "melta: "), "stderr = %q, want the dispatcher diagnostic", stderr)
 		s.withdrawn()
 	})
 
@@ -579,7 +579,7 @@ func TestRootRuntimeStartupFailures(t *testing.T) {
 		testassert.NoError(t, os.WriteFile(sentinel, []byte("sentinel"), 0o600))
 		stdout, stderr, code := s.runOne(s.runtimeArgs(s.configPath)...)
 		testassert.Require(t, code == 1, "exit = %d, want 1\nstdout=%s\nstderr=%s", code, stdout, stderr)
-		testassert.Require(t, strings.HasPrefix(stderr, "lightcode: "), "stderr = %q, want the dispatcher diagnostic", stderr)
+		testassert.Require(t, strings.HasPrefix(stderr, "melta: "), "stderr = %q, want the dispatcher diagnostic", stderr)
 		{
 			_, err := os.Stat(sentinel)
 			testassert.NoError(t, err)
@@ -605,7 +605,7 @@ func TestRootRuntimeCleanupFailure(t *testing.T) {
 	if code := owner.awaitExit(); code != 1 {
 		t.Fatalf("cleanup failure exit = %d, want 1\noutput=%s", code, owner.out.String())
 	}
-	if !strings.Contains(owner.out.String(), "lightcode: ") {
+	if !strings.Contains(owner.out.String(), "melta: ") {
 		t.Fatalf("output = %q, want the dispatcher diagnostic", owner.out.String())
 	}
 	{

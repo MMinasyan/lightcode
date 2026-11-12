@@ -35,7 +35,7 @@ func main() {
 	}
 
 	if err := runWails(); err != nil {
-		fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
+		fmt.Fprintf(os.Stderr, "melta: %v\n", err)
 		os.Exit(1)
 	}
 }
