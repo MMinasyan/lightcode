@@ -3027,7 +3027,11 @@ func TestSettleAgentTerminalClassifiesRunError(t *testing.T) {
 		testassert.NoError(t, executeDirect(h, c, h.ctx, testOpID, prepared))
 		rec := settledOperation(t, store, sessionID, testOpID)
 		testassert.Require(t, rec.State.Status == OperationSuccess && rec.State.Terminal != nil && rec.State.Terminal.Detail == "", "operation state = %+v, want quiet success with empty detail", rec.State)
+		// The successor can commit between the validator's register and entry
+		// reads; hold the same Session lock as its commits for one coherent view.
+		c.mu.Lock()
 		graph, err := validateFixture(t, store, sessionID)
+		c.mu.Unlock()
 		testassert.NoError(t, err)
 		rounds := 0
 		for _, entry := range graph.Entries {
