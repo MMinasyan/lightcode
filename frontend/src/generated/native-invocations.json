@@ -185,6 +185,20 @@
     "body": "forbidden",
     "query_members": {}
   },
+  "InvokeExtension": {
+    "session_id": "forbidden",
+    "field": "forbidden",
+    "query": "forbidden",
+    "body": "required",
+    "query_members": {}
+  },
+  "ListExtensionCapabilities": {
+    "session_id": "forbidden",
+    "field": "forbidden",
+    "query": "forbidden",
+    "body": "forbidden",
+    "query_members": {}
+  },
   "ListExtensionPackages": {
     "session_id": "forbidden",
     "field": "forbidden",

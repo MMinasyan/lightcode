@@ -87,7 +87,10 @@ install -Dm755 build/bin/lightcode ~/.local/bin/lightcode
 
 #### Configure
 
-Lightcode ships with bundled provider metadata, but no credentials and no preset default model. On first run it creates `~/.lightcode/config.json` with an empty skeleton. API keys live in environment variables (or `~/.lightcode/.env`), referenced by name from provider `transport.api_key_env` fields:
+Lightcode ships with bundled provider metadata, but no credentials and no preset default model. On first run it
+creates `~/.lightcode/config.json` when absent, enabling the shipped Agents and Adaptation extensions without
+selecting a model. API keys live in environment variables (or `~/.lightcode/.env`), referenced by name from
+provider `transport.api_key_env` fields:
 
 ```json
 {
@@ -205,15 +208,61 @@ diagnostics), `upgrade` (self-update; verifies the release's SHA-256 checksum be
 
 - `~/.lightcode/config.json` — provider, baseline, extension and global permission settings, including Agent definitions
 - `~/.lightcode/.env` — local API keys
-- `~/.lightcode/lightcode.db` — durable session state (SQLite), owned by the Runtime
+- `~/.lightcode/lightcode.db` — durable session state (SQLite), owned by the managed owner
 - `~/.lightcode/runtime.json` — live Runtime owner record (present only while the owner runs)
 - `~/.lightcode/code/<session-id>/` — per-session code snapshots and command output (internal adjunct)
 - `~/.lightcode/cache/discovery/` — provider discovery responses
 - `~/.lightcode/debug/wire/` — raw request and stream dumps when `LIGHTCODE_DEBUG_WIRE=1`
 
-Filesystem sessions created before the SQLite store stay under `~/.lightcode/projects/`: they are
-not migrated, not loaded, and not deleted. Their code snapshots remain reachable through the
-Runtime's retained snapshot operations, addressed explicitly by workspace and old session id.
+Filesystem sessions created before the SQLite store stay under `~/.lightcode/projects/`: no reader enumerates,
+loads, migrates, repairs, or deletes their conversation or snapshot bytes. The current protocol has no retained
+snapshot operations for them.
+
+### Framework and extension API
+
+The same source tree exposes the public Go framework used by the shipped runtime. The Engine is independently
+usable: [`model/`](model/) defines provider-neutral model values and the OpenAI-compatible one-attempt transport;
+[`agent/`](agent/) provides stream assembly, the model/tool loop and the standalone adapters. A zero-tool run is
+valid, and Engine-only callers own persistence and recovery. See
+[`melta/testdata/external/engine/engine_test.go`](melta/testdata/external/engine/engine_test.go)
+(`TestEngineOnlyRun`).
+
+The complete baseline is [`melta/`](melta/): `melta.Open(ctx, Options)` in [`melta/melta.go`](melta/melta.go)
+composes the public [`harness/`](harness/) state machine, [`prompt/`](prompt/) assembler, standard tools, jobs and
+included SQLite storage. `DataDir`, `Configuration` and `Credentials` are required and explicit; the locations for
+global rules, discovery cache, workspace policies and wire debugging are optional, as are `Agent`, `Strategy`,
+native `Extensions`, the storage factory and the permission evaluator. An empty `Extensions` slice with no installed
+packages is the supported zero-extension baseline: the seven standard tools, SQLite storage, jobs and default
+prompt/rules handling are built in. The Agents and Adaptation extensions are optional. Creating a Session requires a
+non-empty local Workspace; no optional extension or network listener is required.
+[`extension/`](extension/) is the native contract (declarations, `extension.Compile`, typed callbacks and fixed host
+services), and [`extension/worker/`](extension/worker/) is the executable extension protocol. [`runtime/`](runtime/)
+is only the protocol host and first-run initialization; [`protocol/`](protocol/) is the generated contract and
+[`client/`](client/) the handwritten HTTP/SSE client.
+
+Extensions use the generic generated surface. `ListExtensionCapabilities` returns enabled declarations, methods,
+schemas, settings and exposures; `InvokeExtension` names one concrete capability/contract/method and one
+harness/workspace/session target, so adding an extension needs no protocol regeneration. A declared success returns
+the success envelope with its exact raw result; a validated declared failure returns HTTP 422 with the extension's
+own code/message and optional data/partial, not a baseline error code; predispatch and host failures use the normal
+typed error codes and statuses. The CLI
+(`/runtime ...`), ACP (`runtime/...`) and desktop bridge all forward these operations through the shared generated
+invocation table. There is no specialized extension UI.
+
+Local executable extensions are installed as a directory containing `manifest.json` and a contained entry point;
+install and remove change next-start selection only and edit neither configuration nor Session data. The loaded code
+set is fixed until the owner restarts, so replacing executable code needs a deliberate restart, not a Runtime
+rebuild. Settings and enablement changes use ordinary configuration reload.
+
+Tracked public acceptance examples are
+[`melta/testdata/external/baseline_test.go`](melta/testdata/external/baseline_test.go)
+(`TestPublicBaselineEndToEnd`, zero extensions),
+[`melta/testdata/external/extension_test.go`](melta/testdata/external/extension_test.go)
+(`TestPublicExtensionIntegration`), and [`melta/packages_test.go`](melta/packages_test.go)
+(`TestInstalledWorkerPublicExtensionAcceptance`). The independent module runs under
+`TestExternalModuleGOWORKOff`; `go test ./...` includes it. Other structural gates are
+`go test ./agent -run TestPublicFoundationDependencyIsolation` and `make check-protocol`; the frontend suite runs
+with `cd frontend && npm test`.
 
 ---
 

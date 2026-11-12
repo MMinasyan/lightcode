@@ -391,6 +391,18 @@ var dispatchCases = []dispatchCase{
 		status: 200, response: `{"warnings":[],"warnings_revision":{"instance_id":"0123456789abcdef0123456789abcdef","revision":"1"}}`,
 		method: "GET", path: "/v1/warnings",
 	},
+	{
+		name: "ListExtensionCapabilities", operation: "ListExtensionCapabilities",
+		status: 200, response: `[]`,
+		method: "GET", path: "/v1/extensions/capabilities",
+	},
+	{
+		name: "InvokeExtension", operation: "InvokeExtension",
+		params: `{"body":{"extension_id":"fixture","capability_id":"fixture.service","contract_id":"fixture.service/v1","contract_version":"1","method":"raw","target":{"kind":"harness"},"arguments":{"big":9007199254740993},"request_id":"req-1"}}`,
+		status: 200, response: `{"kind":"success","result":{"big":9007199254740993}}`,
+		method: "POST", path: "/v1/extensions/invoke",
+		body: `{"extension_id":"fixture","capability_id":"fixture.service","contract_id":"fixture.service/v1","contract_version":"1","method":"raw","target":{"kind":"harness"},"arguments":{"big":9007199254740993},"request_id":"req-1"}`,
+	},
 }
 
 func TestAgentRosterValidation(t *testing.T) {
@@ -664,23 +676,28 @@ func sortedKeys[V any](values map[string]V) []string {
 // partial code-revert result, each returned beside the retained received
 // status and exact body bytes.
 func TestInvokeMapsDeclaredErrors(t *testing.T) {
-	invokeRejection := func(t *testing.T, body string) (int, json.RawMessage, error) {
+	invokeRejection := func(t *testing.T, operation, body string) (int, json.RawMessage, error) {
 		t.Helper()
 		c, doer := newScriptFixture(t)
 		doer.respond = func(*http.Request) (*http.Response, error) {
 			return scriptedResponse(http.StatusConflict, body), nil
 		}
-		return clientops.Invoke(context.Background(), c, "GetHealth", nil)
+		params := json.RawMessage(nil)
+		if operation == "RevertSessionCode" {
+			params = json.RawMessage(`{"session_id":"s1","body":{"boundary_operation_id":"op"}}`)
+		}
+		return clientops.Invoke(context.Background(), c, operation, params)
 	}
 	t.Run("plain error", func(t *testing.T) {
 		const payload = `{"code":"conflict","message":"in use","session_id":"s1"}`
-		status, raw, err := invokeRejection(t, payload)
+		status, raw, err := invokeRejection(t, "GetHealth", payload)
 		var responseErr *clientops.ResponseError
 		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want *clientops.ResponseError", err)
 		testassert.Require(t, status == http.StatusConflict && string(raw) == payload, "Invoke = (%d, %q), want the received status and body", status, raw)
 		testassert.Check(t, responseErr.Status == http.StatusConflict, "status = %d, want %d", responseErr.Status, http.StatusConflict)
 		testassert.Check(t, responseErr.Payload.Code == protocol.ErrorCodeConflict && responseErr.Payload.Message == "in use", "payload = %+v", responseErr.Payload)
 		testassert.Check(t, responseErr.Partial == nil, "partial = %+v, want nil", responseErr.Partial)
+		testassert.Check(t, string(responseErr.Body) == payload, "body = %q, want the exact received body", responseErr.Body)
 		if responseErr.Error() != "in use" {
 			t.Errorf("Error() = %q, want the returned message", responseErr.Error())
 		}
@@ -689,11 +706,12 @@ func TestInvokeMapsDeclaredErrors(t *testing.T) {
 	})
 	t.Run("partial result", func(t *testing.T) {
 		const payload = `{"error":{"code":"conflict","message":"partial restore"},"restored":["a.go"],"skipped":[{"path":"b.go","error":"denied"}]}`
-		status, raw, err := invokeRejection(t, payload)
+		status, raw, err := invokeRejection(t, "RevertSessionCode", payload)
 		var responseErr *clientops.ResponseError
 		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want *clientops.ResponseError", err)
 		testassert.Require(t, status == http.StatusConflict && string(raw) == payload, "Invoke = (%d, %q), want the received status and body", status, raw)
 		testassert.Require(t, responseErr.Partial != nil, "partial = nil, want the complete generated result")
+		testassert.Check(t, string(responseErr.Body) == payload, "body = %q, want the exact received body", responseErr.Body)
 		testassert.Check(t, len(responseErr.Partial.Restored) == 1 && responseErr.Partial.Restored[0] == "a.go", "restored = %v", responseErr.Partial.Restored)
 		testassert.Check(t, len(responseErr.Partial.Skipped) == 1 && responseErr.Partial.Skipped[0].Path == "b.go", "skipped = %v", responseErr.Partial.Skipped)
 		testassert.Check(t, responseErr.Payload.Message == "partial restore", "payload = %+v", responseErr.Payload)
@@ -702,9 +720,28 @@ func TestInvokeMapsDeclaredErrors(t *testing.T) {
 		}
 	})
 	t.Run("partial result with empty arrays", func(t *testing.T) {
-		_, _, err := invokeRejection(t, `{"error":{"code":"conflict","message":"none"},"restored":[],"skipped":[]}`)
+		_, _, err := invokeRejection(t, "RevertSessionCode", `{"error":{"code":"conflict","message":"none"},"restored":[],"skipped":[]}`)
 		var responseErr *clientops.ResponseError
 		testassert.Require(t, errors.As(err, &responseErr) && responseErr.Partial != nil, "error = %v, want a partial result", err)
+	})
+	t.Run("baseline partial", func(t *testing.T) {
+		partial := "{\n  \"big\": 9007199254740993,\n  \"text\": \"line\\\\nbreak\"\n}"
+		payload := `{"code":"conflict","message":"baseline partial","partial_result":` + partial + `}`
+		status, raw, err := invokeRejection(t, "GetHealth", payload)
+		var responseErr *clientops.ResponseError
+		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want a baseline ResponseError", err)
+		testassert.Require(t, responseErr.Partial == nil, "baseline partial was labelled a code-revert partial")
+		testassert.Require(t, responseErr.Payload.PartialResult != nil, "payload omitted partial_result")
+		testassert.Require(t, string(*responseErr.Payload.PartialResult) == partial, "payload partial = %q, want %q", *responseErr.Payload.PartialResult, partial)
+		testassert.Require(t, string(responseErr.Body) == payload && string(raw) == payload && status == http.StatusConflict, "baseline partial retained = (%d, %q, %q)", status, raw, responseErr.Body)
+	})
+	t.Run("baseline explicit null partial", func(t *testing.T) {
+		const payload = `{"code":"conflict","message":"null partial","partial_result":null}`
+		_, _, err := invokeRejection(t, "GetHealth", payload)
+		var responseErr *clientops.ResponseError
+		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want a baseline ResponseError", err)
+		testassert.Require(t, responseErr.Payload.PartialResult != nil && string(*responseErr.Payload.PartialResult) == "null", "explicit null partial = %+v", responseErr.Payload.PartialResult)
+		testassert.Require(t, string(responseErr.Body) == payload, "explicit null body = %q", responseErr.Body)
 	})
 }
 
@@ -923,4 +960,193 @@ func assertTransportFailure(t *testing.T, err error) {
 	testassert.Require(t, err != nil, "want a failure")
 	var responseErr *clientops.ResponseError
 	testassert.Require(t, !errors.As(err, &responseErr) && !errors.Is(err, clientops.ErrInvalidParams) && !errors.Is(err, clientops.ErrInvalidResponse), "transport failure mapped to a protocol error: %v; transport failure mapped to a local binding failure: %v; transport failure mapped to an invalid delivery: %v", err, err, err)
+}
+
+func TestInvokeExtensionDeclaredFailureAndDeliveryClasses(t *testing.T) {
+	const declared = `{"kind":"failure","error":{"code":"guest_code","message":"guest message","data":{"big":9007199254740993}},"partial_result":["partial",null,1]}`
+	c, doer := newScriptFixture(t)
+	doer.respond = func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(http.StatusUnprocessableEntity, declared), nil
+	}
+	_, _, err := clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+	var extensionErr *clientops.ExtensionResponseError
+	testassert.Require(t, errors.As(err, &extensionErr), "error = %v, want ExtensionResponseError", err)
+	testassert.Require(t, extensionErr.Status == http.StatusUnprocessableEntity && extensionErr.Failure.Error.Code == "guest_code" && extensionErr.Failure.Error.Message == "guest message" && extensionErr.Failure.PartialResult != nil, "extension failure = %+v", extensionErr)
+	testassert.Require(t, string(extensionErr.Body) == declared, "extension failure body = %q, want exact bytes", extensionErr.Body)
+	var responseErr *clientops.ResponseError
+	testassert.Require(t, !errors.As(err, &responseErr), "declared guest failure was misclassified as a baseline ResponseError")
+
+	// A restore-shaped guest partial stays a guest failure, never the current
+	// operation's restore partial.
+	restoreShaped := `{"kind":"failure","error":{"code":"guest_code","message":"guest"},"partial_result":{"restored":[],"skipped":[],"error":{"code":"conflict","message":"guest"}}}`
+	c, doer = newScriptFixture(t)
+	doer.respond = func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(http.StatusUnprocessableEntity, restoreShaped), nil
+	}
+	_, _, err = clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+	testassert.Require(t, errors.As(err, &extensionErr) && extensionErr.Failure.PartialResult != nil, "restore-shaped guest failure = %v", err)
+	testassert.Require(t, !errors.As(err, &responseErr) || responseErr.Partial != nil, "restore-shaped guest payload was misclassified")
+
+	// The 422 schema's baseline Error alternative keeps its existing class.
+	c, doer = newScriptFixture(t)
+	doer.respond = func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(http.StatusUnprocessableEntity, `{"code":"corrupt","message":"baseline"}`), nil
+	}
+	_, _, err = clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+	testassert.Require(t, errors.As(err, &responseErr) && responseErr.Payload.Code == protocol.ErrorCodeCorrupt, "baseline 422 = %v", err)
+
+	// Malformed wrappers retain their status and exact body as invalid
+	// delivery, never a fabricated baseline error.
+	for _, malformed := range []string{
+		`{"kind":"failure","error":null}`,
+		`{"kind":"failure","error":{"code":"","message":"x"}}`,
+		`{"kind":"failure","error":{"code":"x","message":"y"},"unknown":true}`,
+		`{"kind":"success","result":null}`,
+		`{"kind":"success"}`,
+	} {
+		c, doer = newScriptFixture(t)
+		doer.respond = func(*http.Request) (*http.Response, error) {
+			return scriptedResponse(http.StatusUnprocessableEntity, malformed), nil
+		}
+		status, body, invokeErr := clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+		testassert.Require(t, errors.Is(invokeErr, clientops.ErrInvalidResponse), "malformed %q error = %v, want invalid delivery", malformed, invokeErr)
+		testassert.Require(t, status == http.StatusUnprocessableEntity && string(body) == malformed, "malformed %q retained = (%d, %q)", malformed, status, body)
+	}
+
+	// Success null is a present result value, not a missing one.
+	c, doer = newScriptFixture(t)
+	doer.respond = func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(http.StatusOK, `{"kind":"success","result":null}`), nil
+	}
+	result, err := clientops.Call(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+	testassert.Require(t, err == nil && string(result) == `{"kind":"success","result":null}`, "null success = (%s, %v)", result, err)
+}
+
+// TestRestoreShapeSelectsPartialOnlyForRevertSessionCode proves the
+// restored/skipped member sniff is the current code-revert operation's own
+// partial interpretation: every other operation refuses that body as invalid
+// delivery with its status and exact bytes retained, never a fabricated
+// ResponseError.Partial.
+func TestRestoreShapeSelectsPartialOnlyForRevertSessionCode(t *testing.T) {
+	const restoreShaped = `{"restored":["a.go"],"skipped":[],"error":{"code":"conflict","message":"restore-shaped"}}`
+	const restoreParams = `{"session_id":"s1","body":{"boundary_operation_id":"op"}}`
+	cases := []struct {
+		name      string
+		operation string
+		params    string
+	}{
+		{"revert code", "RevertSessionCode", restoreParams},
+		{"invoke extension", "InvokeExtension", `{"body":{}}`},
+		{"unrelated ordinary operation", "SubmitSession", `{"session_id":"s1","body":{"operation_id":"op-submit","mode":"regular","content":[]}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, doer := newScriptFixture(t)
+			doer.respond = func(*http.Request) (*http.Response, error) {
+				return scriptedResponse(http.StatusConflict, restoreShaped), nil
+			}
+			status, body, err := clientops.Invoke(context.Background(), c, tc.operation, json.RawMessage(tc.params))
+			if tc.operation == "RevertSessionCode" {
+				var responseErr *clientops.ResponseError
+				testassert.Require(t, errors.As(err, &responseErr) && responseErr.Partial != nil, "RevertSessionCode error = %v, want the genuine partial", err)
+				testassert.Require(t, status == http.StatusConflict && string(body) == restoreShaped, "RevertSessionCode retained = (%d, %q)", status, body)
+				return
+			}
+			var responseErr *clientops.ResponseError
+			testassert.Require(t, errors.Is(err, clientops.ErrInvalidResponse), "%s error = %v, want invalid delivery", tc.operation, err)
+			testassert.Require(t, !errors.As(err, &responseErr) || responseErr.Partial != nil, "%s fabricated a ResponseError.Partial", tc.operation)
+			testassert.Require(t, status == http.StatusConflict && string(body) == restoreShaped, "%s retained = (%d, %q)", tc.operation, status, body)
+		})
+	}
+}
+
+// TestExtensionFailureEnvelopeOnlyAt422 proves the declared failure arm is
+// selected only for InvokeExtension's declared 422. The same envelope at any
+// other status is invalid delivery, while baseline Error bodies keep their
+// ordinary classification at 422 and 500.
+func TestExtensionFailureEnvelopeOnlyAt422(t *testing.T) {
+	const declared = `{"kind":"failure","error":{"code":"guest_code","message":"guest message"}}`
+	for _, status := range []int{http.StatusBadRequest, http.StatusConflict, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			c, doer := newScriptFixture(t)
+			doer.respond = func(*http.Request) (*http.Response, error) {
+				return scriptedResponse(status, declared), nil
+			}
+			gotStatus, body, err := clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+			var extensionErr *clientops.ExtensionResponseError
+			var responseErr *clientops.ResponseError
+			testassert.Require(t, errors.Is(err, clientops.ErrInvalidResponse), "status %d error = %v, want invalid delivery", status, err)
+			testassert.Require(t, !errors.As(err, &extensionErr) && !errors.As(err, &responseErr), "status %d fabricated a declared or baseline error", status)
+			testassert.Require(t, gotStatus == status && string(body) == declared, "status %d retained = (%d, %q)", status, gotStatus, body)
+		})
+	}
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"declared 422", http.StatusUnprocessableEntity, declared},
+		{"baseline 422", http.StatusUnprocessableEntity, `{"code":"corrupt","message":"baseline"}`},
+		{"baseline 500", http.StatusInternalServerError, `{"code":"storage","message":"baseline"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, doer := newScriptFixture(t)
+			doer.respond = func(*http.Request) (*http.Response, error) {
+				return scriptedResponse(tc.status, tc.body), nil
+			}
+			status, body, err := clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+			if tc.name == "declared 422" {
+				var extensionErr *clientops.ExtensionResponseError
+				testassert.Require(t, errors.As(err, &extensionErr) && extensionErr.Failure.Error.Code == "guest_code", "declared 422 = %v", err)
+			} else {
+				var responseErr *clientops.ResponseError
+				testassert.Require(t, errors.As(err, &responseErr), "%s = %v, want the baseline ResponseError", tc.name, err)
+			}
+			testassert.Require(t, status == tc.status && string(body) == tc.body, "%s retained = (%d, %q)", tc.name, status, body)
+		})
+	}
+}
+
+// TestInvokeExtensionExactEnvelopeMembers proves the shared generated-value
+// decoder rejects case-variant envelope members that encoding/json would
+// otherwise bind case-insensitively, while opaque result/data objects keep
+// their own independent member names.
+func TestInvokeExtensionExactEnvelopeMembers(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"declared failure Code sibling", http.StatusUnprocessableEntity, `{"kind":"failure","error":{"code":"","Code":"guest","message":"failure"}}`},
+		{"success RESULT sibling", http.StatusOK, `{"kind":"success","result":{"ok":true},"RESULT":{"ok":false}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, doer := newScriptFixture(t)
+			doer.respond = func(*http.Request) (*http.Response, error) {
+				return scriptedResponse(tc.status, tc.body), nil
+			}
+			status, body, err := clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+			var extensionErr *clientops.ExtensionResponseError
+			testassert.Require(t, errors.Is(err, clientops.ErrInvalidResponse) && !errors.As(err, &extensionErr), "error = %v, want invalid delivery without a declared failure", err)
+			testassert.Require(t, status == tc.status && string(body) == tc.body, "retained = (%d, %q), want the exact received response", status, body)
+		})
+	}
+
+	// Opaque result and failure-data objects are not envelope members: their
+	// own case-varied keys stay untouched.
+	c, doer := newScriptFixture(t)
+	doer.respond = func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(http.StatusOK, `{"kind":"success","result":{"Code":"guest","RESULT":9007199254740993}}`), nil
+	}
+	result, err := clientops.Call(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+	testassert.Require(t, err == nil && strings.Contains(string(result), `"RESULT":9007199254740993`), "opaque result = (%s, %v)", result, err)
+
+	c, doer = newScriptFixture(t)
+	declared := `{"kind":"failure","error":{"code":"guest_code","message":"failure","data":{"Code":"guest","RESULT":9007199254740993}}}`
+	doer.respond = func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(http.StatusUnprocessableEntity, declared), nil
+	}
+	_, _, err = clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+	var extensionErr *clientops.ExtensionResponseError
+	testassert.Require(t, errors.As(err, &extensionErr) && extensionErr.Failure.Error.Data != nil && string(*extensionErr.Failure.Error.Data) == `{"Code":"guest","RESULT":9007199254740993}`, "opaque failure data = %v", err)
 }

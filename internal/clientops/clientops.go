@@ -23,10 +23,23 @@ type ResponseError struct {
 	Status  int
 	Payload protocol.Error
 	Partial *protocol.CodeRevertResult
+	Body    []byte
 }
 
 // Error returns the received Runtime error's message.
 func (e *ResponseError) Error() string { return e.Payload.Message }
+
+// ExtensionResponseError is one received declared extension failure. Failure
+// is the generated 422 failure envelope and Body is the exact received body,
+// so the declaration's own code, data and partial result stay lossless.
+type ExtensionResponseError struct {
+	Status  int
+	Failure protocol.ExtensionFailureResult
+	Body    []byte
+}
+
+// Error returns the received declared failure's message.
+func (e *ExtensionResponseError) Error() string { return e.Failure.Error.Message }
 
 // decodeRuntimeError decodes one declared non-2xx Runtime body from its
 // preserved raw members: a partial code-revert result requires its non-null
@@ -90,6 +103,10 @@ func decodeError(raw json.RawMessage) (protocol.Error, error) {
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return protocol.Error{}, fmt.Errorf("malformed runtime error: %v", err)
 	}
+	if partial, ok := members["partial_result"]; ok {
+		value := append(json.RawMessage(nil), partial...)
+		payload.PartialResult = &value
+	}
 	if !payload.Code.Valid() {
 		return protocol.Error{}, fmt.Errorf("runtime error code %q is outside the closed set", payload.Code)
 	}
@@ -120,13 +137,75 @@ func Invoke(ctx context.Context, c *client.Client, operation string, params json
 	if err != nil {
 		return 0, nil, err
 	}
-	status, body, err := receive(response, expected)
+	status, body, err := receive(response, expected, operation)
 	if err == nil && operation == "DeleteSession" {
 		if _, decodeErr := DecodeDeletionResult(body); decodeErr != nil {
 			return status, body, fmt.Errorf("%v: %w", decodeErr, ErrInvalidResponse)
 		}
 	}
+	if err == nil && operation == "InvokeExtension" {
+		if decodeErr := decodeExtensionSuccess(body); decodeErr != nil {
+			return status, body, fmt.Errorf("%v: %w", decodeErr, ErrInvalidResponse)
+		}
+	}
 	return status, body, err
+}
+
+// decodeExtensionSuccess validates the fixed 200 extension envelope through
+// the shared generated-value decoder. The opaque result itself stays
+// untouched.
+func decodeExtensionSuccess(body []byte) error {
+	var success protocol.ExtensionSuccess
+	if err := protocol.DecodeValue(body, &success); err != nil {
+		return fmt.Errorf("malformed extension success body: %v", err)
+	}
+	return nil
+}
+
+// decodeExtensionFailure recognizes the fixed 422 declared-failure envelope by
+// its explicit kind. An absent kind is the ordinary baseline Error; a present
+// but malformed envelope is a delivery failure, never a fabricated baseline
+// ErrorCode. Structural validation belongs to the shared generated-value
+// decoder; only the nonempty guest code/message and raw null preservation stay
+// here.
+func decodeExtensionFailure(body []byte) (*protocol.ExtensionFailureResult, error) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		return nil, fmt.Errorf("malformed runtime error body: %v", err)
+	}
+	if members == nil {
+		return nil, fmt.Errorf("malformed runtime error body: not one JSON object")
+	}
+	rawKind, hasKind := members["kind"]
+	if !hasKind {
+		return nil, nil
+	}
+	var kind string
+	if isJSONNull(rawKind) || json.Unmarshal(rawKind, &kind) != nil || kind != "failure" {
+		return nil, fmt.Errorf("extension failure kind is not failure")
+	}
+	var failure protocol.ExtensionFailureResult
+	if err := protocol.DecodeValue(body, &failure); err != nil {
+		return nil, fmt.Errorf("malformed extension failure body: %v", err)
+	}
+	if failure.Error.Code == "" || failure.Error.Message == "" {
+		return nil, fmt.Errorf("extension failure requires nonempty code and message")
+	}
+	var errorMembers map[string]json.RawMessage
+	if rawError, ok := members["error"]; ok {
+		if err := json.Unmarshal(rawError, &errorMembers); err != nil {
+			return nil, fmt.Errorf("malformed extension failure error object: %v", err)
+		}
+	}
+	if data, ok := errorMembers["data"]; ok {
+		value := append(json.RawMessage(nil), data...)
+		failure.Error.Data = &value
+	}
+	if partial, ok := members["partial_result"]; ok {
+		value := append(json.RawMessage(nil), partial...)
+		failure.PartialResult = &value
+	}
+	return &failure, nil
 }
 
 // Call is the thin typed consumer of Invoke: it returns the raw successful
@@ -149,7 +228,7 @@ func Call(ctx context.Context, c *client.Client, operation string, params json.R
 // unexpected-success-status failure wraps ErrInvalidResponse and retains the
 // received status and available body bytes; a declared non-2xx rejection is
 // the ResponseError over those same bytes.
-func receive(response *http.Response, expected int) (int, json.RawMessage, error) {
+func receive(response *http.Response, expected int, operation string) (int, json.RawMessage, error) {
 	status := response.StatusCode
 	body, err := io.ReadAll(response.Body)
 	_ = response.Body.Close()
@@ -166,11 +245,32 @@ func receive(response *http.Response, expected int) (int, json.RawMessage, error
 		return status, body, nil
 	}
 	if status < 200 || status >= 300 {
-		payload, partial, err := decodeRuntimeError(body)
+		// The declared extension-failure envelope has exactly one status of
+		// its own; every other status carries the ordinary baseline Error.
+		if operation == "InvokeExtension" && status == http.StatusUnprocessableEntity {
+			failure, err := decodeExtensionFailure(body)
+			if err != nil {
+				return status, body, fmt.Errorf("%v: %w", err, ErrInvalidResponse)
+			}
+			if failure != nil {
+				return status, body, &ExtensionResponseError{Status: status, Failure: *failure, Body: body}
+			}
+		}
+		// Restore-shaped partial interpretation belongs only to the current
+		// code-revert operation; every other operation decodes one baseline
+		// Error and refuses a body without its declared members.
+		if operation == "RevertSessionCode" {
+			payload, partial, err := decodeRuntimeError(body)
+			if err != nil {
+				return status, body, fmt.Errorf("%v: %w", err, ErrInvalidResponse)
+			}
+			return status, body, &ResponseError{Status: status, Payload: payload, Partial: partial, Body: body}
+		}
+		payload, err := decodeError(body)
 		if err != nil {
 			return status, body, fmt.Errorf("%v: %w", err, ErrInvalidResponse)
 		}
-		return status, body, &ResponseError{Status: status, Payload: payload, Partial: partial}
+		return status, body, &ResponseError{Status: status, Payload: payload, Body: body}
 	}
 	return status, body, fmt.Errorf("runtime returned status %d for an operation expecting %d: %w", status, expected, ErrInvalidResponse)
 }

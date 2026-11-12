@@ -94,8 +94,9 @@ function main() {
           throw new Error(`operation ${operation.operation_id} response ${status} names unknown component ${schema}`);
         }
         accepts += 1;
-        const target = status === 'default'
-          ? `P.${operation.operation_id}Errors['default']`
+        const errorStatus = status !== 'default' && Number(status) >= 400;
+        const target = status === 'default' || errorStatus
+          ? `P.${operation.operation_id}Errors['${status}']`
           : `P.${operation.operation_id}Responses['${status}']`;
         lines.push(`const operation_${operation.operation_id}_response_${status}: ${target} = ${array ? `[${payload}]` : payload};`);
       }

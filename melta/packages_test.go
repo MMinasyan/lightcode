@@ -521,6 +521,177 @@ func TestPackageRemoveSyncsExtensionDirectory(t *testing.T) {
 	mustNotExist(t, filepath.Join(extensionDir, "selected"), "remove retained the selected record")
 }
 
+// TestInstalledWorkerPublicExtensionAcceptance exercises an actually installed
+// worker through the public extension surface: discovery, concrete Harness- and
+// Session-target invocations, exact declared results, package removal, a
+// deliberate restart over the same store and configuration, retained history
+// without replay, and Session-data cleanup that preserves the extension cache
+// and configuration bytes.
+func TestInstalledWorkerPublicExtensionAcceptance(t *testing.T) {
+	binary := buildExecutableFixture(t)
+	declaration := fixtureExecutableDeclaration(t, binary)
+	eachProductionStore(t, func(t *testing.T, e *productionEnv) {
+		ctx := context.Background()
+		enableFixturePlugin(t, e.configPath, "fixture")
+		e.server.setScript(func(_ context.Context, body string) []string {
+			if lastUserText(body) == "worker work" {
+				return textTurnEvents("worker done")
+			}
+			return textTurnEvents("done")
+		})
+		owner, err := e.openExecutablesWith(ctx, []executableExtension{{Declaration: declaration, EntryPoint: binary}})
+		if err != nil {
+			t.Fatalf("open installed fixture: %v", err)
+		}
+		defer func() { _ = owner.Close(ctx) }()
+		caller := testCaller(owner)
+
+		catalog, err := owner.ListExtensionCapabilities(ctx, caller)
+		testassert.NoError(t, err)
+		var entry *protocol.ExtensionCapabilityCatalog
+		for i := range catalog {
+			if catalog[i].ExtensionId == "fixture" {
+				entry = &catalog[i]
+				break
+			}
+		}
+		testassert.Require(t, entry != nil, "catalog omitted the installed worker: %+v", catalog)
+		var discoveredCommands, discoveredService bool
+		for _, capability := range entry.Capabilities {
+			switch capability.CapabilityId {
+			case "fixture.commands":
+				discoveredCommands = capability.ContractId == "fixture.commands/v1" && capability.ContractVersion == extension.ContractVersion && capability.Kind == protocol.ExtensionCapabilityKindService
+			case "fixture.service":
+				discoveredService = capability.ContractId == "fixture.service/v1" && capability.ContractVersion == extension.ContractVersion && capability.Kind == protocol.ExtensionCapabilityKindService
+			}
+		}
+		testassert.Require(t, discoveredCommands && discoveredService, "catalog capabilities = %+v", entry.Capabilities)
+		var sawCommand, sawNamespaces, sawFailure, sawRaw bool
+		for _, exposed := range entry.Exposed {
+			switch exposed.Method {
+			case "command":
+				sawCommand = exposed.CapabilityId == "fixture.commands" && exposed.Kind == protocol.SessionWork && exposed.Target == protocol.ExtensionExposureTargetSession
+			case "namespaces":
+				sawNamespaces = exposed.CapabilityId == "fixture.commands" && exposed.Kind == protocol.Query && exposed.Target == protocol.ExtensionExposureTargetSession
+			case "fail":
+				sawFailure = exposed.CapabilityId == "fixture.service" && exposed.Kind == protocol.Query && exposed.Target == protocol.ExtensionExposureTargetHarness
+			case "raw":
+				sawRaw = exposed.CapabilityId == "fixture.service" && exposed.Kind == protocol.Query && exposed.Target == protocol.ExtensionExposureTargetHarness
+			}
+		}
+		testassert.Require(t, sawCommand && sawNamespaces && sawFailure && sawRaw, "catalog exposures = %+v", entry.Exposed)
+
+		rawValue := "{\n  \"big\": 9007199254740993,\n  \"escaped\": \"line\\n\\t\\\"quote\\\" \\\\ slash\"\n}"
+		raw, err := owner.InvokeExtension(ctx, caller, fixtureRequest("fixture", "fixture.service", "fixture.service/v1", "raw", harnessTarget(), rawValue, "req-worker-raw"))
+		testassert.NoError(t, err)
+		testassert.Require(t, raw.Failure == nil && string(raw.Value) == rawValue, "raw worker result = %+v, want the exact raw bytes", raw)
+
+		failure, err := owner.InvokeExtension(ctx, caller, fixtureRequest("fixture", "fixture.service", "fixture.service/v1", "fail", harnessTarget(), `{}`, "req-worker-fail"))
+		testassert.NoError(t, err)
+		wantData := "{\n  \"big\": 9007199254740993\n}"
+		wantPartial := `["partial", null, 1]`
+		testassert.Require(t, failure.Failure != nil && failure.Failure.Code == "guest_code" && failure.Failure.Message == "guest message" && string(failure.Failure.Data) == wantData && string(failure.Failure.Partial) == wantPartial && failure.Value == nil, "declared worker failure = %+v, want exact data/partial", failure.Failure)
+
+		selection := &protocol.AgentSelection{Inputs: &protocol.AgentInputs{
+			Model:        "prov/m",
+			Instructions: "worker public extension",
+			AssemblyMode: protocol.AgentAssemblyNone,
+			Tools:        []string{},
+			Capabilities: []string{},
+			Constraints:  protocol.ToolConstraints{},
+			Strategy:     protocol.StrategySelection{Id: "", Settings: "{}"},
+		}}
+		session, err := owner.CreateSession(ctx, caller, e.workspace("worker-public"), selection)
+		testassert.NoError(t, err)
+		sessionCaller, err := owner.Caller(CallerContext{
+			Origin: harness.InputOriginUser,
+			Scope:  CallerScope{Kind: CallerScopeSession, SessionID: session.SessionId},
+		})
+		testassert.NoError(t, err)
+
+		namespaces, err := owner.InvokeExtension(ctx, sessionCaller, fixtureRequest("fixture", "fixture.commands", "fixture.commands/v1", "namespaces", sessionTarget(session.SessionId), `{}`, "req-worker-namespaces"))
+		testassert.NoError(t, err)
+		testassert.Require(t, namespaces.Failure == nil, "namespaces failure = %+v", namespaces.Failure)
+		var directories struct {
+			SessionDirectory string `json:"session_directory"`
+			CacheDirectory   string `json:"cache_directory"`
+		}
+		testassert.NoError(t, json.Unmarshal(namespaces.Value, &directories))
+		testassert.Require(t, directories.SessionDirectory != "" && directories.CacheDirectory != "", "namespaces = %s", namespaces.Value)
+		testassert.NoError(t, os.WriteFile(filepath.Join(directories.SessionDirectory, "session.sentinel"), []byte("session"), 0o600))
+		testassert.NoError(t, os.WriteFile(filepath.Join(directories.CacheDirectory, "cache.sentinel"), []byte("cache"), 0o600))
+
+		submitted, err := owner.InvokeExtension(ctx, sessionCaller, fixtureRequest("fixture", "fixture.commands", "fixture.commands/v1", "command", sessionTarget(session.SessionId), `{"method":"submit","arguments":{"operation_id":"op-worker-extension","mode":"regular","content":[{"kind":"text","text":"worker work"}]}}`, "req-worker-submit"))
+		testassert.NoError(t, err)
+		testassert.Require(t, submitted.Failure == nil, "submit failure = %+v", submitted.Failure)
+		awaitOperation(t, owner, session.SessionId, "op-worker-extension", harness.OperationSuccess)
+
+		page, err := owner.GetHistory(ctx, caller, session.SessionId, nil)
+		testassert.NoError(t, err)
+		input, ok := workerExtensionInput(page, "op-worker-extension")
+		testassert.Require(t, ok && input.Origin == protocol.InputOriginPlugin && input.ExtensionId != nil && *input.ExtensionId == "fixture", "admitted input attribution = %+v", input)
+
+		configBefore, err := os.ReadFile(e.configPath)
+		testassert.NoError(t, err)
+		testassert.NoError(t, owner.RemoveExtensionPackage(ctx, caller, "fixture"))
+		configAfterRemoval, err := os.ReadFile(e.configPath)
+		testassert.NoError(t, err)
+		testassert.Require(t, string(configAfterRemoval) == string(configBefore), "package removal rewrote the configuration")
+		testassert.NoError(t, owner.Close(ctx))
+
+		restarted, err := e.openExecutablesWith(ctx, nil)
+		if err != nil {
+			t.Fatalf("reopen after package removal: %v", err)
+		}
+		defer func() { _ = restarted.Close(ctx) }()
+		restartedCaller := testCaller(restarted)
+		catalog, err = restarted.ListExtensionCapabilities(ctx, restartedCaller)
+		testassert.NoError(t, err)
+		for _, candidate := range catalog {
+			testassert.Require(t, candidate.ExtensionId != "fixture", "removed worker is still cataloged: %+v", candidate)
+		}
+		_, err = restarted.InvokeExtension(ctx, restartedCaller, fixtureRequest("fixture", "fixture.commands", "fixture.commands/v1", "namespaces", sessionTarget(session.SessionId), `{}`, "req-worker-removed"))
+		testassert.Require(t, errors.Is(err, harness.ErrNotFound), "invocation after package removal = %v, want not-found", err)
+
+		page, err = restarted.GetHistory(ctx, restartedCaller, session.SessionId, nil)
+		testassert.NoError(t, err)
+		input, ok = workerExtensionInput(page, "op-worker-extension")
+		testassert.Require(t, ok && input.ExtensionId != nil && *input.ExtensionId == "fixture", "reopened history = %+v, want the retained extension attribution", input)
+		if data, err := os.ReadFile(filepath.Join(directories.SessionDirectory, "session.sentinel")); err != nil || string(data) != "session" {
+			t.Fatalf("Session sentinel after removal = (%q, %v), want preserved", data, err)
+		}
+
+		_, err = restarted.ArchiveSession(ctx, restartedCaller, session.SessionId)
+		testassert.NoError(t, err)
+		deletion, err := restarted.DeleteSession(ctx, restartedCaller, session.SessionId)
+		testassert.NoError(t, err)
+		testassert.Require(t, len(deletion.CleanupFailures) == 0, "deletion cleanup failures = %+v", deletion.CleanupFailures)
+		mustNotExist(t, filepath.Join(e.dataDir, "code", session.SessionId), "the deleted Session tree")
+		if data, err := os.ReadFile(filepath.Join(directories.CacheDirectory, "cache.sentinel")); err != nil || string(data) != "cache" {
+			t.Fatalf("cache after Session deletion = (%q, %v), want preserved", data, err)
+		}
+		configAfter, err := os.ReadFile(e.configPath)
+		testassert.NoError(t, err)
+		testassert.Require(t, string(configAfter) == string(configBefore), "Session deletion or restart rewrote the configuration")
+		testassert.NoError(t, restarted.Close(ctx))
+	})
+}
+
+// workerExtensionInput finds the admitted input of one Operation in a history
+// page.
+func workerExtensionInput(page protocol.HistoryPage, operationID string) (protocol.InputItem, bool) {
+	for _, item := range page.Items {
+		input, err := item.AsInputItem()
+		if err != nil {
+			continue
+		}
+		if input.OperationId != nil && *input.OperationId == operationID {
+			return input, true
+		}
+	}
+	return protocol.InputItem{}, false
+}
+
 // writePackageSourceFiles writes one self-contained source package with a
 // distinct declaration version and an executable placeholder entry point.
 func writePackageSourceFiles(t *testing.T, dir string, declaration extension.Declaration, version, entry string) error {

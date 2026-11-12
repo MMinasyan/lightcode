@@ -546,6 +546,14 @@
      "json": "{\"code\":\"invalid\",\"message\":\"fixture\"}"
     },
     {
+     "name": "partial-result",
+     "json": "{\"code\":\"storage\",\"message\":\"partial\",\"partial_result\":{\"big\":9007199254740993,\"text\":\"line\\\\nbreak\"}}"
+    },
+    {
+     "name": "null-partial-result",
+     "json": "{\"code\":\"storage\",\"message\":\"null partial\",\"partial_result\":null}"
+    },
+    {
      "name": "code-unauthorized",
      "json": "{\"code\":\"unauthorized\",\"message\":\"missing credential\"}"
     },
@@ -705,7 +713,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"14\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"16\"}"
     }
    ],
    "reject": [
@@ -715,16 +723,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"14\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"16\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"14\"}"
+     "json": "{\"protocol_version\":\"16\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"14\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"16\",\"extra\":true}"
     }
    ]
   },
@@ -2323,6 +2331,75 @@
      "typescript": false
     }
    ]
+  },
+  {
+   "schema": "ExtensionCapability",
+   "accept": [{"name":"minimal","json":"{\"capability_id\":\"fixture.service\",\"contract_id\":\"fixture.service/v1\",\"contract_version\":\"1\",\"kind\":\"service\",\"methods\":[{\"name\":\"echo\",\"mode\":\"service_io\",\"input\":\"{\\\"type\\\":\\\"object\\\"}\",\"success\":\"{\\\"type\\\":\\\"object\\\"}\"}]}"},
+    {"name":"hook","json":"{\"capability_id\":\"fixture.hook\",\"contract_id\":\"melta.hook/v1\",\"contract_version\":\"1\",\"kind\":\"hook\",\"methods\":[],\"hooks\":[{\"boundary\":\"prepare\",\"mode\":\"pure\"}]}"},
+    {"name":"strategy","json":"{\"capability_id\":\"fixture.strategy\",\"contract_id\":\"melta.context_strategy/v1\",\"contract_version\":\"1\",\"kind\":\"strategy\",\"methods\":[],\"strategy\":{\"requires_context_window\":true}}"}],
+   "reject": [{"name":"wrong-kind","json":"{\"capability_id\":\"x\",\"contract_id\":\"x/v1\",\"contract_version\":\"1\",\"kind\":\"other\",\"methods\":[]}"}]
+  },
+  {
+   "schema": "ExtensionCapabilityCatalog",
+   "accept": [{"name":"minimal","json":"{\"extension_id\":\"fixture\",\"version\":\"1.0.0\",\"configuration_schema\":\"{\\\"type\\\":\\\"object\\\"}\",\"settings\":\"{\\\"enabled\\\":true}\",\"capabilities\":[],\"exposed\":[]}"}],
+   "reject": [{"name":"unknown","json":"{\"extension_id\":\"fixture\",\"version\":\"1.0.0\",\"configuration_schema\":\"{}\",\"settings\":\"{}\",\"capabilities\":[],\"exposed\":[],\"extra\":true}"}]
+  },
+  {
+   "schema": "ExtensionExposure",
+   "accept": [{"name":"minimal","json":"{\"capability_id\":\"fixture.service\",\"method\":\"echo\",\"kind\":\"query\",\"target\":\"harness\"}"}],
+   "reject": [{"name":"wrong-target","json":"{\"capability_id\":\"fixture.service\",\"method\":\"echo\",\"kind\":\"query\",\"target\":\"other\"}"}]
+  },
+  {
+   "schema": "ExtensionFailure",
+   "accept": [{"name":"minimal","json":"{\"code\":\"guest_code\",\"message\":\"guest message\",\"data\":{\"big\":9007199254740993}}"},
+    {"name":"no-data","json":"{\"code\":\"guest_code\",\"message\":\"guest message\"}"}],
+   "reject": [{"name":"missing-code","json":"{\"message\":\"guest message\"}"}]
+  },
+  {
+   "schema": "ExtensionFailureResult",
+   "accept": [{"name":"minimal","json":"{\"kind\":\"failure\",\"error\":{\"code\":\"guest_code\",\"message\":\"guest message\"},\"partial_result\":[\"partial\",null,1]}"},
+    {"name":"no-partial","json":"{\"kind\":\"failure\",\"error\":{\"code\":\"guest_code\",\"message\":\"guest message\"}}"}],
+   "reject": [{"name":"wrong-kind","json":"{\"kind\":\"success\",\"error\":{\"code\":\"x\",\"message\":\"y\"}}"}]
+  },
+  {
+   "schema": "ExtensionHook",
+   "accept": [{"name":"minimal","json":"{\"boundary\":\"prepare\",\"mode\":\"pure\"}"}],
+   "reject": [{"name":"wrong-mode","json":"{\"boundary\":\"prepare\",\"mode\":\"other\"}"}]
+  },
+  {
+   "schema": "ExtensionInvocationFailure",
+   "accept": [{"name":"declared","json":"{\"kind\":\"failure\",\"error\":{\"code\":\"guest_code\",\"message\":\"guest message\"},\"partial_result\":null}"},
+    {"name":"baseline","json":"{\"code\":\"corrupt\",\"message\":\"baseline\"}"}],
+   "reject": []
+  },
+  {
+   "schema": "ExtensionInvocationRequest",
+   "accept": [{"name":"minimal","json":"{\"extension_id\":\"fixture\",\"capability_id\":\"fixture.service\",\"contract_id\":\"fixture.service/v1\",\"contract_version\":\"1\",\"method\":\"raw\",\"target\":{\"kind\":\"harness\"},\"arguments\":null,\"request_id\":\"req-1\"}"}],
+   "reject": [{"name":"unknown","json":"{\"extension_id\":\"fixture\",\"capability_id\":\"fixture.service\",\"contract_id\":\"fixture.service/v1\",\"contract_version\":\"1\",\"method\":\"raw\",\"target\":{\"kind\":\"harness\"},\"arguments\":{},\"request_id\":\"req-1\",\"operation_id\":\"forged\"}"}]
+  },
+  {
+   "schema": "ExtensionInvocationTarget",
+   "accept": [{"name":"harness","json":"{\"kind\":\"harness\"}"},
+    {"name":"workspace","json":"{\"kind\":\"workspace\",\"workspace\":\"/ws\"}"},
+    {"name":"session","json":"{\"kind\":\"session\",\"session_id\":\"0123456789abcdef0123456789abcdef\"}"}],
+   "reject": [{"name":"missing-kind","json":"{\"workspace\":\"/ws\"}"}]
+  },
+  {
+   "schema": "ExtensionMethod",
+   "accept": [{"name":"minimal","json":"{\"name\":\"echo\",\"mode\":\"service_io\",\"input\":\"{}\",\"success\":\"{}\"}"},
+    {"name":"full","json":"{\"name\":\"echo\",\"mode\":\"service_io\",\"input\":\"{}\",\"success\":\"{}\",\"error\":\"{}\",\"partial\":\"{}\"}"}],
+   "reject": [{"name":"wrong-mode","json":"{\"name\":\"echo\",\"mode\":\"other\",\"input\":\"{}\",\"success\":\"{}\"}"}]
+  },
+  {
+   "schema": "ExtensionStrategy",
+   "accept": [{"name":"minimal","json":"{\"requires_context_window\":true}"}],
+   "reject": [{"name":"missing","json":"{}"}]
+  },
+  {
+   "schema": "ExtensionSuccess",
+   "accept": [{"name":"object","json":"{\"kind\":\"success\",\"result\":{\"big\":9007199254740993}}"},
+    {"name":"null","json":"{\"kind\":\"success\",\"result\":null}"}],
+   "reject": [{"name":"missing-result","json":"{\"kind\":\"success\"}"}]
   }
  ],
  "operations": [
@@ -2541,6 +2618,27 @@
    "path": "/v1/sessions/{id}/interrupt",
    "request": null,
    "responses": {
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "ListExtensionCapabilities",
+   "method": "get",
+   "path": "/v1/extensions/capabilities",
+   "request": null,
+   "responses": {
+    "200": "ExtensionCapabilityCatalog[]",
+    "default": "Error"
+   }
+  },
+  {
+   "operation_id": "InvokeExtension",
+   "method": "post",
+   "path": "/v1/extensions/invoke",
+   "request": "ExtensionInvocationRequest",
+   "responses": {
+    "200": "ExtensionSuccess",
+    "422": "ExtensionInvocationFailure",
     "default": "Error"
    }
   },

@@ -215,15 +215,192 @@ func (e ExecutionEvidence) Valid() bool {
 	}
 }
 
+// Defines values for ExtensionCapabilityKind.
+const (
+	ExtensionCapabilityKindHook     ExtensionCapabilityKind = "hook"
+	ExtensionCapabilityKindService  ExtensionCapabilityKind = "service"
+	ExtensionCapabilityKindStrategy ExtensionCapabilityKind = "strategy"
+	ExtensionCapabilityKindTool     ExtensionCapabilityKind = "tool"
+)
+
+// Valid indicates whether the value is a known member of the ExtensionCapabilityKind enum.
+func (e ExtensionCapabilityKind) Valid() bool {
+	switch e {
+	case ExtensionCapabilityKindHook:
+		return true
+	case ExtensionCapabilityKindService:
+		return true
+	case ExtensionCapabilityKindStrategy:
+		return true
+	case ExtensionCapabilityKindTool:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtensionExposureKind.
+const (
+	Management  ExtensionExposureKind = "management"
+	Query       ExtensionExposureKind = "query"
+	SessionWork ExtensionExposureKind = "session_work"
+)
+
+// Valid indicates whether the value is a known member of the ExtensionExposureKind enum.
+func (e ExtensionExposureKind) Valid() bool {
+	switch e {
+	case Management:
+		return true
+	case Query:
+		return true
+	case SessionWork:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtensionExposureTarget.
+const (
+	ExtensionExposureTargetHarness   ExtensionExposureTarget = "harness"
+	ExtensionExposureTargetSession   ExtensionExposureTarget = "session"
+	ExtensionExposureTargetWorkspace ExtensionExposureTarget = "workspace"
+)
+
+// Valid indicates whether the value is a known member of the ExtensionExposureTarget enum.
+func (e ExtensionExposureTarget) Valid() bool {
+	switch e {
+	case ExtensionExposureTargetHarness:
+		return true
+	case ExtensionExposureTargetSession:
+		return true
+	case ExtensionExposureTargetWorkspace:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtensionFailureResultKind.
+const (
+	ExtensionFailureResultKindFailure ExtensionFailureResultKind = "failure"
+)
+
+// Valid indicates whether the value is a known member of the ExtensionFailureResultKind enum.
+func (e ExtensionFailureResultKind) Valid() bool {
+	switch e {
+	case ExtensionFailureResultKindFailure:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtensionHookBoundary.
+const (
+	AfterTool  ExtensionHookBoundary = "after_tool"
+	BeforeTool ExtensionHookBoundary = "before_tool"
+	Prepare    ExtensionHookBoundary = "prepare"
+	Request    ExtensionHookBoundary = "request"
+)
+
+// Valid indicates whether the value is a known member of the ExtensionHookBoundary enum.
+func (e ExtensionHookBoundary) Valid() bool {
+	switch e {
+	case AfterTool:
+		return true
+	case BeforeTool:
+		return true
+	case Prepare:
+		return true
+	case Request:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtensionHookMode.
+const (
+	ExtensionHookModeEffectful ExtensionHookMode = "effectful"
+	ExtensionHookModePure      ExtensionHookMode = "pure"
+)
+
+// Valid indicates whether the value is a known member of the ExtensionHookMode enum.
+func (e ExtensionHookMode) Valid() bool {
+	switch e {
+	case ExtensionHookModeEffectful:
+		return true
+	case ExtensionHookModePure:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtensionInvocationTargetKind.
+const (
+	ExtensionInvocationTargetKindHarness   ExtensionInvocationTargetKind = "harness"
+	ExtensionInvocationTargetKindSession   ExtensionInvocationTargetKind = "session"
+	ExtensionInvocationTargetKindWorkspace ExtensionInvocationTargetKind = "workspace"
+)
+
+// Valid indicates whether the value is a known member of the ExtensionInvocationTargetKind enum.
+func (e ExtensionInvocationTargetKind) Valid() bool {
+	switch e {
+	case ExtensionInvocationTargetKindHarness:
+		return true
+	case ExtensionInvocationTargetKindSession:
+		return true
+	case ExtensionInvocationTargetKindWorkspace:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtensionMethodMode.
+const (
+	ExtensionMethodModePure      ExtensionMethodMode = "pure"
+	ExtensionMethodModeServiceIo ExtensionMethodMode = "service_io"
+)
+
+// Valid indicates whether the value is a known member of the ExtensionMethodMode enum.
+func (e ExtensionMethodMode) Valid() bool {
+	switch e {
+	case ExtensionMethodModePure:
+		return true
+	case ExtensionMethodModeServiceIo:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtensionSuccessKind.
+const (
+	ExtensionSuccessKindSuccess ExtensionSuccessKind = "success"
+)
+
+// Valid indicates whether the value is a known member of the ExtensionSuccessKind enum.
+func (e ExtensionSuccessKind) Valid() bool {
+	switch e {
+	case ExtensionSuccessKindSuccess:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for HealthProtocolVersion.
 const (
-	N14 HealthProtocolVersion = "14"
+	N16 HealthProtocolVersion = "16"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N14:
+	case N16:
 		return true
 	default:
 		return false
@@ -1148,9 +1325,12 @@ type DiscoveryRequest struct {
 
 // Error defines model for Error.
 type Error struct {
-	Code      ErrorCode `json:"code"`
-	Message   string    `json:"message"`
-	SessionId *string   `json:"session_id,omitempty"`
+	Code    ErrorCode `json:"code"`
+	Message string    `json:"message"`
+
+	// PartialResult One optional opaque produced partial retained by a baseline error that failed after producing it. The value is the original raw JSON and is absent when no partial was produced.
+	PartialResult *json.RawMessage `json:"partial_result,omitempty"`
+	SessionId     *string          `json:"session_id,omitempty"`
 }
 
 // ErrorCode defines model for Error.Code.
@@ -1164,6 +1344,34 @@ type Event struct {
 // ExecutionEvidence One settled tool call's execution knowledge, independent of its status: proven unstarted work, a produced terminal outcome, or a possibly-executed-but-unverified external outcome.
 type ExecutionEvidence string
 
+// ExtensionCapability defines model for ExtensionCapability.
+type ExtensionCapability struct {
+	CapabilityId    string                  `json:"capability_id"`
+	ContractId      string                  `json:"contract_id"`
+	ContractVersion string                  `json:"contract_version"`
+	Hooks           *[]ExtensionHook        `json:"hooks,omitempty"`
+	Kind            ExtensionCapabilityKind `json:"kind"`
+	Methods         []ExtensionMethod       `json:"methods"`
+	Strategy        *ExtensionStrategy      `json:"strategy,omitempty"`
+}
+
+// ExtensionCapabilityKind defines model for ExtensionCapability.Kind.
+type ExtensionCapabilityKind string
+
+// ExtensionCapabilityCatalog defines model for ExtensionCapabilityCatalog.
+type ExtensionCapabilityCatalog struct {
+	Capabilities []ExtensionCapability `json:"capabilities"`
+
+	// ConfigurationSchema One extension configuration document as exact JSON text.
+	ConfigurationSchema ExtensionConfigDocument `json:"configuration_schema"`
+	Exposed             []ExtensionExposure     `json:"exposed"`
+	ExtensionId         string                  `json:"extension_id"`
+
+	// Settings One extension configuration document as exact JSON text.
+	Settings ExtensionConfigDocument `json:"settings"`
+	Version  string                  `json:"version"`
+}
+
 // ExtensionConfigDocument One extension configuration document as exact JSON text.
 type ExtensionConfigDocument = string
 
@@ -1175,6 +1383,106 @@ type ExtensionEdit struct {
 	ExtensionId string `json:"extension_id"`
 }
 
+// ExtensionExposure defines model for ExtensionExposure.
+type ExtensionExposure struct {
+	CapabilityId string                  `json:"capability_id"`
+	Kind         ExtensionExposureKind   `json:"kind"`
+	Method       string                  `json:"method"`
+	Target       ExtensionExposureTarget `json:"target"`
+}
+
+// ExtensionExposureKind defines model for ExtensionExposure.Kind.
+type ExtensionExposureKind string
+
+// ExtensionExposureTarget defines model for ExtensionExposure.Target.
+type ExtensionExposureTarget string
+
+// ExtensionFailure defines model for ExtensionFailure.
+type ExtensionFailure struct {
+	// Code The selected declaration's own failure code string.
+	Code string `json:"code"`
+
+	// Data The declared failure-data schema value, when declared; the declared schema may itself accept null.
+	Data    *json.RawMessage `json:"data,omitempty"`
+	Message string           `json:"message"`
+}
+
+// ExtensionFailureResult defines model for ExtensionFailureResult.
+type ExtensionFailureResult struct {
+	Error ExtensionFailure           `json:"error"`
+	Kind  ExtensionFailureResultKind `json:"kind"`
+
+	// PartialResult The declared partial schema value, when the method declares one; the declared schema may itself accept null.
+	PartialResult *json.RawMessage `json:"partial_result,omitempty"`
+}
+
+// ExtensionFailureResultKind defines model for ExtensionFailureResult.Kind.
+type ExtensionFailureResultKind string
+
+// ExtensionHook defines model for ExtensionHook.
+type ExtensionHook struct {
+	Boundary ExtensionHookBoundary `json:"boundary"`
+	Mode     ExtensionHookMode     `json:"mode"`
+}
+
+// ExtensionHookBoundary defines model for ExtensionHook.Boundary.
+type ExtensionHookBoundary string
+
+// ExtensionHookMode defines model for ExtensionHook.Mode.
+type ExtensionHookMode string
+
+// ExtensionInvocationFailure defines model for ExtensionInvocationFailure.
+type ExtensionInvocationFailure struct {
+	union json.RawMessage
+}
+
+// ExtensionInvocationRequest defines model for ExtensionInvocationRequest.
+type ExtensionInvocationRequest struct {
+	// Arguments One owned JSON value validated against the selected method's input schema. The value itself may be any JSON, including null.
+	Arguments       *json.RawMessage          `json:"arguments"`
+	CapabilityId    string                    `json:"capability_id"`
+	ContractId      string                    `json:"contract_id"`
+	ContractVersion string                    `json:"contract_version"`
+	ExtensionId     string                    `json:"extension_id"`
+	Method          string                    `json:"method"`
+	RequestId       string                    `json:"request_id"`
+	Target          ExtensionInvocationTarget `json:"target"`
+}
+
+// ExtensionInvocationTarget defines model for ExtensionInvocationTarget.
+type ExtensionInvocationTarget struct {
+	Kind ExtensionInvocationTargetKind `json:"kind"`
+
+	// SessionId One canonical Session ID for the session branch.
+	SessionId *string `json:"session_id,omitempty"`
+
+	// Workspace One clean absolute Workspace path for the workspace branch.
+	Workspace *string `json:"workspace,omitempty"`
+}
+
+// ExtensionInvocationTargetKind defines model for ExtensionInvocationTarget.Kind.
+type ExtensionInvocationTargetKind string
+
+// ExtensionMethod defines model for ExtensionMethod.
+type ExtensionMethod struct {
+	// Error One extension configuration document as exact JSON text.
+	Error *ExtensionConfigDocument `json:"error,omitempty"`
+
+	// Input One extension configuration document as exact JSON text.
+	Input ExtensionConfigDocument `json:"input"`
+	Mode  ExtensionMethodMode     `json:"mode"`
+	Name  string                  `json:"name"`
+
+	// Partial One extension configuration document as exact JSON text.
+	Partial *ExtensionConfigDocument `json:"partial,omitempty"`
+
+	// Success One extension configuration document as exact JSON text.
+	Success ExtensionConfigDocument `json:"success"`
+}
+
+// ExtensionMethodMode defines model for ExtensionMethod.Mode.
+type ExtensionMethodMode string
+
 // ExtensionPackage One installed executable extension's live loaded implementation version and the package selected for the next start. Package installation never changes the live loaded set.
 type ExtensionPackage struct {
 	Id string `json:"id"`
@@ -1185,6 +1493,22 @@ type ExtensionPackage struct {
 	// SelectedVersion The selected next-start implementation version; empty when no package is selected or installed.
 	SelectedVersion string `json:"selected_version"`
 }
+
+// ExtensionStrategy defines model for ExtensionStrategy.
+type ExtensionStrategy struct {
+	RequiresContextWindow bool `json:"requires_context_window"`
+}
+
+// ExtensionSuccess defines model for ExtensionSuccess.
+type ExtensionSuccess struct {
+	Kind ExtensionSuccessKind `json:"kind"`
+
+	// Result The declared success schema value, carried as exact raw JSON; the declared schema may itself accept null.
+	Result *json.RawMessage `json:"result"`
+}
+
+// ExtensionSuccessKind defines model for ExtensionSuccess.Kind.
+type ExtensionSuccessKind string
 
 // ExtensionsSettings Extension sections as JSON document strings, keyed by extension ID.
 type ExtensionsSettings map[string]ExtensionConfigDocument
@@ -2057,6 +2381,9 @@ type GetSessionHistoryParams struct {
 // UpdateConfigurationSettingsJSONRequestBody defines body for UpdateConfigurationSettings for application/json ContentType.
 type UpdateConfigurationSettingsJSONRequestBody = UpdateSettingsRequest
 
+// InvokeExtensionJSONRequestBody defines body for InvokeExtension for application/json ContentType.
+type InvokeExtensionJSONRequestBody = ExtensionInvocationRequest
+
 // InstallExtensionPackageJSONRequestBody defines body for InstallExtensionPackage for application/json ContentType.
 type InstallExtensionPackageJSONRequestBody = InstallExtensionPackageRequest
 
@@ -2762,6 +3089,68 @@ func (t *Event) UnmarshalJSON(b []byte) error {
 	return err
 }
 
+// AsExtensionFailureResult returns the union data inside the ExtensionInvocationFailure as a ExtensionFailureResult
+func (t ExtensionInvocationFailure) AsExtensionFailureResult() (ExtensionFailureResult, error) {
+	var body ExtensionFailureResult
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromExtensionFailureResult overwrites any union data inside the ExtensionInvocationFailure as the provided ExtensionFailureResult
+func (t *ExtensionInvocationFailure) FromExtensionFailureResult(v ExtensionFailureResult) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeExtensionFailureResult performs a merge with any union data inside the ExtensionInvocationFailure, using the provided ExtensionFailureResult
+func (t *ExtensionInvocationFailure) MergeExtensionFailureResult(v ExtensionFailureResult) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsError returns the union data inside the ExtensionInvocationFailure as a Error
+func (t ExtensionInvocationFailure) AsError() (Error, error) {
+	var body Error
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromError overwrites any union data inside the ExtensionInvocationFailure as the provided Error
+func (t *ExtensionInvocationFailure) FromError(v Error) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeError performs a merge with any union data inside the ExtensionInvocationFailure, using the provided Error
+func (t *ExtensionInvocationFailure) MergeError(v Error) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t ExtensionInvocationFailure) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *ExtensionInvocationFailure) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
 // AsRuntimeScope returns the union data inside the Scope as a RuntimeScope
 func (t Scope) AsRuntimeScope() (RuntimeScope, error) {
 	var body RuntimeScope
@@ -3098,6 +3487,17 @@ type ClientInterface interface {
 	// GetEvents performs a GET /v1/events (the `GetEvents` operationId) request.
 	GetEvents(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// ListExtensionCapabilities performs a GET /v1/extensions/capabilities (the `ListExtensionCapabilities` operationId) request.
+	ListExtensionCapabilities(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// InvokeExtensionWithBody performs a POST /v1/extensions/invoke (the `InvokeExtension` operationId) request,
+	// with any type of body and a specified content type.
+	InvokeExtensionWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// InvokeExtension performs a POST /v1/extensions/invoke (the `InvokeExtension` operationId) request.
+	// Takes a body of the `application/json` content type.
+	InvokeExtension(ctx context.Context, body InvokeExtensionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// RemoveExtensionPackage performs a DELETE /v1/extensions/packages (the `RemoveExtensionPackage` operationId) request.
 	RemoveExtensionPackage(ctx context.Context, params *RemoveExtensionPackageParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -3340,6 +3740,47 @@ func (c *Client) UpdateConfigurationSettings(ctx context.Context, body UpdateCon
 // GetEvents performs a GET /v1/events (the `GetEvents` operationId) request.
 func (c *Client) GetEvents(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetEventsRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ListExtensionCapabilities performs a GET /v1/extensions/capabilities (the `ListExtensionCapabilities` operationId) request.
+func (c *Client) ListExtensionCapabilities(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListExtensionCapabilitiesRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// InvokeExtensionWithBody performs a POST /v1/extensions/invoke (the `InvokeExtension` operationId) request,
+// with any type of body and a specified content type.
+func (c *Client) InvokeExtensionWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewInvokeExtensionRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// InvokeExtension performs a POST /v1/extensions/invoke (the `InvokeExtension` operationId) request.
+// Takes a body of the `application/json` content type.
+func (c *Client) InvokeExtension(ctx context.Context, body InvokeExtensionJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewInvokeExtensionRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
@@ -4171,6 +4612,73 @@ func NewGetEventsRequest(server string) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	return req, nil
+}
+
+// NewListExtensionCapabilitiesRequest constructs an http.Request for the ListExtensionCapabilities method
+func NewListExtensionCapabilitiesRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/extensions/capabilities")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewInvokeExtensionRequest calls the generic InvokeExtension builder with application/json body
+func NewInvokeExtensionRequest(server string, body InvokeExtensionJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewInvokeExtensionRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewInvokeExtensionRequestWithBody constructs an http.Request for the InvokeExtension method, with any body, and a specified content type
+func NewInvokeExtensionRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/extensions/invoke")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -5945,6 +6453,21 @@ type ClientWithResponsesInterface interface {
 	// Returns a wrapper object for the known response body format(s).
 	GetEventsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetEventsResponse, error)
 
+	// ListExtensionCapabilitiesWithResponse performs a GET /v1/extensions/capabilities (the `ListExtensionCapabilities` operationId) request.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	ListExtensionCapabilitiesWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListExtensionCapabilitiesResponse, error)
+
+	// InvokeExtensionWithBodyWithResponse performs a POST /v1/extensions/invoke (the `InvokeExtension` operationId) request,
+	// with any type of body and a specified content type.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	InvokeExtensionWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*InvokeExtensionResponse, error)
+
+	// InvokeExtensionWithResponse performs a POST /v1/extensions/invoke (the `InvokeExtension` operationId) request.
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	InvokeExtensionWithResponse(ctx context.Context, body InvokeExtensionJSONRequestBody, reqEditors ...RequestEditorFn) (*InvokeExtensionResponse, error)
+
 	// RemoveExtensionPackageWithResponse performs a DELETE /v1/extensions/packages (the `RemoveExtensionPackage` operationId) request.
 	//
 	// Returns a wrapper object for the known response body format(s).
@@ -6385,6 +6908,109 @@ func (r GetEventsResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r GetEventsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ListExtensionCapabilitiesResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]ExtensionCapabilityCatalog
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ListExtensionCapabilitiesResponse) GetJSON200() *[]ExtensionCapabilityCatalog {
+	return r.JSON200
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r ListExtensionCapabilitiesResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r ListExtensionCapabilitiesResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ListExtensionCapabilitiesResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListExtensionCapabilitiesResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ListExtensionCapabilitiesResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type InvokeExtensionResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *ExtensionSuccess
+	// JSON422 the response for an HTTP 422 `application/json` response
+	JSON422 *ExtensionInvocationFailure
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r InvokeExtensionResponse) GetJSON200() *ExtensionSuccess {
+	return r.JSON200
+}
+
+// GetJSON422 returns the response for an HTTP 422 `application/json` response
+func (r InvokeExtensionResponse) GetJSON422() *ExtensionInvocationFailure {
+	return r.JSON422
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r InvokeExtensionResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r InvokeExtensionResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r InvokeExtensionResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r InvokeExtensionResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r InvokeExtensionResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -8249,6 +8875,39 @@ func (c *ClientWithResponses) GetEventsWithResponse(ctx context.Context, reqEdit
 	return ParseGetEventsResponse(rsp)
 }
 
+// ListExtensionCapabilitiesWithResponse performs a GET /v1/extensions/capabilities (the `ListExtensionCapabilities` operationId) request.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) ListExtensionCapabilitiesWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListExtensionCapabilitiesResponse, error) {
+	rsp, err := c.ListExtensionCapabilities(ctx, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListExtensionCapabilitiesResponse(rsp)
+}
+
+// InvokeExtensionWithBodyWithResponse performs a POST /v1/extensions/invoke (the `InvokeExtension` operationId) request,
+// with any type of body and a specified content type.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) InvokeExtensionWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*InvokeExtensionResponse, error) {
+	rsp, err := c.InvokeExtensionWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseInvokeExtensionResponse(rsp)
+}
+
+// InvokeExtensionWithResponse performs a POST /v1/extensions/invoke (the `InvokeExtension` operationId) request.
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) InvokeExtensionWithResponse(ctx context.Context, body InvokeExtensionJSONRequestBody, reqEditors ...RequestEditorFn) (*InvokeExtensionResponse, error) {
+	rsp, err := c.InvokeExtension(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseInvokeExtensionResponse(rsp)
+}
+
 // RemoveExtensionPackageWithResponse performs a DELETE /v1/extensions/packages (the `RemoveExtensionPackage` operationId) request.
 //
 // Returns a wrapper object for the known response body format(s).
@@ -8934,6 +9593,79 @@ func ParseGetEventsResponse(rsp *http.Response) (*GetEventsResponse, error) {
 	}
 
 	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseListExtensionCapabilitiesResponse parses an HTTP response from a ListExtensionCapabilitiesWithResponse call
+func ParseListExtensionCapabilitiesResponse(rsp *http.Response) (*ListExtensionCapabilitiesResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListExtensionCapabilitiesResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []ExtensionCapabilityCatalog
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseInvokeExtensionResponse parses an HTTP response from a InvokeExtensionWithResponse call
+func ParseInvokeExtensionResponse(rsp *http.Response) (*InvokeExtensionResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &InvokeExtensionResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ExtensionSuccess
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ExtensionInvocationFailure
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON422 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
 		var dest Error
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -10203,6 +10935,12 @@ type ServerInterface interface {
 	// (GET /v1/events)
 	GetEvents(w http.ResponseWriter, r *http.Request)
 
+	// (GET /v1/extensions/capabilities)
+	ListExtensionCapabilities(w http.ResponseWriter, r *http.Request)
+
+	// (POST /v1/extensions/invoke)
+	InvokeExtension(w http.ResponseWriter, r *http.Request)
+
 	// (DELETE /v1/extensions/packages)
 	RemoveExtensionPackage(w http.ResponseWriter, r *http.Request, params RemoveExtensionPackageParams)
 
@@ -10374,6 +11112,34 @@ func (siw *ServerInterfaceWrapper) GetEvents(w http.ResponseWriter, r *http.Requ
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetEvents(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListExtensionCapabilities operation middleware
+func (siw *ServerInterfaceWrapper) ListExtensionCapabilities(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListExtensionCapabilities(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// InvokeExtension operation middleware
+func (siw *ServerInterfaceWrapper) InvokeExtension(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.InvokeExtension(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -11581,6 +12347,8 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/v1/extensions/packages", wrapper.RemoveExtensionPackage)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/extensions/packages", wrapper.ListExtensionPackages)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/extensions/packages", wrapper.InstallExtensionPackage)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/extensions/capabilities", wrapper.ListExtensionCapabilities)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/extensions/invoke", wrapper.InvokeExtension)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/models", wrapper.ListModels)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/providers", wrapper.ListProviders)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/providers", wrapper.CreateProvider)

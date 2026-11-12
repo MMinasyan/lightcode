@@ -353,6 +353,7 @@ func open(ctx context.Context, options options) (*Melta, error) {
 		closeStore:    closeStorage,
 		shutdownDone:  make(chan struct{}),
 	}
+	c.hosts.owner = r
 	sweepTicks, stopSweepTicker := options.sweepTicks, func() {}
 	if sweepTicks == nil {
 		ticker := time.NewTicker(sweepInterval)

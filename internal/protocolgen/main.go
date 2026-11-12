@@ -152,6 +152,9 @@ func generateFiles(schemaPath, configPath string) ([]byte, []byte, []byte, error
 	if err := doc.Validate(context.Background()); err != nil {
 		return nil, nil, nil, fmt.Errorf("validating %s: %w", schemaPath, err)
 	}
+	if err := validatePathSchemas(doc); err != nil {
+		return nil, nil, nil, err
+	}
 	sdk, err := codegen.Generate(doc, configuration)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("generating the SDK: %w", err)
@@ -173,6 +176,120 @@ func generateFiles(schemaPath, configPath string) ([]byte, []byte, []byte, error
 		return nil, nil, nil, err
 	}
 	return []byte(sdk), source, contract, nil
+}
+
+// validatePathSchemas inspects every operation path parameter's effective
+// local reference chain before any output is rendered. The supported domain is
+// one unformatted string, string alias or string enum with no x-go-type
+// override at the parameter, reference site or any intermediate allOf
+// definition; harmless naming/import metadata by itself is not rejected.
+func validatePathSchemas(doc *openapi3.T) error {
+	for path, item := range doc.Paths.Map() {
+		for method, operation := range item.Operations() {
+			// Operation-level parameters override path-level parameters with the
+			// same name and location; validate the effective set only.
+			effective := make(map[string]*openapi3.ParameterRef, len(item.Parameters)+len(operation.Parameters))
+			for _, parameter := range item.Parameters {
+				if parameter.Value != nil {
+					effective[parameter.Value.In+"\x00"+parameter.Value.Name] = parameter
+				}
+			}
+			for _, parameter := range operation.Parameters {
+				if parameter.Value != nil {
+					effective[parameter.Value.In+"\x00"+parameter.Value.Name] = parameter
+				}
+			}
+			for _, parameter := range effective {
+				if parameter.Value.In != "path" {
+					continue
+				}
+				if err := validatePathSchema(doc, parameter.Value.Schema, fmt.Sprintf("%s %s path parameter %q", method, path, parameter.Value.Name)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validatePathSchema(doc *openapi3.T, ref *openapi3.SchemaRef, label string) error {
+	return validatePathSchemaNode(doc, ref, label, make(map[string]bool))
+}
+
+// validatePathSchemaNode checks one schema reference's own metadata, then
+// follows the explicit local component-reference chain from the loaded
+// document before checking the resolved value. A plain alias collapses
+// SchemaRef.Value to its target while keeping its own Ref and Extensions only
+// on the component declaration, so .Value alone is not the effective chain.
+func validatePathSchemaNode(doc *openapi3.T, ref *openapi3.SchemaRef, label string, seen map[string]bool) error {
+	if ref == nil {
+		return fmt.Errorf("%s does not resolve to one local schema", label)
+	}
+	if err := rejectPathOverride(ref.Extensions, label); err != nil {
+		return err
+	}
+	if ref.Ref != "" {
+		const prefix = "#/components/schemas/"
+		if !strings.HasPrefix(ref.Ref, prefix) {
+			return fmt.Errorf("%s does not resolve to one local schema", label)
+		}
+		name := strings.TrimPrefix(ref.Ref, prefix)
+		if name == "" || seen[name] {
+			return fmt.Errorf("%s does not resolve to one local schema", label)
+		}
+		// The mark covers only this recursion path: two completed allOf
+		// siblings may reference the same supported schema independently.
+		seen[name] = true
+		defer delete(seen, name)
+		component, ok := doc.Components.Schemas[name]
+		if !ok {
+			return fmt.Errorf("%s does not resolve to one local schema", label)
+		}
+		return validatePathSchemaNode(doc, component, label, seen)
+	}
+	return validatePathSchemaValue(doc, ref.Value, label, seen)
+}
+
+func validatePathSchemaValue(doc *openapi3.T, schema *openapi3.Schema, label string, seen map[string]bool) error {
+	if schema == nil {
+		return fmt.Errorf("%s does not resolve to one local schema", label)
+	}
+	if err := rejectPathOverride(schema.Extensions, label); err != nil {
+		return err
+	}
+	if schema.Format != "" {
+		return fmt.Errorf("%s declares unsupported format %q", label, schema.Format)
+	}
+	// An allOf wrapper's own type is part of the effective schema: a
+	// non-string own type is not made supported by its members.
+	if schema.Type != nil && !schema.Type.Is("string") {
+		return fmt.Errorf("%s does not resolve to the string type", label)
+	}
+	if len(schema.OneOf) != 0 || len(schema.AnyOf) != 0 {
+		return fmt.Errorf("%s is not one plain string schema", label)
+	}
+	if len(schema.AllOf) != 0 {
+		for _, member := range schema.AllOf {
+			if err := validatePathSchemaNode(doc, member, label, seen); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if schema.Type == nil || !schema.Type.Is("string") {
+		return fmt.Errorf("%s does not resolve to the string type", label)
+	}
+	return nil
+}
+
+// rejectPathOverride refuses the generator override the pinned SDK would read
+// from this schema-reference or schema node. Naming/import metadata alone is
+// not a type override and stays allowed.
+func rejectPathOverride(extensions map[string]any, label string) error {
+	if _, overridden := extensions["x-go-type"]; overridden {
+		return fmt.Errorf("%s carries an x-go-type override", label)
+	}
+	return nil
 }
 
 // projectOperations projects every SDK-resolved operation into the native
@@ -423,16 +540,10 @@ var operationDescriptors = map[string]descriptor{
 		status: {{.Status}},
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
 {{- if .Session}}
-			var pathValue {{.SessionType}}
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := {{.SessionType}}(env.session)
 {{- end}}
 {{- if .Field}}
-			var pathValue {{.FieldType}}
-			if err := bindPath(env.field, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := {{.FieldType}}(env.field)
 {{- end}}
 {{- if .Query}}
 			var query protocol.{{.QueryType}}

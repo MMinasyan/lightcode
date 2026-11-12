@@ -302,6 +302,10 @@ type CallContext struct {
 	ToolCallID   string
 	EffectID     string
 
+	// Workspace is the invocation target's separately carried Workspace
+	// attribution. Scope remains the constructed scope identity.
+	Workspace string
+
 	Caller CallerIdentity
 
 	Call func(context.Context, string, string, json.RawMessage) (Result, error)

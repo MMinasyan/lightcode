@@ -7,7 +7,7 @@
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "14"
+  version: "16"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -434,6 +434,51 @@ paths:
           description: The selection was removed; package copies and configuration are retained.
         default:
           $ref: "#/components/responses/Error"
+  /v1/extensions/capabilities:
+    get:
+      operationId: ListExtensionCapabilities
+      responses:
+        "200":
+          description: >
+            Every enabled extension's configuration schema, captured non-secret
+            settings, declared capabilities and methods, and explicit
+            exposures. The order is registration order.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ExtensionCapabilityCatalog"
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/extensions/invoke:
+    post:
+      operationId: InvokeExtension
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtensionInvocationRequest"
+      responses:
+        "200":
+          description: The selected exposed method's declared success value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtensionSuccess"
+        "422":
+          description: >
+            One validated declared failure with its optional declared partial
+            result, or the ordinary baseline Error for a configuration/corrupt
+            class. The declared code is the method declaration's string, not a
+            baseline ErrorCode.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtensionInvocationFailure"
+        default:
+          $ref: "#/components/responses/Error"
   /v1/models:
     get:
       operationId: ListModels
@@ -782,6 +827,13 @@ components:
         session_id:
           type: string
           pattern: "^[0-9a-f]{32}$"
+        partial_result:
+          nullable: true
+          x-go-type: json.RawMessage
+          description: >
+            One optional opaque produced partial retained by a baseline error
+            that failed after producing it. The value is the original raw JSON
+            and is absent when no partial was produced.
     CleanupFailure:
       description: >
         One cleanup attempt that did not complete after the canonical Session
@@ -853,6 +905,262 @@ components:
         source_dir:
           type: string
           minLength: 1
+    ExtensionCapabilityCatalog:
+      type: object
+      additionalProperties: false
+      required:
+        - extension_id
+        - version
+        - configuration_schema
+        - settings
+        - capabilities
+        - exposed
+      properties:
+        extension_id:
+          type: string
+          minLength: 1
+        version:
+          type: string
+          minLength: 1
+        configuration_schema:
+          $ref: "#/components/schemas/ExtensionConfigDocument"
+        settings:
+          $ref: "#/components/schemas/ExtensionConfigDocument"
+        capabilities:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtensionCapability"
+        exposed:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtensionExposure"
+    ExtensionCapability:
+      type: object
+      additionalProperties: false
+      required:
+        - capability_id
+        - contract_id
+        - contract_version
+        - kind
+        - methods
+      properties:
+        capability_id:
+          type: string
+          minLength: 1
+        contract_id:
+          type: string
+          minLength: 1
+        contract_version:
+          type: string
+          minLength: 1
+        kind:
+          type: string
+          enum:
+            - service
+            - tool
+            - hook
+            - strategy
+        methods:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtensionMethod"
+        hooks:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtensionHook"
+        strategy:
+          $ref: "#/components/schemas/ExtensionStrategy"
+    ExtensionMethod:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - mode
+        - input
+        - success
+      properties:
+        name:
+          type: string
+          minLength: 1
+        mode:
+          type: string
+          enum:
+            - pure
+            - service_io
+        input:
+          $ref: "#/components/schemas/ExtensionConfigDocument"
+        success:
+          $ref: "#/components/schemas/ExtensionConfigDocument"
+        error:
+          $ref: "#/components/schemas/ExtensionConfigDocument"
+        partial:
+          $ref: "#/components/schemas/ExtensionConfigDocument"
+    ExtensionHook:
+      type: object
+      additionalProperties: false
+      required:
+        - boundary
+        - mode
+      properties:
+        boundary:
+          type: string
+          enum:
+            - prepare
+            - request
+            - before_tool
+            - after_tool
+        mode:
+          type: string
+          enum:
+            - pure
+            - effectful
+    ExtensionStrategy:
+      type: object
+      additionalProperties: false
+      required:
+        - requires_context_window
+      properties:
+        requires_context_window:
+          type: boolean
+    ExtensionExposure:
+      type: object
+      additionalProperties: false
+      required:
+        - capability_id
+        - method
+        - kind
+        - target
+      properties:
+        capability_id:
+          type: string
+          minLength: 1
+        method:
+          type: string
+          minLength: 1
+        kind:
+          type: string
+          enum:
+            - query
+            - management
+            - session_work
+        target:
+          type: string
+          enum:
+            - harness
+            - workspace
+            - session
+    ExtensionInvocationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - extension_id
+        - capability_id
+        - contract_id
+        - contract_version
+        - method
+        - target
+        - arguments
+        - request_id
+      properties:
+        extension_id:
+          type: string
+          minLength: 1
+        capability_id:
+          type: string
+          minLength: 1
+        contract_id:
+          type: string
+          minLength: 1
+        contract_version:
+          type: string
+          minLength: 1
+        method:
+          type: string
+          minLength: 1
+        target:
+          $ref: "#/components/schemas/ExtensionInvocationTarget"
+        arguments:
+          nullable: true
+          x-go-type: json.RawMessage
+          description: >
+            One owned JSON value validated against the selected method's input
+            schema. The value itself may be any JSON, including null.
+        request_id:
+          type: string
+          minLength: 1
+    ExtensionInvocationTarget:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum:
+            - harness
+            - workspace
+            - session
+        workspace:
+          type: string
+          description: One clean absolute Workspace path for the workspace branch.
+        session_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+          description: One canonical Session ID for the session branch.
+    ExtensionSuccess:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - result
+      properties:
+        kind:
+          type: string
+          enum:
+            - success
+        result:
+          nullable: true
+          x-go-type: json.RawMessage
+          description: The declared success schema value, carried as exact raw JSON; the declared schema may itself accept null.
+    ExtensionFailure:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          minLength: 1
+          description: The selected declaration's own failure code string.
+        message:
+          type: string
+          minLength: 1
+        data:
+          nullable: true
+          x-go-type: json.RawMessage
+          description: The declared failure-data schema value, when declared; the declared schema may itself accept null.
+    ExtensionFailureResult:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - error
+      properties:
+        kind:
+          type: string
+          enum:
+            - failure
+        error:
+          $ref: "#/components/schemas/ExtensionFailure"
+        partial_result:
+          nullable: true
+          x-go-type: json.RawMessage
+          description: The declared partial schema value, when the method declares one; the declared schema may itself accept null.
+    ExtensionInvocationFailure:
+      oneOf:
+        - $ref: "#/components/schemas/ExtensionFailureResult"
+        - $ref: "#/components/schemas/Error"
     SessionLifecycle:
       type: string
       enum:
@@ -958,7 +1266,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "14"
+            - "16"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every

@@ -1099,3 +1099,88 @@ func TestValidateResultEnvelopeShared(t *testing.T) {
 		}
 	}
 }
+
+// TestCompileResolvesDeclarationExposures proves publication metadata resolves
+// against the declaration's own existing service methods, stays outside method
+// contract equality, and rejects every unknown or internal exposure target.
+func TestCompileResolvesDeclarationExposures(t *testing.T) {
+	service := customService("exposed.service", "exposed.contract", ContractVersion,
+		PureMethod("query", `{}`, `{}`),
+		ServiceIOMethod("work", `{}`, `{}`),
+		ServiceIOMethod("manage", `{}`, `{}`),
+	)
+	workspaceTool := ToolCapability("exposed.tool")
+	build := func(lifetime Lifetime, exposed []ExposedMethod, capabilities ...Capability) Native {
+		native := testNative("exposed", lifetime, capabilities, nil, nil)
+		native.Declaration.Exposed = exposed
+		return native
+	}
+	valid := build(LifetimeHarness, []ExposedMethod{
+		{Method: MethodKey{CapabilityID: service.ID, Method: "query"}, Kind: ExposedQuery, Target: ExposedTargetHarness},
+		{Method: MethodKey{CapabilityID: service.ID, Method: "work"}, Kind: ExposedSessionWork, Target: ExposedTargetSession},
+		{Method: MethodKey{CapabilityID: service.ID, Method: "manage"}, Kind: ExposedManagement, Target: ExposedTargetWorkspace},
+	}, service)
+	workspaceService := customService("exposed.workspace", "exposed.workspace.contract", ContractVersion,
+		PureMethod("query", `{}`, `{}`),
+		ServiceIOMethod("work", `{}`, `{}`),
+	)
+	validWorkspace := build(LifetimeWorkspace, []ExposedMethod{
+		{Method: MethodKey{CapabilityID: workspaceService.ID, Method: "query"}, Kind: ExposedQuery, Target: ExposedTargetWorkspace},
+		{Method: MethodKey{CapabilityID: workspaceService.ID, Method: "work"}, Kind: ExposedSessionWork, Target: ExposedTargetSession},
+	}, workspaceService)
+	if _, err := Compile([]Native{validWorkspace}); err != nil {
+		t.Fatalf("Workspace provider with Workspace/Session targets: %v", err)
+	}
+	compiled, err := Compile([]Native{valid})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	declaration, ok := compiled.Declaration("exposed")
+	if !ok || len(declaration.Exposed) != 3 {
+		t.Fatalf("compiled exposures = %+v", declaration)
+	}
+	kinds := make(map[ExposedMethodKind]bool)
+	for _, exposure := range declaration.Exposed {
+		kinds[exposure.Kind] = true
+	}
+	if !kinds[ExposedQuery] || !kinds[ExposedManagement] || !kinds[ExposedSessionWork] {
+		t.Fatalf("compiled exposures = %+v", declaration.Exposed)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		native  Native
+		message string
+	}{
+		{"unknown capability", build(LifetimeHarness, []ExposedMethod{{Method: MethodKey{CapabilityID: "missing", Method: "query"}, Kind: ExposedQuery, Target: ExposedTargetHarness}}, service), "unknown capability"},
+		{"unknown method", build(LifetimeHarness, []ExposedMethod{{Method: MethodKey{CapabilityID: service.ID, Method: "missing"}, Kind: ExposedQuery, Target: ExposedTargetHarness}}, service), "unknown method"},
+		{"tool cannot be exposed", build(LifetimeHarness, []ExposedMethod{{Method: MethodKey{CapabilityID: workspaceTool.ID, Method: "describe"}, Kind: ExposedQuery, Target: ExposedTargetHarness}}, service, workspaceTool), "not a service"},
+		{"operation lifetime cannot be exposed", build(LifetimeOperation, []ExposedMethod{{Method: MethodKey{CapabilityID: service.ID, Method: "query"}, Kind: ExposedQuery, Target: ExposedTargetHarness}}, service), "cannot be exposed"},
+		{"workspace provider cannot expose the harness target", build(LifetimeWorkspace, []ExposedMethod{{Method: MethodKey{CapabilityID: workspaceService.ID, Method: "query"}, Kind: ExposedQuery, Target: ExposedTargetHarness}}, workspaceService), "harness target"},
+		{"duplicate exposure", build(LifetimeHarness, []ExposedMethod{
+			{Method: MethodKey{CapabilityID: service.ID, Method: "query"}, Kind: ExposedQuery, Target: ExposedTargetHarness},
+			{Method: MethodKey{CapabilityID: service.ID, Method: "query"}, Kind: ExposedManagement, Target: ExposedTargetHarness},
+		}, service), "duplicate"},
+		{"invalid kind", build(LifetimeHarness, []ExposedMethod{{Method: MethodKey{CapabilityID: service.ID, Method: "query"}, Kind: "other", Target: ExposedTargetHarness}}, service), "invalid kind"},
+		{"invalid target", build(LifetimeHarness, []ExposedMethod{{Method: MethodKey{CapabilityID: service.ID, Method: "query"}, Kind: ExposedQuery, Target: "other"}}, service), "invalid target"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Compile([]Native{tc.native})
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("error = %v, want %q", err, tc.message)
+			}
+		})
+	}
+
+	// Exposure metadata does not enter the capability's structural contract:
+	// the same service binds a consumer that declares no exposure.
+	consumer := testNative("consumer", LifetimeHarness, nil, []Binding{{
+		Name:         "service",
+		Provider:     "exposed/exposed-c",
+		CapabilityID: service.ID,
+		Definition:   service.Definition(),
+	}}, nil)
+	if _, err := Compile([]Native{valid, consumer}); err != nil {
+		t.Fatalf("exposure metadata changed contract equality: %v", err)
+	}
+}

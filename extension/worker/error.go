@@ -50,6 +50,7 @@ type Error struct {
 	Message     string                    `json:"message"`
 	Interrupted bool                      `json:"interrupted,omitempty"`
 	Evidence    harness.ExecutionEvidence `json:"evidence,omitempty"`
+	Partial     JSONBytes                 `json:"partial,omitempty"`
 }
 
 // Error returns the class and message.
@@ -96,10 +97,22 @@ func classifyError(err error) *Error {
 		return nil
 	}
 	failure := classOfError(err)
+	var typed *Error
+	if errors.As(err, &typed) {
+		failure.Interrupted = typed.Interrupted
+		failure.Evidence = typed.Evidence
+		if len(typed.Partial) != 0 {
+			failure.Partial = append(JSONBytes(nil), typed.Partial...)
+		}
+	}
 	var effect *harness.EffectError
 	if errors.As(err, &effect) {
 		failure.Interrupted = harness.EffectInterrupted(err)
 		failure.Evidence = harness.DeclaredExecutionKnowledge(err)
+	}
+	var callErr *extension.CallError
+	if errors.As(err, &callErr) && len(callErr.Partial) != 0 {
+		failure.Partial = append(JSONBytes(nil), callErr.Partial...)
 	}
 	return failure
 }

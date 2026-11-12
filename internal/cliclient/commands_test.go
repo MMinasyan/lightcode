@@ -662,3 +662,37 @@ func TestUnselectedArchiveInvalidatesListSuccessAndErrorWithoutClearingRoot(t *t
 		})
 	}
 }
+
+// TestRuntimeExtensionDeclaredFailureRendersExactBody proves a declared
+// extension failure stays a known rejection and the CLI displays its raw
+// failure/partial body without treating it as an unknown outcome or a session
+// restore result.
+func TestRuntimeExtensionDeclaredFailureRendersExactBody(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	c.command(`/runtime InvokeExtension {"body":{"extension_id":"fixture","capability_id":"fixture.service","contract_id":"fixture.service/v1","contract_version":"1","method":"fail","target":{"kind":"harness"},"arguments":{},"request_id":"req-1"}}`)
+	request := receive(t, transport.requests)
+	testassert.Require(t, request.req.URL.Path == "/v1/extensions/invoke", "extension call reached %s", request.req.URL.Path)
+	declared := `{"kind":"failure","error":{"code":"guest_code","message":"guest message","data":{"big":9007199254740993}},"partial_result":["partial",null,1]}`
+	request.reject(http.StatusUnprocessableEntity, json.RawMessage(declared))
+	settleAnswering(t, c, transport)
+	text := outputs(c)
+	testassert.Require(t, strings.Contains(text, "guest_code") && strings.Contains(text, "guest message") && strings.Contains(text, `"partial_result":["partial",null,1]`), "declared failure body = %q", text)
+	testassert.Require(t, !strings.Contains(text, "Outcome unknown") && !strings.Contains(text, "request failed"), "declared failure misclassified: %q", text)
+}
+
+// TestRuntimeBaselinePartialRendersExactBody proves a read rejection carrying
+// an ordinary classified Error plus a produced partial displays the exact
+// received body instead of dropping it into a plain message or unknown outcome.
+func TestRuntimeBaselinePartialRendersExactBody(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	c.command(`/runtime ListProviders {}`)
+	request := receive(t, transport.requests)
+	body := "{\n \"code\": \"storage\",\n \"message\": \"partial\",\n \"partial_result\": {\"big\": 9007199254740993}\n}"
+	request.reply <- reply{status: http.StatusInternalServerError, raw: body}
+	settleTasks(t, c)
+	text := outputs(c)
+	testassert.Require(t, strings.Contains(text, "9007199254740993") && strings.Contains(text, `"partial_result"`), "baseline partial body = %q", text)
+	testassert.Require(t, !strings.Contains(text, "Outcome unknown"), "baseline partial reclassified as unknown: %q", text)
+}

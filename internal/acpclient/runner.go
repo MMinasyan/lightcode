@@ -522,15 +522,14 @@ func (r *Runner) runtimeCall(operation string, params json.RawMessage) (json.Raw
 // unavailable-code family, never a committed Operation failure.
 func callError(err error) *rpcError {
 	var responseErr *clientops.ResponseError
+	var extensionErr *clientops.ExtensionResponseError
 	switch {
 	case errors.Is(err, clientops.ErrInvalidParams):
 		return &rpcError{Code: codeInvalidParams, Message: err.Error()}
+	case errors.As(err, &extensionErr):
+		return &rpcError{Code: codeRuntimeError, Message: extensionErr.Error(), Data: append(json.RawMessage(nil), extensionErr.Body...)}
 	case errors.As(err, &responseErr):
-		data, _ := json.Marshal(responseErr.Payload)
-		if responseErr.Partial != nil {
-			data, _ = json.Marshal(responseErr.Partial)
-		}
-		return &rpcError{Code: codeRuntimeError, Message: responseErr.Error(), Data: data}
+		return &rpcError{Code: codeRuntimeError, Message: responseErr.Error(), Data: append(json.RawMessage(nil), responseErr.Body...)}
 	default:
 		return &rpcError{Code: codeTransport, Message: err.Error()}
 	}

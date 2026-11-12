@@ -41,7 +41,7 @@ const (
 // recordContent builds one private discovery document pointing at the
 // fixture endpoint.
 func recordContent(endpoint string) string {
-	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"14","credential":%q}`,
+	return fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"16","credential":%q}`,
 		endpoint, testInstance, testCredential)
 }
 
@@ -70,7 +70,7 @@ func newFixture(t *testing.T, health, events http.HandlerFunc, extra ...map[stri
 func jsonHealth() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"14"}`, testInstance)
+		fmt.Fprintf(w, `{"instance_id":%q,"protocol_version":"16"}`, testInstance)
 	}
 }
 
@@ -247,6 +247,16 @@ func TestDesktopHostCallClassification(t *testing.T) {
 			w.WriteHeader(http.StatusConflict)
 			_, _ = io.WriteString(w, partial)
 		},
+		"/v1/extensions/invoke": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = io.WriteString(w, `{"kind":"failure","error":{"code":"guest_code","message":"guest message"},"partial_result":null}`)
+		},
+		"/v1/providers": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"code":"storage","message":"baseline partial","partial_result":{"big":9007199254740993}}`)
+		},
 		"/v1/sessions/abc/interrupt": func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 		},
@@ -274,6 +284,15 @@ func TestDesktopHostCallClassification(t *testing.T) {
 	rejected, err := host.Call(info.Generation, "RevertSessionCode", `{"session_id":"abc","body":{"operation_id":"op-1"}}`)
 	testassert.NoError(t, err)
 	testassert.Require(t, rejected.Status == http.StatusConflict && !rejected.Invalid && rejected.Body == partial, "rejection response = %+v, want the validated partial body without rejection", rejected)
+
+	extensionFailure, err := host.Call(info.Generation, "InvokeExtension", `{"body":{"extension_id":"fixture","capability_id":"fixture.service","contract_id":"fixture.service/v1","contract_version":"1","method":"fail","target":{"kind":"harness"},"arguments":{},"request_id":"req-1"}}`)
+	testassert.NoError(t, err)
+	testassert.Require(t, extensionFailure.Status == http.StatusUnprocessableEntity && !extensionFailure.Invalid && extensionFailure.Body == `{"kind":"failure","error":{"code":"guest_code","message":"guest message"},"partial_result":null}`, "extension failure = %+v, want the exact body without rejection", extensionFailure)
+
+	baselinePartial, err := host.Call(info.Generation, "ListProviders", "{}")
+	testassert.NoError(t, err)
+	baselineBody := `{"code":"storage","message":"baseline partial","partial_result":{"big":9007199254740993}}`
+	testassert.Require(t, baselinePartial.Status == http.StatusInternalServerError && !baselinePartial.Invalid && baselinePartial.Body == baselineBody, "baseline partial = %+v, want the exact received body", baselinePartial)
 
 	empty, err := host.Call(info.Generation, "InterruptSession", `{"session_id":"abc"}`)
 	testassert.NoError(t, err)
@@ -1077,7 +1096,7 @@ func TestDesktopHostMountedRuntime(t *testing.T) {
 	testassert.Equal(t, response.Status, http.StatusOK)
 	var health protocol.Health
 	testassert.NoError(t, json.Unmarshal([]byte(response.Body), &health))
-	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N14, "health = %+v, want the connected owner", health)
+	testassert.Require(t, health.InstanceId == info.InstanceID && health.ProtocolVersion == protocol.N16, "health = %+v, want the connected owner", health)
 
 	create, err := host.Call(info.Generation, "CreateSession", `{"body":{"workspace":"/ws/smoke","agent_selection":{"definition":{"extension_id":"agents","capability_id":"agents.definitions","definition_id":"integrated"}}}}`)
 	testassert.NoError(t, err)

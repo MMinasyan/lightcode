@@ -208,17 +208,6 @@ func bindQuery(raw json.RawMessage, required []string, target any) error {
 	return nil
 }
 
-// bindPath binds one envelope path string to its SDK-declared path type by
-// JSON-marshaling the string and decoding it into the typed target. Decoding
-// failure is the existing invalid-params class.
-func bindPath(value string, target any) error {
-	encoded, _ := json.Marshal(value)
-	if err := json.Unmarshal(encoded, target); err != nil {
-		return invalidParams("path: %v", err)
-	}
-	return nil
-}
-
 // isJSONNull reports whether one raw member is the null literal.
 func isJSONNull(raw json.RawMessage) bool {
 	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))

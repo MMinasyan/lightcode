@@ -837,14 +837,14 @@ func (s *server) hostcall(ctx context.Context, scope context.Context, wire Conte
 	for {
 		select {
 		case outcome := <-outcomes:
-			return outcome.result, outcome.err
+			return outcome.result, serviceCallError(outcome.err)
 		case <-s.done:
 			s.mu.Lock()
 			delete(s.pending, id)
 			s.mu.Unlock()
 			select {
 			case outcome := <-outcomes:
-				return outcome.result, outcome.err
+				return outcome.result, serviceCallError(outcome.err)
 			default:
 			}
 			return extension.Result{}, extension.ErrClosed
@@ -853,6 +853,20 @@ func (s *server) hostcall(ctx context.Context, scope context.Context, wire Conte
 			_ = s.write(Frame{Kind: KindCancel, ID: id})
 		}
 	}
+}
+
+// serviceCallError exposes one hostcall failure to the author: a failure with
+// a produced partial becomes the same typed CallError native authors receive,
+// wrapping the classed worker error so errors.Is keeps the cause.
+func serviceCallError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var failure *Error
+	if errors.As(err, &failure) && len(failure.Partial) != 0 {
+		return &extension.CallError{Err: failure, Partial: append(json.RawMessage(nil), failure.Partial...)}
+	}
+	return err
 }
 
 func (s *server) nextRequestID() string {
@@ -880,6 +894,9 @@ func (s *server) routeResponse(frame Frame) error {
 	if hasError {
 		if !frame.Error.Class.valid() {
 			return fmt.Errorf("worker: response %q carries unknown error class %q", frame.ID, frame.Error.Class)
+		}
+		if len(frame.Error.Partial) != 0 && !validPresentJSON(json.RawMessage(frame.Error.Partial)) {
+			return fmt.Errorf("worker: response %q carries an invalid error partial", frame.ID)
 		}
 		outcomes <- hostcallOutcome{err: frame.Error}
 		return nil

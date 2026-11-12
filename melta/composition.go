@@ -183,6 +183,7 @@ type composition struct {
 }
 
 type hostServices struct {
+	owner      *Melta
 	background *backgroundBridge
 	harness    *harness.Harness
 	artifacts  *artifactIntervals
@@ -420,6 +421,7 @@ func (c *composition) openScopeReporting(ctx context.Context, info ScopeInfo, an
 		openValue := &capabilityValue{component: component, instanceID: instanceID, scope: sc, targets: targets, activationSecrets: activationSecrets}
 		openIdentity := callIdentity{
 			session:          harness.SessionIdentity{SessionID: info.SessionID},
+			workspace:        info.Workspace,
 			operationID:      info.OperationID,
 			invocationID:     info.InvocationID,
 			purpose:          info.Purpose,
@@ -452,6 +454,7 @@ func (c *composition) openScopeReporting(ctx context.Context, info ScopeInfo, an
 				closeValue := &capabilityValue{component: component, instanceID: instanceID, scope: sc, targets: targets, activationSecrets: activationSecrets}
 				closeIdentity := callIdentity{
 					session:          harness.SessionIdentity{SessionID: info.SessionID},
+					workspace:        info.Workspace,
 					operationID:      info.OperationID,
 					invocationID:     info.InvocationID,
 					purpose:          info.Purpose,
@@ -509,6 +512,8 @@ func (c *composition) hostHandler(id, method string) (extension.Handler, bool) {
 		return c.dataHandler(method)
 	case extension.ContractCredentials:
 		return c.credentialsHandler, true
+	case extension.ContractCommands:
+		return c.commandsHandler(method)
 	}
 	return nil, false
 }
@@ -786,6 +791,7 @@ type workspaceScopes struct {
 	ancestors []*scope
 	obs       *observation
 	sections  map[string]json.RawMessage
+	bindings  map[declaredField]declaredBinding
 
 	mu         sync.Mutex
 	closed     bool
@@ -795,13 +801,14 @@ type workspaceScopes struct {
 	cleanupErr error
 }
 
-func newWorkspaceScopes(owner context.Context, c *composition, ancestors []*scope, obs *observation, sections map[string]json.RawMessage) *workspaceScopes {
+func newWorkspaceScopes(owner context.Context, c *composition, ancestors []*scope, obs *observation, sections map[string]json.RawMessage, bindings map[declaredField]declaredBinding) *workspaceScopes {
 	return &workspaceScopes{
 		owner:     owner,
 		c:         c,
 		ancestors: ancestors,
 		obs:       obs,
 		sections:  sections,
+		bindings:  bindings,
 		live:      make(map[string]*scope),
 		attempts:  make(map[string]*workspaceAttempt),
 	}
@@ -840,6 +847,7 @@ func (w *workspaceScopes) get(ctx context.Context, info ScopeInfo) (*scope, erro
 func (w *workspaceScopes) build(key string, info ScopeInfo, attempt *workspaceAttempt) {
 	defer w.building.Done()
 	info.sections = w.sections
+	info.declaredBindings = w.bindings
 	sc, err := w.c.openScope(w.owner, info, w.ancestors)
 	if err != nil {
 		w.mu.Lock()

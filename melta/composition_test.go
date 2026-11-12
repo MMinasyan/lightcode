@@ -134,7 +134,7 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 				}
 				return extension.Instance{Capabilities: map[string]extension.Implementation{"ws.svc": testServiceImplementation()}}, nil
 			}))
-		w := newWorkspaceScopes(context.Background(), c, nil, newObservation(), nil)
+		w := newWorkspaceScopes(context.Background(), c, nil, newObservation(), nil, nil)
 		firstCtx, cancelFirst := context.WithCancel(context.Background())
 		first := make(chan error, 1)
 		go func() {
@@ -167,7 +167,7 @@ func TestWorkspaceScopeAttemptsAreSharedPerKey(t *testing.T) {
 				}
 				return extension.Instance{Capabilities: map[string]extension.Implementation{"ws.svc": testServiceImplementation()}}, nil
 			}))
-		w := newWorkspaceScopes(context.Background(), c, nil, newObservation(), nil)
+		w := newWorkspaceScopes(context.Background(), c, nil, newObservation(), nil, nil)
 		_, err := w.get(context.Background(), workspaceScopeInfo("/w"))
 		testassert.Require(t, errors.Is(err, errFactory), "first attempt = %v, want the factory error", err)
 		_, err = w.get(context.Background(), workspaceScopeInfo("/w"))
@@ -216,7 +216,7 @@ func TestWorkspaceConstructionCleanupRetained(t *testing.T) {
 								return extension.Instance{Capabilities: map[string]extension.Implementation{"later": testServiceImplementation()}}, nil
 							}),
 					)
-					w := newWorkspaceScopes(owner, c, nil, newObservation(), nil)
+					w := newWorkspaceScopes(owner, c, nil, newObservation(), nil, nil)
 					caller, cancelCaller := context.WithCancel(context.Background())
 					defer cancelCaller()
 					result := make(chan error, 1)
@@ -278,7 +278,7 @@ func TestWorkspaceShutdownJoinsConstructionAndLiveCleanupErrors(t *testing.T) {
 				return extension.Instance{Capabilities: map[string]extension.Implementation{"later": testServiceImplementation()}}, nil
 			}),
 	)
-	w := newWorkspaceScopes(context.Background(), c, nil, newObservation(), nil)
+	w := newWorkspaceScopes(context.Background(), c, nil, newObservation(), nil, nil)
 	_, err := w.get(context.Background(), workspaceScopeInfo("/live"))
 	testassert.NoError(t, err)
 	_, err = w.get(context.Background(), workspaceScopeInfo("/failed"))

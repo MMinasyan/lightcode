@@ -50,6 +50,7 @@ func testCallContext() extension.CallContext {
 		Scope:        extension.ScopeIdentity{Kind: extension.LifetimeOperation, Revision: "rev-1", Workspace: "/workspace", SessionID: "session-1", OperationID: "op-1"},
 		Revision:     "rev-1",
 		Section:      json.RawMessage("{\n  \"setting\": true\n}"),
+		Workspace:    "target-workspace",
 		SessionID:    "session-1",
 		OperationID:  "op-1",
 		InvocationID: "inv-1",
@@ -966,6 +967,11 @@ func TestDeclarationWireFormPreservesSchemaBytes(t *testing.T) {
 				`{"type":"object","additionalProperties":false}`,
 				`{"type":"null"}`)),
 		},
+		Exposed: []extension.ExposedMethod{{
+			Method: extension.MethodKey{CapabilityID: "service-1", Method: "call"},
+			Kind:   extension.ExposedQuery,
+			Target: extension.ExposedTargetHarness,
+		}},
 	}
 	wire := worker.NewDeclaration(declaration)
 	encoded, err := json.Marshal(wire)
@@ -1104,6 +1110,7 @@ func TestHostContextEncodersMatchCallbackValues(t *testing.T) {
 		Scope:        extension.ScopeIdentity{Kind: extension.LifetimeOperation, Revision: "7", Workspace: "workspace", SessionID: "session", OperationID: "operation", InvocationID: "invocation", Purpose: "conversation"},
 		Revision:     "7",
 		Section:      json.RawMessage(`{"enabled":true}`),
+		Workspace:    "target-workspace",
 		SessionID:    "session",
 		OperationID:  "operation",
 		InvocationID: "invocation",
@@ -1119,7 +1126,7 @@ func TestHostContextEncodersMatchCallbackValues(t *testing.T) {
 	}
 	if wire.ExtensionID != call.ExtensionID || wire.ComponentID != call.ComponentID || wire.InstanceID != call.InstanceID ||
 		wire.Lifetime != call.Lifetime || !reflect.DeepEqual(wire.Scope, call.Scope) || wire.Revision != call.Revision ||
-		!bytes.Equal(wire.Section, call.Section) || wire.SessionID != call.SessionID || wire.OperationID != call.OperationID ||
+		!bytes.Equal(wire.Section, call.Section) || wire.Workspace != call.Workspace || wire.SessionID != call.SessionID || wire.OperationID != call.OperationID ||
 		wire.InvocationID != call.InvocationID || wire.Purpose != call.Purpose || wire.RequestID != call.RequestID ||
 		wire.ToolCallID != call.ToolCallID || wire.EffectID != call.EffectID ||
 		wire.Caller == nil || wire.Caller.ExtensionID != call.Caller.ExtensionID || wire.Caller.ComponentID != call.Caller.ComponentID || wire.Caller.InstanceID != call.Caller.InstanceID {
@@ -1139,5 +1146,38 @@ func TestHostContextEncodersMatchCallbackValues(t *testing.T) {
 	instanceWire := worker.NewInstanceContext("instance-token", instance)
 	if instanceWire.Token != "instance-token" || instanceWire.InstanceID != "instance" || !bytes.Equal(instanceWire.Section, instance.Section) {
 		t.Fatalf("instance context = %+v", instanceWire)
+	}
+	if instanceWire.Workspace != instance.Scope.Workspace {
+		t.Fatalf("instance workspace = %q, want %q", instanceWire.Workspace, instance.Scope.Workspace)
+	}
+}
+
+// TestErrorPartialFrameRoundTrip proves the existing error frame carries an
+// optional produced partial as one canonical JSONBytes value and returns the
+// exact bytes through the bounded frame codec.
+func TestErrorPartialFrameRoundTrip(t *testing.T) {
+	partial := json.RawMessage("{\"restored\":[\"a.go\"],\"big\":9007199254740993}")
+	frame := worker.Frame{
+		Kind: worker.KindResponse,
+		ID:   "response-1",
+		Error: &worker.Error{
+			Class:   worker.ClassConflict,
+			Message: "partial failure",
+			Partial: worker.JSONBytes(partial),
+		},
+	}
+	encoded, err := frame.Encode()
+	if err != nil {
+		t.Fatalf("encoding error frame: %v", err)
+	}
+	decoded, err := worker.NewReader(bytes.NewReader(encoded)).ReadFrame()
+	if err != nil {
+		t.Fatalf("decoding error frame: %v", err)
+	}
+	if decoded.Error == nil || decoded.Error.Class != worker.ClassConflict || decoded.Error.Message != "partial failure" {
+		t.Fatalf("decoded error = %+v", decoded.Error)
+	}
+	if !bytes.Equal(decoded.Error.Partial, partial) {
+		t.Fatalf("partial = %q, want %q", decoded.Error.Partial, partial)
 	}
 }

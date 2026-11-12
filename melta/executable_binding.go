@@ -489,22 +489,37 @@ func executableBackground() context.Context { return context.Background() }
 // terminal, or the worker's cancelled-class answer without declared knowledge
 // to a request the host cancelled, is the binding-infrastructure failure with
 // delivery knowledge.
+// ownedWorkerFailure exposes one worker terminal error to the host-side author
+// as the typed call error when it carries a produced partial, otherwise as the
+// classed worker error unchanged.
+func ownedWorkerFailure(failure *worker.Error) error {
+	if failure == nil {
+		return nil
+	}
+	if len(failure.Partial) == 0 {
+		return failure
+	}
+	return &extension.CallError{Err: failure, Partial: append(json.RawMessage(nil), failure.Partial...)}
+}
+
 func decodeOutcome(outcome requestOutcome) (any, error) {
 	if outcome.err == nil && outcome.failure == nil {
 		return outcome.value, nil
 	}
 	if outcome.failure != nil {
+		cause := ownedWorkerFailure(outcome.failure)
 		known := outcome.failure.Interrupted || outcome.failure.Evidence != ""
 		if known {
-			return nil, &harness.EffectError{Evidence: outcome.failure.Evidence, Interrupted: outcome.failure.Interrupted, Err: outcome.failure}
+			return nil, &harness.EffectError{Evidence: outcome.failure.Evidence, Interrupted: outcome.failure.Interrupted, Err: cause}
 		}
 		if !(outcome.hostCancelled && outcome.failure.Class == worker.ClassCancelled) {
-			return nil, outcome.failure
+			return nil, cause
 		}
+		outcome.err = cause
 	}
 	err := outcome.err
 	if outcome.failure != nil {
-		err = outcome.failure
+		err = ownedWorkerFailure(outcome.failure)
 	}
 	if err == nil {
 		err = extension.ErrClosed

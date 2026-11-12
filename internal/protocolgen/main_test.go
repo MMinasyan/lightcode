@@ -523,6 +523,208 @@ components:
 `,
 		},
 		{
+			name: "a formatted referenced path type",
+			schema: base + `  /v1/dated/{day}:
+    get:
+      operationId: GetDated
+      parameters:
+        - name: day
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Day"
+      responses:
+        "200":
+          description: a date path
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  schemas:
+    Day:
+      type: string
+      format: date
+`,
+		},
+		{
+			name: "a non-string referenced path type",
+			schema: base + `  /v1/counted/{count}:
+    get:
+      operationId: GetCounted
+      parameters:
+        - name: count
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Count"
+      responses:
+        "200":
+          description: an integer path
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  schemas:
+    Count:
+      type: integer
+`,
+		},
+		{
+			name: "an x-go-type override on a referenced path type",
+			schema: base + `  /v1/mapped/{mapped}:
+    get:
+      operationId: GetMapped
+      parameters:
+        - name: mapped
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Mapped"
+      responses:
+        "200":
+          description: an overridden path
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  schemas:
+    Mapped:
+      type: string
+      x-go-type: "[]string"
+`,
+		},
+		{
+			name: "a formatted intermediate definition",
+			schema: base + `  /v1/wrapped/{wrapped}:
+    get:
+      operationId: GetWrapped
+      parameters:
+        - name: wrapped
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Wrapped"
+      responses:
+        "200":
+          description: an intermediate formatted path
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  schemas:
+    Wrapped:
+      allOf:
+        - type: string
+          format: date
+`,
+		},
+		{
+			name: "a direct x-go-type override on the path schema",
+			schema: base + `  /v1/direct/{name}:
+    get:
+      operationId: GetDirect
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            x-go-type: CustomString
+      responses:
+        "200":
+          description: a direct override
+          content:
+            application/json:
+              schema:
+                type: object
+`,
+		},
+		{
+			name: "a plain intermediate alias x-go-type override",
+			schema: base + `  /v1/aliased/{name}:
+    get:
+      operationId: GetAliased
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Alias"
+      responses:
+        "200":
+          description: an alias override
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  schemas:
+    Base:
+      type: string
+    Alias:
+      $ref: "#/components/schemas/Base"
+      x-go-type: CustomString
+`,
+		},
+		{
+			name: "an allOf member reference-site x-go-type override",
+			schema: base + `  /v1/member/{name}:
+    get:
+      operationId: GetMember
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Mapped"
+      responses:
+        "200":
+          description: an allOf member override
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  schemas:
+    Base:
+      type: string
+    Mapped:
+      allOf:
+        - $ref: "#/components/schemas/Base"
+          x-go-type: CustomString
+`,
+		},
+		{
+			name: "an allOf parent with its own non-string type",
+			schema: base + `  /v1/parent/{name}:
+    get:
+      operationId: GetParent
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Wrapped"
+      responses:
+        "200":
+          description: a parent type
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  schemas:
+    Wrapped:
+      type: integer
+      allOf:
+        - type: string
+`,
+		},
+		{
 			name: "an array request body",
 			schema: base + `  /v1/other:
     post:
@@ -904,18 +1106,40 @@ paths:
       responses:
         "204":
           description: a contentless success
-  /v1/dated/{day}:
+  /v1/shared/{name}:
     get:
-      operationId: GetDated
+      operationId: GetShared
       parameters:
-        - name: day
+        - name: name
           in: path
           required: true
           schema:
-            $ref: "#/components/schemas/Day"
+            $ref: "#/components/schemas/shared_alias"
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
       responses:
         "200":
-          description: a date path
+          description: two sibling references to one supported string schema
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/names/{name}:
+    get:
+      operationId: GetName
+      parameters:
+        - $ref: "#/components/parameters/NameField"
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: an escaped path with a raw query
           content:
             application/json:
               schema:
@@ -944,6 +1168,12 @@ components:
       required: true
       schema:
         type: string
+    NameField:
+      name: name
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/plain_field"
   schemas:
     ProviderField:
       type: string
@@ -957,17 +1187,20 @@ components:
         - context_window
     plain_field:
       type: string
-    Day:
+      x-go-type-name: PlainFieldAlias
+    shared_alias:
       type: string
-      format: date
+      allOf:
+        - $ref: "#/components/schemas/plain_field"
+        - $ref: "#/components/schemas/plain_field"
 `
 
 // fixtureDispatchTest is the generated module's own test. It drives the real
 // generated SDK through the real stateless binder against an httptest route and
 // compares every request's path, query, raw body, declared status and received
-// response bytes with independently authored expectations. The date row proves
-// the SDK's non-string path type stays compiled and parsed, and a direct string
-// cast producer would fail this module's compilation.
+// response bytes with independently authored expectations. The rows cover
+// unformatted string, string-alias and string-enum path conversion, escaped
+// path and raw query serialization, and the compiled generated bindings.
 const fixtureDispatchTest = `package clientops
 
 import (
@@ -1050,7 +1283,9 @@ func TestGeneratedFixtureDispatch(t *testing.T) {
 		{"unlisted 203 success", "Accepted203", "", "POST", "/v1/accepted", "", "", 203, "{\"ok\":true}"},
 		{"unlisted 210 success", "Extended210", "", "GET", "/v1/extended", "", "", 210, "{\"ok\":true}"},
 		{"contentless 204 success", "Removed204", "", "DELETE", "/v1/removed", "", "", 204, ""},
-		{"named date path", "GetDated", "{\"field\":\"2024-01-02\"}", "GET", "/v1/dated/2024-01-02", "", "", 200, "{\"ok\":true}"},
+		{"escaped referenced path with raw query", "GetName", "{\"field\":\"a b/c\",\"query\":{\"cursor\":\"x y&z\"}}", "GET", "/v1/names/a%20b%2Fc", "cursor=x+y%26z", "", 200, "{\"ok\":true}"},
+		{"shared sibling references generate and dispatch", "GetShared", "{\"field\":\"shared value\",\"query\":{\"cursor\":\"shared query\"}}", "GET", "/v1/shared/shared%20value", "cursor=shared+query", "", 200, "{\"ok\":true}"},
+		{"unknown enum value passes through", "ResetProviderField", "{\"field\":\"unknown_value\",\"query\":{\"provider_id\":\"prov\"}}", "DELETE", "/v1/providers/fields/unknown_value", "provider_id=prov", "", 200, "{\"ok\":true}"},
 		{"raw JSON body", "CreateSession", "{\"body\":{\"workspace\":\"/ws\",\"opaque\":9007199254740993}}", "POST", "/v1/sessions", "", "{\"workspace\":\"/ws\",\"opaque\":9007199254740993}", 200, "{\"ok\":true}"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1084,7 +1319,7 @@ func TestGeneratedFixtureDispatch(t *testing.T) {
 	}{
 		{"omitted required query override", "QueryOverride", ""},
 		{"mixed query missing its required member", "MixedQuery", "{\"query\":{\"cursor\":\"abc\"}}"},
-		{"invalid date path text", "GetDated", "{\"field\":\"not-a-date\"}"},
+		{"missing name path", "GetName", "{\"query\":{\"cursor\":\"x\"}}"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mu.Lock()
@@ -1103,7 +1338,7 @@ func TestGeneratedFixtureDispatch(t *testing.T) {
 		})
 	}
 	names := OperationNames()
-	want := []string{"Accepted203", "CreateSession", "Extended210", "Extra", "GetDated", "GetHealth", "MixedQuery", "OptionalOverride", "PingSession", "QueryOverride", "Removed204", "ResetPlainField", "ResetProviderField", "ResetProviderModelField", "get_extra"}
+	want := []string{"Accepted203", "CreateSession", "Extended210", "Extra", "GetHealth", "GetName", "GetShared", "MixedQuery", "OptionalOverride", "PingSession", "QueryOverride", "Removed204", "ResetPlainField", "ResetProviderField", "ResetProviderModelField", "get_extra"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("OperationNames() = %v, want %v", names, want)
 	}
@@ -1144,7 +1379,8 @@ func TestGeneratedFixtureCompilesAndDispatches(t *testing.T) {
 		"CreateSession":           {SessionID: modeForbidden, Field: modeForbidden, Query: modeForbidden, Body: modeRequired},
 		"Extended210":             {SessionID: modeForbidden, Field: modeForbidden, Query: modeForbidden, Body: modeForbidden},
 		"Extra":                   {SessionID: modeRequired, Field: modeForbidden, Query: modeForbidden, Body: modeRequired},
-		"GetDated":                {SessionID: modeForbidden, Field: modeRequired, Query: modeForbidden, Body: modeForbidden},
+		"GetName":                 {SessionID: modeForbidden, Field: modeRequired, Query: modeOptional, Body: modeForbidden, QueryMembers: map[string]contractMember{"cursor": {Required: false, Type: "string"}}},
+		"GetShared":               {SessionID: modeForbidden, Field: modeRequired, Query: modeOptional, Body: modeForbidden, QueryMembers: map[string]contractMember{"cursor": {Required: false, Type: "string"}}},
 		"GetHealth":               {SessionID: modeForbidden, Field: modeForbidden, Query: modeForbidden, Body: modeForbidden},
 		"MixedQuery":              {SessionID: modeForbidden, Field: modeForbidden, Query: modeRequired, Body: modeForbidden, QueryMembers: map[string]contractMember{"all": {Required: true, Type: "boolean"}, "cursor": {Required: false, Type: "string"}}},
 		"OptionalOverride":        {SessionID: modeForbidden, Field: modeForbidden, Query: modeOptional, Body: modeForbidden, QueryMembers: map[string]contractMember{"limit": {Required: false, Type: "string"}}},

@@ -257,7 +257,8 @@ func (h *Host) Call(generation, operation, params string) (HTTPResponse, error) 
 	status, body, err := clientops.Invoke(ctx, conn, operation, json.RawMessage(params))
 	if err != nil {
 		var responseErr *clientops.ResponseError
-		if errors.As(err, &responseErr) {
+		var extensionErr *clientops.ExtensionResponseError
+		if errors.As(err, &responseErr) || errors.As(err, &extensionErr) {
 			return HTTPResponse{Status: status, Body: string(body)}, nil
 		}
 		if errors.Is(err, clientops.ErrInvalidResponse) {

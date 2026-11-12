@@ -10,6 +10,7 @@
 import { Call } from '../../client-bindings/wailsjs/go/desktopclient/Host';
 import type { Error as RuntimeError } from '../generated/protocol/types.gen';
 import { errorText } from '../lib/errors.js';
+import { parseExactJSON } from './exactjson.js';
 
 // The locally frozen generation handle, not a copied protocol DTO.
 export type InvocationClient = Readonly<{ generation: string }>;
@@ -17,7 +18,7 @@ export type InvocationClient = Readonly<{ generation: string }>;
 export type ClassifiedResult =
   | { kind: 'ok'; data: unknown }
   | { kind: 'loss'; message: string }
-  | { kind: 'rejection'; message: string; payload: unknown }
+  | { kind: 'rejection'; message: string; payload: unknown; body?: string }
   | { kind: 'invalid'; message: string };
 
 // ONE invocation boundary: compose nothing, decode only the accepted body.
@@ -48,9 +49,10 @@ export async function invokeNative(
     return { kind: 'ok', data: {} };
   }
   if (response.status < 200 || response.status >= 300) {
-    // The native owner validated this Error/partial body; decode it directly.
-    const payload = JSON.parse(response.body);
-    return { kind: 'rejection', message: rejectionMessage(payload, label), payload };
+    // The native owner validated this Error/partial body; decode it directly
+    // while retaining the exact received bytes and every numeric token.
+    const payload = parseExactJSON(response.body);
+    return { kind: 'rejection', message: rejectionMessage(payload, label), payload, body: response.body };
   }
   // Decoder failures are invalid delivery, never native-call loss.
   try {
@@ -68,9 +70,19 @@ export async function invokeNative(
 
 // Preserve the rejected body's text; fall back to the label only when it carries none.
 function rejectionMessage(error: unknown, label: string): string {
+  if (isExtensionFailure(error)) {
+    return error.error.message;
+  }
   const generated = error as RuntimeError | undefined;
   if (typeof generated?.message === 'string' && generated.message !== '') {
     return generated.message;
   }
   return `${label}: request failed`;
+}
+
+// A declared extension failure carries its own nested message; the kind makes
+// the shape explicit rather than sniffing restore-like members.
+function isExtensionFailure(value: unknown): value is { kind: 'failure'; error: { message: string } } {
+  const failure = value as { kind?: unknown; error?: { message?: unknown } } | undefined;
+  return failure?.kind === 'failure' && typeof failure.error?.message === 'string' && failure.error.message !== '';
 }
