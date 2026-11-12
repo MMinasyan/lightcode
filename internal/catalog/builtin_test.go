@@ -49,9 +49,25 @@ func TestBundledCatalogFilesValidateAndBuild(t *testing.T) {
 	})
 	testassert.NoError(t, err)
 
-	for _, providerID := range []string{"openai", "openrouter"} {
+	for _, providerID := range []string{"openai", "openrouter", "atlascloud"} {
 		testassert.Require(t, seen[providerID], "bundled provider %q was not found", providerID)
 	}
+}
+
+func TestAtlasCloudBundledCatalog(t *testing.T) {
+	bundled, err := readBundledProviders(bundledFS)
+	testassert.NoError(t, err)
+	raw := bundled["atlascloud"]
+	testassert.Require(t, raw != nil, "atlascloud bundled provider missing")
+
+	result := Build(BuildInputs{Bundled: map[string]json.RawMessage{"atlascloud": raw}})
+	testassert.Require(t, len(result.Warnings) == 0, "Build warnings = %#v, want none", result.Warnings)
+	prov := result.Catalog.Providers["atlascloud"]
+	testassert.Require(t, prov != nil, "atlascloud provider missing after Build")
+	testassert.Equal(t, prov.Transport.BaseURL, "https://api.atlascloud.ai/v1")
+	testassert.Equal(t, prov.Transport.APIKeyEnv, "ATLASCLOUD_API_KEY")
+	testassert.Require(t, prov.Models["deepseek-ai/deepseek-v4-pro"] != nil, "DeepSeek V4 Pro model missing")
+	testassert.Require(t, prov.Models["qwen/qwen3.5-flash"] != nil, "Qwen3.5 Flash model missing")
 }
 
 func TestBrokenBundledCatalogFixtureFailsStrictValidation(t *testing.T) {
