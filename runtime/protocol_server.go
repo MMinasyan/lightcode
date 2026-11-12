@@ -16,10 +16,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/atomicfs"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // sseConnectionKey is the private context key carrying the native
@@ -28,7 +28,7 @@ import (
 type sseConnectionKey struct{}
 
 // ProtocolHost owns one host's listener attachment and supplies the
-// BeforeRelease callback to the MELTA owner that must run after admitted work
+// BeforeRelease callback to the Melta owner that must run after admitted work
 // and scopes settle and before storage or the ownership lock is released.
 type ProtocolHost struct {
 	mu       sync.Mutex

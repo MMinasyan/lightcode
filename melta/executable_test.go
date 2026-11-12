@@ -14,13 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extension/worker"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/prompt"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extension/worker"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/prompt"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 const executableTestTimeout = 10 * time.Second
@@ -767,7 +767,7 @@ func newExecutableConfigurationService(t *testing.T, h *serviceHarness, declarat
 	}
 	service = newConfigurationService(context.Background(), composition, h.loader,
 		NewFileConfigurationSource(h.configPath),
-		NewEnvironmentCredentialSource(filepath.Join(h.home, ".lightcode", ".env")),
+		NewEnvironmentCredentialSource(filepath.Join(h.home, ".melta", ".env")),
 		h.locations(), harness.IncludedStrategyBinding(), newObservation())
 	service.composition = composition
 	service.dataDir = t.TempDir()

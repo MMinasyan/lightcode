@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // unknownIDText is the retained unknown-ID error for one job identity.
@@ -814,7 +814,7 @@ func TestKillRetainsFiveSecondDiagnoseAndAbandon(t *testing.T) {
 
 	testassert.Require(t, killErr == nil, "Kill = %v, want nil from the abandon outcome", killErr)
 	testassert.Require(t, elapsed >= 5*time.Second && elapsed <= 15*time.Second, "Kill returned after %v, want the retained 5-second diagnose-and-abandon bound; Kill returned after %v, want no unbounded wait", elapsed, elapsed)
-	want := fmt.Sprintf("lightcode: process %s not reaped within 5s after SIGKILL\n", id)
+	want := fmt.Sprintf("melta: process %s not reaped within 5s after SIGKILL\n", id)
 	testassert.Require(t, strings.Contains(string(diagnosis), want), "Kill stderr = %q, want %q", diagnosis, want)
 	release() // the exit goroutine reaps during the registered cleanup
 }

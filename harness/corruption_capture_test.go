@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // The capture-availability contract regressions: the surviving reads must

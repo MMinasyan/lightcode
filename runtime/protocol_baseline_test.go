@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extensions/adaptation"
-	"github.com/MMinasyan/lightcode/extensions/agents"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extensions/adaptation"
+	"github.com/Syntheresis/melta/extensions/agents"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // baselineModel is the supplied-Runtime fixture's local OpenAI-compatible

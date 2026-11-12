@@ -5,7 +5,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // Captured pricing codec oracles: the capture carries the effective model's

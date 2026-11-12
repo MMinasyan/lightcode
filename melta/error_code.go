@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extension/worker"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extension/worker"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // ErrorCode classifies one producer error into its public class by errors.Is

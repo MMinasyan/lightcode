@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // execEdit runs one edit through the exported Normalize* + Prepare* entries.

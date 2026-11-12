@@ -3,7 +3,7 @@ package catalog
 import (
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestUserCostProtectionUsesCapturedInput proves the refresh merge reads the

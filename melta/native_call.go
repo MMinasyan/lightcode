@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
 )
 
 // nativeGrant is the private authority one callback view carries. It never

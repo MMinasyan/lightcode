@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestRunForegroundCommandTimeoutSendsTERMBeforeKILL pins the timeout
@@ -22,7 +22,7 @@ import (
 func TestRunForegroundCommandTimeoutSendsTERMBeforeKILL(t *testing.T) {
 	dir := t.TempDir()
 
-	output, err := RunForegroundCommand(context.Background(), "trap 'echo got-term; exit 0' TERM; sleep 10", dir, 1, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
+	output, err := RunForegroundCommand(context.Background(), "trap 'echo got-term; exit 0' TERM; sleep 10", dir, 1, 0, 0, filepath.Join(dir, ".melta"), os.Environ())
 	var exitErr *ExitError
 	testassert.Require(t, errors.As(err, &exitErr), "error = %T %v, want *ExitError", err, err)
 	testassert.Require(t, strings.Contains(output, "got-term") && strings.Contains(exitErr.Output, "got-term"), "output=%q exitErr.Output=%q, want SIGTERM trap output before timeout error", output, exitErr.Output)
@@ -74,7 +74,7 @@ func TestRunForegroundCommandCancellationWhileRunningIsDeterministic(t *testing.
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := RunForegroundCommand(ctx, "sleep 5", dir, 60, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
+		_, err := RunForegroundCommand(ctx, "sleep 5", dir, 60, 0, 0, filepath.Join(dir, ".melta"), os.Environ())
 		errCh <- err
 	}()
 
@@ -107,7 +107,7 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 		}
 		defer func() { waitCommand = origWait }()
 
-		result, err := RunForegroundCommand(context.Background(), "printf ok", dir, 1, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
+		result, err := RunForegroundCommand(context.Background(), "printf ok", dir, 1, 0, 0, filepath.Join(dir, ".melta"), os.Environ())
 		testassert.Require(t, err == nil && result == "ok", "result = (%q, %v), want the already-finished real result", result, err)
 	})
 
@@ -126,7 +126,7 @@ func TestRunForegroundCommandCompletedBeatsLateEvents(t *testing.T) {
 		errCh := make(chan error, 1)
 		resCh := make(chan string, 1)
 		go func() {
-			result, err := RunForegroundCommand(ctx, "printf ok", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
+			result, err := RunForegroundCommand(ctx, "printf ok", dir, 0, 0, 0, filepath.Join(dir, ".melta"), os.Environ())
 			resCh <- result
 			errCh <- err
 		}()
@@ -150,7 +150,7 @@ func TestRunForegroundCommandTimeoutOverflowRejectedBeforeLaunch(t *testing.T) {
 	dir := t.TempDir()
 	probe := filepath.Join(dir, "overflow-launched")
 
-	_, err := RunForegroundCommand(context.Background(), "touch "+probe, dir, int(math.MaxInt64/int64(time.Second))+1, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
+	_, err := RunForegroundCommand(context.Background(), "touch "+probe, dir, int(math.MaxInt64/int64(time.Second))+1, 0, 0, filepath.Join(dir, ".melta"), os.Environ())
 	testassert.Require(t, err != nil && strings.Contains(err.Error(), "overflows the seconds-to-duration conversion"), "err = %v, want the overflow rejection", err)
 	{
 		_, statErr := os.Stat(probe)
@@ -166,7 +166,7 @@ func TestRunForegroundCommandParentDeadlineIsCancellation(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(1*time.Second))
 	defer cancel()
 
-	_, err := RunForegroundCommand(ctx, "sleep 5", dir, 0, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
+	_, err := RunForegroundCommand(ctx, "sleep 5", dir, 0, 0, 0, filepath.Join(dir, ".melta"), os.Environ())
 	var exitErr *ExitError
 	testassert.Require(t, errors.As(err, &exitErr) && exitErr.ExitCode == -1 && strings.HasPrefix(exitErr.Output, "command cancelled"), "err = %v, want the cancellation classification for a parent deadline", err)
 }
@@ -177,13 +177,13 @@ func TestRunForegroundCommandParentDeadlineIsCancellation(t *testing.T) {
 // marker inside ExitError.Output.
 func TestRunForegroundCommandNonZeroExitLargeOutputIsBounded(t *testing.T) {
 	home := t.TempDir()
-	spillDir := filepath.Join(home, ".lightcode")
+	spillDir := filepath.Join(home, ".melta")
 
 	output, err := RunForegroundCommand(context.Background(), "printf 'abcdefg\\n1234567\\n' && exit 7", "", 2, 12, 5, spillDir, os.Environ())
 	var exitErr *ExitError
 	testassert.Require(t, errors.As(err, &exitErr), "error = %T %v, want *ExitError", err, err)
 	testassert.Require(t, output != "abcdefg\n1234567\n", "output = %q, want bounded output", output)
-	testassert.Require(t, strings.Contains(exitErr.Output, "Error: Exit code 7\n") && strings.Contains(exitErr.Output, "Full output (16 bytes) saved to: "+home+"/.lightcode/cmd_output_"), "ExitError.Output = %q, missing exit header; ExitError.Output = %q, want spill marker", exitErr.Output, exitErr.Output)
+	testassert.Require(t, strings.Contains(exitErr.Output, "Error: Exit code 7\n") && strings.Contains(exitErr.Output, "Full output (16 bytes) saved to: "+home+"/.melta/cmd_output_"), "ExitError.Output = %q, missing exit header; ExitError.Output = %q, want spill marker", exitErr.Output, exitErr.Output)
 }
 
 // TestRunForegroundCommandTimeoutLargeOutputIsBounded pins the timeout
@@ -191,13 +191,13 @@ func TestRunForegroundCommandNonZeroExitLargeOutputIsBounded(t *testing.T) {
 // and the spill marker inside ExitError.Output.
 func TestRunForegroundCommandTimeoutLargeOutputIsBounded(t *testing.T) {
 	home := t.TempDir()
-	spillDir := filepath.Join(home, ".lightcode")
+	spillDir := filepath.Join(home, ".melta")
 
 	output, err := RunForegroundCommand(context.Background(), "printf 'abcdefg\\n1234567\\n'; sleep 5", "", 1, 12, 5, spillDir, os.Environ())
 	var exitErr *ExitError
 	testassert.Require(t, errors.As(err, &exitErr), "error = %T %v, want *ExitError", err, err)
 	testassert.Require(t, output != "abcdefg\n1234567\n", "output = %q, want bounded output", output)
-	testassert.Require(t, strings.Contains(exitErr.Output, "Error: Exit code -1 (timeout)\n") && strings.Contains(exitErr.Output, "Full output (16 bytes) saved to: "+home+"/.lightcode/cmd_output_"), "ExitError.Output = %q, missing timeout header; ExitError.Output = %q, want spill marker", exitErr.Output, exitErr.Output)
+	testassert.Require(t, strings.Contains(exitErr.Output, "Error: Exit code -1 (timeout)\n") && strings.Contains(exitErr.Output, "Full output (16 bytes) saved to: "+home+"/.melta/cmd_output_"), "ExitError.Output = %q, missing timeout header; ExitError.Output = %q, want spill marker", exitErr.Output, exitErr.Output)
 }
 
 // TestRunForegroundCommandTimeoutKillsNearConfiguredDeadline pins that a
@@ -207,7 +207,7 @@ func TestRunForegroundCommandTimeoutKillsNearConfiguredDeadline(t *testing.T) {
 	dir := t.TempDir()
 	start := time.Now()
 
-	_, err := RunForegroundCommand(context.Background(), "sleep 2", dir, 1, 0, 0, filepath.Join(dir, ".lightcode"), os.Environ())
+	_, err := RunForegroundCommand(context.Background(), "sleep 2", dir, 1, 0, 0, filepath.Join(dir, ".melta"), os.Environ())
 	var exitErr *ExitError
 	testassert.Require(t, errors.As(err, &exitErr), "error = %T %v, want *ExitError", err, err)
 	testassert.Require(t, exitErr.ExitCode == -1 && strings.Contains(exitErr.Output, "timeout"), "ExitError = %+v, want timeout with exit code -1", exitErr)
@@ -231,7 +231,7 @@ func TestRunForegroundCommandCancellationOutput(t *testing.T) {
 		outCh := make(chan string, 1)
 		command := "printf 'abcdefg\\n1234567\\n'; touch " + ready + "; sleep 5"
 		go func() {
-			output, err := RunForegroundCommand(ctx, command, "", 5, 12, 5, filepath.Join(home, ".lightcode"), os.Environ())
+			output, err := RunForegroundCommand(ctx, command, "", 5, 12, 5, filepath.Join(home, ".melta"), os.Environ())
 			outCh <- output
 			errCh <- err
 		}()
@@ -254,7 +254,7 @@ func TestRunForegroundCommandCancellationOutput(t *testing.T) {
 			t.Fatal("cancelled command did not return")
 		}
 		output := <-outCh
-		testassert.Require(t, strings.HasPrefix(exitErr.Output, "command cancelled\n") && strings.Contains(exitErr.Output, "Full output (16 bytes) saved to: "+home+"/.lightcode/cmd_output_"), "ExitError.Output = %q, want cancellation header plus output; ExitError.Output = %q, want spill marker", exitErr.Output, exitErr.Output)
+		testassert.Require(t, strings.HasPrefix(exitErr.Output, "command cancelled\n") && strings.Contains(exitErr.Output, "Full output (16 bytes) saved to: "+home+"/.melta/cmd_output_"), "ExitError.Output = %q, want cancellation header plus output; ExitError.Output = %q, want spill marker", exitErr.Output, exitErr.Output)
 		testassert.Require(t, output != "abcdefg\n1234567\n", "output = %q, want bounded output", output)
 	})
 }
@@ -350,10 +350,10 @@ func TestNormalizeRunCommandArgs(t *testing.T) {
 		}
 	}
 
-	normalized, err := NormalizeRunCommandArgs(decode(t, `{"command":"ls","_lightcode_receipt":"x"}`), 120)
+	normalized, err := NormalizeRunCommandArgs(decode(t, `{"command":"ls","_melta_receipt":"x"}`), 120)
 	testassert.NoError(t, err)
 	{
-		_, ok := normalized["_lightcode_receipt"]
+		_, ok := normalized["_melta_receipt"]
 		testassert.Require(t, !ok, "normalized arguments retained a private field")
 	}
 }

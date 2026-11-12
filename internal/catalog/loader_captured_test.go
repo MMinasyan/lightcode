@@ -12,8 +12,8 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestLoaderLoadCapturedUsesInputWithoutReadingConfig(t *testing.T) {
@@ -43,7 +43,7 @@ func TestLoaderLoadCapturedUsesInputWithoutReadingConfig(t *testing.T) {
 		t.Fatalf("captured model = %#v, want the exact number preserved from the captured input", model)
 	}
 	{
-		_, err := os.Stat(filepath.Join(home, ".lightcode", "config.json"))
+		_, err := os.Stat(filepath.Join(home, ".melta", "config.json"))
 		testassert.Require(t, os.IsNotExist(err), "LoadCaptured read or created the main configuration: %v", err)
 	}
 }
@@ -80,7 +80,7 @@ func TestLoaderLoadCapturedCostProtectionUsesCapturedInput(t *testing.T) {
 		testassert.NoError(t, err)
 	}
 	{
-		_, err := os.Stat(filepath.Join(home, ".lightcode", "config.json"))
+		_, err := os.Stat(filepath.Join(home, ".melta", "config.json"))
 		testassert.Require(t, os.IsNotExist(err), "cost protection reread the main configuration: %v", err)
 	}
 

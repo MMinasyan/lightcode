@@ -8,13 +8,13 @@ import (
 	"strings"
 	"testing"
 
-	agents "github.com/MMinasyan/lightcode/extensions/agents"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/prompt"
-	"github.com/MMinasyan/lightcode/protocol"
+	agents "github.com/Syntheresis/melta/extensions/agents"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/prompt"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 const testConfigDocument = `{

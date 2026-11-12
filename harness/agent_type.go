@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net/url"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // ToolConstraints are the selected hard tool constraints.

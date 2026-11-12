@@ -10,7 +10,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // operationDescriptors is the schema's native operation set keyed by its source

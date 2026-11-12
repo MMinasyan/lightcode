@@ -22,10 +22,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/clientops"
-	"github.com/MMinasyan/lightcode/internal/version"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/clientops"
+	"github.com/Syntheresis/melta/internal/version"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 const (
@@ -400,7 +400,7 @@ func (r *Runner) initialize(ctx context.Context, params json.RawMessage) (json.R
 		}
 	}
 	encoded, err := json.Marshal(initializeResult{
-		ServerInfo: serverInfo{Name: "lightcode", Version: version.String()},
+		ServerInfo: serverInfo{Name: "melta", Version: version.String()},
 		Runtime:    conn.health,
 		Methods:    supportedMethods(),
 	})

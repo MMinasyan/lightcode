@@ -12,8 +12,8 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // ResponseError is one received Runtime error or partial code-revert result.

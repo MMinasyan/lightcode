@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"sort"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 func (st *assemblyState) buildCalls() []model.ToolCall {

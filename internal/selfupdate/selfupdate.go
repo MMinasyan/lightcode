@@ -22,19 +22,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/Syntheresis/melta/internal/version"
 )
 
 const (
-	repoURL = "https://github.com/MMinasyan/lightcode"
+	repoURL = "https://github.com/Syntheresis/melta"
 
 	// AssetName is the single published binary asset per release tag.
-	AssetName = "lightcode-linux-amd64.tar.gz"
+	AssetName = "melta-linux-amd64.tar.gz"
 
 	// MinInstallable is the oldest release tag upgrade will install: the
 	// first tag whose binary answers --version, which the smoke check and
 	// the strict dispatcher require. Older releases fall through unknown
-	// arguments into a GUI launch; the installer's LIGHTCODE_VERSION pin
+	// arguments into a GUI launch; the installer's MELTA_VERSION pin
 	// is the path to them.
 	MinInstallable = "v0.0.3"
 )
@@ -111,7 +111,7 @@ func LatestTag() (string, error) {
 
 // AssetURLs composes the download URLs for a target tag. A non-empty base
 // overrides the channel with <base>/<asset> and <base>/SHA256SUMS — no tag
-// in the path, exactly the installer's LIGHTCODE_RELEASE_BASE semantics.
+// in the path, exactly the installer's MELTA_RELEASE_BASE semantics.
 func AssetURLs(base, tag string) (assetURL, sumsURL string) {
 	if base != "" {
 		base = strings.TrimRight(base, "/")
@@ -161,7 +161,7 @@ func VerifySHA256(data, sums []byte, assetName string) error {
 }
 
 // ExtractBinary returns the bytes of the archive member named exactly
-// "lightcode". Only a regular-file member is accepted; symlinks,
+// "melta". Only a regular-file member is accepted; symlinks,
 // directories, and anything else are rejected.
 func ExtractBinary(tarball []byte) ([]byte, error) {
 	gz, err := gzip.NewReader(bytes.NewReader(tarball))
@@ -178,11 +178,11 @@ func ExtractBinary(tarball []byte) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read release archive: %w", err)
 		}
-		if hdr.Name != "lightcode" {
+		if hdr.Name != "melta" {
 			continue
 		}
 		if hdr.Typeflag != tar.TypeReg {
-			return nil, fmt.Errorf("release archive member lightcode is not a regular file")
+			return nil, fmt.Errorf("release archive member melta is not a regular file")
 		}
 		data, err := io.ReadAll(tr)
 		if err != nil {
@@ -190,16 +190,16 @@ func ExtractBinary(tarball []byte) ([]byte, error) {
 		}
 		return data, nil
 	}
-	return nil, fmt.Errorf("release archive has no lightcode member")
+	return nil, fmt.Errorf("release archive has no melta member")
 }
 
 // Stage writes the verified binary into the target directory under a random
-// .lightcode.tmp.* name, mode 0755. Staging next to the target gives the
+// .melta.tmp.* name, mode 0755. Staging next to the target gives the
 // same filesystem for the atomic rename, an exec-capable location, and the
 // guarantee that the smoke check executes the same inode the rename
 // promotes. A crash strands one dotfile; uninstall sweeps them.
 func Stage(dir string, binary []byte) (string, error) {
-	f, err := os.CreateTemp(dir, ".lightcode.tmp.*")
+	f, err := os.CreateTemp(dir, ".melta.tmp.*")
 	if err != nil {
 		return "", fmt.Errorf("stage new binary: %w", err)
 	}
@@ -222,7 +222,7 @@ func Stage(dir string, binary []byte) (string, error) {
 }
 
 // SmokeCheck executes the staged binary with --version before the swap,
-// output captured and never forwarded, LIGHTCODE_* stripped from the child
+// output captured and never forwarded, MELTA_* stripped from the child
 // env. Pass requires both an exit-0 child and the target tag in the
 // captured output; non-termination within the timeout is failure.
 func SmokeCheck(staged, tag string) error {
@@ -243,7 +243,7 @@ func SmokeCheck(staged, tag string) error {
 	cmd := exec.CommandContext(ctx, staged, "--version")
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	cmd.Env = envWithoutLightcode()
+	cmd.Env = envWithoutMelta()
 	// Without WaitDelay, a grandchild inheriting the output pipe keeps
 	// Wait blocked long after the timeout killed the staged binary.
 	cmd.WaitDelay = 100 * time.Millisecond
@@ -260,11 +260,11 @@ func SmokeCheck(staged, tag string) error {
 	return nil
 }
 
-func envWithoutLightcode() []string {
+func envWithoutMelta() []string {
 	env := os.Environ()
 	kept := env[:0]
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "LIGHTCODE_") {
+		if strings.HasPrefix(kv, "MELTA_") {
 			continue
 		}
 		kept = append(kept, kv)
@@ -322,7 +322,7 @@ func Check(currentVersion, currentDisplay, latest string) CheckResult {
 	return result
 }
 
-// IgnoreReleaseBaseAsRoot reports whether a set LIGHTCODE_RELEASE_BASE must
+// IgnoreReleaseBaseAsRoot reports whether a set MELTA_RELEASE_BASE must
 // be dropped: on the install path under euid 0 the override is ignored —
 // custom-base into a root-owned directory is unsupported; use the
 // installer. The --check refusal applies regardless of euid and is the

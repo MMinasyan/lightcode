@@ -4,7 +4,7 @@ PREFIX ?= $(HOME)/.local
 # build; used when testing upgrade flows). COMMIT is best-effort.
 VERSION ?= dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null)
-VERSION_PKG := github.com/MMinasyan/lightcode/internal/version
+VERSION_PKG := github.com/Syntheresis/melta/internal/version
 LDFLAGS := -X $(VERSION_PKG).Version=$(VERSION) -X $(VERSION_PKG).Commit=$(COMMIT)
 
 build:
@@ -28,7 +28,7 @@ fuzz-short:
 	go test $(PKG) -fuzz=. -fuzztime=30s
 
 # Lint rule classes intentionally excluded: G204 (subprocess), G304
-# (file inclusion), G306/G302 (file perms), G301 (dir perms). Lightcode
+# (file inclusion), G306/G302 (file perms), G301 (dir perms). Melta
 # IS a file-IO + command-runner tool; these rules describe its design.
 GOSEC_EXCLUDE := G204,G301,G302,G304,G306
 GOBIN := $(shell go env GOBIN)
@@ -47,14 +47,14 @@ lint: install-lint-tools
 install: build
 	dest="$(PREFIX)/bin"; \
 	mkdir -p "$$dest" || exit 1; \
-	tmp=$$(mktemp "$$dest/.lightcode.tmp.XXXXXX") || exit 1; \
+	tmp=$$(mktemp "$$dest/.melta.tmp.XXXXXX") || exit 1; \
 	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
-	cp build/bin/lightcode "$$tmp" || exit 1; \
+	cp build/bin/melta "$$tmp" || exit 1; \
 	chmod 755 "$$tmp" || exit 1; \
-	mv "$$tmp" "$$dest/lightcode" || exit 1
+	mv "$$tmp" "$$dest/melta" || exit 1
 
 uninstall:
-	rm -f $(PREFIX)/bin/lightcode
+	rm -f $(PREFIX)/bin/melta
 
 generate-protocol:
 	go run ./internal/protocolgen -schema protocol/openapi.yaml -config protocol/oapi-codegen.yaml -sdk-out protocol/protocol.gen.go -out internal/clientops/operations.gen.go -native-contract-out frontend/src/generated/native-invocations.json

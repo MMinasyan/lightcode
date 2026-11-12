@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/runtime"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/internal/plugins/builtin"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/runtime"
 )
 
 // The mounted generated-client composition fixture: one real Runtime over
@@ -30,7 +30,7 @@ const mountedOwnerAgents = `{"solo":{"model":"prov/m","system_prompt":"simple"},
 
 // mountedDiscoveryEnv is the one handshake value the Node process receives:
 // the path to the temporary discovery record, never its contents.
-const mountedDiscoveryEnv = "LIGHTCODE_PROTOCOL_DISCOVERY"
+const mountedDiscoveryEnv = "MELTA_PROTOCOL_DISCOVERY"
 
 func writeMountedFile(t *testing.T, path, content string) {
 	t.Helper()

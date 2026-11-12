@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestManagedEnvCrossInstanceOperations proves two independent managers (as
@@ -34,7 +34,7 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 		}
 	}
 
-	keys := []string{"LIGHTCODE_TEST_A", "LIGHTCODE_TEST_B", "LIGHTCODE_TEST_C"}
+	keys := []string{"MELTA_TEST_A", "MELTA_TEST_B", "MELTA_TEST_C"}
 	for _, k := range keys {
 		key := k
 		os.Unsetenv(key)
@@ -74,7 +74,7 @@ func TestManagedEnvCrossInstanceOperations(t *testing.T) {
 
 	// An absent removal is a no-op success.
 	before, _, _ := ReadDotEnvKeys(envPath)
-	testassert.NoError(t, newMgr().TryRemove("LIGHTCODE_TEST_ABSENT"))
+	testassert.NoError(t, newMgr().TryRemove("MELTA_TEST_ABSENT"))
 	after, _, _ := ReadDotEnvKeys(envPath)
 	testassert.Require(t, len(before) == len(after), "absent removal changed the file: %v -> %v", before, after)
 }

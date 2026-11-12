@@ -10,11 +10,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/pathutil"
-	"github.com/MMinasyan/lightcode/internal/safefs"
-	"github.com/MMinasyan/lightcode/internal/snapshot"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/pathutil"
+	"github.com/Syntheresis/melta/internal/safefs"
+	"github.com/Syntheresis/melta/internal/snapshot"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // This file owns the deferred code-snapshot adjunct and the bounded viewer:

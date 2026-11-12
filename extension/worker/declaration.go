@@ -1,6 +1,6 @@
 package worker
 
-import "github.com/MMinasyan/lightcode/extension"
+import "github.com/Syntheresis/melta/extension"
 
 // Declaration is the wire form of one extension declaration. Every schema and
 // parameter byte field is a JSONBytes value so the outer frame encoder never

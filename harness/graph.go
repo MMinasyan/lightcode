@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // graphEntry is one committed entry of a validated Session graph: the storage

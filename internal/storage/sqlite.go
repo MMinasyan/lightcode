@@ -22,7 +22,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/harness"
 )
 
 const (

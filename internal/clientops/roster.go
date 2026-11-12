@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // AgentRoster decodes the required roster used for initial Session selection.

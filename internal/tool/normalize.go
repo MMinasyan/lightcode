@@ -67,13 +67,13 @@ const (
 	minInt = -maxInt - 1
 )
 
-// stripPrivateArgs copies args without model-supplied private `_lightcode_`
+// stripPrivateArgs copies args without model-supplied private `_melta_`
 // fields, so no private receipt or canonical path can survive into
 // executable authority. Unrelated schema-accepted fields are retained.
 func stripPrivateArgs(args map[string]any) map[string]any {
 	clean := make(map[string]any, len(args))
 	for k, v := range args {
-		if strings.HasPrefix(k, "_lightcode_") {
+		if strings.HasPrefix(k, "_melta_") {
 			continue
 		}
 		clean[k] = v
@@ -82,7 +82,7 @@ func stripPrivateArgs(args map[string]any) map[string]any {
 }
 
 // NormalizeReadArgs performs target read_file argument normalization: it
-// strips private `_lightcode_` fields, checks the JSON argument schema with
+// strips private `_melta_` fields, checks the JSON argument schema with
 // strict consumed-field types and applies the retained defaults/clamps for
 // offset and limit. It never touches the filesystem and preserves unrelated
 // schema-accepted fields.
@@ -120,7 +120,7 @@ func NormalizeReadArgs(args map[string]any, defaultLimit int) (map[string]any, e
 }
 
 // NormalizeRunCommandArgs performs target run_command argument normalization:
-// private `_lightcode_` fields are stripped, the required command must be a
+// private `_melta_` fields are stripped, the required command must be a
 // nonempty string, and a supplied background member must be a boolean — an
 // absent member is written as false and present booleans are preserved, while
 // null or any non-boolean is rejected as an argument-validation error. A
@@ -166,7 +166,7 @@ func NormalizeRunCommandArgs(args map[string]any, defaultTimeout int) (map[strin
 }
 
 // NormalizeSleepArgs performs target sleep argument normalization: private
-// `_lightcode_` fields are stripped and a present seconds must be a strict
+// `_melta_` fields are stripped and a present seconds must be a strict
 // integer before the retained 1..300 clamp applies; an absent seconds keeps
 // the retained default of 1. The normalized form carries the clamped value
 // as its canonical-integer lexeme.
@@ -185,7 +185,7 @@ func NormalizeSleepArgs(args map[string]any) (map[string]any, error) {
 }
 
 // NormalizeWriteArgs performs target write_file argument normalization:
-// private `_lightcode_` fields are stripped and the schema-required path
+// private `_melta_` fields are stripped and the schema-required path
 // and content must be strings — an absent, null or wrong-typed required
 // field is the same argument-validation error, never silent coercion.
 func NormalizeWriteArgs(args map[string]any) (map[string]any, error) {
@@ -201,7 +201,7 @@ func NormalizeWriteArgs(args map[string]any) (map[string]any, error) {
 }
 
 // NormalizeEditArgs performs target edit_file argument normalization:
-// private `_lightcode_` fields are stripped and the schema-required fields
+// private `_melta_` fields are stripped and the schema-required fields
 // must be strings — an absent, null or wrong-typed required field is the
 // same argument-validation error, never silent coercion. replace_all keeps
 // its schema default when absent.
@@ -225,7 +225,7 @@ func NormalizeEditArgs(args map[string]any) (map[string]any, error) {
 }
 
 // NormalizePatchArgs performs target apply_patch argument normalization:
-// private `_lightcode_` fields are stripped and the patch payload text is
+// private `_melta_` fields are stripped and the patch payload text is
 // preserved verbatim. The input member must be a string when present;
 // a wrong type is an argument-validation error, never a later patch-syntax
 // error. V4A parsing belongs to canonical preparation.

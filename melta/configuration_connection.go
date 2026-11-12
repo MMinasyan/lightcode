@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // This file owns the connection operators: the write-only connect and
@@ -268,7 +268,7 @@ func (s *configurationService) editProviderDisconnect(providerID string, plan *c
 			if observed.Managed {
 				plan.keyAction, plan.keyEnv = keyActionRemove, envName
 			} else if observed.Value != "" {
-				return 0, configurationFailure(fmt.Errorf("provider %q is connected via environment; unset %s outside Lightcode", providerID, envName))
+				return 0, configurationFailure(fmt.Errorf("provider %q is connected via environment; unset %s outside Melta", providerID, envName))
 			}
 			// An absent unmanaged key: nothing to remove; the disconnect
 			// still publishes the ready next generation.

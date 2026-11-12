@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/editpreview"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/editpreview"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func applyPatchInput(t *testing.T, s string) string {

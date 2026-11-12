@@ -17,13 +17,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // Owner-lifecycle fixtures: one native model server, traceable plugins and the
@@ -70,7 +70,7 @@ func newOwnerEnvIn(t *testing.T, home, dataDir string) *ownerEnv {
 	e := &ownerEnv{
 		t: t, home: home, dataDir: dataDir,
 		configPath: filepath.Join(dataDir, "config.json"),
-		envPath:    filepath.Join(home, ".lightcode", ".env"),
+		envPath:    filepath.Join(home, ".melta", ".env"),
 		events:     &traceLog{},
 		server:     newProductionModelServer(t, "", ""),
 	}
@@ -114,7 +114,7 @@ func isolateBundledCredentials(t *testing.T) {
 // file configuration at configPath, an environment credential source at the
 // application dotenv path, and the selected application locations.
 func testOptions(dataDir, configPath, home string, plugins ...extension.Native) Options {
-	dataRoot := filepath.Join(home, ".lightcode")
+	dataRoot := filepath.Join(home, ".melta")
 	return Options{
 		DataDir:       dataDir,
 		Configuration: NewFileConfigurationSource(configPath),
@@ -190,9 +190,9 @@ func (e *ownerEnv) options(natives ...extension.Native) options {
 		Configuration: NewFileConfigurationSource(e.configPath),
 		Credentials:   NewEnvironmentCredentialSource(e.envPath),
 		Locations: Locations{
-			GlobalRulesDir:     filepath.Join(e.home, ".lightcode"),
-			DiscoveryCacheDir:  filepath.Join(e.home, ".lightcode", "cache", "discovery"),
-			WorkspacePolicyDir: filepath.Join(e.home, ".lightcode", "projects"),
+			GlobalRulesDir:     filepath.Join(e.home, ".melta"),
+			DiscoveryCacheDir:  filepath.Join(e.home, ".melta", "cache", "discovery"),
+			WorkspacePolicyDir: filepath.Join(e.home, ".melta", "projects"),
 		},
 		Extensions: natives,
 	}
@@ -264,14 +264,14 @@ func (e *ownerEnv) countedPlugin(id string, scope ScopeKind, providesID string, 
 	})
 }
 
-// sqliteDerivationPlugin opens lightcode.db under the ScopeInfo DataDir it
+// sqliteDerivationPlugin opens melta.db under the ScopeInfo DataDir it
 // receives, proving the same normalized owner root reaches the factory.
 func (e *ownerEnv) sqliteDerivationPlugin() extension.Native {
 	capability := testServiceCapability("session_store")
 	return testNative("db", extension.LifetimeHarness, []extension.Capability{capability}, nil, func(_ context.Context, info extension.InstanceContext) (extension.Instance, error) {
 		e.scopeDataDir.Store(info.DataDir)
 		e.events.add("open:db")
-		store, err := storage.OpenSQLite(filepath.Join(info.DataDir, "lightcode.db"))
+		store, err := storage.OpenSQLite(filepath.Join(info.DataDir, "melta.db"))
 		if err != nil {
 			return extension.Instance{}, err
 		}
@@ -601,7 +601,7 @@ func TestRuntimeOpenValidatesOptionsAndNormalizesPaths(t *testing.T) {
 			testassert.NoError(t, err)
 		}
 		{
-			_, err := os.Stat(filepath.Join(e.dataDir, "lightcode.db"))
+			_, err := os.Stat(filepath.Join(e.dataDir, "melta.db"))
 			testassert.NoError(t, err)
 		}
 		testassert.NoError(t, r.Close(context.Background()))
@@ -652,7 +652,7 @@ func TestRuntimeOpenResolvesOneCanonicalDataRoot(t *testing.T) {
 		owner, err := Open(context.Background(), Options{
 			DataDir:       dataDir,
 			Configuration: NewFileConfigurationSource(configPath),
-			Credentials:   NewEnvironmentCredentialSource(filepath.Join(home, ".lightcode", ".env")),
+			Credentials:   NewEnvironmentCredentialSource(filepath.Join(home, ".melta", ".env")),
 		})
 		return owner, storeDataDir, err
 	}
@@ -774,12 +774,12 @@ func TestRuntimeOwnershipLockIsExclusive(t *testing.T) {
 	testassert.NoError(t, again.Close(context.Background()))
 }
 
-const lockChildEnv = "LIGHTCODE_RUNTIME_LOCK_CHILD"
+const lockChildEnv = "MELTA_RUNTIME_LOCK_CHILD"
 
 // TestRuntimeOwnershipLockSpansProcessExit proves process ownership with a
 // real second process: contention while the child holds the lock, and
 // reacquisition after the child is killed or exits through managed shutdown.
-// When LIGHTCODE_RUNTIME_LOCK_CHILD names a data directory this very test
+// When MELTA_RUNTIME_LOCK_CHILD names a data directory this very test
 // binary runs as the child: it acquires ownership, announces it, and shuts
 // its owner down only when its standard input closes.
 func TestRuntimeOwnershipLockSpansProcessExit(t *testing.T) {
@@ -1535,7 +1535,7 @@ func TestRuntimeBaselineServicesAreDirectlyConstructed(t *testing.T) {
 		}))
 		testassert.NoError(t, r.Close(context.Background()))
 		{
-			_, err := os.Stat(filepath.Join(e.dataDir, "lightcode.db"))
+			_, err := os.Stat(filepath.Join(e.dataDir, "melta.db"))
 			testassert.Require(t, err == nil, "the owner never composed its own store at the data root: %v", err)
 		}
 		testassert.Equal(t, exported.listCount(), 0)
@@ -1823,7 +1823,7 @@ func testManaged(r *Melta, name string) bool {
 // baseline assertions read the source file before any managed write.
 func ensureDotEnv(t *testing.T, home string) {
 	t.Helper()
-	path := filepath.Join(home, ".lightcode", ".env")
+	path := filepath.Join(home, ".melta", ".env")
 	if _, err := os.Stat(path); err == nil {
 		return
 	}

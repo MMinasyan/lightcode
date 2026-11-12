@@ -26,10 +26,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 var publicModelRef = model.ModelRef{Provider: "prov", Model: "gpt-x"}
@@ -419,7 +419,7 @@ func eachStore(t *testing.T, run func(t *testing.T, store harness.Storage)) {
 		run(t, storage.NewMemory())
 	})
 	t.Run("sqlite", func(t *testing.T) {
-		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 		testassert.NoError(t, err)
 		defer store.Close()
 		run(t, store)
@@ -2952,7 +2952,7 @@ func TestPublicLifecycleRollbackOnTransactionFailure(t *testing.T) {
 	}{
 		{name: "memory", open: func(t *testing.T) harness.Storage { return storage.NewMemory() }},
 		{name: "sqlite", open: func(t *testing.T) harness.Storage {
-			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 			testassert.NoError(t, err)
 			t.Cleanup(func() { store.Close() })
 			return store

@@ -14,9 +14,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestStorageComposition constructs memory and a temporary-file SQLite store

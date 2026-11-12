@@ -19,11 +19,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/acpclient"
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/clientops"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/Syntheresis/melta/internal/acpclient"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/clientops"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/internal/version"
 )
 
 // The scripted fixture speaks the real generated HTTP protocol over one
@@ -725,7 +725,7 @@ func TestACPInitializeBeforeAndAfter(t *testing.T) {
 	testassert.NoError(t, json.Unmarshal([]byte(resultOf(t, response)), &members))
 	testassert.Require(t, len(members) == 3, "initialize result members = %v, want exactly serverInfo, runtime, and methods", members)
 	testassert.NoError(t, json.Unmarshal([]byte(resultOf(t, response)), &result))
-	testassert.Require(t, result.ServerInfo.Name == "lightcode" && result.ServerInfo.Version == version.String() && string(result.Runtime) == healthBody(), "serverInfo = %+v, want the native identity; runtime = %s, want the generated Health", result.ServerInfo, result.Runtime)
+	testassert.Require(t, result.ServerInfo.Name == "melta" && result.ServerInfo.Version == version.String() && string(result.Runtime) == healthBody(), "serverInfo = %+v, want the native identity; runtime = %s, want the generated Health", result.ServerInfo, result.Runtime)
 	wantMethods := clientops.OperationNames()
 	slices.Sort(wantMethods)
 	testassert.Require(t, reflect.DeepEqual(result.Methods, wantMethods), "methods = %v, want the sorted supported invocation names", result.Methods)

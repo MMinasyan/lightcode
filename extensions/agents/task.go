@@ -14,11 +14,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/toolargs"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/toolargs"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 const (
@@ -261,13 +261,13 @@ func newOperationID() (string, error) {
 }
 
 // normalizeTaskArgs is the task tool's member validator: private
-// `_lightcode_` fields are stripped, a present prompt or subagent_type must
+// `_melta_` fields are stripped, a present prompt or subagent_type must
 // be a string, and every other member is preserved; Prepare owns the
 // semantics.
 func normalizeTaskArgs(args map[string]any) (map[string]any, error) {
 	clean := make(map[string]any, len(args))
 	for key, value := range args {
-		if strings.HasPrefix(key, "_lightcode_") {
+		if strings.HasPrefix(key, "_melta_") {
 			continue
 		}
 		if key == "prompt" || key == "subagent_type" {

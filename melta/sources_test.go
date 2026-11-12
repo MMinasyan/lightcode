@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // memoryCredentialSource is the in-memory credential fixture: captured values
@@ -119,58 +119,66 @@ func sourceConfigDocument(endpoint, keyEnv, name string) []byte {
 // empty and HOME pointing at a nonexistent directory; then writes the value
 // document and admits with the captured credential.
 func TestRuntimeValueConfigurationAndUnusableHome(t *testing.T) {
-	t.Setenv("HOME", filepath.Join(t.TempDir(), "missing-home"))
-	const keyEnv = "VALUE_SOURCE_KEY"
-	const key = "value-source-secret"
-	server := newProductionModelServer(t, "", "")
-	value := NewValueConfigurationSource(sourceConfigDocument(server.URL, keyEnv, "Before"))
-	credentials := &memoryCredentialSource{values: map[string]CredentialValue{keyEnv: {Value: key, Defined: true, Managed: true}}}
-	dataDir := t.TempDir()
-	r, err := Open(context.Background(), Options{
-		DataDir:       dataDir,
-		Configuration: value,
-		Credentials:   credentials,
-	})
-	testassert.NoError(t, err)
-	defer func() {
-		{
-			err := r.Close(context.Background())
+	for _, source := range []string{"custom", "environment"} {
+		t.Run(source, func(t *testing.T) {
+			t.Setenv("HOME", filepath.Join(t.TempDir(), "missing-home"))
+			const keyEnv = "LIGHTCODE_CUSTOM_API_KEY"
+			const key = "value-source-secret"
+			server := newProductionModelServer(t, "", "")
+			value := NewValueConfigurationSource(sourceConfigDocument(server.URL, keyEnv, "Before"))
+			var credentials CredentialSource = &memoryCredentialSource{values: map[string]CredentialValue{keyEnv: {Value: key, Defined: true, Managed: true}}}
+			if source == "environment" {
+				t.Setenv(keyEnv, key)
+				credentials = NewEnvironmentCredentialSource(filepath.Join(t.TempDir(), ".env"))
+			}
+			dataDir := t.TempDir()
+			r, err := Open(context.Background(), Options{
+				DataDir:       dataDir,
+				Configuration: value,
+				Credentials:   credentials,
+			})
 			testassert.NoError(t, err)
-		}
-	}()
-	{
-		data, err := value.Read(context.Background())
-		testassert.NoError(t, err)
-		testassert.Equal(t, string(data), string(sourceConfigDocument(server.URL, keyEnv, "Before")))
-	}
+			defer func() {
+				{
+					err := r.Close(context.Background())
+					testassert.NoError(t, err)
+				}
+			}()
+			{
+				data, err := value.Read(context.Background())
+				testassert.NoError(t, err)
+				testassert.Equal(t, string(data), string(sourceConfigDocument(server.URL, keyEnv, "Before")))
+			}
 
-	updated := sourceConfigDocument(server.URL, keyEnv, "After")
-	testassert.NoError(t, value.Write(context.Background(), updated))
-	{
-		_, err := r.Reload(context.Background(), testCaller(r))
-		testassert.NoError(t, err)
-	}
-	{
-		data, err := value.Read(context.Background())
-		testassert.NoError(t, err)
-		testassert.Equal(t, string(data), string(updated))
-	}
+			updated := sourceConfigDocument(server.URL, keyEnv, "After")
+			testassert.NoError(t, value.Write(context.Background(), updated))
+			{
+				_, err := r.Reload(context.Background(), testCaller(r))
+				testassert.NoError(t, err)
+			}
+			{
+				data, err := value.Read(context.Background())
+				testassert.NoError(t, err)
+				testassert.Equal(t, string(data), string(updated))
+			}
 
-	workspace := t.TempDir()
-	var record harness.SessionRecord
-	testassert.NoError(t, r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
-		var err error
-		record, err = r.createSessionRecord(ctx, h, workspace, harness.AgentSelection{Inputs: &harness.AgentInputs{
-			Model:        model.ModelRef{Provider: "prov", Model: "m"},
-			AssemblyMode: "none",
-		}})
-		return err
-	}))
-	submitThroughRuntime(t, r, record.Identity.SessionID, "op-value-source", "hello")
-	awaitOperation(t, r, record.Identity.SessionID, "op-value-source", harness.OperationSuccess)
-	{
-		got := server.authAt(0)
-		testassert.Equal(t, got, "Bearer "+key)
+			workspace := t.TempDir()
+			var record harness.SessionRecord
+			testassert.NoError(t, r.withHarness(context.Background(), func(ctx context.Context, h *harness.Harness) error {
+				var err error
+				record, err = r.createSessionRecord(ctx, h, workspace, harness.AgentSelection{Inputs: &harness.AgentInputs{
+					Model:        model.ModelRef{Provider: "prov", Model: "m"},
+					AssemblyMode: "none",
+				}})
+				return err
+			}))
+			submitThroughRuntime(t, r, record.Identity.SessionID, "op-value-source", "hello")
+			awaitOperation(t, r, record.Identity.SessionID, "op-value-source", harness.OperationSuccess)
+			{
+				got := server.authAt(0)
+				testassert.Equal(t, got, "Bearer "+key)
+			}
+		})
 	}
 }
 

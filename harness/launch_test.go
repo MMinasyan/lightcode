@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // spawnRecord wraps one spawn callback with a plain call counter that also

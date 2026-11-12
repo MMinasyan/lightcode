@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/cmdoutput"
+	"github.com/Syntheresis/melta/internal/cmdoutput"
 )
 
 // waitCommand is the one cmd.Wait seam for foreground commands: the

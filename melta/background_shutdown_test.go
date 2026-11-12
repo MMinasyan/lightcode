@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/jobs"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/jobs"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // The jobs-service fixtures: one scripted service records stop invocations

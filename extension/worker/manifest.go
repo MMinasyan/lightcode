@@ -3,7 +3,7 @@ package worker
 import (
 	"encoding/json"
 
-	"github.com/MMinasyan/lightcode/extension"
+	"github.com/Syntheresis/melta/extension"
 )
 
 // Manifest is one installed executable package's manifest: the worker's wire

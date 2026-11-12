@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // tinyChunkReader delivers at most chunk bytes per Read call, proving the framing logic is independent of how the underlying reader happens to split data — arbitrary boundary positions must never change which events are produced.

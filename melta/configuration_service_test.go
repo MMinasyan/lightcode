@@ -18,14 +18,14 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // serviceHarness roots one configurationService test at a scratch HOME and a
@@ -48,7 +48,7 @@ func newServiceHarness(t *testing.T) *serviceHarness {
 	if _, err := os.Stat(h.configPath); os.IsNotExist(err) {
 		writeServiceFile(t, h.configPath, `{"providers":{},"extensions":{"agents":{"enabled":true},"adaptation":{"enabled":true}}}`)
 	}
-	h.loader = catalog.NewLoader(filepath.Join(h.home, ".lightcode", "cache", "discovery"), staticBundledFS())
+	h.loader = catalog.NewLoader(filepath.Join(h.home, ".melta", "cache", "discovery"), staticBundledFS())
 	return h
 }
 
@@ -65,15 +65,15 @@ func (h *serviceHarness) serviceWithDefaults(owner context.Context, defaults []s
 	}
 	return newConfigurationService(owner, c, h.loader,
 		NewFileConfigurationSource(h.configPath),
-		NewEnvironmentCredentialSource(filepath.Join(h.home, ".lightcode", ".env")),
+		NewEnvironmentCredentialSource(filepath.Join(h.home, ".melta", ".env")),
 		h.locations(), harness.IncludedStrategyBinding(), newObservation())
 }
 
 func (h *serviceHarness) locations() Locations {
 	return Locations{
-		GlobalRulesDir:     filepath.Join(h.home, ".lightcode"),
-		DiscoveryCacheDir:  filepath.Join(h.home, ".lightcode", "cache", "discovery"),
-		WorkspacePolicyDir: filepath.Join(h.home, ".lightcode", "projects"),
+		GlobalRulesDir:     filepath.Join(h.home, ".melta"),
+		DiscoveryCacheDir:  filepath.Join(h.home, ".melta", "cache", "discovery"),
+		WorkspacePolicyDir: filepath.Join(h.home, ".melta", "projects"),
 	}
 }
 
@@ -1169,11 +1169,11 @@ func TestConfigurationServiceUsesSelectedLocations(t *testing.T) {
 	testassert.NoError(t, err)
 	testassert.Require(t, snapshot.snapshot.catalog.Providers["remote"].Models["remote-model"] != nil, "the discovery publication never reached the assembled catalog")
 	{
-		_, err := os.Stat(filepath.Join(home, ".lightcode", "cache", "discovery", "remote.json"))
+		_, err := os.Stat(filepath.Join(home, ".melta", "cache", "discovery", "remote.json"))
 		testassert.NoError(t, err)
 	}
 	{
-		_, err := os.Stat(filepath.Join(home, ".lightcode", ".env"))
+		_, err := os.Stat(filepath.Join(home, ".melta", ".env"))
 		testassert.Require(t, os.IsNotExist(err), "the configuration build touched the dotenv source: %v", err)
 	}
 	entries, err := os.ReadDir(dataDir)
@@ -1240,7 +1240,7 @@ func TestConfigurationServiceCapturesWorkspacePermissions(t *testing.T) {
 	// reload resolves the workspace rule over the captured global member.
 	dirID, err := config.WorkspacePermissionDirID("/ws")
 	testassert.NoError(t, err)
-	permissionPath := filepath.Join(h.home, ".lightcode", "projects", dirID, "permissions.json")
+	permissionPath := filepath.Join(h.home, ".melta", "projects", dirID, "permissions.json")
 	writeServiceFile(t, permissionPath, `{"rules":[{"permission":"file.write","target":"*","access":"deny"}]}`)
 	{
 		got := first.snapshot.permissionPolicy("/ws")
@@ -1287,8 +1287,8 @@ func TestConfigurationServiceCapturesWorkspacePermissions(t *testing.T) {
 	// A failed enumeration of the inventory directory leaves the whole
 	// Workspace policy level absent for the revision, uniformly, without
 	// failing publication.
-	testassert.NoError(t, os.Chmod(filepath.Join(h.home, ".lightcode", "projects"), 0o000))
-	t.Cleanup(func() { _ = os.Chmod(filepath.Join(h.home, ".lightcode", "projects"), 0o700) })
+	testassert.NoError(t, os.Chmod(filepath.Join(h.home, ".melta", "projects"), 0o000))
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(h.home, ".melta", "projects"), 0o700) })
 	fifth, err := svc.publish(context.Background())
 	testassert.NoError(t, err)
 	{
@@ -1301,7 +1301,7 @@ func TestConfigurationServiceCapturesWorkspacePermissions(t *testing.T) {
 	}
 
 	// A file removed again is absent policy at the reload that observes it.
-	testassert.NoError(t, os.Chmod(filepath.Join(h.home, ".lightcode", "projects"), 0o700))
+	testassert.NoError(t, os.Chmod(filepath.Join(h.home, ".melta", "projects"), 0o700))
 	testassert.NoError(t, os.Remove(permissionPath))
 	sixth, err := svc.publish(context.Background())
 	testassert.NoError(t, err)

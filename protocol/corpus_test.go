@@ -10,8 +10,8 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi3"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The shared contract corpus: one committed JSON document with every fixture

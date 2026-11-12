@@ -1,4 +1,4 @@
-// Package doctor runs read-only diagnostics over a Lightcode install. It
+// Package doctor runs read-only diagnostics over a Melta install. It
 // composes only read-only seams — config.Parse/ReadDotEnvKeys/
 // ClassifyKeySource, catalog.BuildOffline/ProviderConnected, the
 // package-level project lookups, and lockfile reads — and performs zero
@@ -14,9 +14,9 @@ import (
 	"slices"
 	"sort"
 
-	agentcfg "github.com/MMinasyan/lightcode/extensions/agents"
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
+	agentcfg "github.com/Syntheresis/melta/extensions/agents"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/internal/config"
 )
 
 // Check statuses.
@@ -84,7 +84,7 @@ func Run(p Params) (Report, bool) {
 		return summarize(checks), false
 	}
 
-	dataDir := filepath.Join(p.Home, ".lightcode")
+	dataDir := filepath.Join(p.Home, ".melta")
 	cfg, agentsCfg, dotenvKeys := dataChecks(p, dataDir, &checks, add)
 
 	// Catalog.

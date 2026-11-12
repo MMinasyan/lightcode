@@ -2,8 +2,8 @@
 //
 // Version and Commit are stamped at build time:
 //
-//	-ldflags "-X github.com/MMinasyan/lightcode/internal/version.Version=v0.0.3
-//	          -X github.com/MMinasyan/lightcode/internal/version.Commit=abc1234"
+//	-ldflags "-X github.com/Syntheresis/melta/internal/version.Version=v0.0.3
+//	          -X github.com/Syntheresis/melta/internal/version.Commit=abc1234"
 //
 // An unstamped binary is a dev build.
 package version
@@ -97,12 +97,12 @@ func String() string {
 func Line() string {
 	plat := runtime.GOOS + "/" + runtime.GOARCH
 	if IsRelease(Version) {
-		return "lightcode " + Version + " (" + plat + ")"
+		return "melta " + Version + " (" + plat + ")"
 	}
 	if Commit != "" {
-		return "lightcode dev (" + Commit + ", " + plat + ")"
+		return "melta dev (" + Commit + ", " + plat + ")"
 	}
-	return "lightcode dev (" + plat + ")"
+	return "melta dev (" + plat + ")"
 }
 
 // Info is the machine-readable shape; fields report the raw stamped

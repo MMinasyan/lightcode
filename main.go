@@ -9,10 +9,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/MMinasyan/lightcode/internal/acpclient"
-	"github.com/MMinasyan/lightcode/internal/cliclient"
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/desktopclient"
+	"github.com/Syntheresis/melta/internal/acpclient"
+	"github.com/Syntheresis/melta/internal/cliclient"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/desktopclient"
 )
 
 //go:embed all:frontend/dist
@@ -22,7 +22,7 @@ func main() {
 	// Diagnostics only: no config or env-file loading happens before
 	// dispatch.
 	level := slog.LevelWarn
-	if os.Getenv("LIGHTCODE_DEBUG") == "1" {
+	if os.Getenv("MELTA_DEBUG") == "1" {
 		level = slog.LevelDebug
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
@@ -35,7 +35,7 @@ func main() {
 	}
 
 	if err := runWails(); err != nil {
-		fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
+		fmt.Fprintf(os.Stderr, "melta: %v\n", err)
 		os.Exit(1)
 	}
 }

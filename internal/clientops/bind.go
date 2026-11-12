@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // contentTypeJSON is the content type every declared request body uses.

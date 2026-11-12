@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 func TestLaunchChildCommitPointOwnsAdmittedChild(t *testing.T) {
@@ -28,7 +28,7 @@ func TestLaunchChildCommitPointOwnsAdmittedChild(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
-			inner, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+			inner, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 			testassert.NoError(t, err)
 			t.Cleanup(func() { testassert.NoError(t, inner.Close()) })
 			store := &publicationCancelStore{Storage: inner}

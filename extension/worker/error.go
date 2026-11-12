@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
 )
 
 // Class is the closed public infrastructure error class.

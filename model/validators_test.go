@@ -11,7 +11,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // richOutputFixture builds one deterministic completed output carrying every

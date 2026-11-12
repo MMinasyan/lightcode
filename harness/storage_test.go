@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestClosedKinds proves every entry and register kind constant carries its exact contract string and that no constant collapses onto a sibling or the zero value, so the kind set stays closed to the declared non-zero values.

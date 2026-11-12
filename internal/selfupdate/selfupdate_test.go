@@ -11,13 +11,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/internal/version"
 )
 
 func TestLatestTag(t *testing.T) {
@@ -28,9 +29,9 @@ func TestLatestTag(t *testing.T) {
 		wantTag  string
 		wantErr  string
 	}{
-		{"redirect with tag", http.StatusFound, "https://github.com/MMinasyan/lightcode/releases/tag/v0.0.2", "v0.0.2", ""},
-		{"malformed location", http.StatusFound, "https://github.com/MMinasyan/lightcode/releases", "", "unexpected redirect"},
-		{"non-semver tag", http.StatusFound, "https://github.com/MMinasyan/lightcode/releases/tag/nightly", "", "unexpected tag"},
+		{"redirect with tag", http.StatusFound, "https://github.com/Syntheresis/melta/releases/tag/v0.0.2", "v0.0.2", ""},
+		{"malformed location", http.StatusFound, "https://github.com/Syntheresis/melta/releases", "", "unexpected redirect"},
+		{"non-semver tag", http.StatusFound, "https://github.com/Syntheresis/melta/releases/tag/nightly", "", "unexpected tag"},
 		{"non-redirect", http.StatusOK, "", "", "unexpected status"},
 	}
 	for _, tc := range cases {
@@ -59,8 +60,8 @@ func TestLatestTag(t *testing.T) {
 
 func TestAssetURLs(t *testing.T) {
 	asset, sums := AssetURLs("", "v0.0.4")
-	testassert.Equal(t, asset, "https://github.com/MMinasyan/lightcode/releases/download/v0.0.4/"+AssetName)
-	testassert.Equal(t, sums, "https://github.com/MMinasyan/lightcode/releases/download/v0.0.4/SHA256SUMS")
+	testassert.Equal(t, asset, "https://github.com/Syntheresis/melta/releases/download/v0.0.4/"+AssetName)
+	testassert.Equal(t, sums, "https://github.com/Syntheresis/melta/releases/download/v0.0.4/SHA256SUMS")
 
 	// A base override composes <base>/<asset> with no tag in the path,
 	// matching the installer's semantics.
@@ -128,22 +129,22 @@ type member = struct {
 
 func TestExtractBinary(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
-		tb := buildTarball(t, map[string]member{"lightcode": {body: "BINARY", typeflag: tar.TypeReg}})
+		tb := buildTarball(t, map[string]member{"melta": {body: "BINARY", typeflag: tar.TypeReg}})
 		data, err := ExtractBinary(tb)
 		testassert.NoError(t, err)
 		testassert.Require(t, string(data) == "BINARY", "extracted %q", data)
 	})
 
 	t.Run("missing member", func(t *testing.T) {
-		tb := buildTarball(t, map[string]member{"otherfile": {body: "X", typeflag: tar.TypeReg}})
+		tb := buildTarball(t, map[string]member{"lightcode": {body: "X", typeflag: tar.TypeReg}})
 		{
 			_, err := ExtractBinary(tb)
-			testassert.Require(t, err != nil && strings.Contains(err.Error(), "no lightcode member"), "err = %v", err)
+			testassert.Require(t, err != nil && strings.Contains(err.Error(), "no melta member"), "err = %v", err)
 		}
 	})
 
 	t.Run("symlink member rejected", func(t *testing.T) {
-		tb := buildTarball(t, map[string]member{"lightcode": {typeflag: tar.TypeSymlink, linkname: "/bin/sh"}})
+		tb := buildTarball(t, map[string]member{"melta": {typeflag: tar.TypeSymlink, linkname: "/bin/sh"}})
 		{
 			_, err := ExtractBinary(tb)
 			testassert.Require(t, err != nil && strings.Contains(err.Error(), "not a regular file"), "err = %v", err)
@@ -151,7 +152,7 @@ func TestExtractBinary(t *testing.T) {
 	})
 
 	t.Run("dir member rejected", func(t *testing.T) {
-		tb := buildTarball(t, map[string]member{"lightcode": {typeflag: tar.TypeDir}})
+		tb := buildTarball(t, map[string]member{"melta": {typeflag: tar.TypeDir}})
 		{
 			_, err := ExtractBinary(tb)
 			testassert.Require(t, err != nil && strings.Contains(err.Error(), "not a regular file"), "err = %v", err)
@@ -159,7 +160,7 @@ func TestExtractBinary(t *testing.T) {
 	})
 
 	t.Run("short body", func(t *testing.T) {
-		tb := buildTarball(t, map[string]member{"lightcode": {body: "BINARY", typeflag: tar.TypeReg}})
+		tb := buildTarball(t, map[string]member{"melta": {body: "BINARY", typeflag: tar.TypeReg}})
 		{
 			_, err := ExtractBinary(tb[:len(tb)/2])
 			testassert.Require(t, err != nil, "truncated archive must error")
@@ -182,11 +183,11 @@ func smokeScript(body string) []byte {
 func TestStageAndSmokeAndReplace(t *testing.T) {
 	t.Run("single inode from stage through replace", func(t *testing.T) {
 		dir := t.TempDir()
-		target := filepath.Join(dir, "lightcode")
+		target := filepath.Join(dir, "melta")
 		testassert.NoError(t, os.WriteFile(target, []byte("old"), 0o755))
-		staged, err := Stage(dir, smokeScript(`echo "lightcode v9.9.9 (linux/amd64)"`))
+		staged, err := Stage(dir, smokeScript(`echo "melta v9.9.9 (linux/amd64)"`))
 		testassert.NoError(t, err)
-		testassert.Require(t, strings.HasPrefix(filepath.Base(staged), ".lightcode.tmp."), "staged name = %q", staged)
+		testassert.Require(t, strings.HasPrefix(filepath.Base(staged), ".melta.tmp."), "staged name = %q", staged)
 		info, err := os.Stat(staged)
 		testassert.NoError(t, err)
 		if info.Mode().Perm() != 0o755 {
@@ -203,7 +204,7 @@ func TestStageAndSmokeAndReplace(t *testing.T) {
 
 	t.Run("stale staged files do not block", func(t *testing.T) {
 		dir := t.TempDir()
-		testassert.NoError(t, os.WriteFile(filepath.Join(dir, ".lightcode.tmp.stale"), []byte("x"), 0o755))
+		testassert.NoError(t, os.WriteFile(filepath.Join(dir, ".melta.tmp.stale"), []byte("x"), 0o755))
 		{
 			_, err := Stage(dir, []byte("new"))
 			testassert.NoError(t, err)
@@ -212,7 +213,7 @@ func TestStageAndSmokeAndReplace(t *testing.T) {
 
 	t.Run("smoke fails on wrong tag", func(t *testing.T) {
 		dir := t.TempDir()
-		staged, err := Stage(dir, smokeScript(`echo "lightcode v0.0.1 (linux/amd64)"`))
+		staged, err := Stage(dir, smokeScript(`echo "melta v0.0.1 (linux/amd64)"`))
 		testassert.NoError(t, err)
 		{
 			err := SmokeCheck(staged, "v9.9.9")
@@ -222,7 +223,7 @@ func TestStageAndSmokeAndReplace(t *testing.T) {
 
 	t.Run("smoke fails on nonzero exit even with matching tag", func(t *testing.T) {
 		dir := t.TempDir()
-		staged, err := Stage(dir, smokeScript(`echo "lightcode v9.9.9 (linux/amd64)"; exit 3`))
+		staged, err := Stage(dir, smokeScript(`echo "melta v9.9.9 (linux/amd64)"; exit 3`))
 		testassert.NoError(t, err)
 		{
 			err := SmokeCheck(staged, "v9.9.9")
@@ -256,11 +257,11 @@ func TestStageAndSmokeAndReplace(t *testing.T) {
 		}
 	})
 
-	t.Run("smoke strips LIGHTCODE_ env from the child", func(t *testing.T) {
-		t.Setenv("LIGHTCODE_SMOKE_CANARY", "leaked")
+	t.Run("smoke strips MELTA_ env from the child", func(t *testing.T) {
+		t.Setenv("MELTA_SMOKE_CANARY", "leaked")
 		dir := t.TempDir()
 		// The script fails the tag check when the canary leaks through.
-		staged, err := Stage(dir, smokeScript(`if [ -n "$LIGHTCODE_SMOKE_CANARY" ]; then echo leaked; else echo lightcode v9.9.9; fi`))
+		staged, err := Stage(dir, smokeScript(`if [ -n "$MELTA_SMOKE_CANARY" ]; then echo leaked; else echo melta v9.9.9; fi`))
 		testassert.NoError(t, err)
 		testassert.NoError(t, SmokeCheck(staged, "v9.9.9"))
 	})
@@ -308,22 +309,24 @@ func TestMinInstallableShape(t *testing.T) {
 // TestFloorWithinReleaseTag is the release-workflow gate: it runs against
 // the tag being released and fails when the floor exceeds it.
 func TestFloorWithinReleaseTag(t *testing.T) {
-	tag := os.Getenv("LIGHTCODE_RELEASE_TAG")
+	tag := os.Getenv("MELTA_RELEASE_TAG")
 	if tag == "" {
-		t.Skip("LIGHTCODE_RELEASE_TAG not set")
+		t.Skip("MELTA_RELEASE_TAG not set")
 	}
 	testassert.Require(t, version.IsRelease(MinInstallable), "floor %q is not an exact vMAJOR.MINOR.PATCH tag", MinInstallable)
 	testassert.Require(t, version.IsRelease(tag), "release tag %q is not an exact vMAJOR.MINOR.PATCH tag", tag)
 	testassert.Require(t, version.Compare(MinInstallable, tag) <= 0, "floor %s exceeds the tag being released (%s)", MinInstallable, tag)
 }
 
-func TestEnvWithoutLightcode(t *testing.T) {
-	t.Setenv("LIGHTCODE_TEST_STRIP", "1")
+func TestEnvWithoutMelta(t *testing.T) {
+	t.Setenv("MELTA_TEST_STRIP", "1")
+	t.Setenv("LIGHTCODE_TEST_KEEP", "1")
 	t.Setenv("KEEP_THIS_VAR", "1")
-	env := envWithoutLightcode()
-	joined := strings.Join(env, "\n")
-	testassert.Require(t, !strings.Contains(joined, "LIGHTCODE_"), "LIGHTCODE_ vars not stripped: %s", joined)
-	testassert.Require(t, strings.Contains(joined, "KEEP_THIS_VAR=1"), "non-LIGHTCODE vars must be kept")
+	env := envWithoutMelta()
+	for _, entry := range env {
+		testassert.Require(t, !strings.HasPrefix(entry, "MELTA_"), "MELTA_ entry not stripped: %q", entry)
+	}
+	testassert.Require(t, slices.Contains(env, "LIGHTCODE_TEST_KEEP=1") && slices.Contains(env, "KEEP_THIS_VAR=1"), "ordinary entries were stripped")
 }
 
 func TestIgnoreReleaseBaseAsRoot(t *testing.T) {

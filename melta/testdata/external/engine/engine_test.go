@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/agent"
+	"github.com/Syntheresis/melta/model"
 )
 
 // writeTextTurn and writeToolTurn are this package's own SSE turns: the

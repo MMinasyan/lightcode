@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestWorkspacePermissionDirID proves the retained storage-key derivation:
@@ -40,7 +40,7 @@ func TestProjectsDir(t *testing.T) {
 	home, err := os.UserHomeDir()
 	testassert.NoError(t, err)
 	{
-		want := filepath.Join(home, ".lightcode", "projects")
+		want := filepath.Join(home, ".melta", "projects")
 		testassert.Equal(t, root, want)
 	}
 }

@@ -7,9 +7,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/clientview"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/clientview"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The shared projection corpus stores every payload as raw JSON text, so an

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // SessionLifecycle is the closed lifecycle of a durable Session. No other

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestBundledCatalogFilesValidateAndBuild(t *testing.T) {
@@ -41,6 +41,10 @@ func TestBundledCatalogFilesValidateAndBuild(t *testing.T) {
 		testassert.Require(t, len(result.Warnings) == 0, "%s: Build warnings = %#v, want none", path, result.Warnings)
 		provider := result.Catalog.Providers[providerID]
 		testassert.Require(t, provider != nil, "%s: provider %q missing after Build", path, providerID)
+		if providerID == "openrouter" {
+			testassert.Equal(t, provider.Transport.Headers["X-Title"], "Melta")
+			testassert.Equal(t, provider.Transport.Headers["HTTP-Referer"], "https://github.com/Syntheresis/melta")
+		}
 		{
 			errs := ValidateEffective(provider)
 			testassert.Require(t, len(errs) == 0, "%s: ValidateEffective errors = %#v", path, errs)

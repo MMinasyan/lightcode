@@ -1,17 +1,17 @@
-// Package builtin assembles MELTA's shipped optional native extension
+// Package builtin assembles Melta's shipped optional native extension
 // registration set: the bundled model adaptation and the Agents extension
 // (definitions, configuration edit, and child-session task tool). The durable
 // SQLite store, the jobs service, and the seven standard tools are baseline
-// services the MELTA owner constructs directly, so they are not part of
+// services the Melta owner constructs directly, so they are not part of
 // this set. It is ordinary composition data with no configuration logic and
 // no additional Core authority; a custom build supplies its own native slice
 // through the same melta.Open and its own Agent constructor worlds.
 package builtin
 
 import (
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extensions/adaptation"
-	"github.com/MMinasyan/lightcode/extensions/agents"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extensions/adaptation"
+	"github.com/Syntheresis/melta/extensions/agents"
 )
 
 // Plugins returns the shipped registration set in registration order.

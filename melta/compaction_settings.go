@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/prompt"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/prompt"
 )
 
 // compactionSettings is the parsed top-level compaction section: the optional

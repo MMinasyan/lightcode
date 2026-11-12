@@ -18,7 +18,7 @@ func BuildOffline(home string, userRaw map[string]any) (BuildResult, error) {
 	}
 	cacheDir := ""
 	if home != "" {
-		cacheDir = filepath.Join(home, ".lightcode", "cache", "discovery")
+		cacheDir = filepath.Join(home, ".melta", "cache", "discovery")
 	}
 	records, cacheWarnings := ReadDiscoveryCache(cacheDir)
 	result := Build(BuildInputs{Bundled: bundled, UserRaw: userRaw, Records: records})

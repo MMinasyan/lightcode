@@ -1,4 +1,4 @@
-<h1 align="center">Lightcode</h1>
+<h1 align="center">Melta</h1>
 
 <p align="center">
   A coding agent that works with any OpenAI-compatible LLM provider.<br>
@@ -7,11 +7,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <a href="https://goreportcard.com/report/github.com/MMinasyan/lightcode"><img src="https://goreportcard.com/badge/github.com/MMinasyan/lightcode" alt="Go Report Card"></a>
-</p>
-
-<p align="center">
-  <img src="screenshot.png" width="800" alt="Lightcode screenshot" />
+  <a href="https://goreportcard.com/report/github.com/Syntheresis/melta"><img src="https://goreportcard.com/badge/github.com/Syntheresis/melta" alt="Go Report Card"></a>
 </p>
 
 ---
@@ -31,7 +27,7 @@
 
 **Providers** — Bundled metadata for OpenAI, OpenRouter, Alibaba/Qwen, Google Gemini, xAI/Grok, DeepSeek, Moonshot/Kimi, Mistral, MiniMax, Z.ai, Together, Groq, Fireworks, and Xiaomi MiMo. Add Ollama, llama.cpp, or any other OpenAI-compatible endpoint through config. Configure N providers simultaneously, switch mid-session.
 
-Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. Provider compatibility still varies: some OpenAI-compatible models stream text correctly but do not reliably support streamed tool calls. Test a new provider/model with a real tool call before relying on it.
+Melta uses the OpenAI Chat Completions shape with streaming and tool calls. Provider compatibility still varies: some OpenAI-compatible models stream text correctly but do not reliably support streamed tool calls. Test a new provider/model with a real tool call before relying on it.
 
 **Tools** — `read_file` · `write_file` · `edit_file` · `apply_patch` · `run_command` · `process` · `sleep` · `task`
 
@@ -49,16 +45,19 @@ Lightcode uses the OpenAI Chat Completions shape with streaming and tool calls. 
 
 #### Install
 
+Existing releases still contain Lightcode. Until a Melta release is published, build from source using the
+instructions below.
+
 Linux amd64 is the first supported release target. Install the prebuilt binary from the latest GitHub Release:
 
 ```bash
-curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Syntheresis/melta/releases/latest/download/install.sh | sh
 ```
 
-Run Lightcode:
+Run Melta:
 
 ```bash
-lightcode
+melta
 ```
 
 Linux amd64 on Debian/Ubuntu and Fedora is the first supported release target. macOS, Windows, Linux arm64, and package-manager formats are not part of this first release target.
@@ -77,19 +76,19 @@ sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev
 wails build -tags webkit2_41
 ```
 
-Binary: `build/bin/lightcode`
+Binary: `build/bin/melta`
 
 Optional install:
 
 ```bash
-install -Dm755 build/bin/lightcode ~/.local/bin/lightcode
+install -Dm755 build/bin/melta ~/.local/bin/melta
 ```
 
 #### Configure
 
-Lightcode ships with bundled provider metadata, but no credentials and no preset default model. On first run it
-creates `~/.lightcode/config.json` when absent, enabling the shipped Agents and Adaptation extensions without
-selecting a model. API keys live in environment variables (or `~/.lightcode/.env`), referenced by name from
+Melta ships with bundled provider metadata, but no credentials and no preset default model. On first run it
+creates `~/.melta/config.json` when absent, enabling the shipped Agents and Adaptation extensions without
+selecting a model. API keys live in environment variables (or `~/.melta/.env`), referenced by name from
 provider `transport.api_key_env` fields:
 
 ```json
@@ -124,7 +123,7 @@ provider `transport.api_key_env` fields:
 }
 ```
 
-Add model selections to the same `~/.lightcode/config.json` document:
+Add model selections to the same `~/.melta/config.json` document:
 
 ```json
 {
@@ -143,17 +142,17 @@ Add model selections to the same `~/.lightcode/config.json` document:
 Example key setup:
 
 ```bash
-mkdir -p ~/.lightcode
-printf 'OPENROUTER_API_KEY=...\n' >> ~/.lightcode/.env
+mkdir -p ~/.melta
+printf 'OPENROUTER_API_KEY=...\n' >> ~/.melta/.env
 ```
 
-Shell-exported environment variables take precedence over values in `~/.lightcode/.env`.
+Shell-exported environment variables take precedence over values in `~/.melta/.env`.
 
 #### Permissions
 
 Every tool call is checked before execution against one automatic policy and never prompts. The built-in policy allows file reads and writes inside the workspace and denies sensitive file basenames (`.env`, private keys, credential files) even there. Its target permissions are scoped: `command.run`, `child.launch`, and `process.own` allow any target, and `sleep` only its fixed target; anything undeclared is denied. Child sessions are gated by the same policy. Pair targets are canonical: a resolved file path for the file pairs, one parsed shell segment (or the complete normalized command) for `command.run`, `*` for `sleep`, the complete source-qualified Agent definition reference for `child.launch` (extension, capability and definition components path-escaped and joined with `/`), and `<session-id>/<job-id>` for `process.own` read/kill (or `*` for its list action).
 
-Optional rule lists refine that policy: global rules live in the `permissions` member of `~/.lightcode/config.json`, per-workspace rules in `~/.lightcode/projects/p-<full SHA-256 of the cleaned absolute workspace path>/permissions.json` (that directory name is a storage key for the permission file, not a durable project record):
+Optional rule lists refine that policy: global rules live in the `permissions` member of `~/.melta/config.json`, per-workspace rules in `~/.melta/projects/p-<full SHA-256 of the cleaned absolute workspace path>/permissions.json` (that directory name is a storage key for the permission file, not a durable project record):
 
 ```json
 {
@@ -171,18 +170,18 @@ Rule targets are globs matched against the pair's canonical target — for examp
 
 #### Run
 
-Run Lightcode from the workspace directory you want it to work on:
+Run Melta from the workspace directory you want it to work on:
 
 ```bash
-lightcode                       # Desktop GUI
-lightcode cli                   # Terminal REPL
-lightcode acp                   # JSON-RPC over stdio
+melta                  # Desktop GUI
+melta cli              # Terminal REPL
+melta acp              # JSON-RPC over stdio
 ```
 
 All three clients share one managed Runtime owner process. The first client starts it
-(`lightcode runtime --data-dir ~/.lightcode --config ~/.lightcode/config.json` under the hood) and
+(`melta runtime --data-dir ~/.melta --config ~/.melta/config.json` under the hood) and
 later clients attach to the same owner. SIGINT or SIGTERM on the Runtime process is the managed
-shutdown — closing the last client is not a shutdown. `lightcode upgrade` replaces the executable,
+shutdown — closing the last client is not a shutdown. `melta upgrade` replaces the executable,
 not the running Runtime; restart the Runtime to apply backend changes.
 
 Useful CLI commands:
@@ -195,24 +194,24 @@ Useful CLI commands:
 - `/context`, `/compact`, `/warnings` — token usage, manual compaction, current warnings
 - `/children`, `/stop`, `/runtime`, `/copy`, `/clear`, `/exit`
 
-ACP clients drive Lightcode over newline-delimited JSON-RPC on stdio.
+ACP clients drive Melta over newline-delimited JSON-RPC on stdio.
 
 #### Commands
 
 Beyond the run modes above, the binary ships utility commands: `runtime` (run the shared Runtime
 owner directly; clients start it automatically), `version`, `doctor` (offline install/config
 diagnostics), `upgrade` (self-update; verifies the release's SHA-256 checksum before installing),
-`uninstall`, `completion`, `models`, and `config`. Run `lightcode help` for the full reference.
+`uninstall`, `completion`, `models`, and `config`. Run `melta help` for the full reference.
 
 #### Data locations
 
-- `~/.lightcode/config.json` — provider, baseline, extension and global permission settings, including Agent definitions
-- `~/.lightcode/.env` — local API keys
-- `~/.lightcode/lightcode.db` — durable session state (SQLite), owned by the managed owner
-- `~/.lightcode/runtime.json` — live Runtime owner record (present only while the owner runs)
-- `~/.lightcode/code/<session-id>/` — per-session code snapshots and command output (internal adjunct)
-- `~/.lightcode/cache/discovery/` — provider discovery responses
-- `~/.lightcode/debug/wire/` — raw request and stream dumps when `LIGHTCODE_DEBUG_WIRE=1`
+- `~/.melta/config.json` — provider, baseline, extension and global permission settings, including Agent definitions
+- `~/.melta/.env` — local API keys
+- `~/.melta/melta.db` — durable session state (SQLite), owned by the managed owner
+- `~/.melta/runtime.json` — live Runtime owner record (present only while the owner runs)
+- `~/.melta/code/<session-id>/` — per-session code snapshots and command output (internal adjunct)
+- `~/.melta/cache/discovery/` — provider discovery responses
+- `~/.melta/debug/wire/` — raw request and stream dumps when `MELTA_DEBUG_WIRE=1`
 
 Filesystem sessions created before the SQLite store stay under `~/.lightcode/projects/`: no reader enumerates,
 loads, migrates, repairs, or deletes their conversation or snapshot bytes. The current protocol has no retained

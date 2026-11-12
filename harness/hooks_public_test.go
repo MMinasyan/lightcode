@@ -9,9 +9,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // hookNormalize is the public hook rows' byte-preserving normalizer: it

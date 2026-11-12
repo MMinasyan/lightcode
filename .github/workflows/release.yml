@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    if: github.repository == 'MMinasyan/lightcode'
+    if: github.repository == 'Syntheresis/melta'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -95,7 +95,7 @@ jobs:
           TAG: ${{ steps.release_ref.outputs.tag }}
         run: |
           commit=$(git rev-parse --short HEAD)
-          pkg=github.com/MMinasyan/lightcode/internal/version
+          pkg=github.com/Syntheresis/melta/internal/version
           $(go env GOPATH)/bin/wails build -tags webkit2_41 -ldflags "-X ${pkg}.Version=${TAG} -X ${pkg}.Commit=${commit}"
 
       - name: Protocol freshness
@@ -118,7 +118,7 @@ jobs:
       - name: Verify selfupdate floor
         env:
           TAG: ${{ steps.release_ref.outputs.tag }}
-        run: LIGHTCODE_RELEASE_TAG="$TAG" go test ./internal/selfupdate -run TestFloorWithinReleaseTag -v
+        run: MELTA_RELEASE_TAG="$TAG" go test ./internal/selfupdate -run TestFloorWithinReleaseTag -v
 
       - name: Fuzz seed corpus
         run: go test -tags webkit2_41 -run=Fuzz ./model/... ./internal/catalog/...
@@ -128,22 +128,22 @@ jobs:
 
       - name: Check binary linkage
         run: |
-          file build/bin/lightcode
-          ldd build/bin/lightcode
-          ! ldd build/bin/lightcode | grep 'not found'
-          ldd build/bin/lightcode | grep 'libwebkit2gtk-4.1.so.0'
-          ldd build/bin/lightcode | grep 'libsoup-3.0.so.0'
+          file build/bin/melta
+          ldd build/bin/melta
+          ! ldd build/bin/melta | grep 'not found'
+          ldd build/bin/melta | grep 'libwebkit2gtk-4.1.so.0'
+          ldd build/bin/melta | grep 'libsoup-3.0.so.0'
 
       - name: Package release assets
         run: |
           mkdir -p dist/pkg
-          cp build/bin/lightcode dist/pkg/lightcode
-          chmod 755 dist/pkg/lightcode
-          tar -C dist/pkg -czf dist/lightcode-linux-amd64.tar.gz lightcode
+          cp build/bin/melta dist/pkg/melta
+          chmod 755 dist/pkg/melta
+          tar -C dist/pkg -czf dist/melta-linux-amd64.tar.gz melta
           cp scripts/install.sh dist/install.sh
           chmod 644 dist/install.sh
-          (cd dist && sha256sum install.sh lightcode-linux-amd64.tar.gz > SHA256SUMS)
-          tar -tzf dist/lightcode-linux-amd64.tar.gz
+          (cd dist && sha256sum install.sh melta-linux-amd64.tar.gz > SHA256SUMS)
+          tar -tzf dist/melta-linux-amd64.tar.gz
           (cd dist && sha256sum -c SHA256SUMS)
 
       - name: Verify packaged version
@@ -151,21 +151,21 @@ jobs:
           TAG: ${{ steps.release_ref.outputs.tag }}
         run: |
           tmp=$(mktemp -d)
-          tar -C "$tmp" -xzf dist/lightcode-linux-amd64.tar.gz
-          "$tmp/lightcode" version | grep -F "${TAG}"
+          tar -C "$tmp" -xzf dist/melta-linux-amd64.tar.gz
+          "$tmp/melta" version | grep -Fx "melta ${TAG} (linux/amd64)"
 
       - name: Upload release assets
         uses: actions/upload-artifact@v4
         with:
-          name: lightcode-release-assets
+          name: melta-release-assets
           path: |
             dist/install.sh
-            dist/lightcode-linux-amd64.tar.gz
+            dist/melta-linux-amd64.tar.gz
             dist/SHA256SUMS
           if-no-files-found: error
 
   publish:
-    if: github.repository == 'MMinasyan/lightcode'
+    if: github.repository == 'Syntheresis/melta'
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -174,15 +174,15 @@ jobs:
       - name: Download release assets
         uses: actions/download-artifact@v4
         with:
-          name: lightcode-release-assets
+          name: melta-release-assets
           path: dist
 
       - name: Verify release assets
         run: |
           test -f dist/install.sh
-          test -f dist/lightcode-linux-amd64.tar.gz
+          test -f dist/melta-linux-amd64.tar.gz
           test -f dist/SHA256SUMS
-          tar -tzf dist/lightcode-linux-amd64.tar.gz
+          tar -tzf dist/melta-linux-amd64.tar.gz
           (cd dist && sha256sum -c SHA256SUMS)
 
       - name: Publish GitHub Release
@@ -194,14 +194,14 @@ jobs:
           set -euo pipefail
           notes=dist/release-notes.md
           cat >"$notes" <<'EOF'
-          ## Lightcode Linux amd64 installer
+          ## Melta Linux amd64 installer
 
-          This release adds the Linux amd64 prebuilt installer path for Lightcode.
+          This release adds the Linux amd64 prebuilt installer path for Melta.
 
           Assets:
 
           - `install.sh`
-          - `lightcode-linux-amd64.tar.gz`
+          - `melta-linux-amd64.tar.gz`
           - `SHA256SUMS`
 
           The installer verifies the tarball checksum from `SHA256SUMS` before extraction and install.
@@ -220,7 +220,7 @@ jobs:
           if release_id=$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .id 2>/dev/null); then
             gh release upload "$RELEASE_TAG" \
               dist/install.sh \
-              dist/lightcode-linux-amd64.tar.gz \
+              dist/melta-linux-amd64.tar.gz \
               dist/SHA256SUMS \
               --clobber \
               --repo "$GH_REPO"
@@ -231,7 +231,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" \
               dist/install.sh \
-              dist/lightcode-linux-amd64.tar.gz \
+              dist/melta-linux-amd64.tar.gz \
               dist/SHA256SUMS \
               --title "$RELEASE_TAG" \
               --notes-file "$notes" \

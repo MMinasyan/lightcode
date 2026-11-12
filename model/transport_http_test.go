@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // mustTransport builds a transport from the given resolved input, failing the test on any construction error. Valid-input fixtures only; every rejection case is asserted explicitly where it belongs (TestNewTransportRejectsInvalidResolvedInput).

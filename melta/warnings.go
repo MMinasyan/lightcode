@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The Core producer source names. A source is an open string, not a closed

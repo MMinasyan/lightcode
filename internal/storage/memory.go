@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/harness"
 )
 
 // NewMemory returns the test-only in-memory implementation of the harness

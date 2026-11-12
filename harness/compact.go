@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/agent"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/agent"
+	"github.com/Syntheresis/melta/model"
 )
 
 // serializeCompactionMessages renders the frozen projected conversation as

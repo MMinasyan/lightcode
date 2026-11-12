@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // jobsComposedDoc appends top-level baseline roots to the shared composed

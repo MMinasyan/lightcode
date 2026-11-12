@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The warning-presentation suite: the Melta-owned store's setup refresh at
@@ -449,7 +449,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin(compactToolsPlugin()))
 		svc := newConfigurationService(owner, comp, sh.loader,
 			NewFileConfigurationSource(sh.configPath),
-			NewEnvironmentCredentialSource(filepath.Join(sh.home, ".lightcode", ".env")),
+			NewEnvironmentCredentialSource(filepath.Join(sh.home, ".melta", ".env")),
 			sh.locations(), harness.IncludedStrategyBinding(), r.obs)
 		svc.composition, svc.dataDir = comp, sh.dataDir
 		svc.attachWarnings(r.warnings)

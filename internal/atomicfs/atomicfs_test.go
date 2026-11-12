@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestWriteReplacesAtomicallyWithMode(t *testing.T) {
@@ -392,7 +392,7 @@ func TestWithLockSerializesReadModifyWrite(t *testing.T) {
 // TestWithLockReportsReleaseFailureToStderr proves WithLock retains the
 // callback result and reports a failed release exactly once: the callback
 // error is returned unchanged, and stderr carries exactly
-// `lightcode: release lock <lockPath>: <error>`. It fails against the old
+// `melta: release lock <lockPath>: <error>`. It fails against the old
 // defer-based release, which ignored the release error silently.
 func TestWithLockReportsReleaseFailureToStderr(t *testing.T) {
 	dir := t.TempDir()
@@ -407,7 +407,7 @@ func TestWithLockReportsReleaseFailureToStderr(t *testing.T) {
 	testassert.Equal(t, WithLock(lockPath, func() error { return callbackErr }), callbackErr)
 	{
 		out := stderr()
-		testassert.Require(t, out == "lightcode: release lock "+lockPath+": "+injected.Error()+"\n", "stderr = %q, want the one exact release diagnostic", out)
+		testassert.Require(t, out == "melta: release lock "+lockPath+": "+injected.Error()+"\n", "stderr = %q, want the one exact release diagnostic", out)
 	}
 }
 
@@ -487,7 +487,7 @@ func TestTryWithLockRows(t *testing.T) {
 		testassert.Require(t, ok && err == callbackErr, "TryWithLock = (%v, %v), want (true, callbackErr)", ok, err)
 		{
 			out := stderr()
-			testassert.Require(t, out == "lightcode: release lock "+lockPath+": "+injected.Error()+"\n", "stderr = %q, want the one exact release diagnostic", out)
+			testassert.Require(t, out == "melta: release lock "+lockPath+": "+injected.Error()+"\n", "stderr = %q, want the one exact release diagnostic", out)
 		}
 	})
 	t.Run("panic_releases", func(t *testing.T) {
@@ -513,8 +513,8 @@ func TestTryWithLockRows(t *testing.T) {
 // TestCrashBeforeRenameLeavesReadableOrphanTemp and names the destination it
 // publishes to; crashChildCreateEnv selects the CreateExclusive shape.
 const (
-	crashChildDestEnv   = "LIGHTCODE_ATOMICFS_CRASH_DEST"
-	crashChildCreateEnv = "LIGHTCODE_ATOMICFS_CRASH_CREATE"
+	crashChildDestEnv   = "MELTA_ATOMICFS_CRASH_DEST"
+	crashChildCreateEnv = "MELTA_ATOMICFS_CRASH_CREATE"
 )
 
 // TestCrashBeforeRenameLeavesReadableOrphanTemp proves the crash-before-

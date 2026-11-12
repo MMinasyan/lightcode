@@ -7,7 +7,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestBuildCatalogFromBundledOnly(t *testing.T) {
@@ -312,7 +312,7 @@ func TestBuildDeepMergesUserOverridesAndPassesSidecarsThrough(t *testing.T) {
 		},
 		UserRaw: map[string]any{
 			"openrouter": map[string]any{
-				"transport": map[string]any{"headers": map[string]any{"HTTP-Referer": "https://lightcode.local"}},
+				"transport": map[string]any{"headers": map[string]any{"HTTP-Referer": "https://melta.local"}},
 				"models": map[string]any{
 					"openai/gpt-5.4-mini": map[string]any{
 						"input_modalities": []any{"text"},
@@ -328,7 +328,7 @@ func TestBuildDeepMergesUserOverridesAndPassesSidecarsThrough(t *testing.T) {
 	testassert.Require(t, len(result.Warnings) == 0, "Build warnings = %#v, want none", result.Warnings)
 	provider, model, err := result.Catalog.Lookup(ModelRef{Provider: "openrouter", Model: "openai/gpt-5.4-mini"})
 	testassert.NoError(t, err)
-	testassert.Require(t, provider.Transport.Headers["OpenAI-Beta"] == "assistants=v2" && provider.Transport.Headers["HTTP-Referer"] == "https://lightcode.local", "headers = %#v", provider.Transport.Headers)
+	testassert.Require(t, provider.Transport.Headers["OpenAI-Beta"] == "assistants=v2" && provider.Transport.Headers["HTTP-Referer"] == "https://melta.local", "headers = %#v", provider.Transport.Headers)
 	body := ShallowMergeBody(provider.ExtraBody, model.ExtraBody)
 	testassert.Require(t, body["reasoning_effort"] == "high", "sidecar body = %#v", body)
 	{

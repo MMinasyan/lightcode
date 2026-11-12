@@ -1,4 +1,4 @@
-// Package client connects one Go caller to an authenticated Lightcode
+// Package client connects one Go caller to an authenticated Melta
 // Runtime over the generated protocol: strict startup-file discovery,
 // authenticated health, authenticated protocol byte requests, and the one SSE
 // notification stream. It imports only the standard library and the generated
@@ -18,7 +18,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The client's closed failure classification. ErrNoRuntime means no verified

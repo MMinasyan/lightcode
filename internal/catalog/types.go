@@ -1,7 +1,7 @@
-// Package catalog builds and validates Lightcode's provider/model catalog.
+// Package catalog builds and validates Melta's provider/model catalog.
 package catalog
 
-import "github.com/MMinasyan/lightcode/model"
+import "github.com/Syntheresis/melta/model"
 
 // ErrInvalidModelRef is returned when a provider-prefixed model reference is malformed.
 var ErrInvalidModelRef = model.ErrInvalidModelRef

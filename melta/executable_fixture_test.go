@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extension/worker"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extension/worker"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // buildExecutableFixture builds the shared Go authoring-adapter fixture at
@@ -38,7 +38,7 @@ func buildExecutableFixtureVersion(t *testing.T, version string) string {
 	binary := filepath.Join(t.TempDir(), "fixture-worker")
 	arguments := []string{"build"}
 	if version != "" {
-		arguments = append(arguments, "-ldflags=-X github.com/MMinasyan/lightcode/extension/worker/testdata/fixture/native.fixtureVersion="+version)
+		arguments = append(arguments, "-ldflags=-X github.com/Syntheresis/melta/extension/worker/testdata/fixture/native.fixtureVersion="+version)
 	}
 	arguments = append(arguments, "-o", binary, "./testdata/fixture")
 	command := exec.Command("go", arguments...)
@@ -219,7 +219,7 @@ func (e *productionEnv) openExecutables(ctx context.Context, executables []execu
 	return open(ctx, options{
 		DataDir:       e.dataDir,
 		Configuration: NewFileConfigurationSource(e.configPath),
-		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".lightcode", ".env")),
+		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".melta", ".env")),
 		Locations:     e.locations(),
 		Identity:      e.identity,
 		Extensions:    []extension.Native{fixtureAgentPlugin(extension.Native{Declaration: declaration})},
@@ -535,7 +535,7 @@ func (e *productionEnv) openExecutablesWith(ctx context.Context, executables []e
 	return open(ctx, options{
 		DataDir:       e.dataDir,
 		Configuration: NewFileConfigurationSource(e.configPath),
-		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".lightcode", ".env")),
+		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".melta", ".env")),
 		Locations:     e.locations(),
 		Identity:      e.identity,
 		Extensions:    extras,

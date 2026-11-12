@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/pathutil"
-	"github.com/MMinasyan/lightcode/internal/safefs"
+	"github.com/Syntheresis/melta/internal/pathutil"
+	"github.com/Syntheresis/melta/internal/safefs"
 )
 
 // executeParsedPatch is the shared apply engine for an already-parsed patch

@@ -6,7 +6,7 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // The context strategy contract: one pure algorithm deciding the context

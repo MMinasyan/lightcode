@@ -1,7 +1,7 @@
 package catalog
 
 import (
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 	"testing"
 )
 
@@ -26,7 +26,7 @@ func TestDeepMergeCatalogMergesObjectsAndReplacesArrays(t *testing.T) {
 	user := map[string]any{
 		"transport": map[string]any{
 			"headers": map[string]any{
-				"HTTP-Referer": "https://lightcode.local",
+				"HTTP-Referer": "https://melta.local",
 			},
 		},
 		"models": map[string]any{
@@ -45,7 +45,7 @@ func TestDeepMergeCatalogMergesObjectsAndReplacesArrays(t *testing.T) {
 	merged := DeepMergeCatalog(bundled, user)
 
 	headers := merged["transport"].(map[string]any)["headers"].(map[string]any)
-	testassert.Require(t, headers["OpenAI-Beta"] == "assistants=v2" && headers["HTTP-Referer"] == "https://lightcode.local", "bundled header missing after merge: %#v; user header missing after merge: %#v", headers, headers)
+	testassert.Require(t, headers["OpenAI-Beta"] == "assistants=v2" && headers["HTTP-Referer"] == "https://melta.local", "bundled header missing after merge: %#v; user header missing after merge: %#v", headers, headers)
 
 	model := merged["models"].(map[string]any)["gpt-5.4-mini"].(map[string]any)
 	extra := model["extra_body"].(map[string]any)

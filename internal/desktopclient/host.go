@@ -21,11 +21,11 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/linux"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/clientops"
-	"github.com/MMinasyan/lightcode/internal/version"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/clientops"
+	"github.com/Syntheresis/melta/internal/version"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // ConnectionInfo describes one opened native connection generation. The
@@ -110,7 +110,7 @@ func appOptions(host *Host, assets fs.FS) *options.App {
 // root host's naming: the native title is always the selected Workspace
 // basename under the product prefix.
 func windowTitle(workspace string) string {
-	return "Lightcode — " + filepath.Base(workspace)
+	return "Melta — " + filepath.Base(workspace)
 }
 
 // startup is the Wails startup hook. Wails launches it once and

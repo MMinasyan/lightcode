@@ -1,4 +1,4 @@
-module github.com/MMinasyan/lightcode
+module github.com/Syntheresis/melta
 
 go 1.26.0
 

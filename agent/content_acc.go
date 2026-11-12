@@ -3,7 +3,7 @@ package agent
 import (
 	"sort"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 type partAcc struct {

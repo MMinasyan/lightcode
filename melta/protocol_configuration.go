@@ -7,11 +7,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // This file owns the configuration/model/provider/warning read projections:
@@ -725,15 +725,15 @@ func usableModelCount(prov *catalog.Provider) int {
 }
 
 // generateAPIKeyEnvName applies the retained name-generation rule: the base
-// name LIGHTCODE_<UPPER_SNAKE_ID>_API_KEY (or the PROVIDER fallback for an
+// name MELTA_<UPPER_SNAKE_ID>_API_KEY (or the PROVIDER fallback for an
 // unusable ID), suffixed 2+ while occupied. A name is occupied when the
 // captured catalog references it or the credential source defines it —
 // managed orphans and externally defined empty variables included — so
 // allocation never reuses or overwrites an existing binding.
 func (s *configurationService) generateAPIKeyEnvName(ctx context.Context, providerID string, cat *catalog.Catalog) (string, error) {
-	base := "LIGHTCODE_" + upperSnake(providerID) + "_API_KEY"
-	if base == "LIGHTCODE__API_KEY" {
-		base = "LIGHTCODE_PROVIDER_API_KEY"
+	base := "MELTA_" + upperSnake(providerID) + "_API_KEY"
+	if base == "MELTA__API_KEY" {
+		base = "MELTA_PROVIDER_API_KEY"
 	}
 	referenced := make(map[string]bool, len(cat.Providers))
 	for _, prov := range cat.Providers {

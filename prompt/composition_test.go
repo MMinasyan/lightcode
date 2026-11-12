@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/prompt"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/prompt"
 )
 
 func assemblyInput(workspace string, mode prompt.Mode, rules prompt.Rules) prompt.AssemblyInput {
@@ -230,8 +230,8 @@ func TestAssembleInstructionHeadingNormalization(t *testing.T) {
 
 func TestAssembleUsesOnlyExplicitInputs(t *testing.T) {
 	home := t.TempDir()
-	testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700))
-	writeRules(t, filepath.Join(home, ".lightcode"), "AMBIENT_HOME_RULES")
+	testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".melta"), 0o700))
+	writeRules(t, filepath.Join(home, ".melta"), "AMBIENT_HOME_RULES")
 	t.Setenv("HOME", home)
 	t.Setenv("SHELL", "/ambient-shell")
 
@@ -241,7 +241,7 @@ func TestAssembleUsesOnlyExplicitInputs(t *testing.T) {
 	input.Shell = "caller-shell"
 	assembled := assembleInput(t, input)
 
-	for _, forbidden := range []string{"AMBIENT_HOME_RULES", "Lightcode, an agentic coding assistant", "/ambient-shell"} {
+	for _, forbidden := range []string{"AMBIENT_HOME_RULES", "Melta, an agentic coding assistant", "/ambient-shell"} {
 		testassert.Require(t, !strings.Contains(assembled, forbidden), "assembly carried implicit input %q\n%s", forbidden, assembled)
 	}
 	testassert.Require(t, strings.Contains(assembled, "Shell: caller-shell") && strings.Contains(assembled, "EXPLICIT_RULES"), "assembly lost an explicit input\n%s", assembled)

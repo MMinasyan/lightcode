@@ -9,8 +9,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func pricingRate(v float64) *float64 { return &v }

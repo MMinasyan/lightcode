@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/acpclient"
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/acpclient"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestACPSignalHelper is the subprocess entry: one bridge parked on open

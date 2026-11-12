@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extension/worker"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extension/worker"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // TestProtocolMountedPackageOperations proves the generated schema-first

@@ -18,12 +18,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // Production composition suite: the concrete preparation through public Open
@@ -274,9 +274,9 @@ func newProductionEnv(t *testing.T, store harness.Storage) *productionEnv {
 
 func (e *productionEnv) locations() Locations {
 	return Locations{
-		GlobalRulesDir:     filepath.Join(e.home, ".lightcode"),
-		DiscoveryCacheDir:  filepath.Join(e.home, ".lightcode", "cache", "discovery"),
-		WorkspacePolicyDir: filepath.Join(e.home, ".lightcode", "projects"),
+		GlobalRulesDir:     filepath.Join(e.home, ".melta"),
+		DiscoveryCacheDir:  filepath.Join(e.home, ".melta", "cache", "discovery"),
+		WorkspacePolicyDir: filepath.Join(e.home, ".melta", "projects"),
 	}
 }
 
@@ -284,7 +284,7 @@ func (e *productionEnv) options(plugins []extension.Native) Options {
 	return Options{
 		DataDir:       e.dataDir,
 		Configuration: NewFileConfigurationSource(e.configPath),
-		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".lightcode", ".env")),
+		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".melta", ".env")),
 		Locations:     e.locations(),
 		Identity:      e.identity,
 		Extensions:    plugins,

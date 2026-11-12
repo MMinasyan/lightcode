@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/atomicfs"
 )
 
 // SnapshotMeta is written alongside each snapshotted file. OriginalPath

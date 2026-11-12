@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // TestAssembleFinishReasonMatrix pins the exact finish/payload validation table: valid completions with and without a finish reason, stop requiring payload, tool_calls requiring at least one valid call, unsupported reasons erroring, identical repeat pass silently, and a later conflicting reason pinning an errored output even after completion was already established.

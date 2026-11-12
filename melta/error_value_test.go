@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 func TestErrorValueProjectsClassCauseAndOwnedPartial(t *testing.T) {

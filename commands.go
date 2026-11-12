@@ -15,11 +15,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/doctor"
-	"github.com/MMinasyan/lightcode/internal/selfupdate"
-	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/doctor"
+	"github.com/Syntheresis/melta/internal/selfupdate"
+	"github.com/Syntheresis/melta/internal/version"
 )
 
 // outW and errW are the dispatcher's streams: a command's answer goes to
@@ -49,7 +49,7 @@ var errLaunchGUI = errors.New("launch gui")
 // errSilent marks a failure whose message the handler already printed in
 // its own pinned format (the taxonomy's unprefixed exceptions, like the
 // user-decline status "cancelled"); the dispatcher exits 1 without the
-// "lightcode:" line.
+// "melta:" line.
 var errSilent = errors.New("silent failure")
 
 // command is one registry entry. The registry is the single source for
@@ -219,7 +219,7 @@ func init() {
 			summary: "remove the installed binary (and optionally all data)",
 			flags: func() *flag.FlagSet {
 				fs := newFlagSet("uninstall")
-				fs.BoolVar(&uninstallPurge, "purge", false, "also remove ~/.lightcode (API keys, sessions, snapshots)")
+				fs.BoolVar(&uninstallPurge, "purge", false, "also remove ~/.melta (API keys, sessions, snapshots)")
 				fs.BoolVar(&uninstallYes, "yes", false, "skip the confirmation prompt")
 				fs.BoolVar(&uninstallDryRun, "dry-run", false, "list what would be removed and exit")
 				return fs
@@ -343,9 +343,9 @@ func runUpgrade(raw []string) error {
 		return fmt.Errorf("no prebuilt release for %s/%s; build from source (see README)", runtime.GOOS, runtime.GOARCH)
 	}
 
-	base := os.Getenv("LIGHTCODE_RELEASE_BASE")
+	base := os.Getenv("MELTA_RELEASE_BASE")
 	if base != "" && selfupdate.IgnoreReleaseBaseAsRoot() {
-		fmt.Fprintln(errW, "note: LIGHTCODE_RELEASE_BASE ignored when running as root")
+		fmt.Fprintln(errW, "note: MELTA_RELEASE_BASE ignored when running as root")
 		base = ""
 	}
 
@@ -354,7 +354,7 @@ func runUpgrade(raw []string) error {
 		explicit = positionals[0]
 	}
 	if !version.IsRelease(version.Version) && explicit == "" {
-		return fmt.Errorf("this is a development build (%s); pass an explicit version to upgrade anyway: lightcode upgrade %s", version.String(), selfupdate.MinInstallable)
+		return fmt.Errorf("this is a development build (%s); pass an explicit version to upgrade anyway: melta upgrade %s", version.String(), selfupdate.MinInstallable)
 	}
 
 	var target string
@@ -365,7 +365,7 @@ func runUpgrade(raw []string) error {
 		}
 		target = explicit
 	case base != "":
-		return usageErrorf("LIGHTCODE_RELEASE_BASE is set; pass an explicit version")
+		return usageErrorf("MELTA_RELEASE_BASE is set; pass an explicit version")
 	default:
 		tag, err := selfupdate.LatestTag()
 		if err != nil {
@@ -399,7 +399,7 @@ func runUpgrade(raw []string) error {
 		fmt.Fprintf(errW, "installing %s over dev build\n", target)
 	}
 	if !floorOK {
-		return fmt.Errorf("%s predates the upgrade command; install it with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | LIGHTCODE_VERSION=%s sh", target, target)
+		return fmt.Errorf("%s predates the upgrade command; install it with the installer instead: curl -fsSL https://github.com/Syntheresis/melta/releases/latest/download/install.sh | MELTA_VERSION=%s sh", target, target)
 	}
 
 	targetPath, targetDir, err := selfupdate.ResolveExecutable()
@@ -407,7 +407,7 @@ func runUpgrade(raw []string) error {
 		return err
 	}
 	if !selfupdate.DirWritable(targetDir) {
-		return fmt.Errorf("binary is at %s (not writable); re-run as: sudo lightcode upgrade", targetPath)
+		return fmt.Errorf("binary is at %s (not writable); re-run as: sudo melta upgrade", targetPath)
 	}
 
 	assetURL, sumsURL := selfupdate.AssetURLs(base, target)
@@ -433,7 +433,7 @@ func runUpgrade(raw []string) error {
 	if err := selfupdate.SmokeCheck(staged, target); err != nil {
 		// #nosec G703 -- staged comes from os.CreateTemp in the binary's own resolved directory, not external input.
 		_ = os.Remove(staged)
-		return fmt.Errorf("%v; install with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | LIGHTCODE_VERSION=%s sh", err, target)
+		return fmt.Errorf("%v; install with the installer instead: curl -fsSL https://github.com/Syntheresis/melta/releases/latest/download/install.sh | MELTA_VERSION=%s sh", err, target)
 	}
 	if err := selfupdate.Replace(staged, targetPath); err != nil {
 		return err
@@ -448,8 +448,8 @@ func runUpgradeCheck(positionals []string) error {
 	if len(positionals) > 0 {
 		return usageErrorf("--check takes no version argument")
 	}
-	if os.Getenv("LIGHTCODE_RELEASE_BASE") != "" {
-		return usageErrorf("LIGHTCODE_RELEASE_BASE is set; --check is meaningless against a directory base")
+	if os.Getenv("MELTA_RELEASE_BASE") != "" {
+		return usageErrorf("MELTA_RELEASE_BASE is set; --check is meaningless against a directory base")
 	}
 	latest, err := selfupdate.LatestTag()
 	if err != nil {
@@ -470,7 +470,7 @@ func runUpgradeCheck(positionals []string) error {
 	case selfupdate.StatusDevBuild:
 		fmt.Fprintf(outW, "current: %s, latest: %s\n", result.Current, result.Latest)
 	case selfupdate.StatusUpdateAvailable:
-		fmt.Fprintf(outW, "current: %s, latest: %s (update available; run: lightcode upgrade)\n", result.Current, result.Latest)
+		fmt.Fprintf(outW, "current: %s, latest: %s (update available; run: melta upgrade)\n", result.Current, result.Latest)
 	default:
 		fmt.Fprintf(outW, "current: %s, latest: %s (up to date)\n", result.Current, result.Latest)
 	}
@@ -494,7 +494,7 @@ func runUninstall(purge, yes, dryRun bool) error {
 		if err != nil {
 			return "", fmt.Errorf("resolve home dir: %w", err)
 		}
-		return filepath.Join(home, ".lightcode"), nil
+		return filepath.Join(home, ".melta"), nil
 	}
 
 	// A pure read: it works in a pipe without --yes and against an
@@ -514,7 +514,7 @@ func runUninstall(purge, yes, dryRun bool) error {
 	dataDir := ""
 	if purge {
 		if selfupdate.Geteuid() == 0 {
-			return fmt.Errorf("refusing to purge user data as root; run 'lightcode uninstall --purge' as the owning user first, then remove the binary with sudo")
+			return fmt.Errorf("refusing to purge user data as root; run 'melta uninstall --purge' as the owning user first, then remove the binary with sudo")
 		}
 		dataDir, err = resolveDataDir()
 		if err != nil {
@@ -532,11 +532,11 @@ func runUninstall(purge, yes, dryRun bool) error {
 			// removed) can never fire when nothing was purged.
 			purge = false
 		case selfupdate.DataDirSymlink:
-			return fmt.Errorf("~/.lightcode is a symlink; refusing to purge through it")
+			return fmt.Errorf("~/.melta is a symlink; refusing to purge through it")
 		case selfupdate.DataDirNotDir:
-			return fmt.Errorf("~/.lightcode is not a directory; refusing to purge")
+			return fmt.Errorf("~/.melta is not a directory; refusing to purge")
 		case selfupdate.DataDirNotOwned:
-			return fmt.Errorf("~/.lightcode is not owned by the current user; refusing to purge")
+			return fmt.Errorf("~/.melta is not owned by the current user; refusing to purge")
 		}
 	}
 
@@ -544,7 +544,7 @@ func runUninstall(purge, yes, dryRun bool) error {
 	// install, and the refusal must be deterministic when both this
 	// preflight and the no-TTY refusal would fire.
 	if !purge && !selfupdate.DirWritable(binDir) {
-		return fmt.Errorf("binary is at %s (not writable); re-run as: sudo lightcode uninstall", binPath)
+		return fmt.Errorf("binary is at %s (not writable); re-run as: sudo melta uninstall", binPath)
 	}
 
 	if !yes {
@@ -575,7 +575,7 @@ func runUninstall(purge, yes, dryRun bool) error {
 		if purge {
 			// The privileged two-step: data is gone, the root-owned
 			// binary needs sudo. The requested operation is incomplete.
-			return fmt.Errorf("data removed; binary still installed at %s - run: sudo lightcode uninstall --yes", binPath)
+			return fmt.Errorf("data removed; binary still installed at %s - run: sudo melta uninstall --yes", binPath)
 		}
 		return err
 	}
@@ -634,12 +634,12 @@ func runConfig(pathOnly bool) error {
 	}
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return fmt.Errorf("config not created yet (run lightcode once to initialize): %s", path)
+		return fmt.Errorf("config not created yet (run melta once to initialize): %s", path)
 	}
 	if err != nil {
 		return err
 	}
-	if os.Getenv("LIGHTCODE_CONFIG") != "" {
+	if os.Getenv("MELTA_CONFIG") != "" {
 		fmt.Fprintf(errW, "using config at %s\n", path)
 	}
 	_, err = outW.Write(data)
@@ -718,8 +718,8 @@ func dispatch(argv []string) (launchGUI bool, code int) {
 	}
 	cmd := findCommand(name)
 	if cmd == nil {
-		fmt.Fprintf(errW, "lightcode: unknown command %q\n", argv[1])
-		fmt.Fprintln(errW, "Run 'lightcode help' for usage.")
+		fmt.Fprintf(errW, "melta: unknown command %q\n", argv[1])
+		fmt.Fprintln(errW, "Run 'melta help' for usage.")
 		return false, 2
 	}
 	fs := cmd.flags()
@@ -728,7 +728,7 @@ func dispatch(argv []string) (launchGUI bool, code int) {
 			renderCommandHelp(outW, cmd)
 			return false, 0
 		}
-		fmt.Fprintf(errW, "lightcode: %v\n", err)
+		fmt.Fprintf(errW, "melta: %v\n", err)
 		renderCommandUsage(errW, cmd)
 		return false, 2
 	}
@@ -743,11 +743,11 @@ func dispatch(argv []string) (launchGUI bool, code int) {
 	case exitCodeOf(err) >= 0:
 		return false, exitCodeOf(err)
 	case errors.Is(err, errUsage):
-		fmt.Fprintf(errW, "lightcode: %v\n", err)
+		fmt.Fprintf(errW, "melta: %v\n", err)
 		renderCommandUsage(errW, cmd)
 		return false, 2
 	default:
-		fmt.Fprintf(errW, "lightcode: %v\n", err)
+		fmt.Fprintf(errW, "melta: %v\n", err)
 		return false, 1
 	}
 }
@@ -761,7 +761,7 @@ func exitCodeOf(err error) int {
 }
 
 func usageLine(cmd *command) string {
-	s := "Usage: lightcode " + cmd.name
+	s := "Usage: melta " + cmd.name
 	if cmd.args != "" {
 		s += " " + cmd.args
 	}
@@ -795,9 +795,9 @@ func renderCommandHelp(w io.Writer, cmd *command) {
 }
 
 func renderTopHelp(w io.Writer) {
-	fmt.Fprintln(w, "Lightcode - coding agent")
+	fmt.Fprintln(w, "Melta - coding agent")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Usage: lightcode [command]")
+	fmt.Fprintln(w, "Usage: melta [command]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Commands:")
 	for i := range commands {
@@ -813,7 +813,7 @@ func renderTopHelp(w io.Writer) {
 	fmt.Fprintln(w, "  -h, --help      show help")
 	fmt.Fprintln(w, "  -v, --version   print the build version")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Use 'lightcode help <command>' or 'lightcode <command> -h' for command help.")
+	fmt.Fprintln(w, "Use 'melta help <command>' or 'melta <command> -h' for command help.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Exit codes: 0 success, 1 failure, 2 usage error; the terminal client exits 130 when a signal terminates it.")
 }

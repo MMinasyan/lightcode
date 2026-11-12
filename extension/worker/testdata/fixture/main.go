@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/MMinasyan/lightcode/extension/worker"
-	fixture "github.com/MMinasyan/lightcode/extension/worker/testdata/fixture/native"
+	"github.com/Syntheresis/melta/extension/worker"
+	fixture "github.com/Syntheresis/melta/extension/worker/testdata/fixture/native"
 )
 
 func main() {

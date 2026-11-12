@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // insertForeignCompactAdmission publishes one complete compact admission of

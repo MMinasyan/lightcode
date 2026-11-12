@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/internal/clientops"
-	"github.com/MMinasyan/lightcode/internal/clientview"
-	"github.com/MMinasyan/lightcode/internal/terminal"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/clientops"
+	"github.com/Syntheresis/melta/internal/clientview"
+	"github.com/Syntheresis/melta/internal/terminal"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 type readChain struct {

@@ -13,9 +13,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The client package's controlled loopback fixtures: a scripted server models

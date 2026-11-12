@@ -18,11 +18,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/snapshot"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/snapshot"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/protocol"
 	"golang.org/x/sys/unix"
 )
 
@@ -944,7 +944,7 @@ func seedLegacySessionFixture(t *testing.T, home, workspace, legacyID string) st
 	normalized := filepath.Clean(workspace)
 	sum := sha256.Sum256([]byte(normalized))
 	hash := hex.EncodeToString(sum[:])
-	dir := filepath.Join(home, ".lightcode", "projects", "p-"+hash, "sessions", legacyID)
+	dir := filepath.Join(home, ".melta", "projects", "p-"+hash, "sessions", legacyID)
 	writeTestJSON(t, filepath.Join(dir, "meta.json"), map[string]any{
 		"id":           legacyID,
 		"created_at":   "2026-01-01T00:00:00Z",

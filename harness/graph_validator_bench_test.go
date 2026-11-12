@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // benchValidatorFixture assembles a coherent Session of n terminal message

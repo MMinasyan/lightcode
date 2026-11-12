@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/atomicfs"
 )
 
 // envLockPath is the cross-process lock serializing read-modify-write of the
@@ -18,12 +18,12 @@ func envLockPath(envPath string) string {
 
 // ErrExternalKey is returned by ManagedEnv.TrySet and TryRemove when the
 // requested key is already present in the process environment from outside
-// Lightcode (a shell export). Lightcode refuses to shadow it.
-var ErrExternalKey = fmt.Errorf("env var is set externally; Lightcode will not override it")
+// Melta (a shell export). Melta refuses to shadow it.
+var ErrExternalKey = fmt.Errorf("env var is set externally; Melta will not override it")
 
 // CredentialValue is one source-coherent observation of an environment
 // variable: its current value, whether the source defines it at all, and
-// whether Lightcode's managed file owns it. Infrastructure data only — it is
+// whether Melta's managed file owns it. Infrastructure data only — it is
 // never a protocol DTO, log value, or durable capture.
 type CredentialValue struct {
 	Value   string
@@ -62,7 +62,7 @@ func (m *ManagedEnv) Capture(names []string) (map[string]CredentialValue, error)
 		return nil, err
 	}
 	for _, message := range malformed {
-		fmt.Fprintf(os.Stderr, "lightcode: .env %s: skipping %s\n", m.Path(), message)
+		fmt.Fprintf(os.Stderr, "melta: .env %s: skipping %s\n", m.Path(), message)
 	}
 	environment := parseEnviron(os.Environ())
 	out := make(map[string]CredentialValue, len(names))

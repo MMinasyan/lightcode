@@ -15,12 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/clientview"
-	"github.com/MMinasyan/lightcode/internal/terminal"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/clientview"
+	"github.com/Syntheresis/melta/internal/terminal"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 const instance = "0123456789abcdef0123456789abcdef"

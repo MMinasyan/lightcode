@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 func mountedOwner(t *testing.T, ctx context.Context, options melta.Options) (*melta.Melta, *ProtocolHost, *ProtocolServer) {

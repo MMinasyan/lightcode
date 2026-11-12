@@ -1,8 +1,8 @@
-// Package config loads the Lightcode config file and resolves process-level
+// Package config loads the Melta config file and resolves process-level
 // settings. Provider/model metadata is owned by internal/catalog and
 // extensions/agents; this package keeps only non-model runtime sections.
 //
-// Secrets are env vars. They are loaded at startup from ~/.lightcode/.env (if
+// Secrets are env vars. They are loaded at startup from ~/.melta/.env (if
 // present) or inherited from the shell. They are never written to config.json
 // and never logged.
 package config
@@ -24,7 +24,7 @@ import (
 // ErrMissingEnvVar) to surface a friendlier hint that points at the .env file.
 var ErrMissingEnvVar = errors.New("provider API key env var is unset")
 
-// ConfigPath returns the path where Lightcode expects its main config file.
+// ConfigPath returns the path where Melta expects its main config file.
 // The user owns this file; it is auto-created as an empty skeleton on first
 // run if it does not exist.
 func ConfigPath() (string, error) {
@@ -32,14 +32,14 @@ func ConfigPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".lightcode", "config.json"), nil
+	return filepath.Join(home, ".melta", "config.json"), nil
 }
 
 // ResolvePath returns the config file path the process should use: the
-// LIGHTCODE_CONFIG override when set, otherwise ConfigPath(). It only
+// MELTA_CONFIG override when set, otherwise ConfigPath(). It only
 // resolves the path — it never creates or reads the file.
 func ResolvePath() (string, error) {
-	if path := os.Getenv("LIGHTCODE_CONFIG"); path != "" {
+	if path := os.Getenv("MELTA_CONFIG"); path != "" {
 		return path, nil
 	}
 	return ConfigPath()

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestSidecarLayersShallowMergeInOrder pins rule 6: provider, then model, then runtime extra-body layers shallow-merge over the base in that order with later winning per key; values pass through byte-exact from whichever layer won them. (Reserved keys can never reach this point — their presence rejects encoding first, pinned by TestReservedKeys*.)
@@ -119,7 +119,7 @@ func TestOutputTokenFieldsNeverEmitted(t *testing.T) {
 	}
 }
 
-// TestSidecarLayersNeverEmitPrivateKeys pins rule 9 at top-level scope: _lightcode_* private persistence fields never reach the wire from any of the three sidecar layers (provider, model, runtime), and stripping them disturbs no other merge — sibling keys still shallow-merge with later layers winning.
+// TestSidecarLayersNeverEmitPrivateKeys pins rule 9 at top-level scope: _melta_* private persistence fields never reach the wire from any of the three sidecar layers (provider, model, runtime), and stripping them disturbs no other merge — sibling keys still shallow-merge with later layers winning.
 func TestSidecarLayersNeverEmitPrivateKeys(t *testing.T) {
 	req := Request{Messages: []Message{userText("hi")}} // valid request so only layer contents vary per subtest.
 
@@ -128,8 +128,8 @@ func TestSidecarLayersNeverEmitPrivateKeys(t *testing.T) {
 		private Extra  // this scope's full layer (private field plus its merge-healthy sibling).
 		wantKey string // the sibling expected to still merge exactly as usual after stripping.
 	}{
-		{"provider", Extra{"_lightcode_state": json.RawMessage(`1`), "temperature": json.RawMessage(`0.5`)}, "temperature"},
-		{"model", Extra{"_lightcode_cursor": json.RawMessage(`"x"`), "top_p": json.RawMessage(`0.9`)}, "top_p"},
+		{"provider", Extra{"_melta_state": json.RawMessage(`1`), "_lightcode_state": json.RawMessage(`7`), "temperature": json.RawMessage(`0.5`)}, "temperature"},
+		{"model", Extra{"_melta_cursor": json.RawMessage(`"x"`), "top_p": json.RawMessage(`0.9`)}, "top_p"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := testResolved() // valid baseline; only this scope's layer differs per subtest (the other scopes stay empty).
@@ -143,8 +143,11 @@ func TestSidecarLayersNeverEmitPrivateKeys(t *testing.T) {
 			testassert.Require(t, err == nil, "Encode returned unexpected error for layer %s: %v", tc.name, err)
 
 			obj := decodeObject(t, body)
+			if tc.name == "provider" {
+				testassert.Equal(t, string(obj["_lightcode_state"]), "7")
+			}
 			for k := range obj { // no private field of any spelling reaches the wire from this scope.
-				testassert.Require(t, !strings.HasPrefix(k, "_lightcode_"), "body carries private key %q from layer %s: %s", k, tc.name, string(body))
+				testassert.Require(t, !strings.HasPrefix(k, "_melta_"), "body carries private key %q from layer %s: %s", k, tc.name, string(body))
 			}
 			// the sibling merge must survive stripping exactly as usual.
 			{
@@ -157,7 +160,7 @@ func TestSidecarLayersNeverEmitPrivateKeys(t *testing.T) {
 	t.Run("runtime", func(t *testing.T) { // the per-call scope enters through Encode's own argument rather than a resolved field.
 		rt := testResolved()
 		runtimeExtras := map[string]json.RawMessage{
-			"_lightcode_trace":  json.RawMessage(`[]`),   // private key in the runtime layer itself...
+			"_melta_trace":      json.RawMessage(`[]`),   // private key in the runtime layer itself...
 			"frequency_penalty": json.RawMessage(`0.25`), // ...with a sibling that must still merge through unchanged.
 		}
 
@@ -166,7 +169,7 @@ func TestSidecarLayersNeverEmitPrivateKeys(t *testing.T) {
 
 		obj := decodeObject(t, body)
 		for k := range obj { // the private floor applies at top level exactly like in message scopes (rule 9 shared).
-			testassert.Require(t, !strings.HasPrefix(k, "_lightcode_"), "body carries private key %q from layer runtime: %s", k, string(body))
+			testassert.Require(t, !strings.HasPrefix(k, "_melta_"), "body carries private key %q from layer runtime: %s", k, string(body))
 		}
 		{
 			got := obj["frequency_penalty"]
@@ -176,16 +179,16 @@ func TestSidecarLayersNeverEmitPrivateKeys(t *testing.T) {
 
 	t.Run("all-layers-at-once", func(t *testing.T) { // one private key per scope in a single encode — the full top-level surface of rule 9.
 		rt := testResolved()
-		rt.ProviderExtraBody = Extra{"_lightcode_a": json.RawMessage(`1`)}
-		rt.ModelExtraBody = Extra{"_lightcode_b": json.RawMessage(`2`)}
-		runtimeExtras := map[string]json.RawMessage{"_lightcode_c": json.RawMessage(`3`)}
+		rt.ProviderExtraBody = Extra{"_melta_a": json.RawMessage(`1`)}
+		rt.ModelExtraBody = Extra{"_melta_b": json.RawMessage(`2`)}
+		runtimeExtras := map[string]json.RawMessage{"_melta_c": json.RawMessage(`3`)}
 
 		body, _, err := Encode(rt, req, runtimeExtras) // all three must vanish; a valid encode with nothing else to say about them.
 		testassert.NoError(t, err)
 
 		obj := decodeObject(t, body)
 		for k := range obj { // absence across every scope is what this row exists to pin in one shot.
-			testassert.Require(t, !strings.HasPrefix(k, "_lightcode_"), "body carries private key %q: %s", k, string(body))
+			testassert.Require(t, !strings.HasPrefix(k, "_melta_"), "body carries private key %q: %s", k, string(body))
 		}
 	})
 }
@@ -215,7 +218,7 @@ func TestCloneResolvedInputClonesEvenWhenEmpty(t *testing.T) {
 	dropSet["k-late"] = true                                // ...same discipline on the drop set, whose keys drive replay filtering when retained by a transport.
 	families[ModelRef{Provider: "p", Model: "m"}] = "f"     // ...and the family table consulted only for cross-model replay decisions.
 	in.MustPreserve = append(in.MustPreserve, "late-field") // slice growth on the caller's own backing storage must not extend the clone (a shared header would let it).
-	providerLayer["_lightcode_late"] = json.RawMessage(`1`) // extra-scope insertions... (must never reach retained layers through a shared map reference either).
+	providerLayer["_melta_late"] = json.RawMessage(`1`)     // extra-scope insertions... (must never reach retained layers through a shared map reference either).
 	modelLayer["k-late"] = json.RawMessage(`2`)             // ...independent per scope, so each field's clone state is judged on its own row rather than masked by siblings.
 
 	if _, ok := out.Headers["X-Late"]; ok {

@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // TestCompleteCallCountMatchesBuildCalls compares the scalar completion count with the owning construction over complete and incomplete tool-slot fixtures — the query must equal buildCalls' length without sorting, argument conversion or extra finalization — and pins that reading the count leaves the built order and verbatim raw arguments/extras untouched.

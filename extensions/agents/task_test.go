@@ -6,11 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // TestDecodeSettingsRangesAndShapes proves the settings decoder the tool's
@@ -97,12 +97,13 @@ func taskCall(t *testing.T, args string) model.ToolCall {
 
 // TestNormalizeTaskArguments proves the member validator.
 func TestNormalizeTaskArguments(t *testing.T) {
-	got, err := taskTool{}.Normalize(extension.ToolContext{}, taskCall(t, `{"prompt":"do it","subagent_type":"secondary","extra":42,"_lightcode_probe":"secret"}`))
+	got, err := taskTool{}.Normalize(extension.ToolContext{}, taskCall(t, `{"prompt":"do it","subagent_type":"secondary","extra":42,"_melta_probe":"secret","_lightcode_probe":"ordinary"}`))
 	testassert.NoError(t, err)
 	var args map[string]any
 	testassert.NoError(t, json.Unmarshal(got, &args))
+	testassert.Equal(t, args["_lightcode_probe"], any("ordinary"))
 	{
-		_, ok := args["_lightcode_probe"]
+		_, ok := args["_melta_probe"]
 		testassert.Check(t, !ok, "normalized arguments retained the private field: %s", got)
 	}
 	testassert.Check(t, args["prompt"] == "do it" && args["subagent_type"] == "secondary", "normalized arguments = %s, want the members preserved", got)

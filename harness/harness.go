@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // CallbackIdentity is the minimal immutable carrier the Harness binds to one

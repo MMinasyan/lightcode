@@ -22,8 +22,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/cmdoutput"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/cmdoutput"
 )
 
 // Exit reasons: first reason wins, recorded by whichever of the timeout or
@@ -454,7 +454,7 @@ func (j *Manager) Kill(sessionID, jobID string) error {
 		case <-time.After(5 * time.Second):
 			// An unreapable child after SIGKILL is diagnosed and abandoned
 			// rather than blocking the caller indefinitely.
-			fmt.Fprintf(os.Stderr, "lightcode: process %s not reaped within 5s after SIGKILL\n", jobID)
+			fmt.Fprintf(os.Stderr, "melta: process %s not reaped within 5s after SIGKILL\n", jobID)
 		}
 	}
 	return nil

@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/snapshot"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/snapshot"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // testCodeGroupStore adapts one real snapshot.CodeStore to the complete

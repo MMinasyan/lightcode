@@ -9,8 +9,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func snapshotTree(t *testing.T, root string) map[string]string {
@@ -44,9 +44,9 @@ func run(t *testing.T, p Params) (Report, bool) {
 func params(home string) Params {
 	return Params{
 		Home:                home,
-		ConfigPath:          filepath.Join(home, ".lightcode", "config.json"),
+		ConfigPath:          filepath.Join(home, ".melta", "config.json"),
 		WorkDir:             "/nonexistent-workdir",
-		BinaryPath:          "/test/lightcode",
+		BinaryPath:          "/test/melta",
 		Version:             "dev",
 		Platform:            "linux/amd64",
 		LookupEnv:           func(string) (string, bool) { return "", false },
@@ -67,14 +67,14 @@ func find(t *testing.T, r Report, group, name string) Check {
 
 func writeConfig(t *testing.T, home, body string) {
 	t.Helper()
-	dir := filepath.Join(home, ".lightcode")
+	dir := filepath.Join(home, ".melta")
 	testassert.NoError(t, os.MkdirAll(dir, 0o700))
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o600))
 }
 
 func writeAgents(t *testing.T, home, body string) {
 	t.Helper()
-	writeDefinitions(t, filepath.Join(home, ".lightcode", "config.json"), body)
+	writeDefinitions(t, filepath.Join(home, ".melta", "config.json"), body)
 }
 
 func writeDefinitions(t *testing.T, path, body string) {
@@ -120,7 +120,7 @@ func TestFreshHome(t *testing.T) {
 		}
 	}
 	{
-		_, err := os.Stat(filepath.Join(home, ".lightcode"))
+		_, err := os.Stat(filepath.Join(home, ".melta"))
 		testassert.Require(t, os.IsNotExist(err), "doctor created the data dir")
 	}
 }
@@ -128,7 +128,7 @@ func TestFreshHome(t *testing.T) {
 // TestExternalConfigDiagnosedWithoutDataDir pins that the addressed config
 // path, not the default data directory, governs the read-only diagnosis: an
 // external config.json and its active Agent section drive the
-// config/agents/provider/model checks while HOME/.lightcode stays absent.
+// config/agents/provider/model checks while HOME/.melta stays absent.
 func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
 	writeExternal := func(t *testing.T, dir, name, body string) string {
 		t.Helper()
@@ -171,7 +171,7 @@ func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
 		testassert.Require(t, !noProviders, "a connected external provider must clear the fresh-install hint")
 		testassert.Require(t, report.Failures == 0, "external config has failures: %+v", report.Checks)
 		{
-			_, err := os.Stat(filepath.Join(home, ".lightcode"))
+			_, err := os.Stat(filepath.Join(home, ".melta"))
 			testassert.Require(t, os.IsNotExist(err), "doctor created the data dir")
 		}
 	})
@@ -202,7 +202,7 @@ func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
 	})
 
 	t.Run("directory error keeps its own diagnostic", func(t *testing.T) {
-		// HOME exists as a regular file, so Lstat(home/.lightcode) fails
+		// HOME exists as a regular file, so Lstat(home/.melta) fails
 		// with ENOTDIR. The dir diagnostic must report that error and the
 		// addressed external config must still be diagnosed.
 		homeFile := filepath.Join(t.TempDir(), "home")
@@ -223,12 +223,12 @@ func TestExternalConfigDiagnosedWithoutDataDir(t *testing.T) {
 
 func TestMissingConfigReportedNotCreated(t *testing.T) {
 	home := t.TempDir()
-	testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700))
+	testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".melta"), 0o700))
 	report, _ := run(t, params(home))
 	c := find(t, report, "data", "config")
 	testassert.Require(t, c.Status == StatusOK && c.Detail == "config.json: not created yet (created on first run)", "data/config = %+v", c)
 	{
-		_, err := os.Stat(filepath.Join(home, ".lightcode", "config.json"))
+		_, err := os.Stat(filepath.Join(home, ".melta", "config.json"))
 		testassert.Require(t, os.IsNotExist(err), "doctor created config.json")
 	}
 }
@@ -318,7 +318,7 @@ func TestKeySourceClasses(t *testing.T) {
 	t.Run("dotenv-only key is managed and connected", func(t *testing.T) {
 		home := t.TempDir()
 		writeConfig(t, home, keyedProviderConfig)
-		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("DOCTOR_TEST_KEY=x\n"), 0o600))
+		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".melta", ".env"), []byte("DOCTOR_TEST_KEY=x\n"), 0o600))
 		report, _ := run(t, params(home))
 		c := find(t, report, "providers", "keyedtest")
 		testassert.Require(t, c.Status == StatusOK && c.Detail == "key managed, connected, 1 usable models", "dotenv-only key = %+v (the false-none/false-disconnected regression)", c)
@@ -336,7 +336,7 @@ func TestKeySourceClasses(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				home := t.TempDir()
 				writeConfig(t, home, keyedProviderConfig)
-				testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte(envBody), 0o600))
+				testassert.NoError(t, os.WriteFile(filepath.Join(home, ".melta", ".env"), []byte(envBody), 0o600))
 				report, noProviders := run(t, params(home))
 				c := find(t, report, "providers", "keyedtest")
 				testassert.Require(t, c.Status == StatusOK && c.Detail == "key managed, not connected, 1 usable models", "empty dotenv value = %+v", c)
@@ -359,7 +359,7 @@ func TestKeySourceClasses(t *testing.T) {
   "default_model": "keyedtest/m1"
 }`)
 		writeAgents(t, home, `{"primary": {"model": "keyedtest/m1"}}`)
-		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("DOCTOR_TEST_KEY=\n"), 0o600))
+		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".melta", ".env"), []byte("DOCTOR_TEST_KEY=\n"), 0o600))
 		report, _ := run(t, params(home))
 		{
 			c := find(t, report, "setup", "model")
@@ -383,7 +383,7 @@ func TestKeySourceClasses(t *testing.T) {
 		// to an empty value, so the .env credential never loads.
 		home := t.TempDir()
 		writeConfig(t, home, keyedProviderConfig)
-		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("DOCTOR_TEST_KEY=x\n"), 0o600))
+		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".melta", ".env"), []byte("DOCTOR_TEST_KEY=x\n"), 0o600))
 		p := params(home)
 		p.LookupEnv = func(name string) (string, bool) { return "", name == "DOCTOR_TEST_KEY" }
 		report, noProviders := run(t, p)
@@ -395,7 +395,7 @@ func TestKeySourceClasses(t *testing.T) {
 	t.Run("shell beats dotenv", func(t *testing.T) {
 		home := t.TempDir()
 		writeConfig(t, home, keyedProviderConfig)
-		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("DOCTOR_TEST_KEY=x\n"), 0o600))
+		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".melta", ".env"), []byte("DOCTOR_TEST_KEY=x\n"), 0o600))
 		p := params(home)
 		p.LookupEnv = func(name string) (string, bool) { return "x", name == "DOCTOR_TEST_KEY" }
 		report, _ := run(t, p)
@@ -552,7 +552,7 @@ func TestCatalogWarningSeverities(t *testing.T) {
 
 	t.Run("corrupt discovery cache warns", func(t *testing.T) {
 		home := t.TempDir()
-		dir := filepath.Join(home, ".lightcode", "cache", "discovery")
+		dir := filepath.Join(home, ".melta", "cache", "discovery")
 		testassert.NoError(t, os.MkdirAll(dir, 0o700))
 		testassert.NoError(t, os.WriteFile(filepath.Join(dir, "cacheprov.json"), []byte("{not json"), 0o600))
 		report, _ := run(t, params(home))
@@ -582,7 +582,7 @@ func TestCatalogWarningSeverities(t *testing.T) {
 func TestMalformedDotEnvLineWarns(t *testing.T) {
 	home := t.TempDir()
 	writeConfig(t, home, `{"providers": {}, "default_model": ""}`)
-	testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", ".env"), []byte("no equals sign\nGOOD_KEY=v\n"), 0o600))
+	testassert.NoError(t, os.WriteFile(filepath.Join(home, ".melta", ".env"), []byte("no equals sign\nGOOD_KEY=v\n"), 0o600))
 	report, _ := run(t, params(home))
 	warned := false
 	for _, c := range report.Checks {
@@ -595,7 +595,7 @@ func TestMalformedDotEnvLineWarns(t *testing.T) {
 
 func TestPermissionWarnings(t *testing.T) {
 	home := t.TempDir()
-	dir := filepath.Join(home, ".lightcode")
+	dir := filepath.Join(home, ".melta")
 	testassert.NoError(t, os.MkdirAll(dir, 0o755))
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("K=v\n"), 0o644))
 	report, _ := run(t, params(home))
@@ -616,7 +616,7 @@ func TestSymlinkDataDirWarns(t *testing.T) {
 	home := t.TempDir()
 	real := filepath.Join(home, "realdata")
 	testassert.NoError(t, os.MkdirAll(real, 0o700))
-	testassert.NoError(t, os.Symlink(real, filepath.Join(home, ".lightcode")))
+	testassert.NoError(t, os.Symlink(real, filepath.Join(home, ".melta")))
 	report, _ := run(t, params(home))
 	c := find(t, report, "data", "dir")
 	testassert.Require(t, c.Status == StatusWarn, "symlinked data dir = %+v, want warn", c)

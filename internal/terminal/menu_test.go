@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestShowMenuDoesNotRedrawAtNavigationBounds(t *testing.T) {

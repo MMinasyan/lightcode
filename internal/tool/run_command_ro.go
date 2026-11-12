@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/shellparse"
+	"github.com/Syntheresis/melta/internal/shellparse"
 )
 
 var simpleReadOnlyCommands = map[string]bool{

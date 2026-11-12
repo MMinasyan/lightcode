@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// bundledFS contains Lightcode's hand-curated built-in provider catalog files.
+// bundledFS contains Melta's hand-curated built-in provider catalog files.
 //
 //go:embed builtin
 var bundledFS embed.FS

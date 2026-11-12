@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
 )
 
 func TestOwnCallErrorValidatesAndOwnsPartial(t *testing.T) {

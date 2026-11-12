@@ -16,14 +16,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The connection suite: the write-only provider connect/disconnect and the
@@ -471,7 +471,7 @@ func TestConnectProviderExternalKeyNeverPersisted(t *testing.T) {
 		r, _ := openConnectionRuntime(t, store, server.URL)
 		defer closeProjectionRuntime(r)
 		ctx := context.Background()
-		// The shell key is set outside Lightcode and stays unmanaged. The
+		// The shell key is set outside Melta and stays unmanaged. The
 		// published revision observes it at the next build.
 		t.Setenv("CONNECTION_DISC_KEY", "shell-exported-value")
 		_, err := r.Reload(ctx, testCaller(r))
@@ -1401,7 +1401,7 @@ func TestDisconnectProviderOverlappingReadStaysCoherent(t *testing.T) {
 // after a real generation N+1 credential mutation publishes, while N+1's own
 // capture projects the removed pair.
 func TestMutationResultStaysFrozenAfterNextPublication(t *testing.T) {
-	reserveEnvKey(t, "LIGHTCODE_FROZEN_API_KEY")
+	reserveEnvKey(t, "MELTA_FROZEN_API_KEY")
 	h := newMetadataHarness(t)
 	writeServiceFile(t, h.configPath, metadataConfigDocument)
 	svc := h.service(context.Background(), servicePlugin("capowner", &h.opens, acceptValidator))
@@ -1478,7 +1478,7 @@ func TestDisconnectProviderRefusals(t *testing.T) {
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, harness.ErrInvalid)
 
 		// An external set key refuses, naming the env variable alone — no
-		// value exists in a Lightcode store, and none is invented.
+		// value exists in a Melta store, and none is invented.
 		_, err = r.DisconnectProvider(ctx, testCaller(r), "staticp")
 		testassert.Require(t, err != nil && strings.Contains(err.Error(), "CONNECTION_STATIC_KEY") && !strings.Contains(err.Error(), "shell-exported-value"), "external disconnect error %q, want the env name without any value", err)
 		assertRuntimeMutationRefused(t, r, sub, before, generation, warnRev, err, ErrConfiguration)
@@ -1638,7 +1638,7 @@ func TestCreateProviderGeneratedEnvNamePersistsExactKey(t *testing.T) {
 		r, _, sub, closeRuntime := openConnectionSubscription(t, store, server.URL, 8)
 		defer closeRuntime()
 		ctx := context.Background()
-		reserveEnvKey(t, "LIGHTCODE_NEWP_API_KEY")
+		reserveEnvKey(t, "MELTA_NEWP_API_KEY")
 
 		key := "sk-live-add-1"
 		window := 4096
@@ -1650,14 +1650,14 @@ func TestCreateProviderGeneratedEnvNamePersistsExactKey(t *testing.T) {
 
 		// The generated name went to the raw layer, the exact (untrimmed)
 		// value only to the managed env.
-		testassert.Equal(t, mutation.Result.ApiKeyEnv, "LIGHTCODE_NEWP_API_KEY")
+		testassert.Equal(t, mutation.Result.ApiKeyEnv, "MELTA_NEWP_API_KEY")
 		raw, err := os.ReadFile(r.configPathForTest())
-		testassert.Require(t, err == nil && strings.Contains(string(raw), `"api_key_env": "LIGHTCODE_NEWP_API_KEY"`) && !strings.Contains(string(raw), key), "raw config = (%q, %v), want the generated name and never the key value", raw, err)
-		if envValueForTest(r, "LIGHTCODE_NEWP_API_KEY") != key || !testManaged(r, "LIGHTCODE_NEWP_API_KEY") {
-			t.Fatalf("managed key state = (%q, %v)", envValueForTest(r, "LIGHTCODE_NEWP_API_KEY"), testManaged(r, "LIGHTCODE_NEWP_API_KEY"))
+		testassert.Require(t, err == nil && strings.Contains(string(raw), `"api_key_env": "MELTA_NEWP_API_KEY"`) && !strings.Contains(string(raw), key), "raw config = (%q, %v), want the generated name and never the key value", raw, err)
+		if envValueForTest(r, "MELTA_NEWP_API_KEY") != key || !testManaged(r, "MELTA_NEWP_API_KEY") {
+			t.Fatalf("managed key state = (%q, %v)", envValueForTest(r, "MELTA_NEWP_API_KEY"), testManaged(r, "MELTA_NEWP_API_KEY"))
 		}
 		envData, err := os.ReadFile(r.managedEnvForTest().Path())
-		testassert.Require(t, err == nil && strings.Contains(string(envData), "LIGHTCODE_NEWP_API_KEY="+key+"\n"), ".env = (%q, %v), want the exact untrimmed value", envData, err)
+		testassert.Require(t, err == nil && strings.Contains(string(envData), "MELTA_NEWP_API_KEY="+key+"\n"), ".env = (%q, %v), want the exact untrimmed value", envData, err)
 		mutBytes, merr := json.Marshal(mutation)
 		testassert.Require(t, merr == nil && !strings.Contains(string(mutBytes), key), "mutation bytes carry the key value (%v)", merr)
 		eventBytes, eerr := json.Marshal(event)
@@ -1878,7 +1878,7 @@ func TestCreateProviderGeneratedNameSkipsOccupiedNames(t *testing.T) {
 		// The catalog-referenced occupancy: one no-key registration names the
 		// holder's binding explicitly, so every later captured catalog
 		// references that base name.
-		holderEnv := "LIGHTCODE_CATALOGREF_API_KEY"
+		holderEnv := "MELTA_CATALOGREF_API_KEY"
 		reserveEnvKey(t, holderEnv)
 		{
 			_, err := r.AddProvider(ctx, testCaller(r), "catrefholder",
@@ -1895,31 +1895,31 @@ func TestCreateProviderGeneratedNameSkipsOccupiedNames(t *testing.T) {
 			occupy func(t *testing.T)
 			intact func(t *testing.T, base string)
 		}{
-			{"managed orphan", "newp", "LIGHTCODE_NEWP_API_KEY",
+			{"managed orphan", "newp", "MELTA_NEWP_API_KEY",
 				func(t *testing.T) {
-					testassert.NoError(t, r.managedEnvForTest().TrySet("LIGHTCODE_NEWP_API_KEY", "stale-managed-value"))
+					testassert.NoError(t, r.managedEnvForTest().TrySet("MELTA_NEWP_API_KEY", "stale-managed-value"))
 				},
 				func(t *testing.T, base string) {
 					if envValueForTest(r, base) != "stale-managed-value" || !testManaged(r, base) {
 						t.Fatalf("managed orphan after allocation = (%q, %v), want the stale value untouched", envValueForTest(r, base), testManaged(r, base))
 					}
 				}},
-			{"externally defined empty", "emptyext", "LIGHTCODE_EMPTYEXT_API_KEY",
-				func(t *testing.T) { t.Setenv("LIGHTCODE_EMPTYEXT_API_KEY", "") },
+			{"externally defined empty", "emptyext", "MELTA_EMPTYEXT_API_KEY",
+				func(t *testing.T) { t.Setenv("MELTA_EMPTYEXT_API_KEY", "") },
 				func(t *testing.T, base string) {
 					value, defined := os.LookupEnv(base)
 					if !defined || value != "" || testManaged(r, base) {
 						t.Fatalf("external-empty occupancy after allocation = (%q, defined %v, managed %v), want it untouched and unmanaged", value, defined, testManaged(r, base))
 					}
 				}},
-			{"externally defined nonempty", "shellext", "LIGHTCODE_SHELLEXT_API_KEY",
-				func(t *testing.T) { t.Setenv("LIGHTCODE_SHELLEXT_API_KEY", "shell-exported-value") },
+			{"externally defined nonempty", "shellext", "MELTA_SHELLEXT_API_KEY",
+				func(t *testing.T) { t.Setenv("MELTA_SHELLEXT_API_KEY", "shell-exported-value") },
 				func(t *testing.T, base string) {
 					if envValueForTest(r, base) != "shell-exported-value" || testManaged(r, base) {
 						t.Fatalf("external shell occupancy after allocation = (%q, %v), want it untouched and unmanaged", envValueForTest(r, base), testManaged(r, base))
 					}
 				}},
-			{"catalog referenced", "catalogref", "LIGHTCODE_CATALOGREF_API_KEY",
+			{"catalog referenced", "catalogref", "MELTA_CATALOGREF_API_KEY",
 				func(t *testing.T) {},
 				func(t *testing.T, base string) {
 					testassert.Equal(t, r.config.current().catalog.Providers["catrefholder"].Transport.APIKeyEnv, base)

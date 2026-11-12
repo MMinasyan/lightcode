@@ -12,13 +12,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extensions/adaptation"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/internal/tool"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/prompt"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extensions/adaptation"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/internal/tool"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/prompt"
 )
 
 // Tool-spec fixtures for the composer: ToolSpec records the pure describe

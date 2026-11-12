@@ -3,7 +3,7 @@ package harness
 import (
 	"math"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // This file owns the read-time approximate USD cost estimate. It computes

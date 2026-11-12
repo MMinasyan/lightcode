@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/agent"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/agent"
+	"github.com/Syntheresis/melta/model"
 )
 
 // executionDriver is the one owner of one admitted run: the immutable capture,

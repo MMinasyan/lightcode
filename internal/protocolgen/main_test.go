@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // The fixture schemas are one valid Health/Events baseline with local
@@ -1214,7 +1214,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 type recordedCall struct {
@@ -1403,7 +1403,7 @@ func TestGeneratedFixtureCompilesAndDispatches(t *testing.T) {
 			testassert.Require(t, reflect.DeepEqual(got.QueryMembers, want.QueryMembers), "fixture contract %q query members = %+v, want %+v", name, got.QueryMembers, want.QueryMembers)
 		}
 	}
-	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte(`module github.com/MMinasyan/lightcode
+	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte(`module github.com/Syntheresis/melta
 
 go 1.26.0
 

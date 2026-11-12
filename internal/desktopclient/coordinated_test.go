@@ -21,14 +21,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/acpclient"
-	"github.com/MMinasyan/lightcode/internal/cliclient"
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/protocol"
-	"github.com/MMinasyan/lightcode/runtime"
+	"github.com/Syntheresis/melta/internal/acpclient"
+	"github.com/Syntheresis/melta/internal/cliclient"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/plugins/builtin"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/protocol"
+	"github.com/Syntheresis/melta/runtime"
 	"golang.org/x/sys/unix"
 )
 

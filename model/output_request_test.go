@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // assistantMsg builds a valid assistant message on the full test source and applies an optional mutation to it.

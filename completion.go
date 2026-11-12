@@ -60,9 +60,9 @@ func escapeSingleQuoted(s string) string {
 
 func writeBashCompletion(w io.Writer) {
 	top := append(commandNames(), "-h", "--help", "-v", "--version")
-	fmt.Fprintln(w, "# bash completion for lightcode")
-	fmt.Fprintln(w, `# install: eval "$(lightcode completion bash)"`)
-	fmt.Fprintln(w, "_lightcode_completions() {")
+	fmt.Fprintln(w, "# bash completion for melta")
+	fmt.Fprintln(w, `# install: eval "$(melta completion bash)"`)
+	fmt.Fprintln(w, "_melta_completions() {")
 	fmt.Fprintln(w, `    local cur="${COMP_WORDS[COMP_CWORD]}"`)
 	fmt.Fprintln(w, `    if [ "$COMP_CWORD" -eq 1 ]; then`)
 	fmt.Fprintf(w, "        COMPREPLY=($(compgen -W '%s' -- \"$cur\"))\n", escapeSingleQuoted(strings.Join(top, " ")))
@@ -77,15 +77,15 @@ func writeBashCompletion(w io.Writer) {
 	}
 	fmt.Fprintln(w, "    esac")
 	fmt.Fprintln(w, "}")
-	fmt.Fprintln(w, "complete -F _lightcode_completions lightcode")
+	fmt.Fprintln(w, "complete -F _melta_completions melta")
 }
 
 func writeZshCompletion(w io.Writer) {
-	fmt.Fprintln(w, "#compdef lightcode")
-	fmt.Fprintln(w, `# install: eval "$(lightcode completion zsh)"`)
-	fmt.Fprintln(w, "_lightcode() {")
-	fmt.Fprintln(w, "    local -a _lightcode_commands")
-	fmt.Fprintln(w, "    _lightcode_commands=(")
+	fmt.Fprintln(w, "#compdef melta")
+	fmt.Fprintln(w, `# install: eval "$(melta completion zsh)"`)
+	fmt.Fprintln(w, "_melta() {")
+	fmt.Fprintln(w, "    local -a _melta_commands")
+	fmt.Fprintln(w, "    _melta_commands=(")
 	for i := range commands {
 		cmd := &commands[i]
 		fmt.Fprintf(w, "        '%s:%s'\n", cmd.name, escapeSingleQuoted(cmd.summary))
@@ -96,7 +96,7 @@ func writeZshCompletion(w io.Writer) {
 	fmt.Fprintln(w, "        '--version:print the build version'")
 	fmt.Fprintln(w, "    )")
 	fmt.Fprintln(w, "    if (( CURRENT == 2 )); then")
-	fmt.Fprintln(w, "        _describe 'command' _lightcode_commands")
+	fmt.Fprintln(w, "        _describe 'command' _melta_commands")
 	fmt.Fprintln(w, "        return")
 	fmt.Fprintln(w, "    fi")
 	fmt.Fprintln(w, `    case "${words[2]}" in`)
@@ -110,32 +110,32 @@ func writeZshCompletion(w io.Writer) {
 	fmt.Fprintln(w, "}")
 	// compdef registers under eval too; the #compdef header alone is only
 	// honored when the file is loaded from fpath.
-	fmt.Fprintln(w, "compdef _lightcode lightcode")
+	fmt.Fprintln(w, "compdef _melta melta")
 }
 
 func writeFishCompletion(w io.Writer) {
-	fmt.Fprintln(w, "# fish completion for lightcode")
-	fmt.Fprintln(w, "# install: lightcode completion fish | source")
-	fmt.Fprintln(w, "complete -c lightcode -f")
+	fmt.Fprintln(w, "# fish completion for melta")
+	fmt.Fprintln(w, "# install: melta completion fish | source")
+	fmt.Fprintln(w, "complete -c melta -f")
 	for i := range commands {
 		cmd := &commands[i]
-		fmt.Fprintf(w, "complete -c lightcode -n __fish_use_subcommand -a %s -d '%s'\n", cmd.name, escapeSingleQuoted(cmd.summary))
+		fmt.Fprintf(w, "complete -c melta -n __fish_use_subcommand -a %s -d '%s'\n", cmd.name, escapeSingleQuoted(cmd.summary))
 	}
-	fmt.Fprintln(w, "complete -c lightcode -n __fish_use_subcommand -s h -l help -d 'show help'")
-	fmt.Fprintln(w, "complete -c lightcode -n __fish_use_subcommand -s v -l version -d 'print the build version'")
+	fmt.Fprintln(w, "complete -c melta -n __fish_use_subcommand -s h -l help -d 'show help'")
+	fmt.Fprintln(w, "complete -c melta -n __fish_use_subcommand -s v -l version -d 'print the build version'")
 	for i := range commands {
 		cmd := &commands[i]
 		cond := fmt.Sprintf("__fish_seen_subcommand_from %s", cmd.name)
 		if cmd.name == "completion" {
-			fmt.Fprintf(w, "complete -c lightcode -n '%s' -a 'bash zsh fish'\n", cond)
+			fmt.Fprintf(w, "complete -c melta -n '%s' -a 'bash zsh fish'\n", cond)
 		}
 		for _, name := range registeredFlagNames(cmd) {
 			if len(name) == 1 {
-				fmt.Fprintf(w, "complete -c lightcode -n '%s' -s %s\n", cond, name)
+				fmt.Fprintf(w, "complete -c melta -n '%s' -s %s\n", cond, name)
 			} else {
-				fmt.Fprintf(w, "complete -c lightcode -n '%s' -o %s -l %s\n", cond, name, name)
+				fmt.Fprintf(w, "complete -c melta -n '%s' -o %s -l %s\n", cond, name, name)
 			}
 		}
-		fmt.Fprintf(w, "complete -c lightcode -n '%s' -s h -l help -d 'show help'\n", cond)
+		fmt.Fprintf(w, "complete -c melta -n '%s' -s h -l help -d 'show help'\n", cond)
 	}
 }

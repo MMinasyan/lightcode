@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestCatalogLookupReturnsUnknownErrors(t *testing.T) {

@@ -15,8 +15,8 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/internal/safefs"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/internal/safefs"
 )
 
 // extensionDataHash is the one path component derived from a validated

@@ -1,7 +1,7 @@
 package config
 
 import (
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 	"testing"
 )
 

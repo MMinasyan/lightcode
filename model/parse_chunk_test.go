@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestParseStreamChunkRaw pins the fixed parser contract row by row: top-level chunk shape typing, usage normalization arithmetic with its single floor at zero, first-choice-only selection, raw pass-through of role/finish reasons and tool-call name/argument pieces, strict typing for every present non-null canonical field while null stays absent at each scope, closed content-kind classification with byte-for-byte extra retention under the retained denylists, per-event lowest-unused-index normalization for omitted tool indexes (with supplied duplicates tolerated), and protocol errors naming their exact offending shape for any wrong type.

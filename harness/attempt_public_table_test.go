@@ -23,10 +23,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // attemptTableFixture wires one Harness over the given store whose prepared
@@ -224,7 +224,7 @@ func TestPublicSharedAttemptOrchestrationTable(t *testing.T) {
 	}{
 		{"memory", func(t *testing.T) harness.Storage { return storage.NewMemory() }},
 		{"sqlite", func(t *testing.T) harness.Storage {
-			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 			testassert.NoError(t, err)
 			t.Cleanup(func() { store.Close() })
 			return store

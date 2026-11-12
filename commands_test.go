@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/selfupdate"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/Syntheresis/melta/internal/selfupdate"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/internal/version"
 )
 
 // capture swaps the dispatcher streams for one dispatch call.
@@ -36,30 +36,30 @@ func capture(t *testing.T, argv []string) (launchGUI bool, code int, stdout, std
 }
 
 func TestDispatchUnknownCommand(t *testing.T) {
-	gui, code, stdout, stderr := capture(t, []string{"lightcode", "frobnicate"})
+	gui, code, stdout, stderr := capture(t, []string{"melta", "frobnicate"})
 	testassert.Require(t, !gui, "unknown command must not reach the GUI path")
 	testassert.Equal(t, code, 2)
 	testassert.Equal(t, stdout, "")
-	testassert.Require(t, strings.Contains(stderr, `lightcode: unknown command "frobnicate"`) && strings.Contains(stderr, "Run 'lightcode help' for usage."), "stderr missing unknown-command message: %q; stderr missing usage hint: %q", stderr, stderr)
+	testassert.Require(t, strings.Contains(stderr, `melta: unknown command "frobnicate"`) && strings.Contains(stderr, "Run 'melta help' for usage."), "stderr missing unknown-command message: %q; stderr missing usage hint: %q", stderr, stderr)
 }
 
 func TestDispatchUnknownCommandEscapesControlBytes(t *testing.T) {
-	_, code, _, stderr := capture(t, []string{"lightcode", "\x1b]0;evil\x07"})
+	_, code, _, stderr := capture(t, []string{"melta", "\x1b]0;evil\x07"})
 	testassert.Equal(t, code, 2)
 	testassert.Require(t, !strings.ContainsAny(stderr, "\x1b\x07") && strings.Contains(stderr, `\x1b`), "raw control bytes reached stderr: %q; escaped form missing from stderr: %q", stderr, stderr)
 }
 
 func TestDispatchHelpForms(t *testing.T) {
 	for _, argv := range [][]string{
-		{"lightcode", "help"},
-		{"lightcode", "-h"},
-		{"lightcode", "--help"},
+		{"melta", "help"},
+		{"melta", "-h"},
+		{"melta", "--help"},
 	} {
 		gui, code, stdout, stderr := capture(t, argv)
 		testassert.Require(t, !gui && code == 0, "%v: gui=%v code=%d, want handled exit 0", argv, gui, code)
 		testassert.Require(t, stderr == "", "%v: stderr must be empty, got %q", argv, stderr)
 		for _, want := range []string{
-			"Usage: lightcode [command]",
+			"Usage: melta [command]",
 			"desktop", "cli", "acp", "runtime", "help",
 			"(default)",
 			"Exit codes: 0 success, 1 failure, 2 usage error; the terminal client exits 130 when a signal terminates it.",
@@ -70,66 +70,66 @@ func TestDispatchHelpForms(t *testing.T) {
 }
 
 func TestDispatchHelpForCommand(t *testing.T) {
-	_, code, stdout, stderr := capture(t, []string{"lightcode", "help", "doctor"})
+	_, code, stdout, stderr := capture(t, []string{"melta", "help", "doctor"})
 	testassert.Equal(t, code, 0)
 	testassert.Equal(t, stderr, "")
-	testassert.Require(t, strings.Contains(stdout, "Usage: lightcode doctor [flags]") && strings.Contains(stdout, "-json"), "stdout missing doctor usage: %q; stdout missing -json flag: %q", stdout, stdout)
+	testassert.Require(t, strings.Contains(stdout, "Usage: melta doctor [flags]") && strings.Contains(stdout, "-json"), "stdout missing doctor usage: %q; stdout missing -json flag: %q", stdout, stdout)
 }
 
 func TestDispatchHelpUnknownCommand(t *testing.T) {
-	_, code, stdout, stderr := capture(t, []string{"lightcode", "help", "nosuch"})
+	_, code, stdout, stderr := capture(t, []string{"melta", "help", "nosuch"})
 	testassert.Equal(t, code, 2)
 	testassert.Equal(t, stdout, "")
-	testassert.Require(t, strings.Contains(stderr, `lightcode: unknown command "nosuch"`), "stderr missing message: %q", stderr)
+	testassert.Require(t, strings.Contains(stderr, `melta: unknown command "nosuch"`), "stderr missing message: %q", stderr)
 }
 
 func TestDispatchHelpExtraPositional(t *testing.T) {
-	_, code, _, stderr := capture(t, []string{"lightcode", "help", "a", "b"})
+	_, code, _, stderr := capture(t, []string{"melta", "help", "a", "b"})
 	testassert.Equal(t, code, 2)
-	testassert.Require(t, strings.Contains(stderr, "Usage: lightcode help [command]"), "stderr missing help usage: %q", stderr)
+	testassert.Require(t, strings.Contains(stderr, "Usage: melta help [command]"), "stderr missing help usage: %q", stderr)
 }
 
 func TestDispatchBareReachesGUIPath(t *testing.T) {
-	gui, code, stdout, stderr := capture(t, []string{"lightcode"})
+	gui, code, stdout, stderr := capture(t, []string{"melta"})
 	testassert.Require(t, gui && code == 0, "gui=%v code=%d, want GUI path", gui, code)
 	testassert.Require(t, stdout == "" && stderr == "", "bare invocation must print nothing, got out=%q err=%q", stdout, stderr)
 }
 
 func TestDispatchDesktopSameAsBare(t *testing.T) {
-	gui, code, stdout, stderr := capture(t, []string{"lightcode", "desktop"})
+	gui, code, stdout, stderr := capture(t, []string{"melta", "desktop"})
 	testassert.Require(t, gui && code == 0, "gui=%v code=%d, want GUI path", gui, code)
 	testassert.Require(t, stdout == "" && stderr == "", "desktop must print nothing, got out=%q err=%q", stdout, stderr)
 }
 
 func TestDispatchPerCommandHelpFlag(t *testing.T) {
 	for _, name := range []string{"desktop", "cli", "acp", "runtime", "doctor", "completion", "models", "config", "help"} {
-		_, code, stdout, stderr := capture(t, []string{"lightcode", name, "-h"})
+		_, code, stdout, stderr := capture(t, []string{"melta", name, "-h"})
 		testassert.Require(t, code == 0, "%s -h: exit code = %d, want 0", name, code)
 		testassert.Require(t, stderr == "", "%s -h: stderr must be empty, got %q", name, stderr)
-		testassert.Require(t, strings.Contains(stdout, "Usage: lightcode "+name), "%s -h: stdout missing usage: %q", name, stdout)
+		testassert.Require(t, strings.Contains(stdout, "Usage: melta "+name), "%s -h: stdout missing usage: %q", name, stdout)
 	}
 }
 
 func TestDispatchBadFlagPrintsUsageOnce(t *testing.T) {
-	_, code, stdout, stderr := capture(t, []string{"lightcode", "doctor", "-json=abc"})
+	_, code, stdout, stderr := capture(t, []string{"melta", "doctor", "-json=abc"})
 	testassert.Equal(t, code, 2)
 	testassert.Equal(t, stdout, "")
-	testassert.Require(t, strings.HasPrefix(stderr, "lightcode: "), "stderr missing error prefix: %q", stderr)
+	testassert.Require(t, strings.HasPrefix(stderr, "melta: "), "stderr missing error prefix: %q", stderr)
 	{
-		n := strings.Count(stderr, "Usage: lightcode doctor")
+		n := strings.Count(stderr, "Usage: melta doctor")
 		testassert.Require(t, n == 1, "usage printed %d times, want exactly once:\n%s", n, stderr)
 	}
 }
 
 func TestDispatchUnexpectedPositionals(t *testing.T) {
 	for _, argv := range [][]string{
-		{"lightcode", "cli", "extra"},
-		{"lightcode", "acp", "extra"},
-		{"lightcode", "desktop", "extra"},
-		{"lightcode", "runtime", "extra"},
-		{"lightcode", "doctor", "extra"},
-		{"lightcode", "uninstall", "extra"},
-		{"lightcode", "config", "extra"},
+		{"melta", "cli", "extra"},
+		{"melta", "acp", "extra"},
+		{"melta", "desktop", "extra"},
+		{"melta", "runtime", "extra"},
+		{"melta", "doctor", "extra"},
+		{"melta", "uninstall", "extra"},
+		{"melta", "config", "extra"},
 	} {
 		gui, code, stdout, stderr := capture(t, argv)
 		testassert.Require(t, !gui, "%v: must not reach the GUI path", argv)
@@ -143,14 +143,14 @@ func TestDispatchVersion(t *testing.T) {
 	setVersion(t, "v9.9.9", "abcdef1")
 
 	for _, argv := range [][]string{
-		{"lightcode", "version"},
-		{"lightcode", "-v"},
-		{"lightcode", "--version"},
+		{"melta", "version"},
+		{"melta", "-v"},
+		{"melta", "--version"},
 	} {
 		_, code, stdout, stderr := capture(t, argv)
 		testassert.Require(t, code == 0, "%v: exit code = %d, want 0", argv, code)
 		testassert.Require(t, stderr == "", "%v: stderr must be empty, got %q", argv, stderr)
-		want := "lightcode v9.9.9 (" + runtime.GOOS + "/" + runtime.GOARCH + ")\n"
+		want := "melta v9.9.9 (" + runtime.GOOS + "/" + runtime.GOARCH + ")\n"
 		testassert.Require(t, stdout == want, "%v: stdout = %q, want %q", argv, stdout, want)
 	}
 }
@@ -158,7 +158,7 @@ func TestDispatchVersion(t *testing.T) {
 func TestDispatchVersionJSON(t *testing.T) {
 	setVersion(t, "v9.9.9", "abcdef1")
 
-	_, code, stdout, stderr := capture(t, []string{"lightcode", "version", "--json"})
+	_, code, stdout, stderr := capture(t, []string{"melta", "version", "--json"})
 	testassert.Require(t, code == 0 && stderr == "", "exit=%d stderr=%q, want clean exit 0", code, stderr)
 	want := `{"version":"v9.9.9","commit":"abcdef1","os":"` + runtime.GOOS + `","arch":"` + runtime.GOARCH + `"}` + "\n"
 	testassert.Equal(t, stdout, want)
@@ -166,8 +166,8 @@ func TestDispatchVersionJSON(t *testing.T) {
 
 func TestDispatchVersionExtraArgs(t *testing.T) {
 	for _, argv := range [][]string{
-		{"lightcode", "version", "extra"},
-		{"lightcode", "-v", "extra"},
+		{"melta", "version", "extra"},
+		{"melta", "-v", "extra"},
 	} {
 		_, code, stdout, stderr := capture(t, argv)
 		testassert.Require(t, code == 2, "%v: exit code = %d, want 2", argv, code)
@@ -177,16 +177,32 @@ func TestDispatchVersionExtraArgs(t *testing.T) {
 }
 
 func TestDispatchDoctor(t *testing.T) {
+	t.Run("old state is ignored without writes", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("MELTA_CONFIG", "")
+		oldRoot := filepath.Join(home, ".lightcode")
+		for name, body := range map[string]string{"config.json": "{invalid", ".env": "OLD_KEY=secret\n", "cache/discovery/x.json": "{invalid"} {
+			path := filepath.Join(oldRoot, name)
+			testassert.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+			testassert.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+		}
+		before := snapshotHome(t, home)
+		_, code, stdout, stderr := capture(t, []string{"melta", "doctor"})
+		testassert.Require(t, code == 0 && !strings.Contains(stdout, "fail data/config:") && !strings.Contains(stdout, "catalog/x"), "exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+		testassert.Require(t, reflect.DeepEqual(before, snapshotHome(t, home)), "doctor changed the home tree")
+	})
+
 	t.Run("fresh home exits 0 with the report on stdout", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		t.Setenv("LIGHTCODE_CONFIG", "")
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "doctor"})
+		t.Setenv("MELTA_CONFIG", "")
+		_, code, stdout, stderr := capture(t, []string{"melta", "doctor"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
 		testassert.Equal(t, stderr, "")
 		testassert.Require(t, strings.Contains(stdout, "doctor: ") && strings.Contains(stdout, "no providers connected yet - this is expected on a new install") && !strings.Contains(stdout, "fail "), "stdout missing summary line: %q; stdout missing fresh-install appendix: %q; fresh home must not FAIL: %q", stdout, stdout, stdout)
 		{
-			_, err := os.Stat(filepath.Join(home, ".lightcode"))
+			_, err := os.Stat(filepath.Join(home, ".melta"))
 			testassert.Require(t, os.IsNotExist(err), "doctor created the data dir")
 		}
 	})
@@ -194,8 +210,8 @@ func TestDispatchDoctor(t *testing.T) {
 	t.Run("json emits the report shape on stdout", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		t.Setenv("LIGHTCODE_CONFIG", "")
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "doctor", "--json"})
+		t.Setenv("MELTA_CONFIG", "")
+		_, code, stdout, stderr := capture(t, []string{"melta", "doctor", "--json"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		testassert.Equal(t, stderr, "")
 		var decoded struct {
@@ -220,19 +236,19 @@ func TestDispatchDoctor(t *testing.T) {
 	t.Run("invalid config exits 1", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		t.Setenv("LIGHTCODE_CONFIG", "")
-		testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", "config.json"), []byte("{bad json"), 0o600))
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "doctor"})
+		t.Setenv("MELTA_CONFIG", "")
+		testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".melta"), 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".melta", "config.json"), []byte("{bad json"), 0o600))
+		_, code, stdout, stderr := capture(t, []string{"melta", "doctor"})
 		testassert.Require(t, code == 1, "exit code = %d, want 1\nstdout: %s", code, stdout)
 		testassert.Require(t, strings.Contains(stdout, "fail data/config:"), "stdout missing config FAIL: %q", stdout)
-		testassert.Require(t, strings.HasPrefix(stderr, "lightcode: "), "stderr missing error prefix: %q", stderr)
+		testassert.Require(t, strings.HasPrefix(stderr, "melta: "), "stderr missing error prefix: %q", stderr)
 	})
 
 	t.Run("unresolvable home exits 1", func(t *testing.T) {
 		t.Setenv("HOME", "")
-		t.Setenv("LIGHTCODE_CONFIG", "")
-		_, code, stdout, _ := capture(t, []string{"lightcode", "doctor"})
+		t.Setenv("MELTA_CONFIG", "")
+		_, code, stdout, _ := capture(t, []string{"melta", "doctor"})
 		testassert.Require(t, code == 1, "exit code = %d, want 1\nstdout: %s", code, stdout)
 		testassert.Require(t, strings.Contains(stdout, "fail install/"), "stdout missing install-group FAIL: %q", stdout)
 	})
@@ -248,7 +264,7 @@ func setVersion(t *testing.T, v, commit string) {
 func setLatestEndpoint(t *testing.T, tag string) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Location", "https://github.com/MMinasyan/lightcode/releases/tag/"+tag)
+		w.Header().Set("Location", "https://github.com/Syntheresis/melta/releases/tag/"+tag)
 		w.WriteHeader(http.StatusFound)
 	}))
 	t.Cleanup(srv.Close)
@@ -258,36 +274,36 @@ func setLatestEndpoint(t *testing.T, tag string) {
 }
 
 func TestDispatchUpgradeUsageErrors(t *testing.T) {
-	t.Setenv("LIGHTCODE_RELEASE_BASE", "")
+	t.Setenv("MELTA_RELEASE_BASE", "")
 	cases := []struct {
 		argv []string
 		want string
 	}{
-		{[]string{"lightcode", "upgrade", "v1.0.0", "v2.0.0"}, `unexpected argument "v2.0.0"`},
-		{[]string{"lightcode", "upgrade", "foo"}, `invalid version "foo" (expected vMAJOR.MINOR.PATCH)`},
-		{[]string{"lightcode", "upgrade", "v0.0.4", "--check"}, "--check takes no version argument"},
-		{[]string{"lightcode", "upgrade", "--check", "v0.0.4"}, "--check takes no version argument"},
-		{[]string{"lightcode", "upgrade", "--json"}, "--json requires --check"},
+		{[]string{"melta", "upgrade", "v1.0.0", "v2.0.0"}, `unexpected argument "v2.0.0"`},
+		{[]string{"melta", "upgrade", "foo"}, `invalid version "foo" (expected vMAJOR.MINOR.PATCH)`},
+		{[]string{"melta", "upgrade", "v0.0.4", "--check"}, "--check takes no version argument"},
+		{[]string{"melta", "upgrade", "--check", "v0.0.4"}, "--check takes no version argument"},
+		{[]string{"melta", "upgrade", "--json"}, "--json requires --check"},
 	}
 	for _, tc := range cases {
 		_, code, stdout, stderr := capture(t, tc.argv)
 		testassert.Require(t, code == 2, "%v: exit code = %d, want 2\nstderr: %s", tc.argv, code, stderr)
 		testassert.Require(t, stdout == "", "%v: stdout must be empty, got %q", tc.argv, stdout)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: "+tc.want), "%v: stderr = %q, want substring %q", tc.argv, stderr, tc.want)
+		testassert.Require(t, strings.Contains(stderr, "melta: "+tc.want), "%v: stderr = %q, want substring %q", tc.argv, stderr, tc.want)
 	}
 }
 
 func TestDispatchUpgradeCheck(t *testing.T) {
-	t.Setenv("LIGHTCODE_RELEASE_BASE", "")
+	t.Setenv("MELTA_RELEASE_BASE", "")
 
 	t.Run("update available", func(t *testing.T) {
 		setVersion(t, "v0.0.3", "abc1234")
 		setLatestEndpoint(t, "v0.0.4")
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade", "--check"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "upgrade", "--check"})
 		testassert.Require(t, code == 0 && stderr == "", "exit=%d stderr=%q", code, stderr)
-		want := "current: v0.0.3, latest: v0.0.4 (update available; run: lightcode upgrade)\n"
+		want := "current: v0.0.3, latest: v0.0.4 (update available; run: melta upgrade)\n"
 		testassert.Equal(t, stdout, want)
 		entries, _ := os.ReadDir(home)
 		testassert.Require(t, len(entries) == 0, "--check wrote files: %v", entries)
@@ -296,50 +312,50 @@ func TestDispatchUpgradeCheck(t *testing.T) {
 	t.Run("up to date", func(t *testing.T) {
 		setVersion(t, "v0.0.4", "")
 		setLatestEndpoint(t, "v0.0.4")
-		_, code, stdout, _ := capture(t, []string{"lightcode", "upgrade", "--check"})
+		_, code, stdout, _ := capture(t, []string{"melta", "upgrade", "--check"})
 		testassert.Require(t, code == 0 && stdout == "current: v0.0.4, latest: v0.0.4 (up to date)\n", "exit=%d stdout=%q", code, stdout)
 	})
 
 	t.Run("dev build", func(t *testing.T) {
 		setVersion(t, "dev", "abc1234")
 		setLatestEndpoint(t, "v0.0.4")
-		_, code, stdout, _ := capture(t, []string{"lightcode", "upgrade", "--check"})
+		_, code, stdout, _ := capture(t, []string{"melta", "upgrade", "--check"})
 		testassert.Require(t, code == 0 && stdout == "current: dev (abc1234), latest: v0.0.4\n", "exit=%d stdout=%q", code, stdout)
 	})
 
 	t.Run("below floor wins regardless of current", func(t *testing.T) {
 		setVersion(t, "v0.0.3", "")
 		setLatestEndpoint(t, "v0.0.2")
-		_, code, stdout, _ := capture(t, []string{"lightcode", "upgrade", "--check"})
+		_, code, stdout, _ := capture(t, []string{"melta", "upgrade", "--check"})
 		testassert.Require(t, code == 0 && stdout == "current: v0.0.3, latest: v0.0.2 (not selfupdate-capable; use the installer)\n", "exit=%d stdout=%q", code, stdout)
 	})
 
 	t.Run("ordering beyond machine integers still decides", func(t *testing.T) {
 		setVersion(t, "v1.0.0", "")
 		setLatestEndpoint(t, "v18446744073709551615.0.0")
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade", "--check"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "upgrade", "--check"})
 		testassert.Require(t, code == 0 && stderr == "", "exit=%d stderr=%q", code, stderr)
-		want := "current: v1.0.0, latest: v18446744073709551615.0.0 (update available; run: lightcode upgrade)\n"
+		want := "current: v1.0.0, latest: v18446744073709551615.0.0 (update available; run: melta upgrade)\n"
 		testassert.Equal(t, stdout, want)
 	})
 
 	t.Run("json golden", func(t *testing.T) {
 		setVersion(t, "v0.0.3", "abc1234")
 		setLatestEndpoint(t, "v0.0.4")
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade", "--check", "--json"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "upgrade", "--check", "--json"})
 		testassert.Require(t, code == 0 && stderr == "", "exit=%d stderr=%q", code, stderr)
 		want := `{"current":"v0.0.3","latest":"v0.0.4","status":"update-available","updateAvailable":true,"installable":true}` + "\n"
 		testassert.Equal(t, stdout, want)
 	})
 
 	t.Run("refuses under release base regardless of euid", func(t *testing.T) {
-		t.Setenv("LIGHTCODE_RELEASE_BASE", "http://127.0.0.1:1/assets")
+		t.Setenv("MELTA_RELEASE_BASE", "http://127.0.0.1:1/assets")
 		old := selfupdate.Geteuid
 		selfupdate.Geteuid = func() int { return 0 }
 		t.Cleanup(func() { selfupdate.Geteuid = old })
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade", "--check"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "upgrade", "--check"})
 		testassert.Require(t, code == 2 && stdout == "", "exit=%d stdout=%q", code, stdout)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: LIGHTCODE_RELEASE_BASE is set; --check is meaningless against a directory base"), "stderr = %q", stderr)
+		testassert.Require(t, strings.Contains(stderr, "melta: MELTA_RELEASE_BASE is set; --check is meaningless against a directory base"), "stderr = %q", stderr)
 	})
 
 	t.Run("resolution failure exits 1", func(t *testing.T) {
@@ -347,56 +363,56 @@ func TestDispatchUpgradeCheck(t *testing.T) {
 		old := selfupdate.LatestEndpoint
 		selfupdate.LatestEndpoint = "http://127.0.0.1:1/latest"
 		t.Cleanup(func() { selfupdate.LatestEndpoint = old })
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade", "--check"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "upgrade", "--check"})
 		testassert.Require(t, code == 1 && stdout == "", "exit=%d stdout=%q", code, stdout)
-		testassert.Require(t, strings.HasPrefix(stderr, "lightcode: "), "stderr = %q", stderr)
+		testassert.Require(t, strings.HasPrefix(stderr, "melta: "), "stderr = %q", stderr)
 	})
 }
 
 func TestDispatchUpgradeGates(t *testing.T) {
-	t.Setenv("LIGHTCODE_RELEASE_BASE", "")
+	t.Setenv("MELTA_RELEASE_BASE", "")
 
 	t.Run("dev build refuses without explicit target", func(t *testing.T) {
 		setVersion(t, "dev", "abc1234")
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade"})
 		testassert.Equal(t, code, 1)
-		want := "lightcode: this is a development build (dev (abc1234)); pass an explicit version to upgrade anyway: lightcode upgrade v0.0.3"
+		want := "melta: this is a development build (dev (abc1234)); pass an explicit version to upgrade anyway: melta upgrade v0.0.3"
 		testassert.Require(t, strings.Contains(stderr, want), "stderr = %q, want substring %q", stderr, want)
 	})
 
 	t.Run("release base requires explicit target", func(t *testing.T) {
 		setVersion(t, "v0.0.3", "")
-		t.Setenv("LIGHTCODE_RELEASE_BASE", "http://127.0.0.1:1/assets")
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade"})
+		t.Setenv("MELTA_RELEASE_BASE", "http://127.0.0.1:1/assets")
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade"})
 		testassert.Equal(t, code, 2)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: LIGHTCODE_RELEASE_BASE is set; pass an explicit version"), "stderr = %q", stderr)
+		testassert.Require(t, strings.Contains(stderr, "melta: MELTA_RELEASE_BASE is set; pass an explicit version"), "stderr = %q", stderr)
 	})
 
 	t.Run("root drops release base with a note", func(t *testing.T) {
 		setVersion(t, "dev", "abc1234")
-		t.Setenv("LIGHTCODE_RELEASE_BASE", "http://127.0.0.1:1/assets")
+		t.Setenv("MELTA_RELEASE_BASE", "http://127.0.0.1:1/assets")
 		old := selfupdate.Geteuid
 		selfupdate.Geteuid = func() int { return 0 }
 		t.Cleanup(func() { selfupdate.Geteuid = old })
 		// With the override dropped, the dev-build refusal fires next -
 		// not the explicit-target requirement the base would demand.
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade"})
 		testassert.Equal(t, code, 1)
-		testassert.Require(t, strings.Contains(stderr, "note: LIGHTCODE_RELEASE_BASE ignored when running as root") && strings.Contains(stderr, "this is a development build"), "stderr missing root note: %q; stderr = %q, want the dev refusal after the note", stderr, stderr)
+		testassert.Require(t, strings.Contains(stderr, "note: MELTA_RELEASE_BASE ignored when running as root") && strings.Contains(stderr, "this is a development build"), "stderr missing root note: %q; stderr = %q, want the dev refusal after the note", stderr, stderr)
 	})
 
 	t.Run("below-floor target refused with the full installer command", func(t *testing.T) {
 		setVersion(t, "v1.0.0", "")
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade", "v0.0.2"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade", "v0.0.2"})
 		testassert.Equal(t, code, 1)
 		testassert.Require(t, strings.Contains(stderr, "downgrading v1.0.0 -> v0.0.2"), "stderr missing downgrade notice: %q", stderr)
-		want := "lightcode: v0.0.2 predates the upgrade command; install it with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | LIGHTCODE_VERSION=v0.0.2 sh"
-		testassert.Require(t, strings.Contains(stderr, want) && !strings.Contains(stderr, "...") && strings.Contains(stderr, "| LIGHTCODE_VERSION=v0.0.2 sh"), "stderr = %q, want substring %q; the installer command must never be elided: %q; LIGHTCODE_VERSION must sit on the sh side of the pipe: %q", stderr, want, stderr, stderr)
+		want := "melta: v0.0.2 predates the upgrade command; install it with the installer instead: curl -fsSL https://github.com/Syntheresis/melta/releases/latest/download/install.sh | MELTA_VERSION=v0.0.2 sh"
+		testassert.Require(t, strings.Contains(stderr, want) && !strings.Contains(stderr, "...") && strings.Contains(stderr, "| MELTA_VERSION=v0.0.2 sh"), "stderr = %q, want substring %q; the installer command must never be elided: %q; MELTA_VERSION must sit on the sh side of the pipe: %q", stderr, want, stderr, stderr)
 	})
 
 	t.Run("dev current with explicit target prints the install notice", func(t *testing.T) {
 		setVersion(t, "dev", "abc1234")
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade", "v0.0.2"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade", "v0.0.2"})
 		testassert.Equal(t, code, 1)
 		testassert.Require(t, strings.Contains(stderr, "installing v0.0.2 over dev build"), "stderr missing dev install notice: %q", stderr)
 	})
@@ -406,7 +422,7 @@ func TestDispatchUpgradeGates(t *testing.T) {
 // smoke output reports tag.
 func upgradeFixture(t *testing.T, tag string, corruptSums bool) (baseURL string, requests *int) {
 	t.Helper()
-	script := "#!/bin/sh\necho \"lightcode " + tag + " (linux/amd64)\"\necho SMOKE_NOISE_MARKER\n"
+	script := "#!/bin/sh\necho \"melta " + tag + " (linux/amd64)\"\necho SMOKE_NOISE_MARKER\n"
 	return upgradeFixtureScript(t, script, corruptSums)
 }
 
@@ -416,7 +432,7 @@ func upgradeFixtureScript(t *testing.T, script string, corruptSums bool) (baseUR
 	var tarBuf bytes.Buffer
 	gz := gzip.NewWriter(&tarBuf)
 	tw := tar.NewWriter(gz)
-	testassert.NoError(t, tw.WriteHeader(&tar.Header{Name: "lightcode", Mode: 0o755, Typeflag: tar.TypeReg, Size: int64(len(script))}))
+	testassert.NoError(t, tw.WriteHeader(&tar.Header{Name: "melta", Mode: 0o755, Typeflag: tar.TypeReg, Size: int64(len(script))}))
 	{
 		_, err := tw.Write([]byte(script))
 		testassert.NoError(t, err)
@@ -452,7 +468,7 @@ func upgradeFixtureScript(t *testing.T, script string, corruptSums bool) (baseUR
 func fakeInstall(t *testing.T) (dir, target string) {
 	t.Helper()
 	dir = t.TempDir()
-	target = filepath.Join(dir, "lightcode")
+	target = filepath.Join(dir, "melta")
 	testassert.NoError(t, os.WriteFile(target, []byte("old binary"), 0o755))
 	old := selfupdate.ResolveExecutable
 	selfupdate.ResolveExecutable = func() (string, string, error) { return target, dir, nil }
@@ -464,10 +480,10 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 	t.Run("full swap against a fixture base", func(t *testing.T) {
 		setVersion(t, "v1.0.0", "")
 		base, _ := upgradeFixture(t, "v9.9.9", false)
-		t.Setenv("LIGHTCODE_RELEASE_BASE", base)
+		t.Setenv("MELTA_RELEASE_BASE", base)
 		dir, target := fakeInstall(t)
 
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade", "v9.9.9"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "upgrade", "v9.9.9"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		testassert.Equal(t, stdout, "")
 		testassert.Require(t, strings.Contains(stderr, "upgraded v1.0.0 -> v9.9.9; restart the Runtime to apply backend changes.") && !strings.Contains(stderr, "including the GUI's own relaunch when switching projects"), "stderr missing final message: %q; stderr must not promise a GUI relaunch: %q", stderr, stderr)
@@ -478,7 +494,7 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 		entries, err := os.ReadDir(dir)
 		testassert.NoError(t, err)
 		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), ".lightcode.tmp.") {
+			if strings.HasPrefix(e.Name(), ".melta.tmp.") {
 				t.Fatalf("staged file left behind: %s", e.Name())
 			}
 		}
@@ -487,10 +503,10 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 	t.Run("checksum mismatch leaves the target untouched", func(t *testing.T) {
 		setVersion(t, "v1.0.0", "")
 		base, _ := upgradeFixture(t, "v9.9.9", true)
-		t.Setenv("LIGHTCODE_RELEASE_BASE", base)
+		t.Setenv("MELTA_RELEASE_BASE", base)
 		_, target := fakeInstall(t)
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade", "v9.9.9"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade", "v9.9.9"})
 		testassert.Require(t, code == 1, "exit code = %d, want 1\nstderr: %s", code, stderr)
 		testassert.Require(t, strings.Contains(stderr, "checksum mismatch"), "stderr = %q", stderr)
 		data, _ := os.ReadFile(target)
@@ -503,14 +519,14 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 		}
 		setVersion(t, "v1.0.0", "")
 		base, requests := upgradeFixture(t, "v9.9.9", false)
-		t.Setenv("LIGHTCODE_RELEASE_BASE", base)
+		t.Setenv("MELTA_RELEASE_BASE", base)
 		dir, target := fakeInstall(t)
 		testassert.NoError(t, os.Chmod(dir, 0o500))
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade", "v9.9.9"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade", "v9.9.9"})
 		testassert.Equal(t, code, 1)
-		want := "lightcode: binary is at " + target + " (not writable); re-run as: sudo lightcode upgrade"
+		want := "melta: binary is at " + target + " (not writable); re-run as: sudo melta upgrade"
 		testassert.Require(t, strings.Contains(stderr, want), "stderr = %q, want substring %q", stderr, want)
 		if *requests != 0 {
 			t.Fatalf("preflight refusal must make zero requests, made %d", *requests)
@@ -520,10 +536,10 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 	t.Run("dev current with explicit target installs over dev build", func(t *testing.T) {
 		setVersion(t, "dev", "abc1234")
 		base, _ := upgradeFixture(t, "v9.9.9", false)
-		t.Setenv("LIGHTCODE_RELEASE_BASE", base)
+		t.Setenv("MELTA_RELEASE_BASE", base)
 		_, target := fakeInstall(t)
 
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade", "v9.9.9"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "upgrade", "v9.9.9"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		testassert.Equal(t, stdout, "")
 		testassert.Require(t, strings.Contains(stderr, "installing v9.9.9 over dev build") && strings.Contains(stderr, "upgraded dev (abc1234) -> v9.9.9;"), "stderr missing dev install notice: %q; stderr missing final message: %q", stderr, stderr)
@@ -534,16 +550,16 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 	t.Run("executable resolution failure refuses before any download", func(t *testing.T) {
 		setVersion(t, "v1.0.0", "")
 		base, requests := upgradeFixture(t, "v9.9.9", false)
-		t.Setenv("LIGHTCODE_RELEASE_BASE", base)
+		t.Setenv("MELTA_RELEASE_BASE", base)
 		old := selfupdate.ResolveExecutable
 		selfupdate.ResolveExecutable = func() (string, string, error) {
 			return "", "", fmt.Errorf("cannot resolve executable path: boom")
 		}
 		t.Cleanup(func() { selfupdate.ResolveExecutable = old })
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade", "v9.9.9"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade", "v9.9.9"})
 		testassert.Equal(t, code, 1)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: cannot resolve executable path:"), "stderr = %q", stderr)
+		testassert.Require(t, strings.Contains(stderr, "melta: cannot resolve executable path:"), "stderr = %q", stderr)
 		if *requests != 0 {
 			t.Fatalf("resolution failure must make zero requests, made %d", *requests)
 		}
@@ -554,7 +570,7 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 		setLatestEndpoint(t, "v0.0.4")
 		_, target := fakeInstall(t)
 
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "upgrade"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "upgrade"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		testassert.Equal(t, stdout, "")
 		testassert.Require(t, strings.Contains(stderr, "already up to date (v0.0.5)") && !strings.Contains(stderr, "downgrading"), "stderr = %q; bare upgrade must never downgrade: %q", stderr, stderr)
@@ -564,26 +580,26 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 
 	t.Run("equal below-floor target still hits the floor gate", func(t *testing.T) {
 		setVersion(t, "v0.0.2", "")
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade", "v0.0.2"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade", "v0.0.2"})
 		testassert.Require(t, code == 1, "exit code = %d, want 1\nstderr: %s", code, stderr)
 		testassert.Require(t, !strings.Contains(stderr, "already up to date") && strings.Contains(stderr, "v0.0.2 predates the upgrade command"), "equal below-floor target must not report up to date: %q; stderr = %q", stderr, stderr)
 	})
 
 	t.Run("smoke nonzero exit with matching tag removes the staged file", func(t *testing.T) {
 		setVersion(t, "v1.0.0", "")
-		script := "#!/bin/sh\necho \"lightcode v9.9.9 (linux/amd64)\"\nexit 3\n"
+		script := "#!/bin/sh\necho \"melta v9.9.9 (linux/amd64)\"\nexit 3\n"
 		base, _ := upgradeFixtureScript(t, script, false)
-		t.Setenv("LIGHTCODE_RELEASE_BASE", base)
+		t.Setenv("MELTA_RELEASE_BASE", base)
 		dir, target := fakeInstall(t)
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade", "v9.9.9"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade", "v9.9.9"})
 		testassert.Require(t, code == 1, "exit code = %d, want 1\nstderr: %s", code, stderr)
 		testassert.Require(t, strings.Contains(stderr, "failed --version"), "stderr = %q", stderr)
 		data, _ := os.ReadFile(target)
 		testassert.Require(t, string(data) == "old binary", "target touched: %q", data)
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), ".lightcode.tmp.") {
+			if strings.HasPrefix(e.Name(), ".melta.tmp.") {
 				t.Fatalf("staged file left behind: %s", e.Name())
 			}
 		}
@@ -593,20 +609,20 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 		setVersion(t, "v1.0.0", "")
 		script := "#!/bin/sh\nsleep 60\n"
 		base, _ := upgradeFixtureScript(t, script, false)
-		t.Setenv("LIGHTCODE_RELEASE_BASE", base)
+		t.Setenv("MELTA_RELEASE_BASE", base)
 		dir, target := fakeInstall(t)
 		oldTimeout := selfupdate.SmokeTimeout
 		selfupdate.SmokeTimeout = 200 * time.Millisecond
 		t.Cleanup(func() { selfupdate.SmokeTimeout = oldTimeout })
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade", "v9.9.9"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade", "v9.9.9"})
 		testassert.Require(t, code == 1, "exit code = %d, want 1\nstderr: %s", code, stderr)
 		testassert.Require(t, strings.Contains(stderr, "did not exit"), "stderr = %q", stderr)
 		data, _ := os.ReadFile(target)
 		testassert.Require(t, string(data) == "old binary", "target touched: %q", data)
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), ".lightcode.tmp.") {
+			if strings.HasPrefix(e.Name(), ".melta.tmp.") {
 				t.Fatalf("staged file left behind after hang: %s", e.Name())
 			}
 		}
@@ -617,17 +633,17 @@ func TestDispatchUpgradeInstallFlow(t *testing.T) {
 		// The fixture binary reports v9.9.9; ask for v8.8.8 so the smoke
 		// tag match fails after a verified download.
 		base, _ := upgradeFixture(t, "v9.9.9", false)
-		t.Setenv("LIGHTCODE_RELEASE_BASE", base)
+		t.Setenv("MELTA_RELEASE_BASE", base)
 		dir, target := fakeInstall(t)
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "upgrade", "v8.8.8"})
+		_, code, _, stderr := capture(t, []string{"melta", "upgrade", "v8.8.8"})
 		testassert.Require(t, code == 1, "exit code = %d, want 1\nstderr: %s", code, stderr)
 		testassert.Require(t, strings.Contains(stderr, "did not report v8.8.8") && strings.Contains(stderr, "install with the installer instead"), "stderr = %q; stderr missing installer pointer: %q", stderr, stderr)
 		data, _ := os.ReadFile(target)
 		testassert.Require(t, string(data) == "old binary", "target touched on smoke failure: %q", data)
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), ".lightcode.tmp.") {
+			if strings.HasPrefix(e.Name(), ".melta.tmp.") {
 				t.Fatalf("staged file left behind: %s", e.Name())
 			}
 		}
@@ -645,15 +661,31 @@ func uninstallSeams(t *testing.T, tty bool, input string) {
 }
 
 func TestDispatchUninstall(t *testing.T) {
+	t.Run("purge leaves the old root untouched", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		oldRoot := filepath.Join(home, ".lightcode")
+		testassert.NoError(t, os.MkdirAll(oldRoot, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(oldRoot, "sentinel"), []byte("keep"), 0o600))
+		before := snapshotHome(t, oldRoot)
+		_, target := fakeInstall(t)
+		uninstallSeams(t, false, "")
+		_, code, stdout, stderr := capture(t, []string{"melta", "uninstall", "--purge", "--yes"})
+		testassert.Require(t, code == 0 && strings.Contains(stdout+stderr, "no data directory at "+filepath.Join(home, ".melta")), "exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+		testassert.Require(t, reflect.DeepEqual(before, snapshotHome(t, oldRoot)), "purge changed the old root")
+		_, err := os.Stat(target)
+		testassert.Require(t, os.IsNotExist(err), "binary was not removed: %v", err)
+	})
+
 	t.Run("dry run lists targets and removes nothing", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		dataDir := filepath.Join(home, ".lightcode")
+		dataDir := filepath.Join(home, ".melta")
 		testassert.NoError(t, os.MkdirAll(dataDir, 0o700))
 		_, target := fakeInstall(t)
 		uninstallSeams(t, false, "") // works in a pipe without --yes
 
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--dry-run"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "uninstall", "--purge", "--dry-run"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		want := "would remove " + target + "\n" +
 			"would remove " + dataDir + " (all data: API keys, sessions, snapshots)\n"
@@ -679,7 +711,7 @@ func TestDispatchUninstall(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 		uninstallSeams(t, false, "")
 
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall", "--dry-run"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "uninstall", "--dry-run"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		testassert.Equal(t, stdout, "would remove "+target+"\n")
 		testassert.Require(t, !strings.Contains(stderr, "not writable"), "dry run must short-circuit before the writability preflight: %q", stderr)
@@ -689,13 +721,15 @@ func TestDispatchUninstall(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
 		dir, target := fakeInstall(t)
-		staged := filepath.Join(dir, ".lightcode.tmp.stale")
+		staged := filepath.Join(dir, ".melta.tmp.stale")
 		testassert.NoError(t, os.WriteFile(staged, []byte("x"), 0o755))
-		link := filepath.Join(dir, ".lightcode.tmp.link")
+		oldStaged := filepath.Join(dir, ".lightcode.tmp.stale")
+		testassert.NoError(t, os.WriteFile(oldStaged, []byte("keep"), 0o755))
+		link := filepath.Join(dir, ".melta.tmp.link")
 		testassert.NoError(t, os.Symlink(target, link))
 		uninstallSeams(t, false, "")
 
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall", "--yes"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "uninstall", "--yes"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		testassert.Equal(t, stdout, "")
 		testassert.Equal(t, stderr, "removed "+target+"\n")
@@ -707,6 +741,9 @@ func TestDispatchUninstall(t *testing.T) {
 			_, err := os.Stat(staged)
 			testassert.Require(t, os.IsNotExist(err), "owned staged file not swept")
 		}
+		oldBytes, err := os.ReadFile(oldStaged)
+		testassert.NoError(t, err)
+		testassert.Equal(t, string(oldBytes), "keep")
 		{
 			_, err := os.Lstat(link)
 			testassert.Require(t, err == nil, "symlinked staged entry must survive the sweep")
@@ -717,14 +754,14 @@ func TestDispatchUninstall(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
 		dir, target := fakeInstall(t)
-		staged := filepath.Join(dir, ".lightcode.tmp.foreign")
+		staged := filepath.Join(dir, ".melta.tmp.foreign")
 		testassert.NoError(t, os.WriteFile(staged, []byte("x"), 0o755))
 		oldOwner := selfupdate.FileOwner
 		selfupdate.FileOwner = func(info os.FileInfo) (int, bool) { return os.Geteuid() + 1, true }
 		t.Cleanup(func() { selfupdate.FileOwner = oldOwner })
 		uninstallSeams(t, false, "")
 
-		_, code, _, _ := capture(t, []string{"lightcode", "uninstall", "--yes"})
+		_, code, _, _ := capture(t, []string{"melta", "uninstall", "--yes"})
 		testassert.Equal(t, code, 0)
 		{
 			_, err := os.Stat(staged)
@@ -739,12 +776,12 @@ func TestDispatchUninstall(t *testing.T) {
 	t.Run("purge removes data before the binary", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		dataDir := filepath.Join(home, ".lightcode")
+		dataDir := filepath.Join(home, ".melta")
 		testassert.NoError(t, os.MkdirAll(filepath.Join(dataDir, "sessions"), 0o700))
 		_, target := fakeInstall(t)
 		uninstallSeams(t, false, "")
 
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "uninstall", "--purge", "--yes"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		testassert.Equal(t, stdout, "")
 		want := "removed " + dataDir + "\nremoved " + target + "\n"
@@ -765,9 +802,9 @@ func TestDispatchUninstall(t *testing.T) {
 		_, target := fakeInstall(t)
 		uninstallSeams(t, false, "")
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall"})
 		testassert.Equal(t, code, 1)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: uninstall is interactive; pass --yes to confirm non-interactively"), "stderr = %q", stderr)
+		testassert.Require(t, strings.Contains(stderr, "melta: uninstall is interactive; pass --yes to confirm non-interactively"), "stderr = %q", stderr)
 		{
 			_, err := os.Stat(target)
 			testassert.Require(t, err == nil, "refusal must remove nothing")
@@ -780,10 +817,10 @@ func TestDispatchUninstall(t *testing.T) {
 		_, target := fakeInstall(t)
 		uninstallSeams(t, true, "n\n")
 
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "uninstall"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "uninstall"})
 		testassert.Equal(t, code, 1)
 		testassert.Equal(t, stdout, "")
-		testassert.Require(t, strings.Contains(stderr, "Remove "+target+"? [y/N] ") && strings.Contains(stderr, "cancelled\n") && !strings.Contains(stderr, "lightcode: "), "stderr missing prompt: %q; stderr missing cancelled status: %q; cancelled must not carry the error prefix: %q", stderr, stderr, stderr)
+		testassert.Require(t, strings.Contains(stderr, "Remove "+target+"? [y/N] ") && strings.Contains(stderr, "cancelled\n") && !strings.Contains(stderr, "melta: "), "stderr missing prompt: %q; stderr missing cancelled status: %q; cancelled must not carry the error prefix: %q", stderr, stderr, stderr)
 		{
 			_, err := os.Stat(target)
 			testassert.Require(t, err == nil, "decline must remove nothing")
@@ -796,7 +833,7 @@ func TestDispatchUninstall(t *testing.T) {
 		_, target := fakeInstall(t)
 		uninstallSeams(t, true, "\n")
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall"})
 		testassert.Require(t, code == 1 && strings.Contains(stderr, "cancelled"), "exit=%d stderr=%q", code, stderr)
 		{
 			_, err := os.Stat(target)
@@ -807,12 +844,12 @@ func TestDispatchUninstall(t *testing.T) {
 	t.Run("accept via prompt removes", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		dataDir := filepath.Join(home, ".lightcode")
+		dataDir := filepath.Join(home, ".melta")
 		testassert.NoError(t, os.MkdirAll(dataDir, 0o700))
 		_, target := fakeInstall(t)
 		uninstallSeams(t, true, "y\n")
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall", "--purge"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		testassert.Require(t, strings.Contains(stderr, "Remove "+target+" and ALL data in "+dataDir+" (API keys, sessions, snapshots)? [y/N] "), "stderr missing purge prompt: %q", stderr)
 		{
@@ -826,13 +863,13 @@ func TestDispatchUninstall(t *testing.T) {
 		t.Setenv("HOME", home)
 		real := filepath.Join(home, "realdata")
 		testassert.NoError(t, os.MkdirAll(real, 0o700))
-		testassert.NoError(t, os.Symlink(real, filepath.Join(home, ".lightcode")))
+		testassert.NoError(t, os.Symlink(real, filepath.Join(home, ".melta")))
 		_, target := fakeInstall(t)
 		uninstallSeams(t, true, "y\n")
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall", "--purge", "--yes"})
 		testassert.Equal(t, code, 1)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: ~/.lightcode is a symlink; refusing to purge through it"), "stderr = %q", stderr)
+		testassert.Require(t, strings.Contains(stderr, "melta: ~/.melta is a symlink; refusing to purge through it"), "stderr = %q", stderr)
 		{
 			_, err := os.Stat(real)
 			testassert.Require(t, err == nil, "symlink target must be untouched")
@@ -846,16 +883,16 @@ func TestDispatchUninstall(t *testing.T) {
 	t.Run("purge refuses a foreign-owned data dir", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		dataDir := filepath.Join(home, ".lightcode")
+		dataDir := filepath.Join(home, ".melta")
 		testassert.NoError(t, os.MkdirAll(dataDir, 0o700))
 		fakeInstall(t)
 		oldOwner := selfupdate.FileOwner
 		selfupdate.FileOwner = func(info os.FileInfo) (int, bool) { return os.Geteuid() + 1, true }
 		t.Cleanup(func() { selfupdate.FileOwner = oldOwner })
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall", "--purge", "--yes"})
 		testassert.Equal(t, code, 1)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: ~/.lightcode is not owned by the current user; refusing to purge"), "stderr = %q", stderr)
+		testassert.Require(t, strings.Contains(stderr, "melta: ~/.melta is not owned by the current user; refusing to purge"), "stderr = %q", stderr)
 		{
 			_, err := os.Stat(dataDir)
 			testassert.Require(t, err == nil, "foreign-owned data dir must be untouched")
@@ -868,9 +905,9 @@ func TestDispatchUninstall(t *testing.T) {
 		_, target := fakeInstall(t)
 		uninstallSeams(t, true, "y\n")
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall", "--purge"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
-		testassert.Require(t, strings.Contains(stderr, "no data directory at "+filepath.Join(home, ".lightcode")+" - nothing to purge") && strings.Contains(stderr, "Remove "+target+"? [y/N] ") && !strings.Contains(stderr, "ALL data") && !strings.Contains(stderr, "data removed"), "stderr missing nothing-to-purge note: %q; prompt must be the binary-only one: %q; purge prompt must not fire with nothing to purge: %q; the partial-flow message must never fire with nothing purged: %q", stderr, stderr, stderr, stderr)
+		testassert.Require(t, strings.Contains(stderr, "no data directory at "+filepath.Join(home, ".melta")+" - nothing to purge") && strings.Contains(stderr, "Remove "+target+"? [y/N] ") && !strings.Contains(stderr, "ALL data") && !strings.Contains(stderr, "data removed"), "stderr missing nothing-to-purge note: %q; prompt must be the binary-only one: %q; purge prompt must not fire with nothing to purge: %q; the partial-flow message must never fire with nothing purged: %q", stderr, stderr, stderr, stderr)
 		{
 			_, err := os.Stat(target)
 			testassert.Require(t, os.IsNotExist(err), "binary not removed")
@@ -888,9 +925,9 @@ func TestDispatchUninstall(t *testing.T) {
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 		uninstallSeams(t, true, "y\n")
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall"})
 		testassert.Equal(t, code, 1)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: binary is at "+target+" (not writable); re-run as: sudo lightcode uninstall") && !strings.Contains(stderr, "[y/N]"), "stderr = %q; the preflight must refuse before any prompt: %q", stderr, stderr)
+		testassert.Require(t, strings.Contains(stderr, "melta: binary is at "+target+" (not writable); re-run as: sudo melta uninstall") && !strings.Contains(stderr, "[y/N]"), "stderr = %q; the preflight must refuse before any prompt: %q", stderr, stderr)
 	})
 
 	t.Run("privileged partial flow purges data then points at sudo", func(t *testing.T) {
@@ -899,16 +936,16 @@ func TestDispatchUninstall(t *testing.T) {
 		}
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		dataDir := filepath.Join(home, ".lightcode")
+		dataDir := filepath.Join(home, ".melta")
 		testassert.NoError(t, os.MkdirAll(dataDir, 0o700))
 		dir, target := fakeInstall(t)
 		testassert.NoError(t, os.Chmod(dir, 0o500))
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 		uninstallSeams(t, true, "y\n")
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall", "--purge"})
 		testassert.Require(t, code == 1, "exit code = %d, want 1\nstderr: %s", code, stderr)
-		testassert.Require(t, strings.Contains(stderr, "removed "+dataDir+"\n") && strings.Contains(stderr, "lightcode: data removed; binary still installed at "+target+" - run: sudo lightcode uninstall --yes"), "stderr missing data removal line: %q; stderr = %q", stderr, stderr)
+		testassert.Require(t, strings.Contains(stderr, "removed "+dataDir+"\n") && strings.Contains(stderr, "melta: data removed; binary still installed at "+target+" - run: sudo melta uninstall --yes"), "stderr missing data removal line: %q; stderr = %q", stderr, stderr)
 		{
 			_, err := os.Stat(dataDir)
 			testassert.Require(t, os.IsNotExist(err), "data dir must be purged in the partial flow")
@@ -924,7 +961,7 @@ func TestDispatchUninstall(t *testing.T) {
 		_, target := fakeInstall(t)
 		uninstallSeams(t, false, "")
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--yes"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall", "--yes"})
 		testassert.Require(t, code == 0, "exit code = %d, want 0\nstderr: %s", code, stderr)
 		testassert.Require(t, !strings.Contains(stderr, "resolve home dir"), "the binary-only flow must not resolve the home dir: %q", stderr)
 		{
@@ -940,7 +977,7 @@ func TestDispatchUninstall(t *testing.T) {
 		selfupdate.Geteuid = func() int { return 0 }
 		t.Cleanup(func() { selfupdate.Geteuid = oldEuid })
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall", "--purge", "--yes"})
 		testassert.Equal(t, code, 1)
 		testassert.Require(t, strings.Contains(stderr, "refusing to purge user data as root") && !strings.Contains(stderr, "resolve home dir"), "stderr = %q; the root refusal must fire before any home lookup: %q", stderr, stderr)
 	})
@@ -948,16 +985,16 @@ func TestDispatchUninstall(t *testing.T) {
 	t.Run("root refuses to purge", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		dataDir := filepath.Join(home, ".lightcode")
+		dataDir := filepath.Join(home, ".melta")
 		testassert.NoError(t, os.MkdirAll(dataDir, 0o700))
 		fakeInstall(t)
 		oldEuid := selfupdate.Geteuid
 		selfupdate.Geteuid = func() int { return 0 }
 		t.Cleanup(func() { selfupdate.Geteuid = oldEuid })
 
-		_, code, _, stderr := capture(t, []string{"lightcode", "uninstall", "--purge", "--yes"})
+		_, code, _, stderr := capture(t, []string{"melta", "uninstall", "--purge", "--yes"})
 		testassert.Equal(t, code, 1)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: refusing to purge user data as root; run 'lightcode uninstall --purge' as the owning user first, then remove the binary with sudo"), "stderr = %q", stderr)
+		testassert.Require(t, strings.Contains(stderr, "melta: refusing to purge user data as root; run 'melta uninstall --purge' as the owning user first, then remove the binary with sudo"), "stderr = %q", stderr)
 		{
 			_, err := os.Stat(dataDir)
 			testassert.Require(t, err == nil, "root purge refusal must remove nothing")
@@ -968,8 +1005,10 @@ func TestDispatchUninstall(t *testing.T) {
 func TestDispatchCompletion(t *testing.T) {
 	t.Run("registry drift guard across all shells", func(t *testing.T) {
 		for _, shell := range []string{"bash", "zsh", "fish"} {
-			_, code, stdout, stderr := capture(t, []string{"lightcode", "completion", shell})
+			_, code, stdout, stderr := capture(t, []string{"melta", "completion", shell})
 			testassert.Require(t, code == 0 && stderr == "", "%s: exit=%d stderr=%q", shell, code, stderr)
+			registration := map[string]string{"bash": "complete -F _melta_completions melta", "zsh": "#compdef melta", "fish": "complete -c melta"}[shell]
+			testassert.Require(t, strings.Contains(stdout, registration), "%s completion does not register melta", shell)
 			// Every registry command, every registered flag name, and the
 			// top-level aliases must appear; a new command or flag that
 			// misses the generator fails here.
@@ -992,7 +1031,7 @@ func TestDispatchCompletion(t *testing.T) {
 	})
 
 	t.Run("per-command help flags for sampled commands", func(t *testing.T) {
-		_, _, stdout, _ := capture(t, []string{"lightcode", "completion", "bash"})
+		_, _, stdout, _ := capture(t, []string{"melta", "completion", "bash"})
 		for _, name := range []string{"models", "doctor", "upgrade"} {
 			_, after, found := strings.Cut(stdout, name+")")
 			testassert.Require(t, found, "no case arm for %q", name)
@@ -1002,7 +1041,7 @@ func TestDispatchCompletion(t *testing.T) {
 	})
 
 	t.Run("shell enum arm is static", func(t *testing.T) {
-		_, _, stdout, _ := capture(t, []string{"lightcode", "completion", "bash"})
+		_, _, stdout, _ := capture(t, []string{"melta", "completion", "bash"})
 		_, after, found := strings.Cut(stdout, "completion)")
 		testassert.Require(t, found, "no case arm for completion")
 		arm, _, _ := strings.Cut(after, ";;")
@@ -1012,18 +1051,18 @@ func TestDispatchCompletion(t *testing.T) {
 	})
 
 	t.Run("bare completion emits bash", func(t *testing.T) {
-		_, code, stdout, _ := capture(t, []string{"lightcode", "completion"})
-		testassert.Require(t, code == 0 && strings.HasPrefix(stdout, "# bash completion for lightcode"), "exit=%d stdout=%q", code, stdout)
+		_, code, stdout, _ := capture(t, []string{"melta", "completion"})
+		testassert.Require(t, code == 0 && strings.HasPrefix(stdout, "# bash completion for melta"), "exit=%d stdout=%q", code, stdout)
 	})
 
 	t.Run("unsupported shell exits 2", func(t *testing.T) {
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "completion", "powershell"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "completion", "powershell"})
 		testassert.Require(t, code == 2 && stdout == "", "exit=%d stdout=%q", code, stdout)
 		testassert.Require(t, strings.Contains(stderr, `unsupported shell "powershell" (supported: bash, zsh, fish)`), "stderr = %q", stderr)
 	})
 
 	t.Run("second positional exits 2", func(t *testing.T) {
-		_, code, _, stderr := capture(t, []string{"lightcode", "completion", "bash", "zsh"})
+		_, code, _, stderr := capture(t, []string{"melta", "completion", "bash", "zsh"})
 		testassert.Require(t, code == 2 && strings.Contains(stderr, `unexpected argument "zsh"`), "exit=%d stderr=%q", code, stderr)
 	})
 }
@@ -1038,19 +1077,19 @@ func TestEscapeSingleQuoted(t *testing.T) {
 // usage/exit-2 path before any owner work starts.
 func TestDispatchRuntimeUsage(t *testing.T) {
 	for _, argv := range [][]string{
-		{"lightcode", "runtime"},
-		{"lightcode", "runtime", "--data-dir", "/tmp/lightcode-runtime-usage-data"},
-		{"lightcode", "runtime", "--config", "/tmp/lightcode-runtime-usage-config.json"},
-		{"lightcode", "runtime", "--data-dir", "", "--config", "/tmp/lightcode-runtime-usage-config.json"},
-		{"lightcode", "runtime", "--data-dir", "/tmp/lightcode-runtime-usage-data", "--config", ""},
-		{"lightcode", "runtime", "--data-dir", "/tmp/lightcode-runtime-usage-data", "--config", "/tmp/lightcode-runtime-usage-config.json", "extra"},
-		{"lightcode", "runtime", "--bogus"},
+		{"melta", "runtime"},
+		{"melta", "runtime", "--data-dir", "/tmp/melta-runtime-usage-data"},
+		{"melta", "runtime", "--config", "/tmp/melta-runtime-usage-config.json"},
+		{"melta", "runtime", "--data-dir", "", "--config", "/tmp/melta-runtime-usage-config.json"},
+		{"melta", "runtime", "--data-dir", "/tmp/melta-runtime-usage-data", "--config", ""},
+		{"melta", "runtime", "--data-dir", "/tmp/melta-runtime-usage-data", "--config", "/tmp/melta-runtime-usage-config.json", "extra"},
+		{"melta", "runtime", "--bogus"},
 	} {
 		gui, code, stdout, stderr := capture(t, argv)
 		testassert.Require(t, !gui, "%v: must not reach the GUI path", argv)
 		testassert.Require(t, code == 2, "%v: exit code = %d, want 2", argv, code)
 		testassert.Require(t, stdout == "", "%v: stdout must be empty, got %q", argv, stdout)
-		testassert.Require(t, strings.HasPrefix(stderr, "lightcode: ") && strings.Contains(stderr, "Usage: lightcode runtime"), "%v: stderr missing error prefix: %q; %v: stderr missing runtime usage line: %q", argv, stderr, argv, stderr)
+		testassert.Require(t, strings.HasPrefix(stderr, "melta: ") && strings.Contains(stderr, "Usage: melta runtime"), "%v: stderr missing error prefix: %q; %v: stderr missing runtime usage line: %q", argv, stderr, argv, stderr)
 	}
 }
 
@@ -1061,16 +1100,16 @@ func TestDispatchRuntimeUsage(t *testing.T) {
 // usageErrorf so dispatch prints the usage diagnostic with exit code 2.
 func TestDispatchModelsUtilityRouting(t *testing.T) {
 	t.Run("two positionals exit 2 as a usage error", func(t *testing.T) {
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "models", "p1", "p2"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "models", "p1", "p2"})
 		testassert.Require(t, code == 2 && stdout == "", "exit=%d stdout=%q", code, stdout)
-		testassert.Require(t, strings.HasPrefix(stderr, "lightcode: ") && strings.Contains(stderr, `unexpected argument "p2"`) && strings.Contains(stderr, "Usage: lightcode models"), "stderr missing translated usage diagnostic: %q; stderr missing models usage line: %q", stderr, stderr)
+		testassert.Require(t, strings.HasPrefix(stderr, "melta: ") && strings.Contains(stderr, `unexpected argument "p2"`) && strings.Contains(stderr, "Usage: melta models"), "stderr missing translated usage diagnostic: %q; stderr missing models usage line: %q", stderr, stderr)
 	})
 
 	t.Run("terminator keeps operands out of the flag parse", func(t *testing.T) {
 		// The root flag parse stops at `--`; a second positionals
 		// violation proves the terminated operands reached the provider
 		// check instead of being parsed as flags.
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "models", "--", "p1", "p2"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "models", "--", "p1", "p2"})
 		testassert.Require(t, code == 2 && stdout == "", "exit=%d stdout=%q", code, stdout)
 		testassert.Require(t, strings.Contains(stderr, `unexpected argument "p2"`), "stderr missing translated usage diagnostic: %q", stderr)
 	})
@@ -1097,30 +1136,47 @@ func snapshotHome(t *testing.T, root string) map[string]string {
 }
 
 func TestDispatchConfig(t *testing.T) {
+	t.Run("old root and automatic variable are ignored", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("MELTA_CONFIG", "")
+		oldConfig := filepath.Join(home, ".lightcode", "config.json")
+		testassert.NoError(t, os.MkdirAll(filepath.Dir(oldConfig), 0o700))
+		testassert.NoError(t, os.WriteFile(oldConfig, []byte("old config"), 0o600))
+		t.Setenv("LIGHTCODE_CONFIG", oldConfig)
+		before := snapshotHome(t, home)
+		_, code, stdout, stderr := capture(t, []string{"melta", "config", "--path"})
+		want := filepath.Join(home, ".melta", "config.json")
+		testassert.Require(t, code == 0 && stdout == want+"\n", "exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+		_, code, stdout, stderr = capture(t, []string{"melta", "config"})
+		testassert.Require(t, code == 1 && stdout == "" && strings.Contains(stderr, want), "exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+		testassert.Require(t, reflect.DeepEqual(before, snapshotHome(t, home)), "config changed the home tree")
+	})
+
 	t.Run("path prints the resolved path even when absent", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		t.Setenv("LIGHTCODE_CONFIG", "")
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "config", "--path"})
+		t.Setenv("MELTA_CONFIG", "")
+		_, code, stdout, stderr := capture(t, []string{"melta", "config", "--path"})
 		testassert.Require(t, code == 0 && stderr == "", "exit=%d stderr=%q", code, stderr)
-		testassert.Require(t, stdout == filepath.Join(home, ".lightcode", "config.json")+"\n", "stdout = %q", stdout)
+		testassert.Require(t, stdout == filepath.Join(home, ".melta", "config.json")+"\n", "stdout = %q", stdout)
 	})
 
-	t.Run("path honors LIGHTCODE_CONFIG", func(t *testing.T) {
+	t.Run("path honors MELTA_CONFIG", func(t *testing.T) {
 		custom := filepath.Join(t.TempDir(), "custom.json")
-		t.Setenv("LIGHTCODE_CONFIG", custom)
-		_, code, stdout, _ := capture(t, []string{"lightcode", "config", "--path"})
+		t.Setenv("MELTA_CONFIG", custom)
+		_, code, stdout, _ := capture(t, []string{"melta", "config", "--path"})
 		testassert.Require(t, code == 0 && stdout == custom+"\n", "exit=%d stdout=%q", code, stdout)
 	})
 
 	t.Run("default is byte passthrough even for invalid json", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		t.Setenv("LIGHTCODE_CONFIG", "")
+		t.Setenv("MELTA_CONFIG", "")
 		body := "{not json at all"
-		testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", "config.json"), []byte(body), 0o600))
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "config"})
+		testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".melta"), 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".melta", "config.json"), []byte(body), 0o600))
+		_, code, stdout, stderr := capture(t, []string{"melta", "config"})
 		testassert.Require(t, code == 0 && stderr == "", "exit=%d stderr=%q", code, stderr)
 		testassert.Equal(t, stdout, body)
 	})
@@ -1128,8 +1184,8 @@ func TestDispatchConfig(t *testing.T) {
 	t.Run("env override notes the path on stderr", func(t *testing.T) {
 		custom := filepath.Join(t.TempDir(), "custom.json")
 		testassert.NoError(t, os.WriteFile(custom, []byte("{}"), 0o600))
-		t.Setenv("LIGHTCODE_CONFIG", custom)
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "config"})
+		t.Setenv("MELTA_CONFIG", custom)
+		_, code, stdout, stderr := capture(t, []string{"melta", "config"})
 		testassert.Require(t, code == 0 && stdout == "{}", "exit=%d stdout=%q", code, stdout)
 		testassert.Require(t, strings.Contains(stderr, custom), "stderr missing the resolved path: %q", stderr)
 	})
@@ -1137,12 +1193,12 @@ func TestDispatchConfig(t *testing.T) {
 	t.Run("missing file errors without creating it", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		t.Setenv("LIGHTCODE_CONFIG", "")
-		path := filepath.Join(home, ".lightcode", "config.json")
+		t.Setenv("MELTA_CONFIG", "")
+		path := filepath.Join(home, ".melta", "config.json")
 		before := snapshotHome(t, home)
-		_, code, stdout, stderr := capture(t, []string{"lightcode", "config"})
+		_, code, stdout, stderr := capture(t, []string{"melta", "config"})
 		testassert.Require(t, code == 1 && stdout == "", "exit=%d stdout=%q", code, stdout)
-		testassert.Require(t, strings.Contains(stderr, "lightcode: config not created yet (run lightcode once to initialize): "+path), "stderr = %q", stderr)
+		testassert.Require(t, strings.Contains(stderr, "melta: config not created yet (run melta once to initialize): "+path), "stderr = %q", stderr)
 		{
 			after := snapshotHome(t, home)
 			testassert.Require(t, reflect.DeepEqual(before, after), "config wrote to the filesystem:\nbefore: %v\nafter:  %v", before, after)
@@ -1152,11 +1208,11 @@ func TestDispatchConfig(t *testing.T) {
 	t.Run("normal run performs zero writes", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		t.Setenv("LIGHTCODE_CONFIG", "")
-		testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".lightcode", "config.json"), []byte("{}"), 0o600))
+		t.Setenv("MELTA_CONFIG", "")
+		testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".melta"), 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(home, ".melta", "config.json"), []byte("{}"), 0o600))
 		before := snapshotHome(t, home)
-		_, code, stdout, _ := capture(t, []string{"lightcode", "config"})
+		_, code, stdout, _ := capture(t, []string{"melta", "config"})
 		testassert.Require(t, code == 0 && stdout == "{}", "exit=%d stdout=%q", code, stdout)
 		{
 			after := snapshotHome(t, home)
@@ -1166,9 +1222,9 @@ func TestDispatchConfig(t *testing.T) {
 
 	t.Run("resolve failure exits 1", func(t *testing.T) {
 		t.Setenv("HOME", "")
-		t.Setenv("LIGHTCODE_CONFIG", "")
-		_, code, _, stderr := capture(t, []string{"lightcode", "config", "--path"})
-		testassert.Require(t, code == 1 && strings.HasPrefix(stderr, "lightcode: "), "exit=%d stderr=%q", code, stderr)
+		t.Setenv("MELTA_CONFIG", "")
+		_, code, _, stderr := capture(t, []string{"melta", "config", "--path"})
+		testassert.Require(t, code == 1 && strings.HasPrefix(stderr, "melta: "), "exit=%d stderr=%q", code, stderr)
 	})
 }
 

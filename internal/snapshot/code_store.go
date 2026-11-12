@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/MMinasyan/lightcode/internal/pathutil"
-	"github.com/MMinasyan/lightcode/internal/safefs"
+	"github.com/Syntheresis/melta/internal/pathutil"
+	"github.com/Syntheresis/melta/internal/safefs"
 	"golang.org/x/sys/unix"
 )
 

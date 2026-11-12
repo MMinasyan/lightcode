@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/prompt"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/prompt"
 )
 
 var testStart = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)

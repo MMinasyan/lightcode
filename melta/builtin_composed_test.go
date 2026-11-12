@@ -9,8 +9,8 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/plugins/builtin"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // The shipped registration set composes through the real construction path
@@ -61,7 +61,7 @@ func TestBuiltinRegistrationComposes(t *testing.T) {
 	testassert.NoError(t, r.Close(ctx))
 	{
 		got := sortedDataRootNames(t, dataDir)
-		testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after shutdown = %v, want exactly the included store's files and the ownership lock", got)
+		testassert.Require(t, slices.Equal(got, []string{"melta.db", "runtime.lock"}), "data root after shutdown = %v, want exactly the included store's files and the ownership lock", got)
 	}
 }
 

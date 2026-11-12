@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // ForkRequest is the input of one transactional fork: the idle open or

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/harness"
 )
 
 // ErrDenied is the one authority class: the command target lies outside the

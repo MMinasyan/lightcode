@@ -8,24 +8,24 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestCaptureBelowCapExactOutputNoSpill(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 1024, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 1024, MaxLineChars: 80})
 	defer c.Close()
 
 	_, _ = c.Stdout().Write([]byte("hello\n"))
 	_, _ = c.Stderr().Write([]byte("warn\n"))
 
 	testassert.Equal(t, c.Format(), "hello\nwarn\n")
-	assertNoFiles(t, filepath.Join(home, ".lightcode"))
+	assertNoFiles(t, filepath.Join(home, ".melta"))
 }
 
 func TestCaptureManyLinesAboveCapSpillsFullOutput(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 40, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 40, MaxLineChars: 80})
 	defer c.Close()
 	full := numberedLines(25)
 	_, _ = c.Stdout().Write([]byte(full))
@@ -33,7 +33,7 @@ func TestCaptureManyLinesAboveCapSpillsFullOutput(t *testing.T) {
 	result := c.Format()
 	testassert.Require(t, strings.Contains(result, "line 01") && strings.Contains(result, "line 25") && !strings.Contains(result, "line 11"), "Format() = %q, want first and last lines; Format() = %q, want middle lines omitted", result, result)
 	spillPath := extractSpillPath(t, result)
-	testassert.Require(t, strings.HasPrefix(spillPath, filepath.Join(home, ".lightcode", "cmd_output_")), "spill path = %q, want cmd_output_ under home", spillPath)
+	testassert.Require(t, strings.HasPrefix(spillPath, filepath.Join(home, ".melta", "cmd_output_")), "spill path = %q, want cmd_output_ under home", spillPath)
 	data, err := os.ReadFile(spillPath)
 	testassert.Require(t, err == nil, "ReadFile(%q): %v", spillPath, err)
 	if string(data) != full {
@@ -43,7 +43,7 @@ func TestCaptureManyLinesAboveCapSpillsFullOutput(t *testing.T) {
 
 func TestCaptureFewLongLinesAboveCapTruncatesAndSpills(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 10, MaxLineChars: 5})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 10, MaxLineChars: 5})
 	defer c.Close()
 	full := "abcdefg\n1234567\n"
 	_, _ = c.Stdout().Write([]byte(full))
@@ -59,7 +59,7 @@ func TestCaptureFewLongLinesAboveCapTruncatesAndSpills(t *testing.T) {
 
 func TestCaptureSharedBudgetAcrossStdoutAndStderr(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 6, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 6, MaxLineChars: 80})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcd"))
 	_, _ = c.Stderr().Write([]byte("efgh"))
@@ -79,7 +79,7 @@ func TestCaptureSharedBudgetAcrossStdoutAndStderr(t *testing.T) {
 
 func TestCaptureCrossingWriteUsesSingleBudget(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 5, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 5, MaxLineChars: 80})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdef"))
 	_, _ = c.Stderr().Write([]byte("ghij"))
@@ -94,18 +94,18 @@ func TestCaptureCrossingWriteUsesSingleBudget(t *testing.T) {
 
 func TestCaptureDisabledCapReturnsFullOutputNoSpill(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 0, MaxLineChars: 3})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 0, MaxLineChars: 3})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdefg\n"))
 	_, _ = c.Stderr().Write([]byte("1234567\n"))
 
 	testassert.Equal(t, c.Format(), "abcdefg\n1234567\n")
-	assertNoFiles(t, filepath.Join(home, ".lightcode"))
+	assertNoFiles(t, filepath.Join(home, ".melta"))
 }
 
 func TestCaptureRepeatedFormatReusesSpillPath(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 5, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 5, MaxLineChars: 80})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("first\nsecond\nthird\n"))
 
@@ -117,11 +117,11 @@ func TestCaptureRepeatedFormatReusesSpillPath(t *testing.T) {
 
 func TestCaptureFinalSpillFailureReturnsExplicitMarker(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdefghi"))
-	testassert.NoError(t, os.Chmod(filepath.Join(home, ".lightcode"), 0o500))
-	defer func() { _ = os.Chmod(filepath.Join(home, ".lightcode"), 0o700) }()
+	testassert.NoError(t, os.Chmod(filepath.Join(home, ".melta"), 0o500))
+	defer func() { _ = os.Chmod(filepath.Join(home, ".melta"), 0o700) }()
 
 	result := c.Format()
 	testassert.Require(t, strings.Contains(result, "could not be saved:") && !strings.Contains(result, "saved to:"), "Format() = %q, want could-not-save marker; Format() = %q, should not claim saved path", result, result)
@@ -130,7 +130,7 @@ func TestCaptureFinalSpillFailureReturnsExplicitMarker(t *testing.T) {
 func TestCapturePrivateSpillFailureStaysBounded(t *testing.T) {
 	homeFile := filepath.Join(t.TempDir(), "home-file")
 	testassert.NoError(t, os.WriteFile(homeFile, []byte("not a dir"), 0o600))
-	c := NewCapture(Options{Directory: filepath.Join(homeFile, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 4})
+	c := NewCapture(Options{Directory: filepath.Join(homeFile, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 4})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte("abcdefghijklmnopqrstuvwxyz"))
 
@@ -140,7 +140,7 @@ func TestCapturePrivateSpillFailureStaysBounded(t *testing.T) {
 
 func TestCaptureVeryLongLineTruncatedWithoutFullRetention(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 8, MaxLineChars: 5})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 8, MaxLineChars: 5})
 	defer c.Close()
 	_, _ = c.Stdout().Write([]byte(strings.Repeat("x", 10000)))
 
@@ -150,7 +150,7 @@ func TestCaptureVeryLongLineTruncatedWithoutFullRetention(t *testing.T) {
 
 func TestCaptureConcurrentWritersAndFormat(t *testing.T) {
 	home := t.TempDir()
-	c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 64, MaxLineChars: 20})
+	c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 64, MaxLineChars: 20})
 	defer c.Close()
 
 	var wg sync.WaitGroup
@@ -172,7 +172,7 @@ func TestCaptureConcurrentWritersAndFormat(t *testing.T) {
 func TestCaptureConcurrentFormatAndClose(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		home := t.TempDir()
-		c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 16, MaxLineChars: 20})
+		c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 16, MaxLineChars: 20})
 		_, _ = c.Stdout().Write([]byte(strings.Repeat("line\n", 1000)))
 
 		start := make(chan struct{})
@@ -196,7 +196,7 @@ func TestCaptureConcurrentFormatAndClose(t *testing.T) {
 func TestCaptureCloseDeletesUnreturnedVisibleSpillAndKeepsReturned(t *testing.T) {
 	t.Run("unreturned", func(t *testing.T) {
 		home := t.TempDir()
-		c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
+		c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
 		_, _ = c.Stdout().Write([]byte("abcdefghi"))
 		c.Format()
 		c.mu.Lock()
@@ -212,7 +212,7 @@ func TestCaptureCloseDeletesUnreturnedVisibleSpillAndKeepsReturned(t *testing.T)
 
 	t.Run("returned", func(t *testing.T) {
 		home := t.TempDir()
-		c := NewCapture(Options{Directory: filepath.Join(home, ".lightcode"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
+		c := NewCapture(Options{Directory: filepath.Join(home, ".melta"), SpillPrefix: "cmd_output_", MaxBytes: 4, MaxLineChars: 80})
 		_, _ = c.Stdout().Write([]byte("abcdefghi"))
 		path := extractSpillPath(t, c.Format())
 		c.Close()

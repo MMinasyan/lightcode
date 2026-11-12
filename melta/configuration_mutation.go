@@ -9,10 +9,10 @@ import (
 	"slices"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // This file owns the one validated configuration writer: mutations apply a
@@ -88,7 +88,7 @@ type configurationEdit struct {
 // mutate applies one edit to the latest raw user layer and publishes the
 // complete validated candidate through the shared construction and
 // publication path. It holds the build mutex from input read through
-// publication, so Lightcode-side edits and reloads serialize. One capture of
+// publication, so Melta-side edits and reloads serialize. One capture of
 // the ready revision is taken without a reader-visible lock and released
 // again before the candidate build, so the edit's subject and credential
 // decisions never compose live getters and a slow build never blocks readers.

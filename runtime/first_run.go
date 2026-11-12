@@ -5,7 +5,7 @@ import (
 	"io/fs"
 	"os"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/atomicfs"
 )
 
 // mainConfigSkeleton is the application's first-run configuration: it

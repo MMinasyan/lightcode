@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestOwnerInstanceStampsEveryProjection proves the owner's instance identity

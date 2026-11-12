@@ -13,12 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The client conversation projection: every row runs the private pure
@@ -81,7 +81,7 @@ func convResultFact(entryID, assistantID, callID, status, content, metadata stri
 // the unpadded base64url of the first 16 bytes of SHA-256 over the
 // Session/entry binding, stable per binding and distinct per binding.
 func TestConversationItemIDKnownVector(t *testing.T) {
-	const want = "4EngWdrqzp5Q-GPdY7_DFw"
+	const want = "udv-NxsgXrfT-aRfpByfeg"
 	testassert.Equal(t, projectItemID(convSessionID, convEntryID), want)
 	otherSession := projectItemID("ffffffffffffffffffffffffffffffff", convEntryID)
 	otherEntry := projectItemID(convSessionID, "ffffffffffffffffffffffffffffffff")

@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {
@@ -325,7 +325,7 @@ func TestTransportFingerprintCanonicalIdentity(t *testing.T) {
 }
 
 func TestTransportFingerprintIgnoresResolvedAPIKey(t *testing.T) {
-	const apiKeyEnv = "LIGHTCODE_FINGERPRINT_RESOLVED_SECRET"
+	const apiKeyEnv = "MELTA_FINGERPRINT_RESOLVED_SECRET"
 	transport := Transport{BaseURL: "https://example.test/v1", APIKeyEnv: apiKeyEnv}
 	t.Setenv(apiKeyEnv, "resolved-secret-a")
 	firstFingerprint := transportFingerprint(transport)
@@ -851,9 +851,9 @@ func TestFetchDiscoveryIfDueRows(t *testing.T) {
 	})
 	t.Run("missing_key_suppresses", func(t *testing.T) {
 		home := t.TempDir()
-		t.Setenv("LIGHTCODE_FETCH_DUE_KEY", "")
-		_ = os.Unsetenv("LIGHTCODE_FETCH_DUE_KEY")
-		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1", APIKeyEnv: "LIGHTCODE_FETCH_DUE_KEY"}}
+		t.Setenv("MELTA_FETCH_DUE_KEY", "")
+		_ = os.Unsetenv("MELTA_FETCH_DUE_KEY")
+		provider := &Provider{ID: "p", Discovery: true, Transport: Transport{BaseURL: "http://127.0.0.1:9/v1", APIKeyEnv: "MELTA_FETCH_DUE_KEY"}}
 		attempted, discovered, warnings := FetchDiscoveryIfDue(context.Background(), home, provider, nil, time.Now().UTC())
 		testassert.Require(t, !attempted && discovered == nil && len(warnings) == 0, "FetchDiscoveryIfDue = (%v, %#v, %#v), want (false, nil, none) without a key", attempted, discovered, warnings)
 	})

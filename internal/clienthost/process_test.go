@@ -30,14 +30,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/protocol"
-	"github.com/MMinasyan/lightcode/runtime"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/protocol"
+	"github.com/Syntheresis/melta/runtime"
 )
 
 // The helper roles: owner starts a real owner and loses the lock cleanly when
@@ -854,7 +854,7 @@ func TestClientHostPreReadyFailureRestartsDiscovery(t *testing.T) {
 		testassert.Require(t, os.IsNotExist(err), "a failing contender published discovery: %v", err)
 	}
 	{
-		_, err := os.Stat(filepath.Join(s.dataDir, "lightcode.db"))
+		_, err := os.Stat(filepath.Join(s.dataDir, "melta.db"))
 		testassert.Require(t, os.IsNotExist(err), "a failing contender opened storage: %v", err)
 	}
 }

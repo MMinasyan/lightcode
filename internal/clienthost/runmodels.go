@@ -9,8 +9,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/clientops"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/clientops"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // UsageError is an invalid utility argument, distinct from startup or transport failure.

@@ -13,10 +13,10 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The metadata mutation suite: the retained provider/model editor operations
@@ -49,7 +49,7 @@ func metadataBundledFS() fstest.MapFS {
 	return fstest.MapFS{
 		"builtin/bstatic.json": {Data: []byte(`{
 			"id": "bstatic",
-			"transport": {"base_url": "http://bstatic.test/v1", "api_key_env": "", "headers": {"HTTP-Referer": "https://lightcode.test", "X-Title": "Lightcode"}},
+			"transport": {"base_url": "http://bstatic.test/v1", "api_key_env": "", "headers": {"HTTP-Referer": "https://melta.test", "X-Title": "Melta"}},
 			"discovery": false,
 			"models": {"bm": {"context_window": 1000}}
 		}`)},
@@ -60,7 +60,7 @@ func metadataBundledFS() fstest.MapFS {
 		}`)},
 		"builtin/openrouter.json": {Data: []byte(`{
 			"id": "openrouter",
-			"transport": {"base_url": "https://openrouter.test/v1", "api_key_env": "", "headers": {"HTTP-Referer": "https://lightcode.test", "X-Title": "Lightcode"}},
+			"transport": {"base_url": "https://openrouter.test/v1", "api_key_env": "", "headers": {"HTTP-Referer": "https://melta.test", "X-Title": "Melta"}},
 			"discovery": false,
 			"models": {"om": {"context_window": 1000}}
 		}`)},

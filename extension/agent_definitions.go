@@ -3,7 +3,7 @@ package extension
 import (
 	"encoding/json"
 
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/harness"
 )
 
 // AgentDefinitionSummary is one resolver's list entry: the displayed

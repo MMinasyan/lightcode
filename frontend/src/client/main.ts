@@ -12,11 +12,11 @@ if (typeof window !== 'undefined') {
   try {
     const target = document.getElementById('app');
     if (target === null) {
-      throw new Error('lightcode: desktop bootstrap: app mount target is missing');
+      throw new Error('melta: desktop bootstrap: app mount target is missing');
     }
     const connection = new RuntimeConnection();
     mount(App, { target, props: { connection } });
   } catch (error) {
-    console.error('lightcode: desktop bootstrap:', error);
+    console.error('melta: desktop bootstrap:', error);
   }
 }

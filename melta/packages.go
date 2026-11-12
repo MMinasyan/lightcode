@@ -12,12 +12,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extension/worker"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/internal/safefs"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extension/worker"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/safefs"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // packageSelection is the atomic selected-package record: the extension ID,

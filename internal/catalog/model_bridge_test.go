@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // TestModelRefBridgeForwardsPublicIdentity pins the catalog's ModelRef

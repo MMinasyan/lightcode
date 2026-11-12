@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // cancelThen wraps a scripted return value in a run-context cancellation fired at the exact moment the boundary is inside its own invocation — the blocking-fake stand-in that pins what the next checkpoint must observe.

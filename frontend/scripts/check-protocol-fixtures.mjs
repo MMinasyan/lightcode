@@ -39,7 +39,7 @@ function main() {
   const bySchema = new Map(corpus.components.map((entry) => [entry.schema, entry]));
   const firstAccept = (schema) => bySchema.get(schema)?.accept[0]?.json;
 
-  const workspace = mkdtempSync(join(tmpdir(), 'lightcode-protocol-fixtures-'));
+  const workspace = mkdtempSync(join(tmpdir(), 'melta-protocol-fixtures-'));
   let keep = true;
   try {
     const relativeImport = relative(workspace, generatedDir).split(sep).join('/');

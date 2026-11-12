@@ -18,14 +18,14 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/options/linux"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/internal/version"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/protocol"
-	"github.com/MMinasyan/lightcode/runtime"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/plugins/builtin"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/internal/version"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/protocol"
+	"github.com/Syntheresis/melta/runtime"
 )
 
 // The desktop host's controlled fixtures: a scripted loopback server models
@@ -615,7 +615,7 @@ func TestDesktopHostNativeInvocation(t *testing.T) {
 			// The initial window title and every subsequent SetTitle apply
 			// the one shared algorithm: the plain basename join, no
 			// special case.
-			want := "Lightcode — " + filepath.Base(workspace)
+			want := "Melta — " + filepath.Base(workspace)
 			{
 				got := windowTitle(workspace)
 				testassert.Require(t, got == want, "initial title for %q = %q, want %q", workspace, got, want)
@@ -1152,7 +1152,7 @@ func TestDesktopHostAppOptions(t *testing.T) {
 	opts := appOptions(host, assets)
 	testassert.Require(t, opts.Width == 900 && opts.Height == 700, "window size = %dx%d, want 900x700", opts.Width, opts.Height)
 	{
-		want := "Lightcode — WorkspaceDir"
+		want := "Melta — WorkspaceDir"
 		testassert.Equal(t, opts.Title, want)
 	}
 	testassert.Require(t, opts.AssetServer != nil && opts.AssetServer.Assets == assets, "AssetServer.Assets = %v, want the given filesystem", opts.AssetServer)

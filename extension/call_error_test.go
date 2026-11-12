@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
 )
 
 func TestCallErrorPreservesCauseAndPartial(t *testing.T) {

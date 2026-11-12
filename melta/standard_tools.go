@@ -19,16 +19,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/editpreview"
-	"github.com/MMinasyan/lightcode/internal/jobs"
-	"github.com/MMinasyan/lightcode/internal/pathutil"
-	"github.com/MMinasyan/lightcode/internal/shellparse"
-	"github.com/MMinasyan/lightcode/internal/snapshot"
-	"github.com/MMinasyan/lightcode/internal/tool"
-	"github.com/MMinasyan/lightcode/internal/toolargs"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/editpreview"
+	"github.com/Syntheresis/melta/internal/jobs"
+	"github.com/Syntheresis/melta/internal/pathutil"
+	"github.com/Syntheresis/melta/internal/shellparse"
+	"github.com/Syntheresis/melta/internal/snapshot"
+	"github.com/Syntheresis/melta/internal/tool"
+	"github.com/Syntheresis/melta/internal/toolargs"
+	"github.com/Syntheresis/melta/model"
 )
 
 // maxDiagnosticBytes is the durable diagnostic bound for the
@@ -810,12 +810,12 @@ func (t processTool) Prepare(_ context.Context, tc ToolContext, call model.ToolC
 }
 
 // normalizeProcessArgs is the process tool's member validator: private
-// `_lightcode_` fields are stripped, a present action or id must be a
+// `_melta_` fields are stripped, a present action or id must be a
 // string, and every other member is preserved; Prepare owns the semantics.
 func normalizeProcessArgs(args map[string]any) (map[string]any, error) {
 	clean := make(map[string]any, len(args))
 	for key, value := range args {
-		if strings.HasPrefix(key, "_lightcode_") {
+		if strings.HasPrefix(key, "_melta_") {
 			continue
 		}
 		if key == "action" || key == "id" {

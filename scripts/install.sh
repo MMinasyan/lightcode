@@ -1,26 +1,26 @@
 #!/bin/sh
 set -eu
 
-repo_url="https://github.com/MMinasyan/lightcode"
-asset="lightcode-linux-amd64.tar.gz"
-binary_name="lightcode"
+repo_url="https://github.com/Syntheresis/melta"
+asset="melta-linux-amd64.tar.gz"
+binary_name="melta"
 
 usage() {
     printf '%s\n' \
-'Install Lightcode for Linux amd64.
+'Install Melta for Linux amd64.
 
 Usage:
   sh install.sh
-  LIGHTCODE_INSTALL_DIR=/path/to/bin sh install.sh
-  LIGHTCODE_VERSION=vX.Y.Z sh install.sh
+  MELTA_INSTALL_DIR=/path/to/bin sh install.sh
+  MELTA_VERSION=vX.Y.Z sh install.sh
 
 Environment:
-  LIGHTCODE_INSTALL_DIR   Install directory. Default: /usr/local/bin
-  LIGHTCODE_VERSION       Release tag to install. Default: latest release
-  LIGHTCODE_RELEASE_BASE  Release asset base URL for tests
+  MELTA_INSTALL_DIR   Install directory. Default: /usr/local/bin
+  MELTA_VERSION       Release tag to install. Default: latest release
+  MELTA_RELEASE_BASE  Release asset base URL for tests
 
 Downloads the release tarball, verifies SHA256SUMS, installs supported Linux
-runtime packages when needed, and writes lightcode into the target directory.'
+runtime packages when needed, and writes melta into the target directory.'
 }
 
 log() {
@@ -28,7 +28,7 @@ log() {
 }
 
 fail() {
-    printf 'lightcode installer: %s\n' "$*" >&2
+    printf 'melta installer: %s\n' "$*" >&2
     exit 1
 }
 
@@ -232,11 +232,11 @@ if ! have curl && ! have wget; then
     fail "required command not found: curl or wget"
 fi
 
-install_dir=${LIGHTCODE_INSTALL_DIR:-/usr/local/bin}
-release_base=${LIGHTCODE_RELEASE_BASE:-}
+install_dir=${MELTA_INSTALL_DIR:-/usr/local/bin}
+release_base=${MELTA_RELEASE_BASE:-}
 if [ -z "$release_base" ]; then
-    if [ -n "${LIGHTCODE_VERSION:-}" ]; then
-        release_base="$repo_url/releases/download/$LIGHTCODE_VERSION"
+    if [ -n "${MELTA_VERSION:-}" ]; then
+        release_base="$repo_url/releases/download/$MELTA_VERSION"
     else
         release_base="$repo_url/releases/latest/download"
     fi
@@ -279,7 +279,7 @@ mkdir -p "$install_dir" 2>/dev/null || as_root mkdir -p "$install_dir" || fail "
 [ -d "$install_dir" ] || fail "install target is not a directory: $install_dir"
 
 if [ -w "$install_dir" ]; then
-    tmp_install=$install_dir/.lightcode.tmp.$$
+    tmp_install=$install_dir/.melta.tmp.$$
     rm -f "$tmp_install"
     cp "$extracted" "$tmp_install" || {
         rm -f "$tmp_install"
@@ -294,7 +294,7 @@ if [ -w "$install_dir" ]; then
         fail "could not move binary into place"
     }
 else
-    tmp_install=$install_dir/.lightcode.tmp.$$
+    tmp_install=$install_dir/.melta.tmp.$$
     as_root rm -f "$tmp_install"
     as_root cp "$extracted" "$tmp_install" || {
         as_root rm -f "$tmp_install"
@@ -310,9 +310,9 @@ else
     }
 fi
 
-log "Installed Lightcode to $install_dir/$binary_name"
+log "Installed Melta to $install_dir/$binary_name"
 if ! is_path_on_path "$install_dir"; then
-    log "Add $install_dir to PATH to run lightcode from any shell."
+    log "Add $install_dir to PATH to run melta from any shell."
 fi
-log "Run: lightcode"
-log "Or:  lightcode cli"
+log "Run: melta"
+log "Or:  melta cli"

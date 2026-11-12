@@ -3,7 +3,7 @@ package model
 import "testing"
 
 import (
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestBuildHeadersPinsDefaultsKeyAndOverrides pins the single header helper: JSON content type and SSE accept defaults, Bearer authorization exactly when a key is present (empty omits it entirely), then resolved headers overwriting matching defaults case-insensitively while adding new ones — every entry stored in MIME canonical form with http.Header.Set semantics.
@@ -26,16 +26,16 @@ func TestBuildHeadersPinsDefaultsKeyAndOverrides(t *testing.T) {
 		rt := testResolved()
 		rt.APIKey = "sk-test"
 		rt.Headers = map[string]string{
-			"Accept":        "application/json", // overwrites the SSE accept default (exact key here, variant keys in the sibling row).
-			"X-Lightcode-1": "on",               // new already-canonical keys are added.
-			"content-type":  "text/plain; x=1",  // case-insensitive match on Content-Type: replaces it and is stored canonically, exactly as http.Header.Set would.
+			"Accept":       "application/json", // overwrites the SSE accept default (exact key here, variant keys in the sibling row).
+			"X-Melta-1":    "on",               // new already-canonical keys are added.
+			"content-type": "text/plain; x=1",  // case-insensitive match on Content-Type: replaces it and is stored canonically, exactly as http.Header.Set would.
 		}
 		got := BuildHeaders(rt)
 		want := map[string]string{
 			"Content-Type":  "text/plain; x=1", // the resolved value won over the default through its case-variant key — one entry per name total.
 			"Accept":        "application/json",
 			"Authorization": "Bearer sk-test",
-			"X-Lightcode-1": "on",
+			"X-Melta-1":     "on",
 		}
 		assertHeaderMapEqual(t, got, want) // len equality also pins that no lowercase duplicate entry survived alongside the canonical one.
 	})

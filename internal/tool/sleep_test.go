@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestSleepCustomDurationAndClampsMinimum(t *testing.T) {

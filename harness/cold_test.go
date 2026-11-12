@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // coldChildEnv switches this test binary into the child mode of the cold
 // execution regression.
-const coldChildEnv = "LIGHTCODE_COLD_CHILD"
+const coldChildEnv = "MELTA_COLD_CHILD"
 
 // coldChildDone is the child's completion marker: the parent requires it so a
 // child that ran no assertion cannot pass by exiting zero.

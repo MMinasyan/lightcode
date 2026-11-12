@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // stubJobStopper satisfies the seam; Step 2 only proves a non-nil stopper is

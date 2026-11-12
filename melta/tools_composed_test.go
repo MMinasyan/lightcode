@@ -16,13 +16,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/jobs"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/internal/tool"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/jobs"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/internal/tool"
+	"github.com/Syntheresis/melta/model"
 )
 
 // The composed standard-tools tests: the directly constructed baseline tools
@@ -358,7 +358,7 @@ func newToolsHarnessWith(t *testing.T, modelFn func(context.Context, model.Reque
 
 	store := opts.store
 	if store == nil {
-		opened, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
+		opened, err := storage.OpenSQLite(filepath.Join(dataDir, "melta.db"))
 		testassert.NoError(t, err)
 		t.Cleanup(func() { _ = opened.Close() })
 		store = opened
@@ -842,19 +842,19 @@ func TestRunCommandExecuteOutcomes(t *testing.T) {
 	})
 
 	t.Run("the managed key connected after Open is scrubbed while an unlisted sibling and the workspace cwd remain", func(t *testing.T) {
-		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_TEST", "env-value")
-		t.Setenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED", "managed-secret") // cleanup reservation only
-		testassert.NoError(t, os.Unsetenv("LIGHTCODE_TOOLS_PLUGIN_MANAGED"))
+		t.Setenv("MELTA_TOOLS_PLUGIN_TEST", "env-value")
+		t.Setenv("MELTA_TOOLS_PLUGIN_MANAGED", "managed-secret") // cleanup reservation only
+		testassert.NoError(t, os.Unsetenv("MELTA_TOOLS_PLUGIN_MANAGED"))
 		byID, _ := openToolsComposed(t, dataDir, &fakeJobs{}, nil)
 		runCommand := byID["run_command"]
 		// The key connects AFTER the tools plugin opened: the call-time
 		// subprocess-environment producer, not any Open-captured copy, must
 		// scrub it from the child.
 		managed := config.NewManagedEnv(filepath.Join(t.TempDir(), ".env"))
-		testassert.NoError(t, managed.TrySet("LIGHTCODE_TOOLS_PLUGIN_MANAGED", "managed-secret"))
+		testassert.NoError(t, managed.TrySet("MELTA_TOOLS_PLUGIN_MANAGED", "managed-secret"))
 		callTC := tc
 		callTC.SubprocessEnv = testSubprocessEnv(managed)
-		plan := prepare(t, runCommand, callTC, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_TOOLS_PLUGIN_TEST\" \"$LIGHTCODE_TOOLS_PLUGIN_MANAGED\"; pwd"}`)
+		plan := prepare(t, runCommand, callTC, "run_command", `{"command":"printf '%s|%s' \"$MELTA_TOOLS_PLUGIN_TEST\" \"$MELTA_TOOLS_PLUGIN_MANAGED\"; pwd"}`)
 		outcome := plan.Execute(context.Background())
 		testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "result = %+v, want success", outcome.Result)
 		content := outcome.Result.Content
@@ -881,9 +881,9 @@ func TestSleepTool(t *testing.T) {
 				testassert.Check(t, err != nil, "sleep normalized %s, want rejection", args)
 			}
 		}
-		raw, err := normalize(t, sleepTool, tc, "sleep", `{"seconds":2,"_lightcode_receipt":"x"}`)
+		raw, err := normalize(t, sleepTool, tc, "sleep", `{"seconds":2,"_melta_receipt":"x"}`)
 		testassert.NoError(t, err)
-		testassert.Require(t, strings.Contains(string(raw), `"seconds":2`) && !strings.Contains(string(raw), "_lightcode_receipt"), "normalized = %s, want the clamped value with private fields stripped", raw)
+		testassert.Require(t, strings.Contains(string(raw), `"seconds":2`) && !strings.Contains(string(raw), "_melta_receipt"), "normalized = %s, want the clamped value with private fields stripped", raw)
 		raw, err = normalize(t, sleepTool, tc, "sleep", `{"seconds":5000}`)
 		testassert.Require(t, err == nil && strings.Contains(string(raw), `"seconds":300`), "normalized = (%s, %v), want the 300 clamp", raw, err)
 		for _, args := range []string{`{}`, `{"seconds":0}`, `{"seconds":-5}`} {
@@ -1443,8 +1443,8 @@ func TestReadOnlyBackgroundStartRewritesAndHonorsTimeout(t *testing.T) {
 // joined writer keep the failure cleanup honest.
 func TestRunCommandConcurrentManagedWritesSpawnChildren(t *testing.T) {
 	const (
-		externalKey = "LIGHTCODE_CONCURRENT_EXTERNAL"
-		managedKey  = "LIGHTCODE_CONCURRENT_MANAGED"
+		externalKey = "MELTA_CONCURRENT_EXTERNAL"
+		managedKey  = "MELTA_CONCURRENT_MANAGED"
 	)
 	t.Setenv(externalKey, "sibling-value")
 	t.Setenv(managedKey, "") // cleanup reservation only
@@ -1501,7 +1501,7 @@ func TestRunCommandConcurrentManagedWritesSpawnChildren(t *testing.T) {
 			testassert.Require(t, rest == "", "%s child saw a managed value %q, want none", kind, rest)
 		}
 	}
-	command := `printf '%s|%s' "$LIGHTCODE_CONCURRENT_EXTERNAL" "$LIGHTCODE_CONCURRENT_MANAGED"`
+	command := `printf '%s|%s' "$MELTA_CONCURRENT_EXTERNAL" "$MELTA_CONCURRENT_MANAGED"`
 	fgArgs, err := json.Marshal(map[string]any{"command": command})
 	testassert.NoError(t, err)
 	bgArgs, err := json.Marshal(map[string]any{"command": command + "; sleep 30", "background": true})
@@ -1550,9 +1550,9 @@ func TestRunCommandConcurrentManagedWritesSpawnChildren(t *testing.T) {
 // actual child start, so the call-time producer, not any Prepare-time copy,
 // does the scrubbing.
 func TestBackgroundJobEnvironmentScrubsManagedKey(t *testing.T) {
-	t.Setenv("LIGHTCODE_BG_UNLISTED", "early-value")
-	t.Setenv("LIGHTCODE_BG_MANAGED", "managed-secret") // cleanup reservation only
-	testassert.NoError(t, os.Unsetenv("LIGHTCODE_BG_MANAGED"))
+	t.Setenv("MELTA_BG_UNLISTED", "early-value")
+	t.Setenv("MELTA_BG_MANAGED", "managed-secret") // cleanup reservation only
+	testassert.NoError(t, os.Unsetenv("MELTA_BG_MANAGED"))
 	dataDir := t.TempDir()
 	jobsInst := realJobs(t, dataDir)
 	byID := newStandardTools(dataDir, jobsInst)
@@ -1561,12 +1561,12 @@ func TestBackgroundJobEnvironmentScrubsManagedKey(t *testing.T) {
 	tc := callToolContext(ws, ToolConstraints{})
 	tc.SubprocessEnv = testSubprocessEnv(managed)
 	tc.Background = &scriptBackground{}
-	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_BG_UNLISTED\" \"$LIGHTCODE_BG_MANAGED\"; sleep 30","background":true}`)
+	plan := prepare(t, byID["run_command"], tc, "run_command", `{"command":"printf '%s|%s' \"$MELTA_BG_UNLISTED\" \"$MELTA_BG_MANAGED\"; sleep 30","background":true}`)
 	// Both clocks move after Prepare and before the child starts: the
 	// external sibling changes and the key connects. The job must see the
 	// later sibling and no managed key.
-	t.Setenv("LIGHTCODE_BG_UNLISTED", "visible-value")
-	testassert.NoError(t, managed.TrySet("LIGHTCODE_BG_MANAGED", "managed-secret"))
+	t.Setenv("MELTA_BG_UNLISTED", "visible-value")
+	testassert.NoError(t, managed.TrySet("MELTA_BG_MANAGED", "managed-secret"))
 	outcome := plan.Execute(context.Background())
 	testassert.Require(t, outcome.Result.Status == model.ResultSuccess, "result = %+v, want the background start to succeed", outcome.Result)
 	jobID := assertBackgroundImmediate(t, outcome.Result.Content)
@@ -1917,8 +1917,8 @@ func TestBackgroundNilSubprocessEnvNoReservation(t *testing.T) {
 // moments is still scrubbed from the child.
 func TestRunCommandEnvResolvedAtStartNotPrepare(t *testing.T) {
 	managed := stubManagedEnv(t)
-	key := "LIGHTCODE_SCRUB_LATE"
-	external := "LIGHTCODE_TIMING_EXTERNAL"
+	key := "MELTA_SCRUB_LATE"
+	external := "MELTA_TIMING_EXTERNAL"
 	t.Setenv(key, "late-secret") // cleanup reservation only
 	testassert.NoError(t, os.Unsetenv(key))
 	t.Setenv(external, "early-value")
@@ -1926,7 +1926,7 @@ func TestRunCommandEnvResolvedAtStartNotPrepare(t *testing.T) {
 	ws := t.TempDir()
 	tc := callToolContext(ws, ToolConstraints{})
 	tc.SubprocessEnv = testSubprocessEnv(managed)
-	plan := prepare(t, runCommand, tc, "run_command", `{"command":"printf '%s|%s' \"$LIGHTCODE_TIMING_EXTERNAL\" \"$LIGHTCODE_SCRUB_LATE\""}`)
+	plan := prepare(t, runCommand, tc, "run_command", `{"command":"printf '%s|%s' \"$MELTA_TIMING_EXTERNAL\" \"$MELTA_SCRUB_LATE\""}`)
 	// Both clocks move after Prepare: the external sibling changes and the
 	// key connects. A Prepare-time capture would freeze the early sibling and
 	// miss the late managed key; the start-time resolution sees the later

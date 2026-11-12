@@ -1,5 +1,5 @@
 // Package agent defines the caller-driven model/tool effect contracts of the
-// fixed Lightcode Agent, its one stream assembler, its execution loop, and the
+// fixed Melta Agent, its one stream assembler, its execution loop, and the
 // ordinary standalone adapters — AdaptModelEffect over a model.Transport and
 // AdaptTools over a registered tool map — that make the model client plus loop
 // independently usable on their own (the melta-engine surface) without private
@@ -9,7 +9,7 @@
 // those caller boundaries under one cancellation invariant, validating what
 // those caller boundaries return, and the adapters' lookup and settlement
 // mapping. Retry policy, persistence, and events belong to layers above these
-// contracts. It imports only the standard library and lightcode/model.
+// contracts. It imports only the standard library and melta/model.
 package agent
 
 import (
@@ -17,7 +17,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 type (

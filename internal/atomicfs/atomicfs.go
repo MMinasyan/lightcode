@@ -1,5 +1,5 @@
 // Package atomicfs provides the shared publication protocol for
-// ~/.lightcode state files: atomic replace, exclusive create, and a
+// ~/.melta state files: atomic replace, exclusive create, and a
 // cross-process advisory lock. Readers of a file written through Write
 // always observe either the old complete contents or the new complete
 // contents, never a partial write. Records that are read-modify-write
@@ -75,7 +75,7 @@ func Write(path string, data []byte, perm os.FileMode) error {
 	// The file is published and complete; a directory-sync failure cannot be
 	// compensated by the caller, so report it and return success.
 	if err := SyncDir(dir); err != nil {
-		fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
+		fmt.Fprintf(os.Stderr, "melta: %v\n", err)
 	}
 	return nil
 }
@@ -144,7 +144,7 @@ func CreateExclusive(path string, data []byte, perm os.FileMode) (bool, error) {
 	// The file is published and complete; a directory-sync failure cannot be
 	// compensated by the caller, so report it and return success.
 	if err := SyncDir(dir); err != nil {
-		fmt.Fprintf(os.Stderr, "lightcode: %v\n", err)
+		fmt.Fprintf(os.Stderr, "melta: %v\n", err)
 	}
 	return true, nil
 }
@@ -261,7 +261,7 @@ func TryWithLock(lockPath string, fn func() error) (bool, error) {
 func runLocked(l *Lock, lockPath string, fn func() error) error {
 	defer func() {
 		if err := l.Release(); err != nil {
-			fmt.Fprintf(os.Stderr, "lightcode: release lock %s: %v\n", lockPath, err)
+			fmt.Fprintf(os.Stderr, "melta: release lock %s: %v\n", lockPath, err)
 		}
 	}()
 	return fn()

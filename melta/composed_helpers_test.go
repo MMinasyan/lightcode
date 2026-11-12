@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/runtime"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/runtime"
 )
 
 // The shared fixtures of the external composed suite: the event readers over
@@ -96,7 +96,7 @@ func composedCaller(t *testing.T, r *melta.Melta) melta.Caller {
 
 // composedOptions builds explicit construction inputs over one test home.
 func composedOptions(dataDir, configPath, home string, plugins []extension.Native) melta.Options {
-	dataRoot := filepath.Join(home, ".lightcode")
+	dataRoot := filepath.Join(home, ".melta")
 	return melta.Options{
 		DataDir:       dataDir,
 		Configuration: melta.NewFileConfigurationSource(configPath),

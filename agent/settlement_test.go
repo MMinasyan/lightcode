@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // mkSettlementOutput builds one valid model output of the requested closed status carrying exactly testRef's source identity — a construction failure here means this test fixture itself is broken, not the code under test.

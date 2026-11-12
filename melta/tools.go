@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/model"
 )
 
 // ToolDescription is one static tool description: the model-visible

@@ -11,8 +11,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // byteNormalize is the byte-preserving fixture normalizer: it accepts exactly

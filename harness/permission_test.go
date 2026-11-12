@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // isBuiltInOnly reports whether a resolved policy carries no user-level state

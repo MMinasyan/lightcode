@@ -10,9 +10,9 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/pathutil"
-	"github.com/MMinasyan/lightcode/internal/safefs"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/pathutil"
+	"github.com/Syntheresis/melta/internal/safefs"
 )
 
 // PreparedTarget is one canonical target bound during preparation. The

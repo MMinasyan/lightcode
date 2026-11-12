@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/harness"
 )
 
 // This file owns the private per-Session artifact interval: internal

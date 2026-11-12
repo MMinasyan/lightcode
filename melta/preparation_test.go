@@ -17,12 +17,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/prompt"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/prompt"
 )
 
 // Preparation fixtures: the public Open over the existing owner environment
@@ -611,7 +611,7 @@ func eachPrepStore(t *testing.T, run func(t *testing.T, store harness.Storage)) 
 		run(t, storage.NewMemory())
 	})
 	t.Run("sqlite", func(t *testing.T) {
-		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 		testassert.NoError(t, err)
 		defer store.Close()
 		run(t, store)

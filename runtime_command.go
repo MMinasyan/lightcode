@@ -7,9 +7,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/runtime"
+	"github.com/Syntheresis/melta/internal/plugins/builtin"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/runtime"
 )
 
 //go:embed runtime_identity.md
@@ -23,7 +23,7 @@ func installedExtensions() ([]string, []string) {
 	return ids, builtin.DefaultCapabilityIDs()
 }
 
-// runRuntime runs the shared managed MELTA owner and its thin protocol host in
+// runRuntime runs the shared managed Melta owner and its thin protocol host in
 // the foreground for the lifetime of the signal context. It supplies the
 // current application paths and the first-run configuration document, opens
 // the owner with the host withdrawal callback, attaches the protocol and
@@ -44,13 +44,13 @@ func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 	if err != nil {
 		return err
 	}
-	dataRoot := filepath.Join(home, ".lightcode")
+	dataRoot := filepath.Join(home, ".melta")
 	locations := melta.Locations{
 		GlobalRulesDir:     dataRoot,
 		DiscoveryCacheDir:  filepath.Join(dataRoot, "cache", "discovery"),
 		WorkspacePolicyDir: filepath.Join(dataRoot, "projects"),
 	}
-	if os.Getenv("LIGHTCODE_DEBUG_WIRE") == "1" {
+	if os.Getenv("MELTA_DEBUG_WIRE") == "1" {
 		locations.WireDebugDir = filepath.Join(dataRoot, "debug", "wire")
 	}
 	if err := runtime.InitializeFirstRunConfiguration(absConfigPath); err != nil {

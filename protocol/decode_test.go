@@ -3,7 +3,7 @@ package protocol_test
 import (
 	"testing"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 func TestDecodeValueExactRequestMembersButOpaquePayloads(t *testing.T) {
