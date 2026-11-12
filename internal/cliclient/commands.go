@@ -57,7 +57,8 @@ func contentText(parts []protocol.ContentPart) string {
 }
 func knownError(err error) bool {
 	var response *clientops.ResponseError
-	return errors.As(err, &response) || errors.Is(err, clientops.ErrInvalidParams)
+	var extensionFailure *clientops.ExtensionResponseError
+	return errors.As(err, &response) || errors.As(err, &extensionFailure) || errors.Is(err, clientops.ErrInvalidParams)
 }
 func resultText(raw json.RawMessage, err error) string {
 	if err == nil {
@@ -67,6 +68,10 @@ func resultText(raw json.RawMessage, err error) string {
 	if errors.As(err, &response) && response.Partial != nil {
 		raw, _ := json.Marshal(response.Partial)
 		return terminal.RenderWarningMsg(string(raw))
+	}
+	var extensionFailure *clientops.ExtensionResponseError
+	if errors.As(err, &extensionFailure) {
+		return terminal.RenderWarningMsg(string(extensionFailure.Body))
 	}
 	if knownError(err) {
 		return terminal.RenderErrorMsg(err.Error())

@@ -13,6 +13,7 @@ type Declaration struct {
 	Components   []Component                   `json:"components"`
 	Capabilities []Capability                  `json:"capabilities"`
 	Edits        []extension.ConfigurationEdit `json:"configuration_edits,omitempty"`
+	Exposed      []extension.ExposedMethod     `json:"exposed,omitempty"`
 }
 
 // Component is the wire form of one declaration component.
@@ -73,6 +74,7 @@ func NewDeclaration(d extension.Declaration) Declaration {
 		Components:   make([]Component, len(d.Components)),
 		Capabilities: make([]Capability, len(d.Capabilities)),
 		Edits:        append([]extension.ConfigurationEdit(nil), d.Edits...),
+		Exposed:      append([]extension.ExposedMethod(nil), d.Exposed...),
 	}
 	for i, component := range d.Components {
 		out.Components[i] = Component{
@@ -106,6 +108,7 @@ func (d Declaration) Value() extension.Declaration {
 		Components:   make([]extension.Component, len(d.Components)),
 		Capabilities: make([]extension.Capability, len(d.Capabilities)),
 		Edits:        append([]extension.ConfigurationEdit(nil), d.Edits...),
+		Exposed:      append([]extension.ExposedMethod(nil), d.Exposed...),
 	}
 	for i, component := range d.Components {
 		out.Components[i] = extension.Component{

@@ -116,7 +116,7 @@ func (s *configurationService) prepareResources(Caller context.Context, snapshot
 		return errors.Join(err, cleanupErr)
 	}
 	r.runtime = runtime
-	r.workspaces = newWorkspaceScopes(ctx, snapshot.composition, []*scope{runtime}, s.obs, snapshot.extensions)
+	r.workspaces = newWorkspaceScopes(ctx, snapshot.composition, []*scope{runtime}, s.obs, snapshot.extensions, snapshot.declaredBindings)
 	snapshot.resources = r
 	return nil
 }

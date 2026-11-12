@@ -256,8 +256,6 @@ func (p *preparation) bind() func(context.Context, harness.PreparationRequest) (
 		}
 		runtimeScope, workspaces := snapshot.resources.runtime, snapshot.resources.workspaces
 		workspaceInfo := ScopeInfo{Kind: ScopeWorkspace, DataDir: runtimeScope.info.DataDir, Workspace: workspace, Revision: snapshot.resources.revisionString()}
-		workspaceInfo.sections = snapshot.extensions
-		workspaceInfo.declaredBindings = snapshot.declaredBindings
 		workspaceScope, err := workspaces.get(ctx, workspaceInfo)
 		if err != nil {
 			return harness.PreparedExecution{}, err

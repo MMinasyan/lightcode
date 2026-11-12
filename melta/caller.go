@@ -56,6 +56,13 @@ type Caller struct {
 // can mint one; the embedding application binds it after its own
 // authentication.
 func (r *Melta) Caller(grant CallerContext) (Caller, error) {
+	return r.caller(grant)
+}
+
+// caller is the one owner-bound grant constructor: the public Caller method
+// and the host-derived command Caller share the same concrete scope
+// validation.
+func (r *Melta) caller(grant CallerContext) (Caller, error) {
 	if r == nil {
 		return Caller{}, fmt.Errorf("caller requires an issuing owner: %w", harness.ErrInvalid)
 	}

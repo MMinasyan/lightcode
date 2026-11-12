@@ -1197,3 +1197,82 @@ func TestReaderAllowsProtocolNullResult(t *testing.T) {
 		t.Fatalf("frame = %+v", frame)
 	}
 }
+
+// TestServeHostcallPartialDecodesCallError proves a hostcall error carrying a
+// produced partial reaches the worker author as extension.CallError wrapping
+// the classed worker error, with the exact owned bytes and cause preserved.
+func TestServeHostcallPartialDecodesCallError(t *testing.T) {
+	capability := extension.ServiceCapability("service-1", "service/v1", extension.ServiceIOMethod("call", `{}`, `{}`))
+	received := make(chan error, 1)
+	handler := func(ctx context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
+		_, err := call.Call(ctx, "dep", "ping", json.RawMessage(`{}`))
+		received <- err
+		return extension.Result{Value: json.RawMessage(`{}`)}, nil
+	}
+	native := singleNative(baseDeclaration(capability), nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{
+			"service-1": {Service: map[string]extension.Handler{"call": handler}},
+		}}, nil
+	})
+	p := startPeer(t, native)
+	p.activate()
+	p.open("open-token")
+	params, err := json.Marshal(worker.CallParams{Target: instanceTarget("service-1"), Context: testRoutingContext("call-token"), Method: "call", Arguments: worker.JSONBytes(`{}`)})
+	if err != nil {
+		t.Fatalf("encoding call params: %v", err)
+	}
+	p.send(worker.Frame{Kind: worker.KindRequest, ID: "call-1", Method: worker.MethodCall, Params: params})
+	hostcall := p.readRequest(worker.MethodHostcall)
+	partial := json.RawMessage("{\n  \"restored\": [\"a.go\"],\n  \"big\": 9007199254740993\n}")
+	p.send(worker.Frame{Kind: worker.KindResponse, ID: hostcall.ID, Error: &worker.Error{
+		Class: worker.ClassConflict, Message: "partial failure", Partial: worker.JSONBytes(partial),
+	}})
+	response := p.readResponse("call-1")
+	if response.Error != nil {
+		t.Fatalf("author call failed: %v", response.Error)
+	}
+	var callErr *extension.CallError
+	if err := <-received; !errors.As(err, &callErr) {
+		t.Fatalf("author error = %v, want extension.CallError", err)
+	} else if !errors.Is(callErr, harness.ErrConflict) {
+		t.Fatalf("author error cause = %v, want the conflict class", callErr.Err)
+	} else if !bytes.Equal(callErr.Partial, partial) {
+		t.Fatalf("author partial = %q, want %q", callErr.Partial, partial)
+	}
+	if err := p.finish(); err != nil {
+		t.Fatalf("Serve = %v", err)
+	}
+}
+
+// TestServeHostcallMalformedPartialFailsActivation proves an invalid present
+// partial is rejected by the existing activation-invalid-terminal rule rather
+// than delivered to the author.
+func TestServeHostcallMalformedPartialFailsActivation(t *testing.T) {
+	capability := extension.ServiceCapability("service-1", "service/v1", extension.ServiceIOMethod("call", `{}`, `{}`))
+	received := make(chan error, 1)
+	handler := func(ctx context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
+		_, err := call.Call(ctx, "dep", "ping", json.RawMessage(`{}`))
+		received <- err
+		return extension.Result{Value: json.RawMessage(`{}`)}, nil
+	}
+	native := singleNative(baseDeclaration(capability), nil, func(context.Context, extension.InstanceContext) (extension.Instance, error) {
+		return extension.Instance{Capabilities: map[string]extension.Implementation{
+			"service-1": {Service: map[string]extension.Handler{"call": handler}},
+		}}, nil
+	})
+	p := startPeer(t, native)
+	p.activate()
+	p.open("open-token")
+	params, err := json.Marshal(worker.CallParams{Target: instanceTarget("service-1"), Context: testRoutingContext("call-token"), Method: "call", Arguments: worker.JSONBytes(`{}`)})
+	if err != nil {
+		t.Fatalf("encoding call params: %v", err)
+	}
+	p.send(worker.Frame{Kind: worker.KindRequest, ID: "call-1", Method: worker.MethodCall, Params: params})
+	hostcall := p.readRequest(worker.MethodHostcall)
+	p.send(worker.Frame{Kind: worker.KindResponse, ID: hostcall.ID, Error: &worker.Error{
+		Class: worker.ClassInternal, Message: "malformed", Partial: worker.JSONBytes(`not json`),
+	}})
+	if err := p.wait(); err == nil || !strings.Contains(err.Error(), "invalid error partial") {
+		t.Fatalf("Serve error = %v, want the invalid error partial terminal", err)
+	}
+}

@@ -79,7 +79,7 @@ func TestProtocolMountedProjectionAndOwnership(t *testing.T) {
 
 	health, err := client.GetHealthWithResponse(ctx)
 	testassert.Require(t, err == nil && health.JSON200 != nil, "GetHealth = (%+v, %v)", health, err)
-	testassert.Require(t, health.JSON200.InstanceId == owner.InstanceID() && health.JSON200.ProtocolVersion == protocol.N14, "health = %+v, want the owner instance and N14", health.JSON200)
+	testassert.Require(t, health.JSON200.InstanceId == owner.InstanceID() && health.JSON200.ProtocolVersion == protocol.N15, "health = %+v, want the owner instance and N14", health.JSON200)
 	warnings, err := client.GetWarningsWithResponse(ctx)
 	testassert.Require(t, err == nil && warnings.JSON200 != nil && warnings.JSON200.WarningsRevision.InstanceId == owner.InstanceID(), "warnings = (%+v, %v), want the owner-qualified warning revision", warnings, err)
 
@@ -313,10 +313,12 @@ func TestProtocolMountedSettingsSectionsRequireObjects(t *testing.T) {
 	_, _, server := mountedOwner(t, ctx, testOwnerOptions(t))
 	const body = `{"settings":{"sessions":{"auto_archive":false,"archive_after_days":0,"delete_after_archive_days":0},"tools":{},"jobs":{},"compaction":{},"extensions":{}}}`
 	for _, member := range []string{"tools", "jobs", "compaction"} {
-		response := rawMounted(t, http.MethodPut, server.Endpoint()+"/v1/configuration/settings", server.credential,
-			strings.Replace(body, `"`+member+`":{}`, `"`+member+`":42`, 1))
-		typed := decodeMountedError(t, response)
-		testassert.Require(t, response.StatusCode == http.StatusBadRequest && typed.Code == protocol.ErrorCodeInvalid, "%s shape = (%d, %+v), want the typed invalid 400", member, response.StatusCode, typed)
+		for _, replacement := range []string{"42", "null"} {
+			response := rawMounted(t, http.MethodPut, server.Endpoint()+"/v1/configuration/settings", server.credential,
+				strings.Replace(body, `"`+member+`":{}`, `"`+member+`":`+replacement, 1))
+			typed := decodeMountedError(t, response)
+			testassert.Require(t, response.StatusCode == http.StatusBadRequest && typed.Code == protocol.ErrorCodeInvalid, "%s shape %s = (%d, %+v), want the typed invalid 400", member, replacement, response.StatusCode, typed)
+		}
 	}
 }
 

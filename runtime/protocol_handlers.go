@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 
 	"github.com/MMinasyan/lightcode/melta"
@@ -44,6 +46,77 @@ func (rt *protocolHandlers) ReloadConfiguration(w http.ResponseWriter, r *http.R
 	}
 	response := protocol.RevisionResponse{ConfigurationRevision: revision}
 	rt.writeJSON(w, http.StatusOK, &response)
+}
+
+// ListExtensionCapabilities serves the enabled extensions' immutable catalog.
+func (rt *protocolHandlers) ListExtensionCapabilities(w http.ResponseWriter, r *http.Request) {
+	catalog, err := rt.owner.ListExtensionCapabilities(r.Context(), rt.server.caller)
+	if err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	rt.writeJSON(w, http.StatusOK, catalog)
+}
+
+// InvokeExtension serves one exposed declaration: a validated success is the
+// 200 success envelope, a declared domain failure is the 422 failure envelope,
+// and every predispatch/host failure is the ordinary baseline error.
+func (rt *protocolHandlers) InvokeExtension(w http.ResponseWriter, r *http.Request) {
+	var body protocol.ExtensionInvocationRequest
+	if err := decodeRequestBody(r, &body); err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	result, err := rt.owner.InvokeExtension(r.Context(), rt.server.caller, body)
+	if err != nil {
+		writeProtocolError(w, err)
+		return
+	}
+	if result.Failure != nil {
+		rt.writeExtensionFailure(w, result.Failure.Code, result.Failure.Message, result.Failure.Data, result.Failure.Partial)
+		return
+	}
+	rt.writeExtensionSuccess(w, result.Value)
+}
+
+// writeExtensionSuccess writes the validated opaque result directly into the
+// fixed success envelope: no outer marshal recompacts or renumbers it.
+func (rt *protocolHandlers) writeExtensionSuccess(w http.ResponseWriter, value json.RawMessage) {
+	body := make([]byte, 0, len(value)+32)
+	body = append(body, `{"kind":"success","result":`...)
+	body = append(body, value...)
+	body = append(body, '}')
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// writeExtensionFailure writes one validated declared failure with its optional
+// declared partial directly, preserving both opaque payloads exactly.
+func (rt *protocolHandlers) writeExtensionFailure(w http.ResponseWriter, code, message string, data, partial json.RawMessage) {
+	encodedCode, _ := json.Marshal(code)
+	encodedMessage, _ := json.Marshal(message)
+	var errorBody bytes.Buffer
+	errorBody.WriteString(`{"code":`)
+	errorBody.Write(encodedCode)
+	errorBody.WriteString(`,"message":`)
+	errorBody.Write(encodedMessage)
+	if len(data) != 0 {
+		errorBody.WriteString(`,"data":`)
+		errorBody.Write(data)
+	}
+	errorBody.WriteByte('}')
+	body := make([]byte, 0, errorBody.Len()+len(partial)+32)
+	body = append(body, `{"kind":"failure","error":`...)
+	body = append(body, errorBody.Bytes()...)
+	if len(partial) != 0 {
+		body = append(body, `,"partial_result":`...)
+		body = append(body, partial...)
+	}
+	body = append(body, '}')
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	_, _ = w.Write(body)
 }
 
 // ListExtensionPackages serves every loaded extension and selected next-start

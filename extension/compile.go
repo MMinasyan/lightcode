@@ -44,6 +44,7 @@ type CompiledDeclaration struct {
 	config       *jsonschema.Schema
 	Capabilities map[string]*CompiledCapability
 	Components   map[string]*CompiledComponent
+	Exposed      map[MethodKey]ExposedMethod
 }
 
 // MethodSet is one compiled method declaration set. It is the common call
@@ -137,6 +138,7 @@ func (c *Compiled) addDeclaration(declaration Declaration, index int) error {
 		config:       config,
 		Capabilities: make(map[string]*CompiledCapability, len(declaration.Capabilities)),
 		Components:   make(map[string]*CompiledComponent, len(declaration.Components)),
+		Exposed:      make(map[MethodKey]ExposedMethod, len(declaration.Exposed)),
 	}
 	for _, secret := range declaration.Secrets {
 		if !ValidSecretField(secret.Field) {
@@ -230,6 +232,9 @@ func (c *Compiled) addDeclaration(declaration Declaration, index int) error {
 	if err := validateEdits(compiled); err != nil {
 		return err
 	}
+	if err := validateExposures(compiled); err != nil {
+		return err
+	}
 	c.declarations = append(c.declarations, compiled)
 	c.byID[declaration.ID] = compiled
 	return nil
@@ -295,7 +300,7 @@ func validateFixedContractIdentity(capability Capability) error {
 			return invalid("capability %q: fixed contract %s requires version %s, kind %s and its exact method definitions", capability.ID, ContractAgentDefinitions, ContractVersion, KindService)
 		}
 		return nil
-	case ContractPrompt, ContractChildLaunch, ContractData, ContractCredentials:
+	case ContractPrompt, ContractChildLaunch, ContractData, ContractCredentials, ContractCommands:
 		definition, ok := hostCapability(capability.ContractID)
 		if !ok {
 			return invalid("capability %q: fixed host contract %s has no definition", capability.ID, capability.ContractID)
@@ -622,6 +627,42 @@ func validateEdits(declaration *CompiledDeclaration) error {
 		if method.Mode != ModePure {
 			return invalid("extension %q edit %q: method %q is not pure", declaration.Declaration.ID, edit.ID, edit.Method.Method)
 		}
+	}
+	return nil
+}
+
+// validateExposures resolves each publication entry against the declaration's
+// own existing service methods. Only Harness- and Workspace-scoped components
+// can be invoked from outside; Operation- and invocation-scoped methods stay
+// internal calls under genuine admitted context.
+func validateExposures(declaration *CompiledDeclaration) error {
+	for _, exposed := range declaration.Declaration.Exposed {
+		if !exposed.Kind.valid() {
+			return invalid("extension %q exposure %s/%s: invalid kind %q", declaration.Declaration.ID, exposed.Method.CapabilityID, exposed.Method.Method, exposed.Kind)
+		}
+		if !exposed.Target.valid() {
+			return invalid("extension %q exposure %s/%s: invalid target %q", declaration.Declaration.ID, exposed.Method.CapabilityID, exposed.Method.Method, exposed.Target)
+		}
+		capability, ok := declaration.Capabilities[exposed.Method.CapabilityID]
+		if !ok {
+			return invalid("extension %q exposure: unknown capability %q", declaration.Declaration.ID, exposed.Method.CapabilityID)
+		}
+		if capability.Kind != KindService {
+			return invalid("extension %q exposure %s/%s: capability is not a service", declaration.Declaration.ID, exposed.Method.CapabilityID, exposed.Method.Method)
+		}
+		if _, ok := capability.Methods[exposed.Method.Method]; !ok {
+			return invalid("extension %q exposure %s/%s: unknown method", declaration.Declaration.ID, exposed.Method.CapabilityID, exposed.Method.Method)
+		}
+		if capability.Component.Lifetime != LifetimeHarness && capability.Component.Lifetime != LifetimeWorkspace {
+			return invalid("extension %q exposure %s/%s: %s capability cannot be exposed", declaration.Declaration.ID, exposed.Method.CapabilityID, exposed.Method.Method, capability.Component.Lifetime)
+		}
+		if capability.Component.Lifetime == LifetimeWorkspace && exposed.Target == ExposedTargetHarness {
+			return invalid("extension %q exposure %s/%s: Workspace-scoped capability cannot expose the harness target", declaration.Declaration.ID, exposed.Method.CapabilityID, exposed.Method.Method)
+		}
+		if _, duplicate := declaration.Exposed[exposed.Method]; duplicate {
+			return invalid("extension %q exposure %s/%s: duplicate", declaration.Declaration.ID, exposed.Method.CapabilityID, exposed.Method.Method)
+		}
+		declaration.Exposed[exposed.Method] = exposed
 	}
 	return nil
 }

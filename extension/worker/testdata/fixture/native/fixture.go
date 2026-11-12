@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/MMinasyan/lightcode/extension"
+	"github.com/MMinasyan/lightcode/extension/worker"
 	"github.com/MMinasyan/lightcode/harness"
 	"github.com/MMinasyan/lightcode/model"
 )
@@ -45,6 +46,10 @@ const (
 	hooksCapability          = "fixture.hooks"
 	strategyCapability       = "fixture.strategy"
 	serviceCapability        = "fixture.service"
+	aliasCapability          = "fixture.service.alias"
+	commandsCapability       = "fixture.commands"
+	observerCapability       = "fixture.observer"
+	workspaceQueryCapability = "fixture.workspace.query"
 	cleanupCapability        = "fixture.cleanup"
 )
 
@@ -94,24 +99,33 @@ func Declaration() extension.Declaration {
 	credentials, _ := extension.HostCapability(extension.ContractCredentials)
 	data, _ := extension.HostCapability(extension.ContractData)
 	childLaunch, _ := extension.HostCapability(extension.ContractChildLaunch)
+	commands, _ := extension.HostCapability(extension.ContractCommands)
 	return extension.Declaration{
 		ID:           "fixture",
 		Version:      fixtureVersion,
-		ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"},"token":{"type":"string"}},"additionalProperties":false}`),
-		Secrets:      []extension.SecretRef{{Field: "/token", Lifetime: extension.SecretOperation}},
+		ConfigSchema: json.RawMessage(`{"type":"object","properties":{"enabled":{"type":"boolean"},"token":{"type":"string"},"activation_token":{"type":"string"}},"additionalProperties":false}`),
+		Secrets: []extension.SecretRef{
+			{Field: "/token", Lifetime: extension.SecretOperation},
+			{Field: "/activation_token", Lifetime: extension.SecretActivation},
+		},
 		Components: []extension.Component{
 			{
 				ID:       componentHarness,
 				Lifetime: extension.LifetimeHarness,
-				Provides: []string{toolCapability, hooksCapability, strategyCapability, serviceCapability, cleanupCapability},
+				Provides: []string{toolCapability, hooksCapability, strategyCapability, serviceCapability, aliasCapability, commandsCapability, cleanupCapability},
 				Requires: []extension.Binding{
 					{Name: "prompt", Provider: extension.HostProvider, CapabilityID: extension.ContractPrompt, Definition: prompt},
 					{Name: "credentials", Provider: extension.HostProvider, CapabilityID: extension.ContractCredentials, Definition: credentials},
 					{Name: "data", Provider: extension.HostProvider, CapabilityID: extension.ContractData, Definition: data},
 					{Name: "child_launch", Provider: extension.HostProvider, CapabilityID: extension.ContractChildLaunch, Definition: childLaunch},
+					{Name: "commands", Provider: extension.HostProvider, CapabilityID: extension.ContractCommands, Definition: commands},
+					{Name: "observer", Provider: "fixture/fixture.observer.component", CapabilityID: observerCapability, Definition: observerServiceDefinition()},
 				},
 			},
-			{ID: componentWorkspace, Lifetime: extension.LifetimeWorkspace, Provides: []string{workspaceToolCapability}},
+			{ID: "fixture.observer.component", Lifetime: extension.LifetimeHarness, Provides: []string{observerCapability}},
+			{ID: componentWorkspace, Lifetime: extension.LifetimeWorkspace, Provides: []string{workspaceToolCapability, workspaceQueryCapability}, Requires: []extension.Binding{
+				{Name: "credentials", Provider: extension.HostProvider, CapabilityID: extension.ContractCredentials, Definition: credentials},
+			}},
 			{ID: componentOperation, Lifetime: extension.LifetimeOperation, Provides: []string{operationToolCapability}},
 			{ID: componentInvocation, Lifetime: extension.LifetimeInvocation, Provides: []string{invocationToolCapability}},
 		},
@@ -127,19 +141,72 @@ func Declaration() extension.Declaration {
 				extension.SingleHook(extension.BoundaryAfterTool, extension.HookModePure),
 			),
 			extension.StrategyCapability(strategyCapability, true),
-			extension.ServiceCapability(serviceCapability, "fixture.service/v1",
-				extension.ServiceMethod("assemble", extension.ModeServiceIO,
-					`{"type":"object","required":["identity","instructions","mode"],"properties":{"identity":{"type":"string"},"instructions":{"type":"string"},"mode":{"type":"string","enum":["none","simple","full"]}},"additionalProperties":false}`,
-					`{"type":"string"}`, "", ""),
-				extension.ServiceMethod("echo", extension.ModeServiceIO,
-					`{"type":"object"}`, `{"type":"object"}`, "", ""),
-				extension.ServiceMethod("retain", extension.ModeServiceIO,
-					`{"type":"object","additionalProperties":false}`, `{"type":"null"}`, "", ""),
-				extension.ServiceMethod("use_retained", extension.ModeServiceIO,
-					`{"type":"object","additionalProperties":false}`, `{"type":"null"}`, "", ""),
+			extension.ServiceCapability(serviceCapability, "fixture.service/v1", serviceMethods()...),
+			extension.ServiceCapability(aliasCapability, "fixture.service/v1", serviceMethods()...),
+			extension.ServiceCapability(commandsCapability, "fixture.commands/v1", commandMethods()...),
+			extension.ServiceCapability(observerCapability, "fixture.observer/v1",
+				extension.ServiceMethod("observe", extension.ModePure,
+					`{"type":"object","additionalProperties":false}`, `{"type":"object"}`, "", ""),
+			),
+			extension.ServiceCapability(workspaceQueryCapability, "fixture.workspace/v1",
+				extension.ServiceMethod("probe", extension.ModeServiceIO,
+					`{"type":"object","additionalProperties":false}`, `{"type":"object"}`, "", ""),
 			),
 			extension.CleanupCapability(cleanupCapability),
 		},
+		Exposed: []extension.ExposedMethod{
+			{Method: extension.MethodKey{CapabilityID: serviceCapability, Method: "echo"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
+			{Method: extension.MethodKey{CapabilityID: aliasCapability, Method: "echo"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
+			{Method: extension.MethodKey{CapabilityID: workspaceQueryCapability, Method: "probe"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetWorkspace},
+			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "command"}, Kind: extension.ExposedSessionWork, Target: extension.ExposedTargetSession},
+			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "command_harness"}, Kind: extension.ExposedSessionWork, Target: extension.ExposedTargetHarness},
+			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "query_hold"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetSession},
+			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "management_command"}, Kind: extension.ExposedManagement, Target: extension.ExposedTargetHarness},
+			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "pure_command"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
+			{Method: extension.MethodKey{CapabilityID: serviceCapability, Method: "raw"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
+			{Method: extension.MethodKey{CapabilityID: serviceCapability, Method: "fail"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
+			{Method: extension.MethodKey{CapabilityID: serviceCapability, Method: "corrupt"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
+		},
+	}
+}
+
+func serviceMethods() []extension.Method {
+	return []extension.Method{
+		extension.ServiceMethod("assemble", extension.ModeServiceIO,
+			`{"type":"object","required":["identity","instructions","mode"],"properties":{"identity":{"type":"string"},"instructions":{"type":"string"},"mode":{"type":"string","enum":["none","simple","full"]}},"additionalProperties":false}`,
+			`{"type":"string"}`, "", ""),
+		extension.ServiceMethod("echo", extension.ModeServiceIO,
+			`{"type":"object"}`, `{"type":"object"}`, "", ""),
+		extension.ServiceMethod("retain", extension.ModeServiceIO,
+			`{"type":"object","additionalProperties":false}`, `{"type":"null"}`, "", ""),
+		extension.ServiceMethod("use_retained", extension.ModeServiceIO,
+			`{"type":"object","additionalProperties":false}`, `{"type":"null"}`, "", ""),
+		extension.ServiceMethod("raw", extension.ModeServiceIO, `{}`, `{}`, "", ""),
+		extension.ServiceMethod("fail", extension.ModeServiceIO, `{}`, `{}`, `{}`, `{}`),
+		extension.ServiceMethod("corrupt", extension.ModeServiceIO, `{}`, `{}`, "", ""),
+	}
+}
+
+func observerServiceDefinition() extension.CapabilityDefinition {
+	return extension.CapabilityDefinition{
+		ContractID:      "fixture.observer/v1",
+		ContractVersion: extension.ContractVersion,
+		Kind:            extension.KindService,
+		Methods: []extension.Method{extension.ServiceMethod("observe", extension.ModePure,
+			`{"type":"object","additionalProperties":false}`, `{"type":"object"}`, "", "")},
+	}
+}
+
+func commandMethods() []extension.Method {
+	forward := `{"type":"object","required":["method","arguments"],"properties":{"method":{"type":"string","minLength":1},"arguments":{}},"additionalProperties":false}`
+	return []extension.Method{
+		extension.ServiceMethod("command", extension.ModeServiceIO, forward, `{}`, "", `{}`),
+		extension.ServiceMethod("command_harness", extension.ModeServiceIO, forward, `{}`, "", `{}`),
+		extension.ServiceMethod("management_command", extension.ModeServiceIO, forward, `{}`, "", ""),
+		extension.ServiceMethod("pure_command", extension.ModePure, forward, `{}`, "", ""),
+		extension.ServiceMethod("query_hold", extension.ModeServiceIO,
+			`{"type":"object","required":["hold","release"],"properties":{"hold":{"type":"string","minLength":1},"release":{"type":"string","minLength":1},"block":{"type":"string"}},"additionalProperties":false}`,
+			`{}`, "", ""),
 	}
 }
 
@@ -187,11 +254,18 @@ func open(_ context.Context, info extension.InstanceContext) (extension.Instance
 			hooksCapability:    {Preparation: prepareHook, Request: requestHook, BeforeTool: beforeToolHook, AfterTool: afterToolHook},
 			strategyCapability: {Strategy: fixtureStrategy{}},
 			serviceCapability:  {Service: service.handlers()},
+			aliasCapability:    {Service: service.aliasHandlers()},
+			commandsCapability: {Service: commandHandlers()},
 			cleanupCapability:  {Service: map[string]extension.Handler{"cleanup": cleanupHandler}},
+		}
+	case "fixture.observer.component":
+		instance.Capabilities = map[string]extension.Implementation{
+			observerCapability: {Service: map[string]extension.Handler{"observe": observeHandler}},
 		}
 	case componentWorkspace:
 		instance.Capabilities = map[string]extension.Implementation{
-			workspaceToolCapability: {Tool: fixtureTool{capability: workspaceToolCapability}},
+			workspaceToolCapability:  {Tool: fixtureTool{capability: workspaceToolCapability}},
+			workspaceQueryCapability: {Service: map[string]extension.Handler{"probe": workspaceProbeHandler}},
 		}
 	case componentOperation:
 		instance.Capabilities = map[string]extension.Implementation{
@@ -215,10 +289,19 @@ type serviceState struct {
 func (s *serviceState) handlers() map[string]extension.Handler {
 	return map[string]extension.Handler{
 		"assemble":     assembleHandler,
-		"echo":         s.echoHandler,
+		"echo":         s.echoHandler("service"),
 		"retain":       s.retainHandler,
 		"use_retained": s.useRetainedHandler,
+		"raw":          rawHandler,
+		"fail":         failHandler,
+		"corrupt":      corruptHandler,
 	}
+}
+
+func (s *serviceState) aliasHandlers() map[string]extension.Handler {
+	handlers := s.handlers()
+	handlers["echo"] = s.echoHandler("alias")
+	return handlers
 }
 
 func assembleHandler(ctx context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
@@ -226,9 +309,29 @@ func assembleHandler(ctx context.Context, call extension.CallContext, _ json.Raw
 	return call.Call(ctx, "prompt", "assemble", json.RawMessage(`{"identity":"fixture","instructions":"","mode":"none"}`))
 }
 
-func (s *serviceState) echoHandler(_ context.Context, _ extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
-	record("service:echo:%s", digest(arguments))
+func (s *serviceState) echoHandler(label string) extension.Handler {
+	return func(_ context.Context, _ extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+		record("%s:echo:%s", label, digest(arguments))
+		return extension.Result{Value: append(json.RawMessage(nil), arguments...)}, nil
+	}
+}
+
+func rawHandler(_ context.Context, _ extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+	record("service:raw:%s", digest(arguments))
 	return extension.Result{Value: append(json.RawMessage(nil), arguments...)}, nil
+}
+
+func failHandler(_ context.Context, _ extension.CallContext, _ json.RawMessage) (extension.Result, error) {
+	return extension.Result{Failure: &extension.Failure{
+		Code:    "guest_code",
+		Message: "guest message",
+		Data:    json.RawMessage("{\n  \"big\": 9007199254740993\n}"),
+		Partial: json.RawMessage(`["partial", null, 1]`),
+	}}, nil
+}
+
+func corruptHandler(_ context.Context, _ extension.CallContext, _ json.RawMessage) (extension.Result, error) {
+	return extension.Result{}, fmt.Errorf("fixture corrupt: %w", harness.ErrCorrupt)
 }
 
 func (s *serviceState) retainHandler(_ context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
@@ -248,6 +351,145 @@ func (s *serviceState) useRetainedHandler(ctx context.Context, _ extension.CallC
 	}
 	record("service:use_retained")
 	return retained(ctx, "prompt", "assemble", json.RawMessage(`{"identity":"fixture","instructions":"","mode":"none"}`))
+}
+
+// commandHandlers expose the fixed melta.commands/v1 bridge through one
+// ordinary named service. The request names a fixed command method and passes
+// its generated arguments; the host-issued CallContext alone supplies the
+// Session and request identity.
+func commandHandlers() map[string]extension.Handler {
+	return map[string]extension.Handler{
+		"command":            commandHandler("command"),
+		"command_harness":    commandHandler("command_harness"),
+		"management_command": managementCommandHandler,
+		"pure_command":       pureCommandHandler,
+		"query_hold":         queryHoldHandler,
+	}
+}
+
+func commandHandler(label string) extension.Handler {
+	return func(ctx context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+		var request struct {
+			Method    string          `json:"method"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal(arguments, &request); err != nil {
+			return extension.Result{}, err
+		}
+		record("%s:%s;session=%q;request=%q;workspace=%q;scope-workspace=%q", label, request.Method, call.SessionID, call.RequestID, call.Workspace, call.Scope.Workspace)
+		if _, err := call.Call(ctx, "observer", "observe", json.RawMessage(`{}`)); err != nil {
+			return extension.Result{}, err
+		}
+		result, err := call.Call(ctx, "commands", request.Method, request.Arguments)
+		if err == nil {
+			return result, nil
+		}
+		var callErr *extension.CallError
+		if errors.As(err, &callErr) && len(callErr.Partial) != 0 {
+			class, message := "internal", callErr.Error()
+			if failure := worker.Classify(callErr.Err); failure != nil {
+				class, message = string(failure.Class), failure.Message
+			}
+			record("command:revert-call-error;class=%s;partial=%s", class, digest(callErr.Partial))
+			return extension.Result{Failure: &extension.Failure{
+				Code:    class,
+				Message: message,
+				Partial: append(json.RawMessage(nil), callErr.Partial...),
+			}}, nil
+		}
+		return extension.Result{}, err
+	}
+}
+
+func managementCommandHandler(ctx context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+	var request struct {
+		Method    string          `json:"method"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(arguments, &request); err != nil {
+		return extension.Result{}, err
+	}
+	record("management:%s:attempt", request.Method)
+	return call.Call(ctx, "commands", request.Method, request.Arguments)
+}
+
+func pureCommandHandler(ctx context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+	var request struct {
+		Method    string          `json:"method"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(arguments, &request); err != nil {
+		return extension.Result{}, err
+	}
+	record("pure:%s:attempt", request.Method)
+	return call.Call(ctx, "commands", request.Method, request.Arguments)
+}
+
+func queryHoldHandler(ctx context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+	var request struct {
+		Hold    string `json:"hold"`
+		Release string `json:"release"`
+		Block   string `json:"block"`
+	}
+	if err := json.Unmarshal(arguments, &request); err != nil {
+		return extension.Result{}, err
+	}
+	record("query:entered;session=%q;request=%q;workspace=%q;scope-workspace=%q", call.SessionID, call.RequestID, call.Workspace, call.Scope.Workspace)
+	if err := os.WriteFile(request.Hold, []byte("entered"), 0o600); err != nil {
+		return extension.Result{}, err
+	}
+	if err := waitForFile(ctx, request.Release); err != nil {
+		return extension.Result{}, err
+	}
+	record("query:produced;session=%q;request=%q", call.SessionID, call.RequestID)
+	if request.Block != "" {
+		// A produced result waits only for the test's explicit release, not for
+		// the request context: a late cancellation cannot replace it.
+		if err := os.WriteFile(request.Block+".produced", []byte("produced"), 0o600); err != nil {
+			return extension.Result{}, err
+		}
+		bounded, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := waitForFile(bounded, request.Block); err != nil {
+			return extension.Result{}, err
+		}
+	}
+	value, err := json.Marshal(map[string]string{
+		"session_id":      call.SessionID,
+		"request_id":      call.RequestID,
+		"workspace":       call.Workspace,
+		"scope_workspace": call.Scope.Workspace,
+		"scope_kind":      string(call.Scope.Kind),
+	})
+	if err != nil {
+		return extension.Result{}, err
+	}
+	return extension.Result{Value: value}, nil
+}
+
+func observeHandler(_ context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
+	record("observer;session=%q;request=%q;workspace=%q;scope-workspace=%q", call.SessionID, call.RequestID, call.Workspace, call.Scope.Workspace)
+	return extension.Result{Value: json.RawMessage(`{}`)}, nil
+}
+
+func workspaceProbeHandler(ctx context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
+	result, err := call.Call(ctx, "credentials", "get", json.RawMessage(`{"field":"/activation_token"}`))
+	if err != nil {
+		record("workspace:probe:refused;session=%q;workspace=%q", call.SessionID, call.Workspace)
+		return extension.Result{}, err
+	}
+	var credential struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(result.Value, &credential); err != nil {
+		return extension.Result{}, err
+	}
+	record("workspace:probe:credential=%s;session=%q;request=%q;workspace=%q;scope-workspace=%q", digest([]byte(credential.Value)), call.SessionID, call.RequestID, call.Workspace, call.Scope.Workspace)
+	value, err := json.Marshal(map[string]string{"credential": digest([]byte(credential.Value)), "workspace": call.Workspace})
+	if err != nil {
+		return extension.Result{}, err
+	}
+	return extension.Result{Value: value}, nil
 }
 
 func cleanupHandler(_ context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {

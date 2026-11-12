@@ -28,6 +28,18 @@ type ResponseError struct {
 // Error returns the received Runtime error's message.
 func (e *ResponseError) Error() string { return e.Payload.Message }
 
+// ExtensionResponseError is one received declared extension failure. Failure
+// is the generated 422 failure envelope and Body is the exact received body,
+// so the declaration's own code, data and partial result stay lossless.
+type ExtensionResponseError struct {
+	Status  int
+	Failure protocol.ExtensionFailureResult
+	Body    []byte
+}
+
+// Error returns the received declared failure's message.
+func (e *ExtensionResponseError) Error() string { return e.Failure.Error.Message }
+
 // decodeRuntimeError decodes one declared non-2xx Runtime body from its
 // preserved raw members: a partial code-revert result requires its non-null
 // restored and skipped arrays and its non-null Error, which supplies the
@@ -120,13 +132,100 @@ func Invoke(ctx context.Context, c *client.Client, operation string, params json
 	if err != nil {
 		return 0, nil, err
 	}
-	status, body, err := receive(response, expected)
+	status, body, err := receive(response, expected, operation)
 	if err == nil && operation == "DeleteSession" {
 		if _, decodeErr := DecodeDeletionResult(body); decodeErr != nil {
 			return status, body, fmt.Errorf("%v: %w", decodeErr, ErrInvalidResponse)
 		}
 	}
+	if err == nil && operation == "InvokeExtension" {
+		if decodeErr := decodeExtensionSuccess(body); decodeErr != nil {
+			return status, body, fmt.Errorf("%v: %w", decodeErr, ErrInvalidResponse)
+		}
+	}
 	return status, body, err
+}
+
+// decodeExtensionSuccess validates the fixed 200 extension envelope by its
+// kind and required member presence. The opaque result itself stays untouched.
+func decodeExtensionSuccess(body []byte) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		return fmt.Errorf("malformed extension success body: %v", err)
+	}
+	if members == nil {
+		return fmt.Errorf("malformed extension success body: not one JSON object")
+	}
+	for name := range members {
+		if name != "kind" && name != "result" {
+			return fmt.Errorf("extension success carries unknown member %q", name)
+		}
+	}
+	var kind string
+	if raw, ok := members["kind"]; !ok || isJSONNull(raw) || json.Unmarshal(raw, &kind) != nil || kind != "success" {
+		return fmt.Errorf("extension success kind is not success")
+	}
+	if _, ok := members["result"]; !ok {
+		return fmt.Errorf("extension success is missing result")
+	}
+	return nil
+}
+
+// decodeExtensionFailure recognizes the fixed 422 declared-failure envelope by
+// its explicit kind. An absent kind is the ordinary baseline Error; a present
+// but malformed envelope is a delivery failure, never a fabricated baseline
+// ErrorCode.
+func decodeExtensionFailure(body []byte) (*protocol.ExtensionFailureResult, error) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		return nil, fmt.Errorf("malformed runtime error body: %v", err)
+	}
+	if members == nil {
+		return nil, fmt.Errorf("malformed runtime error body: not one JSON object")
+	}
+	rawKind, hasKind := members["kind"]
+	if !hasKind {
+		return nil, nil
+	}
+	var kind string
+	if isJSONNull(rawKind) || json.Unmarshal(rawKind, &kind) != nil || kind != "failure" {
+		return nil, fmt.Errorf("extension failure kind is not failure")
+	}
+	for name := range members {
+		if name != "kind" && name != "error" && name != "partial_result" {
+			return nil, fmt.Errorf("extension failure carries unknown member %q", name)
+		}
+	}
+	rawError, ok := members["error"]
+	if !ok || isJSONNull(rawError) {
+		return nil, fmt.Errorf("extension failure is missing its error object")
+	}
+	var errorMembers map[string]json.RawMessage
+	if err := json.Unmarshal(rawError, &errorMembers); err != nil || errorMembers == nil {
+		return nil, fmt.Errorf("malformed extension failure error object")
+	}
+	for name := range errorMembers {
+		if name != "code" && name != "message" && name != "data" {
+			return nil, fmt.Errorf("extension failure error carries unknown member %q", name)
+		}
+	}
+	var failure protocol.ExtensionFailureResult
+	if code, ok := errorMembers["code"]; !ok || isJSONNull(code) || json.Unmarshal(code, &failure.Error.Code) != nil || failure.Error.Code == "" {
+		return nil, fmt.Errorf("extension failure is missing its non-empty code")
+	}
+	if message, ok := errorMembers["message"]; !ok || isJSONNull(message) || json.Unmarshal(message, &failure.Error.Message) != nil || failure.Error.Message == "" {
+		return nil, fmt.Errorf("extension failure is missing its non-empty message")
+	}
+	if data, ok := errorMembers["data"]; ok {
+		value := append(json.RawMessage(nil), data...)
+		failure.Error.Data = &value
+	}
+	if partial, ok := members["partial_result"]; ok {
+		value := append(json.RawMessage(nil), partial...)
+		failure.PartialResult = &value
+	}
+	failure.Kind = protocol.ExtensionFailureResultKindFailure
+	return &failure, nil
 }
 
 // Call is the thin typed consumer of Invoke: it returns the raw successful
@@ -149,7 +248,7 @@ func Call(ctx context.Context, c *client.Client, operation string, params json.R
 // unexpected-success-status failure wraps ErrInvalidResponse and retains the
 // received status and available body bytes; a declared non-2xx rejection is
 // the ResponseError over those same bytes.
-func receive(response *http.Response, expected int) (int, json.RawMessage, error) {
+func receive(response *http.Response, expected int, operation string) (int, json.RawMessage, error) {
 	status := response.StatusCode
 	body, err := io.ReadAll(response.Body)
 	_ = response.Body.Close()
@@ -166,11 +265,32 @@ func receive(response *http.Response, expected int) (int, json.RawMessage, error
 		return status, body, nil
 	}
 	if status < 200 || status >= 300 {
-		payload, partial, err := decodeRuntimeError(body)
+		// The declared extension-failure envelope has exactly one status of
+		// its own; every other status carries the ordinary baseline Error.
+		if operation == "InvokeExtension" && status == http.StatusUnprocessableEntity {
+			failure, err := decodeExtensionFailure(body)
+			if err != nil {
+				return status, body, fmt.Errorf("%v: %w", err, ErrInvalidResponse)
+			}
+			if failure != nil {
+				return status, body, &ExtensionResponseError{Status: status, Failure: *failure, Body: body}
+			}
+		}
+		// Restore-shaped partial interpretation belongs only to the current
+		// code-revert operation; every other operation decodes one baseline
+		// Error and refuses a body without its declared members.
+		if operation == "RevertSessionCode" {
+			payload, partial, err := decodeRuntimeError(body)
+			if err != nil {
+				return status, body, fmt.Errorf("%v: %w", err, ErrInvalidResponse)
+			}
+			return status, body, &ResponseError{Status: status, Payload: payload, Partial: partial}
+		}
+		payload, err := decodeError(body)
 		if err != nil {
 			return status, body, fmt.Errorf("%v: %w", err, ErrInvalidResponse)
 		}
-		return status, body, &ResponseError{Status: status, Payload: payload, Partial: partial}
+		return status, body, &ResponseError{Status: status, Payload: payload}
 	}
 	return status, body, fmt.Errorf("runtime returned status %d for an operation expecting %d: %w", status, expected, ErrInvalidResponse)
 }

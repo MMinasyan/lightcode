@@ -23,6 +23,7 @@ const (
 	ContractData             = "melta.data"
 	ContractSessionCleanup   = "melta.session_cleanup"
 	ContractCredentials      = "melta.credentials" // #nosec G101 -- Protocol contract identifier, not a credential value.
+	ContractCommands         = "melta.commands"
 
 	// ContractVersion is the one accepted version of every fixed contract.
 	ContractVersion = "1"
@@ -138,6 +139,50 @@ type Declaration struct {
 	Components   []Component         `json:"components"`
 	Capabilities []Capability        `json:"capabilities"`
 	Edits        []ConfigurationEdit `json:"configuration_edits,omitempty"`
+	Exposed      []ExposedMethod     `json:"exposed,omitempty"`
+}
+
+// ExposedMethodKind is the closed publication kind of one exposed method.
+type ExposedMethodKind string
+
+const (
+	ExposedQuery       ExposedMethodKind = "query"
+	ExposedManagement  ExposedMethodKind = "management"
+	ExposedSessionWork ExposedMethodKind = "session_work"
+)
+
+func (k ExposedMethodKind) valid() bool {
+	switch k {
+	case ExposedQuery, ExposedManagement, ExposedSessionWork:
+		return true
+	}
+	return false
+}
+
+// ExposedTargetKind is the closed target-scope kind an exposed method accepts.
+type ExposedTargetKind string
+
+const (
+	ExposedTargetHarness   ExposedTargetKind = "harness"
+	ExposedTargetWorkspace ExposedTargetKind = "workspace"
+	ExposedTargetSession   ExposedTargetKind = "session"
+)
+
+func (t ExposedTargetKind) valid() bool {
+	switch t {
+	case ExposedTargetHarness, ExposedTargetWorkspace, ExposedTargetSession:
+		return true
+	}
+	return false
+}
+
+// ExposedMethod publishes one existing named-service method for client
+// invocation. Kind and target are publication metadata; they never enter the
+// capability's method contract equality.
+type ExposedMethod struct {
+	Method MethodKey         `json:"method"`
+	Kind   ExposedMethodKind `json:"kind"`
+	Target ExposedTargetKind `json:"target"`
 }
 
 // Component declares one independent implementation instance at one lifetime.
@@ -291,6 +336,7 @@ func (d Declaration) owned() Declaration {
 		out.Capabilities[i] = owned
 	}
 	out.Edits = append([]ConfigurationEdit(nil), d.Edits...)
+	out.Exposed = append([]ExposedMethod(nil), d.Exposed...)
 	return out
 }
 
@@ -336,6 +382,8 @@ func hostCapability(id string) (CapabilityDefinition, bool) {
 		return hostDataDefinition(), true
 	case ContractCredentials:
 		return hostCredentialsDefinition(), true
+	case ContractCommands:
+		return hostCommandsDefinition(), true
 	}
 	return CapabilityDefinition{}, false
 }

@@ -54,6 +54,108 @@ export type InstallExtensionPackageRequest = {
     source_dir: string;
 };
 
+export type ExtensionCapabilityCatalog = {
+    extension_id: string;
+    version: string;
+    configuration_schema: ExtensionConfigDocument;
+    settings: ExtensionConfigDocument;
+    capabilities: Array<ExtensionCapability>;
+    exposed: Array<ExtensionExposure>;
+};
+
+export type ExtensionCapability = {
+    capability_id: string;
+    contract_id: string;
+    contract_version: string;
+    kind: 'service' | 'tool' | 'hook' | 'strategy';
+    methods: Array<ExtensionMethod>;
+    hooks?: Array<ExtensionHook>;
+    strategy?: ExtensionStrategy;
+};
+
+export type ExtensionMethod = {
+    name: string;
+    mode: 'pure' | 'service_io';
+    input: ExtensionConfigDocument;
+    success: ExtensionConfigDocument;
+    error?: ExtensionConfigDocument;
+    partial?: ExtensionConfigDocument;
+};
+
+export type ExtensionHook = {
+    boundary: 'prepare' | 'request' | 'before_tool' | 'after_tool';
+    mode: 'pure' | 'effectful';
+};
+
+export type ExtensionStrategy = {
+    requires_context_window: boolean;
+};
+
+export type ExtensionExposure = {
+    capability_id: string;
+    method: string;
+    kind: 'query' | 'management' | 'session_work';
+    target: 'harness' | 'workspace' | 'session';
+};
+
+export type ExtensionInvocationRequest = {
+    extension_id: string;
+    capability_id: string;
+    contract_id: string;
+    contract_version: string;
+    method: string;
+    target: ExtensionInvocationTarget;
+    /**
+     * One owned JSON value validated against the selected method's input schema. The value itself may be any JSON, including null.
+     *
+     */
+    arguments: unknown;
+    request_id: string;
+};
+
+export type ExtensionInvocationTarget = {
+    kind: 'harness' | 'workspace' | 'session';
+    /**
+     * One clean absolute Workspace path for the workspace branch.
+     */
+    workspace?: string;
+    /**
+     * One canonical Session ID for the session branch.
+     */
+    session_id?: string;
+};
+
+export type ExtensionSuccess = {
+    kind: 'success';
+    /**
+     * The declared success schema value, carried as exact raw JSON; the declared schema may itself accept null.
+     */
+    result: unknown;
+};
+
+export type ExtensionFailure = {
+    /**
+     * The selected declaration's own failure code string.
+     */
+    code: string;
+    message: string;
+    /**
+     * The declared failure-data schema value, when declared; the declared schema may itself accept null.
+     */
+    data?: unknown;
+};
+
+export type ExtensionFailureResult = {
+    kind: 'failure';
+    error: ExtensionFailure;
+    /**
+     * The declared partial schema value, when the method declares one; the declared schema may itself accept null.
+     */
+    partial_result?: unknown;
+};
+
+export type ExtensionInvocationFailure = ExtensionFailureResult | Error;
+
 export type SessionLifecycle = 'open' | 'archived';
 
 export type InputOrigin = 'user' | 'runtime' | 'plugin';
@@ -95,7 +197,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '14';
+    protocol_version: '15';
 };
 
 /**
@@ -1582,6 +1684,62 @@ export type InstallExtensionPackageResponses = {
 };
 
 export type InstallExtensionPackageResponse = InstallExtensionPackageResponses[keyof InstallExtensionPackageResponses];
+
+export type ListExtensionCapabilitiesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/extensions/capabilities';
+};
+
+export type ListExtensionCapabilitiesErrors = {
+    /**
+     * One schema-defined typed error.
+     */
+    default: Error;
+};
+
+export type ListExtensionCapabilitiesError = ListExtensionCapabilitiesErrors[keyof ListExtensionCapabilitiesErrors];
+
+export type ListExtensionCapabilitiesResponses = {
+    /**
+     * Every enabled extension's configuration schema, captured non-secret settings, declared capabilities and methods, and explicit exposures. The order is registration order.
+     *
+     */
+    200: Array<ExtensionCapabilityCatalog>;
+};
+
+export type ListExtensionCapabilitiesResponse = ListExtensionCapabilitiesResponses[keyof ListExtensionCapabilitiesResponses];
+
+export type InvokeExtensionData = {
+    body: ExtensionInvocationRequest;
+    path?: never;
+    query?: never;
+    url: '/v1/extensions/invoke';
+};
+
+export type InvokeExtensionErrors = {
+    /**
+     * One validated declared failure with its optional declared partial result, or the ordinary baseline Error for a configuration/corrupt class. The declared code is the method declaration's string, not a baseline ErrorCode.
+     *
+     */
+    422: ExtensionInvocationFailure;
+    /**
+     * One schema-defined typed error.
+     */
+    default: Error;
+};
+
+export type InvokeExtensionError = InvokeExtensionErrors[keyof InvokeExtensionErrors];
+
+export type InvokeExtensionResponses = {
+    /**
+     * The selected exposed method's declared success value.
+     */
+    200: ExtensionSuccess;
+};
+
+export type InvokeExtensionResponse = InvokeExtensionResponses[keyof InvokeExtensionResponses];
 
 export type ListModelsData = {
     body?: never;

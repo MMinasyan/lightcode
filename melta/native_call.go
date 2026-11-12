@@ -3,6 +3,7 @@ package melta
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -13,14 +14,17 @@ import (
 // nativeGrant is the private authority one callback view carries. It never
 // appears in an authoring value.
 type nativeGrant struct {
-	permissions []harness.PermissionRequest
-	pure        bool
-	lifecycle   bool
+	permissions  []harness.PermissionRequest
+	pure         bool
+	lifecycle    bool
+	commands     bool
+	commandScope CallerScope
 }
 
 // callIdentity is the immutable attribution one native callback view carries.
 type callIdentity struct {
 	session      harness.SessionIdentity
+	workspace    string
 	operationID  string
 	invocationID string
 	purpose      string
@@ -153,7 +157,11 @@ func (c *composition) newView(value *capabilityValue, parent context.Context, id
 		RequestID:    identity.requestID,
 		ToolCallID:   identity.toolCallID,
 		EffectID:     identity.effectID,
+		Workspace:    identity.workspace,
 		Caller:       identity.Caller,
+	}
+	if view.auth.Workspace == "" {
+		view.auth.Workspace = value.scope.info.Workspace
 	}
 	view.auth.Call = view.call
 	return view, view.auth
@@ -255,14 +263,14 @@ func (c *composition) dispatch(ctx context.Context, Caller extension.CallContext
 		}
 		hostCaller := Caller
 		hostCaller.Call = nil
-		hostCtx := context.WithValue(ctx, grantContextKey{}, nativeGrant{permissions: append([]harness.PermissionRequest(nil), grant.permissions...)})
+		hostCtx := context.WithValue(ctx, grantContextKey{}, nativeGrant{permissions: append([]harness.PermissionRequest(nil), grant.permissions...), pure: grant.pure, lifecycle: grant.lifecycle, commands: grant.commands, commandScope: grant.commandScope})
 		hostCtx = context.WithValue(hostCtx, secretValuesKey{}, secrets)
 		if lease != nil {
 			hostCtx = context.WithValue(hostCtx, artifactLeaseKey{}, lease)
 		}
 		result, err := handler(hostCtx, hostCaller, arguments)
 		if err != nil {
-			return extension.Result{}, err
+			return extension.Result{}, ownCallError(err)
 		}
 		result = ownResult(result)
 		if err := extension.ValidateResult(binding.Methods, methodName, result); err != nil {
@@ -277,6 +285,7 @@ func (c *composition) dispatch(ctx context.Context, Caller extension.CallContext
 	pure := grant.pure || method.Mode == extension.ModePure
 	childIdentity := callIdentity{
 		session:          harness.SessionIdentity{SessionID: Caller.SessionID},
+		workspace:        Caller.Workspace,
 		operationID:      Caller.OperationID,
 		invocationID:     Caller.InvocationID,
 		purpose:          Caller.Purpose,
@@ -285,20 +294,34 @@ func (c *composition) dispatch(ctx context.Context, Caller extension.CallContext
 		effectID:         Caller.EffectID,
 		revision:         Caller.Revision,
 		Caller:           extension.CallerIdentity{ExtensionID: Caller.ExtensionID, ComponentID: Caller.ComponentID, InstanceID: Caller.InstanceID},
-		grant:            nativeGrant{permissions: grant.permissions, pure: pure, lifecycle: grant.lifecycle},
+		grant:            nativeGrant{permissions: grant.permissions, pure: pure, lifecycle: grant.lifecycle, commands: grant.commands, commandScope: grant.commandScope},
 		lease:            lease,
 		operationSecrets: secrets.operation,
 	}
-	return c.invokeProvider(ctx, provider, binding.Methods, methodName, arguments, nil, childIdentity, grant.lifecycle)
+	return c.invokeAcceptedProvider(ctx, provider, binding.Methods, methodName, arguments, nil, childIdentity, grant.lifecycle)
 }
 
-// invokeProvider runs one declared provider method under the provider scope's
-// guard: the same argument/result validation, private pure view and result
-// ownership as a nested declared call. Host-initiated resolver and
-// configuration-edit calls use this one path with the provider's own compiled
-// methods; a direct Caller may override the captured section, never the
-// authority.
+// invokeProvider is the accept-then-execute wrapper for callers that have not
+// already validated the method arguments: it validates once, then enters the
+// shared accepted-provider execution. Host-initiated resolver and
+// configuration-edit calls use this path; direct Caller may override the
+// captured section, never the authority.
 func (c *composition) invokeProvider(ctx context.Context, provider *capabilityValue, methods extension.MethodSet, method string, arguments, section json.RawMessage, identity callIdentity, lifecycle bool) (extension.Result, error) {
+	if provider == nil {
+		return extension.Result{}, ErrClosed
+	}
+	arguments = append(json.RawMessage(nil), arguments...)
+	if err := extension.ValidateArguments(methods, method, arguments); err != nil {
+		return extension.Result{}, fmt.Errorf("%w: %w", ErrComposition, err)
+	}
+	return c.invokeAcceptedProvider(ctx, provider, methods, method, arguments, section, identity, lifecycle)
+}
+
+// invokeAcceptedProvider executes one already-validated provider call. The
+// method declaration, purity, scope guard, private view and result validation
+// stay shared with invokeProvider and nested dispatch; only argument schema
+// validation has already happened at the accepting boundary.
+func (c *composition) invokeAcceptedProvider(ctx context.Context, provider *capabilityValue, methods extension.MethodSet, method string, arguments, section json.RawMessage, identity callIdentity, lifecycle bool) (extension.Result, error) {
 	if provider == nil {
 		return extension.Result{}, ErrClosed
 	}
@@ -310,9 +333,6 @@ func (c *composition) invokeProvider(ctx context.Context, provider *capabilityVa
 		return extension.Result{}, fmt.Errorf("capability %q: pure callback cannot invoke %s method %q: %w", provider.capability.ID, contract.Mode, method, ErrComposition)
 	}
 	arguments = append(json.RawMessage(nil), arguments...)
-	if err := extension.ValidateArguments(methods, method, arguments); err != nil {
-		return extension.Result{}, fmt.Errorf("%w: %w", ErrComposition, err)
-	}
 	callCtx, release, err := provider.scope.enterFor(ctx, lifecycle)
 	if err != nil {
 		return extension.Result{}, err
@@ -332,13 +352,23 @@ func (c *composition) invokeProvider(ctx context.Context, provider *capabilityVa
 	}
 	result, err := handler(child.ctx, childCall, arguments)
 	if err != nil {
-		return extension.Result{}, err
+		return extension.Result{}, ownCallError(err)
 	}
 	result = ownResult(result)
 	if err := extension.ValidateResult(methods, method, result); err != nil {
 		return extension.Result{}, fmt.Errorf("capability %q: %w", provider.capability.ID, err)
 	}
 	return result, nil
+}
+
+// ownCallError owns the selected partial while preserving the enclosing error
+// chain, including wrappers and joined classifications.
+func ownCallError(err error) error {
+	var callErr *extension.CallError
+	if errors.As(err, &callErr) {
+		return &extension.CallError{Err: err, Partial: append(json.RawMessage(nil), callErr.Partial...)}
+	}
+	return err
 }
 
 func ownResult(result extension.Result) extension.Result {

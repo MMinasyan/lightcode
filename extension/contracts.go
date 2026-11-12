@@ -37,7 +37,7 @@ const fixedDefs = `
 "definitionRef":{"type":"object","required":["extension_id","capability_id","definition_id"],"properties":{"extension_id":{"type":"string","minLength":1},"capability_id":{"type":"string","minLength":1},"definition_id":{"type":"string","minLength":1}},"additionalProperties":false},
 "callerIdentity":{"type":"object","required":["extension_id","component_id","instance_id"],"properties":{"extension_id":{"type":"string","minLength":1},"component_id":{"type":"string","minLength":1},"instance_id":{"type":"string","minLength":1}},"additionalProperties":false},
 "scopeIdentity":{"type":"object","required":["kind","revision"],"properties":{"kind":{"type":"string","enum":["harness","workspace","operation","invocation"]},"revision":{"type":"string"},"workspace":{"type":"string"},"session_id":{"type":"string"},"operation_id":{"type":"string"},"invocation_id":{"type":"string"},"purpose":{"type":"string"}},"additionalProperties":false},
-"callContext":{"type":"object","required":["extension_id","component_id","instance_id","lifetime","scope","revision"],"properties":{"extension_id":{"type":"string","minLength":1},"component_id":{"type":"string","minLength":1},"instance_id":{"type":"string","minLength":1},"lifetime":{"type":"string","enum":["harness","workspace","operation","invocation"]},"scope":{"$ref":"#/$defs/scopeIdentity"},"revision":{"type":"string"},"section":{"$ref":"#/$defs/jsonBytes"},"session_id":{"type":"string"},"operation_id":{"type":"string"},"invocation_id":{"type":"string"},"purpose":{"type":"string"},"request_id":{"type":"string"},"tool_call_id":{"type":"string"},"effect_id":{"type":"string"},"caller":{"$ref":"#/$defs/callerIdentity"}},"additionalProperties":false},
+"callContext":{"type":"object","required":["extension_id","component_id","instance_id","lifetime","scope","revision"],"properties":{"extension_id":{"type":"string","minLength":1},"component_id":{"type":"string","minLength":1},"instance_id":{"type":"string","minLength":1},"lifetime":{"type":"string","enum":["harness","workspace","operation","invocation"]},"scope":{"$ref":"#/$defs/scopeIdentity"},"revision":{"type":"string"},"section":{"$ref":"#/$defs/jsonBytes"},"workspace":{"type":"string"},"session_id":{"type":"string"},"operation_id":{"type":"string"},"invocation_id":{"type":"string"},"purpose":{"type":"string"},"request_id":{"type":"string"},"tool_call_id":{"type":"string"},"effect_id":{"type":"string"},"caller":{"$ref":"#/$defs/callerIdentity"}},"additionalProperties":false},
 "agent":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"model":{"type":"string"},"tools":{"type":"array","items":{"type":"string"}},"capabilities":{"type":"array","items":{"type":"string"}},"readonly":{"type":"boolean"},"subagent":{"type":"boolean"},"write_dir":{"type":"string"},"definition":{"$ref":"#/$defs/definitionRef"}},"additionalProperties":false},
 "strategySelection":{"type":"object","required":["id"],"properties":{"id":{"type":"string"},"settings_base64":{"$ref":"#/$defs/jsonBytes"}},"additionalProperties":false},
 "agentInputs":{"type":"object","required":["instructions","assembly_mode","tools","capabilities","constraints","strategy"],"properties":{"model":{"$ref":"#/$defs/modelRef"},"instructions":{"type":"string"},"assembly_mode":{"type":"string","enum":["none","simple","full"]},"tools":{"type":"array","items":{"type":"string"}},"capabilities":{"type":"array","items":{"type":"string"}},"constraints":{"$ref":"#/$defs/constraints"},"strategy":{"$ref":"#/$defs/strategySelection"}},"additionalProperties":false},
@@ -251,5 +251,38 @@ func hostChildLaunchDefinition() CapabilityDefinition {
 		Methods: []Method{method("launch", ModeServiceIO,
 			string(defsSchema(`{"type":"object","required":["definition","prompt","operation_id","max_concurrent","output_limit"],"properties":{"definition":{"$ref":"#/$defs/definitionRef"},"prompt":{"type":"string"},"operation_id":{"type":"string","minLength":1},"max_concurrent":{"type":"integer","minimum":1},"output_limit":{"type":"integer","minimum":1}},"additionalProperties":false}`)),
 			`{"type":"object","required":["child_session_id"],"properties":{"child_session_id":{"type":"string","minLength":1}},"additionalProperties":false}`, "", "")},
+	}
+}
+
+// hostCommandsDefinition is the fixed melta.commands/v1 host service: one
+// method per ordinary command producer. Request and result schemas remain
+// object-shaped because the accepting handler decodes and validates the exact
+// generated protocol value itself; controls take one closed empty object and
+// return the existing null or generated receipt.
+func hostCommandsDefinition() CapabilityDefinition {
+	const (
+		request = `{"type":"object"}`
+		control = `{"type":"object","additionalProperties":false}`
+		value   = `{"type":"object"}`
+		null    = `{"type":"null"}`
+	)
+	return CapabilityDefinition{
+		ContractID:      ContractCommands,
+		ContractVersion: ContractVersion,
+		Kind:            KindService,
+		Methods: []Method{
+			method("create_session", ModeServiceIO, request, value, "", ""),
+			method("submit", ModeServiceIO, request, value, "", ""),
+			method("fork", ModeServiceIO, request, value, "", ""),
+			method("compact", ModeServiceIO, request, value, "", ""),
+			method("set_agent", ModeServiceIO, request, value, "", ""),
+			method("set_model", ModeServiceIO, request, value, "", ""),
+			method("interrupt", ModeServiceIO, control, null, "", ""),
+			method("stop", ModeServiceIO, control, null, "", ""),
+			method("archive", ModeServiceIO, control, value, "", ""),
+			method("reopen", ModeServiceIO, control, value, "", ""),
+			method("delete", ModeServiceIO, control, value, "", ""),
+			method("revert_code", ModeServiceIO, request, value, "", ""),
+		},
 	}
 }

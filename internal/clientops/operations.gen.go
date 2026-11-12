@@ -23,10 +23,7 @@ var operationDescriptors = map[string]descriptor{
 		session: memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.ArchiveSession(ctx, pathValue)
 		},
 	},
@@ -35,10 +32,7 @@ var operationDescriptors = map[string]descriptor{
 		body:    memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.CompactSessionWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
@@ -94,10 +88,7 @@ var operationDescriptors = map[string]descriptor{
 		session: memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.DeleteSession(ctx, pathValue)
 		},
 	},
@@ -135,10 +126,7 @@ var operationDescriptors = map[string]descriptor{
 		body:    memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.ForkSessionWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
@@ -169,10 +157,7 @@ var operationDescriptors = map[string]descriptor{
 		session: memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.GetSessionCodeSnapshots(ctx, pathValue)
 		},
 	},
@@ -181,10 +166,7 @@ var operationDescriptors = map[string]descriptor{
 		query:   memberOptional,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			var query protocol.GetSessionHistoryParams
 			if env.query != nil {
 				if err := bindQuery(env.query, nil, &query); err != nil {
@@ -198,10 +180,7 @@ var operationDescriptors = map[string]descriptor{
 		session: memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.GetSessionHydration(ctx, pathValue)
 		},
 	},
@@ -222,11 +201,21 @@ var operationDescriptors = map[string]descriptor{
 		session: memberRequired,
 		status:  204,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.InterruptSession(ctx, pathValue)
+		},
+	},
+	"InvokeExtension": {
+		body:   memberRequired,
+		status: 200,
+		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
+			return c.InvokeExtensionWithBody(ctx, contentTypeJSON, bytes.NewReader(env.body))
+		},
+	},
+	"ListExtensionCapabilities": {
+		status: 200,
+		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
+			return c.ListExtensionCapabilities(ctx)
 		},
 	},
 	"ListExtensionPackages": {
@@ -308,10 +297,7 @@ var operationDescriptors = map[string]descriptor{
 		session: memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.ReopenSession(ctx, pathValue)
 		},
 	},
@@ -320,10 +306,7 @@ var operationDescriptors = map[string]descriptor{
 		query:  memberRequired,
 		status: 200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.ProviderField
-			if err := bindPath(env.field, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.ProviderField(env.field)
 			var query protocol.ResetProviderFieldParams
 			if err := bindQuery(env.query, []string{"provider_id"}, &query); err != nil {
 				return nil, err
@@ -336,10 +319,7 @@ var operationDescriptors = map[string]descriptor{
 		query:  memberRequired,
 		status: 200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.ModelField
-			if err := bindPath(env.field, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.ModelField(env.field)
 			var query protocol.ResetProviderModelFieldParams
 			if err := bindQuery(env.query, []string{"provider_id", "model_id"}, &query); err != nil {
 				return nil, err
@@ -352,10 +332,7 @@ var operationDescriptors = map[string]descriptor{
 		body:    memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.RevertSessionCodeWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
@@ -364,10 +341,7 @@ var operationDescriptors = map[string]descriptor{
 		body:    memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.SetSessionAgentTypeWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
@@ -376,10 +350,7 @@ var operationDescriptors = map[string]descriptor{
 		body:    memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.SetSessionModelWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},
@@ -387,10 +358,7 @@ var operationDescriptors = map[string]descriptor{
 		session: memberRequired,
 		status:  204,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.StopSession(ctx, pathValue)
 		},
 	},
@@ -399,10 +367,7 @@ var operationDescriptors = map[string]descriptor{
 		body:    memberRequired,
 		status:  200,
 		call: func(ctx context.Context, c protocol.ClientInterface, env envelope) (*http.Response, error) {
-			var pathValue protocol.SessionID
-			if err := bindPath(env.session, &pathValue); err != nil {
-				return nil, err
-			}
+			pathValue := protocol.SessionID(env.session)
 			return c.SubmitSessionWithBody(ctx, pathValue, contentTypeJSON, bytes.NewReader(env.body))
 		},
 	},

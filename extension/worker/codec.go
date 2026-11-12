@@ -39,6 +39,7 @@ func NewInstanceContext(token string, instance extension.InstanceContext) Contex
 			Scope:        instance.Scope,
 			Revision:     instance.Revision,
 			Section:      JSONBytes(instance.Section),
+			Workspace:    instance.Scope.Workspace,
 			SessionID:    instance.Scope.SessionID,
 			OperationID:  instance.Scope.OperationID,
 			InvocationID: instance.Scope.InvocationID,
@@ -436,6 +437,7 @@ type callContextJSON struct {
 	Scope        extension.ScopeIdentity `json:"scope"`
 	Revision     string                  `json:"revision"`
 	Section      JSONBytes               `json:"section,omitempty"`
+	Workspace    string                  `json:"workspace,omitempty"`
 	SessionID    string                  `json:"session_id,omitempty"`
 	OperationID  string                  `json:"operation_id,omitempty"`
 	InvocationID string                  `json:"invocation_id,omitempty"`
@@ -455,6 +457,7 @@ func callContextFrom(v extension.CallContext) callContextJSON {
 		Scope:        v.Scope,
 		Revision:     v.Revision,
 		Section:      JSONBytes(v.Section),
+		Workspace:    v.Workspace,
 		SessionID:    v.SessionID,
 		OperationID:  v.OperationID,
 		InvocationID: v.InvocationID,
@@ -479,6 +482,7 @@ func callContextValue(v callContextJSON) extension.CallContext {
 		Scope:        v.Scope,
 		Revision:     v.Revision,
 		Section:      append(json.RawMessage(nil), v.Section...),
+		Workspace:    v.Workspace,
 		SessionID:    v.SessionID,
 		OperationID:  v.OperationID,
 		InvocationID: v.InvocationID,

@@ -68,9 +68,19 @@ export async function invokeNative(
 
 // Preserve the rejected body's text; fall back to the label only when it carries none.
 function rejectionMessage(error: unknown, label: string): string {
+  if (isExtensionFailure(error)) {
+    return error.error.message;
+  }
   const generated = error as RuntimeError | undefined;
   if (typeof generated?.message === 'string' && generated.message !== '') {
     return generated.message;
   }
   return `${label}: request failed`;
+}
+
+// A declared extension failure carries its own nested message; the kind makes
+// the shape explicit rather than sniffing restore-like members.
+function isExtensionFailure(value: unknown): value is { kind: 'failure'; error: { message: string } } {
+  const failure = value as { kind?: unknown; error?: { message?: unknown } } | undefined;
+  return failure?.kind === 'failure' && typeof failure.error?.message === 'string' && failure.error.message !== '';
 }

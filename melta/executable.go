@@ -656,6 +656,9 @@ func (a *executableActivation) response(frame worker.Frame) error {
 		if !frame.Error.Class.Valid() {
 			return fmt.Errorf("worker: response %q carries unknown error class %q", frame.ID, frame.Error.Class)
 		}
+		if len(frame.Error.Partial) != 0 && !json.Valid(frame.Error.Partial) {
+			return fmt.Errorf("worker: response %q carries an invalid error partial", frame.ID)
+		}
 		request.mu.Lock()
 		hostCancelled := request.cancelErr != nil
 		request.mu.Unlock()
@@ -734,7 +737,20 @@ func (a *executableActivation) respondResult(id string, result extension.Result)
 // sides use: melta.ErrorCode is the one classifier, and worker classes are the
 // public error codes.
 func executableFailure(err error) *worker.Error {
-	return &worker.Error{Class: worker.Class(ErrorCode(err)), Message: err.Error()}
+	failure := &worker.Error{Class: worker.Class(ErrorCode(err)), Message: err.Error()}
+	var typed *worker.Error
+	if errors.As(err, &typed) {
+		failure.Interrupted = typed.Interrupted
+		failure.Evidence = typed.Evidence
+		if len(typed.Partial) != 0 {
+			failure.Partial = append(worker.JSONBytes(nil), typed.Partial...)
+		}
+	}
+	var callErr *extension.CallError
+	if errors.As(err, &callErr) && len(callErr.Partial) != 0 {
+		failure.Partial = append(worker.JSONBytes(nil), callErr.Partial...)
+	}
+	return failure
 }
 
 func (a *executableActivation) respondError(id string, failure *worker.Error) {
