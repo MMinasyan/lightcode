@@ -133,3 +133,44 @@ func TestProtocolExtensionCatalogAndInvocation(t *testing.T) {
 	malformed := invoke(`{"extension_id":"fixture","capability_id":"fixture.commands","contract_id":"fixture.commands/v1","contract_version":"1","method":"command","target":{"kind":"session","session_id":"` + session.SessionId + `"},"arguments":{"method":"submit","arguments":{"session_id":"forged","operation_id":"op-x","mode":"regular","content":[]}},"request_id":"req-command"}`)
 	testassert.Require(t, malformed.StatusCode == http.StatusBadRequest, "malformed command status = %d body = %s", malformed.StatusCode, readBody(t, malformed))
 }
+
+// TestProtocolExtensionUnmappedCallErrorRetainsPartial proves a directly
+// forwarded CallError keeps the ordinary classified baseline Error and its
+// exact produced partial through the public invocation HTTP boundary.
+func TestProtocolExtensionUnmappedCallErrorRetainsPartial(t *testing.T) {
+	ctx := context.Background()
+	_, _, server := mountedOwner(t, ctx, extensionOwnerOptions(t))
+	invoke := func(mode string) (int, string) {
+		body := `{"extension_id":"fixture","capability_id":"fixture.service","contract_id":"fixture.service/v1","contract_version":"1","method":"call_error","target":{"kind":"harness"},"arguments":{"mode":"` + mode + `"},"request_id":"req-call-error"}`
+		response := rawMounted(t, http.MethodPost, server.Endpoint()+"/v1/extensions/invoke", server.credential, body)
+		return response.StatusCode, readBody(t, response)
+	}
+	decode := func(received string) map[string]json.RawMessage {
+		var members map[string]json.RawMessage
+		testassert.NoError(t, json.Unmarshal([]byte(received), &members))
+		return members
+	}
+	status, received := invoke("valid")
+	members := decode(received)
+	testassert.Require(t, status == http.StatusInternalServerError, "call-error status = %d body = %s", status, received)
+	var code string
+	testassert.NoError(t, json.Unmarshal(members["code"], &code))
+	testassert.Require(t, code == "storage", "call-error code = %q, want storage", code)
+	partial, ok := members["partial_result"]
+	testassert.Require(t, ok, "call-error body omitted partial_result: %s", received)
+	testassert.Require(t, string(partial) == "{\n  \"big\": 9007199254740993,\n  \"text\": \"line\\\\nbreak\"\n}", "partial_result = %q, want the exact produced bytes", partial)
+
+	status, received = invoke("null")
+	members = decode(received)
+	testassert.Require(t, status == http.StatusInternalServerError && string(members["partial_result"]) == "null", "null partial = (%d, %s)", status, received)
+	status, received = invoke("empty")
+	members = decode(received)
+	_, present := members["partial_result"]
+	testassert.Require(t, status == http.StatusInternalServerError && !present, "empty partial = (%d, %s), want the member absent", status, received)
+	status, received = invoke("bad")
+	testassert.Require(t, status == http.StatusInternalServerError, "malformed partial status = %d body = %s", status, received)
+	testassert.Require(t, json.Valid([]byte(received)), "malformed partial produced invalid HTTP JSON: %q", received)
+	members = decode(received)
+	_, present = members["partial_result"]
+	testassert.Require(t, !present, "malformed partial was published: %s", received)
+}

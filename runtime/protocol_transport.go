@@ -1,8 +1,8 @@
 package runtime
 
 import (
+	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -108,17 +108,28 @@ func writeProtocolAuthError(w http.ResponseWriter) {
 // request body — and a corrupt Session's typed identity rides the optional
 // session_id member.
 func writeProtocolError(w http.ResponseWriter, err error) {
-	code, status := classifyProtocolError(err)
-	body := protocol.Error{Code: code, Message: err.Error()}
-	var corrupt *harness.CorruptionError
-	if errors.As(err, &corrupt) && corrupt.SessionID != "" {
-		session := corrupt.SessionID
-		body.SessionId = &session
+	value := melta.ErrorValue(err)
+	status := protocolErrorStatus(value.Code)
+	encodedCode, _ := json.Marshal(value.Code)
+	encodedMessage, _ := json.Marshal(value.Message)
+	var body bytes.Buffer
+	body.WriteString(`{"code":`)
+	body.Write(encodedCode)
+	body.WriteString(`,"message":`)
+	body.Write(encodedMessage)
+	if value.SessionId != nil {
+		session, _ := json.Marshal(*value.SessionId)
+		body.WriteString(`,"session_id":`)
+		body.Write(session)
 	}
-	data, _ := json.Marshal(body) // plain string members; the marshal cannot fail
+	if value.PartialResult != nil {
+		body.WriteString(`,"partial_result":`)
+		body.Write(*value.PartialResult)
+	}
+	body.WriteByte('}')
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(data)
+	_, _ = w.Write(body.Bytes())
 }
 
 // writeJSON writes one owner-built response body with its status; revision

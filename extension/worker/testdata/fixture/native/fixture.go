@@ -160,6 +160,7 @@ func Declaration() extension.Declaration {
 			{Method: extension.MethodKey{CapabilityID: workspaceQueryCapability, Method: "probe"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetWorkspace},
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "command"}, Kind: extension.ExposedSessionWork, Target: extension.ExposedTargetSession},
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "command_harness"}, Kind: extension.ExposedSessionWork, Target: extension.ExposedTargetHarness},
+			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "command_unmapped"}, Kind: extension.ExposedSessionWork, Target: extension.ExposedTargetSession},
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "query_hold"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetSession},
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "namespaces"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetSession},
 			{Method: extension.MethodKey{CapabilityID: commandsCapability, Method: "management_command"}, Kind: extension.ExposedManagement, Target: extension.ExposedTargetHarness},
@@ -167,6 +168,7 @@ func Declaration() extension.Declaration {
 			{Method: extension.MethodKey{CapabilityID: serviceCapability, Method: "raw"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
 			{Method: extension.MethodKey{CapabilityID: serviceCapability, Method: "fail"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
 			{Method: extension.MethodKey{CapabilityID: serviceCapability, Method: "corrupt"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
+			{Method: extension.MethodKey{CapabilityID: serviceCapability, Method: "call_error"}, Kind: extension.ExposedQuery, Target: extension.ExposedTargetHarness},
 		},
 	}
 }
@@ -185,6 +187,7 @@ func serviceMethods() []extension.Method {
 		extension.ServiceMethod("raw", extension.ModeServiceIO, `{}`, `{}`, "", ""),
 		extension.ServiceMethod("fail", extension.ModeServiceIO, `{}`, `{}`, `{}`, `{}`),
 		extension.ServiceMethod("corrupt", extension.ModeServiceIO, `{}`, `{}`, "", ""),
+		extension.ServiceMethod("call_error", extension.ModeServiceIO, `{}`, `{}`, "", ""),
 	}
 }
 
@@ -203,6 +206,7 @@ func commandMethods() []extension.Method {
 	return []extension.Method{
 		extension.ServiceMethod("command", extension.ModeServiceIO, forward, `{}`, "", `{}`),
 		extension.ServiceMethod("command_harness", extension.ModeServiceIO, forward, `{}`, "", `{}`),
+		extension.ServiceMethod("command_unmapped", extension.ModeServiceIO, forward, `{}`, "", `{}`),
 		extension.ServiceMethod("management_command", extension.ModeServiceIO, forward, `{}`, "", ""),
 		extension.ServiceMethod("pure_command", extension.ModePure, forward, `{}`, "", ""),
 		extension.ServiceMethod("query_hold", extension.ModeServiceIO,
@@ -299,6 +303,7 @@ func (s *serviceState) handlers() map[string]extension.Handler {
 		"raw":          rawHandler,
 		"fail":         failHandler,
 		"corrupt":      corruptHandler,
+		"call_error":   callErrorHandler,
 	}
 }
 
@@ -338,6 +343,26 @@ func corruptHandler(_ context.Context, _ extension.CallContext, _ json.RawMessag
 	return extension.Result{}, fmt.Errorf("fixture corrupt: %w", harness.ErrCorrupt)
 }
 
+func callErrorHandler(_ context.Context, _ extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
+	var request struct {
+		Mode string `json:"mode"`
+	}
+	_ = json.Unmarshal(arguments, &request)
+	valid := json.RawMessage("{\n  \"big\": 9007199254740993,\n  \"text\": \"line\\\\nbreak\"\n}")
+	switch request.Mode {
+	case "bad":
+		return extension.Result{}, &extension.CallError{Err: fmt.Errorf("fixture call failure: %w", harness.ErrStorage), Partial: json.RawMessage("{")}
+	case "null":
+		return extension.Result{}, &extension.CallError{Err: fmt.Errorf("fixture call failure: %w", harness.ErrStorage), Partial: json.RawMessage("null")}
+	case "empty":
+		return extension.Result{}, &extension.CallError{Err: fmt.Errorf("fixture call failure: %w", harness.ErrStorage)}
+	case "wrapped":
+		return extension.Result{}, fmt.Errorf("wrapped: %w", &extension.CallError{Err: fmt.Errorf("fixture call failure: %w", harness.ErrStorage), Partial: valid})
+	default:
+		return extension.Result{}, &extension.CallError{Err: fmt.Errorf("fixture call failure: %w", harness.ErrStorage), Partial: valid}
+	}
+}
+
 func (s *serviceState) retainHandler(_ context.Context, call extension.CallContext, _ json.RawMessage) (extension.Result, error) {
 	s.mu.Lock()
 	s.retained = call.Call
@@ -363,8 +388,9 @@ func (s *serviceState) useRetainedHandler(ctx context.Context, _ extension.CallC
 // Session and request identity.
 func commandHandlers() map[string]extension.Handler {
 	return map[string]extension.Handler{
-		"command":            commandHandler("command"),
-		"command_harness":    commandHandler("command_harness"),
+		"command":            commandHandler("command", true),
+		"command_harness":    commandHandler("command_harness", true),
+		"command_unmapped":   commandHandler("command_unmapped", false),
 		"management_command": managementCommandHandler,
 		"pure_command":       pureCommandHandler,
 		"query_hold":         queryHoldHandler,
@@ -372,7 +398,7 @@ func commandHandlers() map[string]extension.Handler {
 	}
 }
 
-func commandHandler(label string) extension.Handler {
+func commandHandler(label string, mapCallError bool) extension.Handler {
 	return func(ctx context.Context, call extension.CallContext, arguments json.RawMessage) (extension.Result, error) {
 		var request struct {
 			Method    string          `json:"method"`
@@ -390,7 +416,7 @@ func commandHandler(label string) extension.Handler {
 			return result, nil
 		}
 		var callErr *extension.CallError
-		if errors.As(err, &callErr) && len(callErr.Partial) != 0 {
+		if mapCallError && errors.As(err, &callErr) && len(callErr.Partial) != 0 {
 			class, message := "internal", callErr.Error()
 			if failure := worker.Classify(callErr.Err); failure != nil {
 				class, message = string(failure.Class), failure.Message

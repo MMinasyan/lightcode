@@ -2,6 +2,7 @@ package melta
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/MMinasyan/lightcode/extension"
@@ -16,6 +17,25 @@ import (
 // wrap it; Caller cancellation/deadline is its own cancelled class, and every
 // unclassified error is internal. Producer-owned partial results use the same
 // mapping, so HTTP never uniquely supplies classification of a private error.
+// ErrorValue projects one producer error onto the generated public error value:
+// its public class, message, optional corrupt Session attribution, and the
+// owned partial produced beside a typed call failure. It is the public owner
+// boundary the Runtime consumes; callers never reclassify the error.
+func ErrorValue(err error) protocol.Error {
+	value := protocol.Error{Code: ErrorCode(err), Message: err.Error()}
+	var corrupt *harness.CorruptionError
+	if errors.As(err, &corrupt) && corrupt.SessionID != "" {
+		session := corrupt.SessionID
+		value.SessionId = &session
+	}
+	var callErr *extension.CallError
+	if errors.As(err, &callErr) && len(callErr.Partial) != 0 {
+		partial := append(json.RawMessage(nil), callErr.Partial...)
+		value.PartialResult = &partial
+	}
+	return value
+}
+
 func ErrorCode(err error) protocol.ErrorCode {
 	var workerErr *worker.Error
 	if errors.As(err, &workerErr) {

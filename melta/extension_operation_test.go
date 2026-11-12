@@ -576,3 +576,108 @@ func TestCallErrorOwnershipPreservesErrorChain(t *testing.T) {
 		t.Fatal("ordinary error was replaced")
 	}
 }
+
+// TestExtensionRevertUnmappedCallErrorParity proves an exposed handler that
+// forwards call.Call directly keeps the public command class and the exact
+// produced partial as extension.CallError on both native and worker transports.
+func TestExtensionRevertUnmappedCallErrorParity(t *testing.T) {
+	eachParityHost(t, func(t *testing.T, host parityHost) parityObservation {
+		r, e := openFixtureParity(t, host)
+		e.server.setScript(func(_ context.Context, _ string) []string { return textTurnEvents("done") })
+		ctx := context.Background()
+		harnessCaller := fixtureCaller(t, r, harnessScope)
+		workspace := e.workspace("revert-unmapped")
+		testassert.NoError(t, os.MkdirAll(workspace, 0o700))
+		session := projectionSessionNamed(t, r, harnessCaller, workspace)
+		first := submitCodeOperation(t, r, session, "op-first", "first")
+		second := submitCodeOperation(t, r, session, "op-second", "second")
+		awaitRestorableSession(t, r, session)
+
+		badEntryDir := filepath.Join(codeGroupRoot(r, session, first.Admission.AdmittedEntry.EntryID), "snapshots", "1", "aaaaaaaaaaaaaaaa")
+		testassert.NoError(t, os.MkdirAll(badEntryDir, 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(badEntryDir, "meta.json"), []byte("{"), 0o600))
+		target := filepath.Join(workspace, "parked.txt")
+		testassert.NoError(t, os.WriteFile(target, []byte("current"), 0o600))
+		fifo := seedFIFOCodeEntry(t, codeGroupRoot(r, session, second.Admission.AdmittedEntry.EntryID), target, "current")
+
+		sessionCaller := fixtureCaller(t, r, CallerScope{Kind: CallerScopeSession, SessionID: session})
+		outcomes := make(chan extensionOutcome, 1)
+		go func() {
+			result, err := r.InvokeExtension(ctx, sessionCaller, fixtureRequest(fixtureExtensionID, fixtureCommands, "fixture.commands/v1", "command_unmapped", sessionTarget(session), `{"method":"revert_code","arguments":{"boundary_operation_id":"op-first"}}`, "req-revert-unmapped"))
+			outcomes <- extensionOutcome{result: result, err: err}
+		}()
+		park := parkOrOutcome(t, fifo, outcomes)
+		defer park.flush()
+		park.release("restored")
+		var out extensionOutcome
+		select {
+		case out = <-outcomes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("unmapped revert command never returned")
+		}
+		var callErr *extension.CallError
+		testassert.Require(t, errors.As(out.err, &callErr) && callErr.Partial != nil && out.result.Failure == nil, "unmapped revert = (%+v, %v), want extension.CallError with a partial", out.result, out.err)
+		testassert.Require(t, ErrorCode(callErr) == protocol.ErrorCodeInternal && callErr.Err != nil, "unmapped revert class = %q cause = %v, want the original internal class and cause", ErrorCode(callErr), callErr.Err)
+		var partial protocol.CodeRevertResult
+		testassert.NoError(t, json.Unmarshal(callErr.Partial, &partial))
+		testassert.Require(t, len(partial.Restored) == 1 && partial.Restored[0] == target && partial.Skipped != nil && partial.Error != nil && partial.Error.Code == protocol.ErrorCodeInternal, "unmapped partial = %+v", partial)
+		remarshaled, err := json.Marshal(partial)
+		testassert.NoError(t, err)
+		testassert.Require(t, bytes.Equal(callErr.Partial, remarshaled), "unmapped partial bytes changed: %q vs %q", callErr.Partial, remarshaled)
+		return newParityObservation()
+	})
+}
+
+// TestExtensionCallErrorPartialValidationParity proves native and worker
+// call-error forwarding preserves valid multiline/large-number, null, empty
+// and wrapped causes exactly; only actual malformed native output is refused
+// as the existing extension invalid-output sentinel.
+func TestExtensionCallErrorPartialValidationParity(t *testing.T) {
+	validPartial := "{\n  \"big\": 9007199254740993,\n  \"text\": \"line\\\\nbreak\"\n}"
+	eachParityHost(t, func(t *testing.T, host parityHost) parityObservation {
+		r, _ := openFixtureParity(t, host)
+		invoke := func(mode string) (extension.Result, error) {
+			return r.InvokeExtension(context.Background(), fixtureCaller(t, r, harnessScope), fixtureRequest(fixtureExtensionID, fixtureService, "fixture.service/v1", "call_error", harnessTarget(), `{"mode":"`+mode+`"}`, "req-call-error-"+mode))
+		}
+		for _, tc := range []struct {
+			mode    string
+			partial string
+			typed   bool
+			wrapped bool
+		}{
+			{"valid", validPartial, true, false},
+			{"null", "null", true, false},
+			{"empty", "", false, false},
+			{"wrapped", validPartial, true, true},
+		} {
+			result, err := invoke(tc.mode)
+			var callErr *extension.CallError
+			testassert.Require(t, result.Failure == nil && err != nil, "%s result = (%+v, %v)", tc.mode, result, err)
+			testassert.Require(t, errors.Is(err, harness.ErrStorage) && ErrorCode(err) == protocol.ErrorCodeStorage, "%s class = %q", tc.mode, ErrorCode(err))
+			if !tc.typed {
+				if errors.As(err, &callErr) {
+					testassert.Require(t, callErr.Partial == nil, "%s partial = %q, want absent", tc.mode, callErr.Partial)
+				}
+				continue
+			}
+			testassert.Require(t, errors.As(err, &callErr), "%s error = %v, want CallError", tc.mode, err)
+			testassert.Require(t, string(callErr.Partial) == tc.partial, "%s partial = %q, want %q", tc.mode, callErr.Partial, tc.partial)
+			if tc.wrapped {
+				testassert.Require(t, strings.Contains(callErr.Err.Error(), "wrapped:"), "wrapped cause = %v", callErr.Err)
+			}
+		}
+		return newParityObservation()
+	})
+}
+
+// TestExtensionMalformedCallErrorPartialRefused proves native malformed call
+// output is rejected at acceptance as the extension invalid-output sentinel,
+// never an exposed CallError carrying invalid bytes. Worker malformed output
+// retains its existing terminal refusal.
+func TestExtensionMalformedCallErrorPartialRefused(t *testing.T) {
+	r, _ := openFixtureParity(t, parityHost{name: "native"})
+	result, err := r.InvokeExtension(context.Background(), fixtureCaller(t, r, harnessScope), fixtureRequest(fixtureExtensionID, fixtureService, "fixture.service/v1", "call_error", harnessTarget(), `{"mode":"bad"}`, "req-bad-call-error"))
+	var callErr *extension.CallError
+	testassert.Require(t, result.Failure == nil && err != nil && !errors.As(err, &callErr), "malformed call error = (%+v, %v), want no CallError", result, err)
+	testassert.Require(t, errors.Is(err, extension.ErrInvalid), "malformed call error = %v, want the extension invalid-output sentinel", err)
+}

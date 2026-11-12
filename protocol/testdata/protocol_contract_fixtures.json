@@ -546,6 +546,14 @@
      "json": "{\"code\":\"invalid\",\"message\":\"fixture\"}"
     },
     {
+     "name": "partial-result",
+     "json": "{\"code\":\"storage\",\"message\":\"partial\",\"partial_result\":{\"big\":9007199254740993,\"text\":\"line\\\\nbreak\"}}"
+    },
+    {
+     "name": "null-partial-result",
+     "json": "{\"code\":\"storage\",\"message\":\"null partial\",\"partial_result\":null}"
+    },
+    {
      "name": "code-unauthorized",
      "json": "{\"code\":\"unauthorized\",\"message\":\"missing credential\"}"
     },
@@ -705,7 +713,7 @@
    "accept": [
     {
      "name": "minimal",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"15\"}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"16\"}"
     }
    ],
    "reject": [
@@ -715,16 +723,16 @@
     },
     {
      "name": "bad-instance-pattern",
-     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"15\"}",
+     "json": "{\"instance_id\":\"XYZ\",\"protocol_version\":\"16\"}",
      "typescript": false
     },
     {
      "name": "missing-instance",
-     "json": "{\"protocol_version\":\"15\"}"
+     "json": "{\"protocol_version\":\"16\"}"
     },
     {
      "name": "unknown-member",
-     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"15\",\"extra\":true}"
+     "json": "{\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"protocol_version\":\"16\",\"extra\":true}"
     }
    ]
   },

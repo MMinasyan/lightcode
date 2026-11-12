@@ -8,6 +8,11 @@ export type Error = {
     code: 'invalid' | 'unauthorized' | 'denied' | 'not_found' | 'conflict' | 'incompatible' | 'corrupt' | 'closed' | 'cancelled' | 'configuration' | 'storage' | 'unavailable' | 'internal';
     message: string;
     session_id?: string;
+    /**
+     * One optional opaque produced partial retained by a baseline error that failed after producing it. The value is the original raw JSON and is absent when no partial was produced.
+     *
+     */
+    partial_result?: unknown;
 };
 
 /**
@@ -197,7 +202,7 @@ export type WarningsRevision = {
 
 export type Health = {
     instance_id: string;
-    protocol_version: '15';
+    protocol_version: '16';
 };
 
 /**

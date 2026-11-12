@@ -267,7 +267,7 @@ func startBridge(t *testing.T, f *fixture, workspace string) *bridge {
 func startBridgeWith(t *testing.T, f *fixture, workspace string, writer io.Writer) *bridge {
 	t.Helper()
 	dataDir := t.TempDir()
-	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"15","credential":%q}`,
+	record := fmt.Sprintf(`{"endpoint":%q,"instance_id":%q,"protocol_version":"16","credential":%q}`,
 		f.server.URL, testInstance, testCredential)
 	testassert.NoError(t, os.WriteFile(filepath.Join(dataDir, "runtime.json"), []byte(record), 0o600))
 	return startRunner(t, clienthost.Options{
@@ -494,7 +494,7 @@ func sseFrame(document string) string {
 }
 
 func healthBody() string {
-	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"15"}`, testInstance)
+	return fmt.Sprintf(`{"instance_id":%q,"protocol_version":"16"}`, testInstance)
 }
 
 func hydrationBody(sessionID, workspace string) string {
@@ -971,7 +971,7 @@ func TestACPEventsAndRepair(t *testing.T) {
 	connected := b.awaitFrame(t, methodFrame("runtime/connected"))
 	var health map[string]any
 	testassert.NoError(t, json.Unmarshal(connected["params"], &health))
-	testassert.Require(t, health["instance_id"] == testInstance && health["protocol_version"] == "15", "runtime/connected params = %v, want the generated Health", health)
+	testassert.Require(t, health["instance_id"] == testInstance && health["protocol_version"] == "16", "runtime/connected params = %v, want the generated Health", health)
 	resync := b.awaitFrame(t, methodFrame("runtime/resync_required"))
 	{
 		params, ok := resync["params"]
@@ -1322,6 +1322,7 @@ func TestACPRuntimeForwarding(t *testing.T) {
 		"/v1/sessions/s1/revert-code": jsonHandler(409, `{"error":{"code":"conflict","message":"partial restore"},"restored":["a.go"],"skipped":[{"path":"b.go","reason":"denied"}]}`),
 		"/v1/sessions/s1/hydration":   jsonHandler(500, "<html>broken</html>"),
 		"/v1/extensions/invoke":       jsonHandler(422, `{"kind":"failure","error":{"code":"guest_code","message":"guest message","data":{"big":9007199254740993}},"partial_result":["partial",null,1]}`),
+		"/v1/providers":               jsonHandler(500, `{"code":"storage","message":"baseline partial","partial_result":{"big":9007199254740993,"text":"line\nbreak"}}`),
 		"/v1/providers/discover":      jsonHandler(200, `[]`),
 	})
 	b := startBridge(t, f, "/ws")
@@ -1353,7 +1354,14 @@ func TestACPRuntimeForwarding(t *testing.T) {
 		testassert.Require(t, string(data) == `{"kind":"failure","error":{"code":"guest_code","message":"guest message","data":{"big":9007199254740993}},"partial_result":["partial",null,1]}`, "extension failure error.data = %s, want the exact declared body", data)
 	}
 
-	malformed := b.call(t, "6", "runtime/GetSessionHydration", `{"session_id":"s1"}`)
+	baselinePartial := b.call(t, "6", "runtime/ListProviders", `{}`)
+	{
+		code, message, data := errorFrame(t, baselinePartial)
+		testassert.Require(t, code == -32000 && message == "baseline partial", "baseline partial error = (%d, %q)", code, message)
+		testassert.Require(t, string(data) == `{"code":"storage","message":"baseline partial","partial_result":{"big":9007199254740993,"text":"line\nbreak"}}`, "baseline partial error.data = %s, want the exact received body", data)
+	}
+
+	malformed := b.call(t, "7", "runtime/GetSessionHydration", `{"session_id":"s1"}`)
 	{
 		code, _, _ := errorFrame(t, malformed)
 		testassert.Equal(t, code, -32001)

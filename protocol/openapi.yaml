@@ -7,7 +7,7 @@
 openapi: "3.0.3"
 info:
   title: lightcode-protocol
-  version: "15"
+  version: "16"
 servers:
   - url: "http://127.0.0.1"
 # Every path requires the bearer credential; it is declared once here and
@@ -827,6 +827,13 @@ components:
         session_id:
           type: string
           pattern: "^[0-9a-f]{32}$"
+        partial_result:
+          nullable: true
+          x-go-type: json.RawMessage
+          description: >
+            One optional opaque produced partial retained by a baseline error
+            that failed after producing it. The value is the original raw JSON
+            and is absent when no partial was produced.
     CleanupFailure:
       description: >
         One cleanup attempt that did not complete after the canonical Session
@@ -1259,7 +1266,7 @@ components:
         protocol_version:
           type: string
           enum:
-            - "15"
+            - "16"
     Scope:
       description: >
         One SSE event's applicable scope, discriminated by kind. Every

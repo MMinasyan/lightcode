@@ -65,9 +65,8 @@ func resultText(raw json.RawMessage, err error) string {
 		return terminal.RenderSystemMsg(string(raw))
 	}
 	var response *clientops.ResponseError
-	if errors.As(err, &response) && response.Partial != nil {
-		raw, _ := json.Marshal(response.Partial)
-		return terminal.RenderWarningMsg(string(raw))
+	if errors.As(err, &response) && (response.Partial != nil || response.Payload.PartialResult != nil) {
+		return terminal.RenderWarningMsg(string(response.Body))
 	}
 	var extensionFailure *clientops.ExtensionResponseError
 	if errors.As(err, &extensionFailure) {
@@ -524,8 +523,8 @@ func (c *CLI) runAttempt(id string) {
 		if err != nil {
 			var response *clientops.ResponseError
 			if errors.As(err, &response) {
-				if response.Partial != nil {
-					raw, _ = json.Marshal(response.Partial)
+				if response.Partial != nil || response.Payload.PartialResult != nil {
+					raw = response.Body
 				} else {
 					raw, _ = json.Marshal(response.Payload)
 				}
@@ -746,7 +745,10 @@ func (c *CLI) command(text string) {
 			read := strings.HasPrefix(invocation[0], "Get") || strings.HasPrefix(invocation[0], "List") || strings.HasPrefix(invocation[0], "Read") || strings.HasPrefix(invocation[0], "Discover")
 			text := resultText(raw, err)
 			if read && err != nil {
-				text = terminal.RenderErrorMsg(err.Error())
+				var response *clientops.ResponseError
+				if !errors.As(err, &response) || response.Payload.PartialResult == nil {
+					text = terminal.RenderErrorMsg(err.Error())
+				}
 			}
 			text = terminal.RenderSystemMsg(invocation[0]) + text
 			c.report(s, text, !read)

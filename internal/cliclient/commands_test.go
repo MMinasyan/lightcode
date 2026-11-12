@@ -680,3 +680,19 @@ func TestRuntimeExtensionDeclaredFailureRendersExactBody(t *testing.T) {
 	testassert.Require(t, strings.Contains(text, "guest_code") && strings.Contains(text, "guest message") && strings.Contains(text, `"partial_result":["partial",null,1]`), "declared failure body = %q", text)
 	testassert.Require(t, !strings.Contains(text, "Outcome unknown") && !strings.Contains(text, "request failed"), "declared failure misclassified: %q", text)
 }
+
+// TestRuntimeBaselinePartialRendersExactBody proves a read rejection carrying
+// an ordinary classified Error plus a produced partial displays the exact
+// received body instead of dropping it into a plain message or unknown outcome.
+func TestRuntimeBaselinePartialRendersExactBody(t *testing.T) {
+	c, transport := fixture(t)
+	settledReader(t, c, transport)
+	c.command(`/runtime ListProviders {}`)
+	request := receive(t, transport.requests)
+	body := "{\n \"code\": \"storage\",\n \"message\": \"partial\",\n \"partial_result\": {\"big\": 9007199254740993}\n}"
+	request.reply <- reply{status: http.StatusInternalServerError, raw: body}
+	settleTasks(t, c)
+	text := outputs(c)
+	testassert.Require(t, strings.Contains(text, "9007199254740993") && strings.Contains(text, `"partial_result"`), "baseline partial body = %q", text)
+	testassert.Require(t, !strings.Contains(text, "Outcome unknown"), "baseline partial reclassified as unknown: %q", text)
+}

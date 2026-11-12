@@ -23,6 +23,7 @@ type ResponseError struct {
 	Status  int
 	Payload protocol.Error
 	Partial *protocol.CodeRevertResult
+	Body    []byte
 }
 
 // Error returns the received Runtime error's message.
@@ -101,6 +102,10 @@ func decodeError(raw json.RawMessage) (protocol.Error, error) {
 	var payload protocol.Error
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return protocol.Error{}, fmt.Errorf("malformed runtime error: %v", err)
+	}
+	if partial, ok := members["partial_result"]; ok {
+		value := append(json.RawMessage(nil), partial...)
+		payload.PartialResult = &value
 	}
 	if !payload.Code.Valid() {
 		return protocol.Error{}, fmt.Errorf("runtime error code %q is outside the closed set", payload.Code)
@@ -284,13 +289,13 @@ func receive(response *http.Response, expected int, operation string) (int, json
 			if err != nil {
 				return status, body, fmt.Errorf("%v: %w", err, ErrInvalidResponse)
 			}
-			return status, body, &ResponseError{Status: status, Payload: payload, Partial: partial}
+			return status, body, &ResponseError{Status: status, Payload: payload, Partial: partial, Body: body}
 		}
 		payload, err := decodeError(body)
 		if err != nil {
 			return status, body, fmt.Errorf("%v: %w", err, ErrInvalidResponse)
 		}
-		return status, body, &ResponseError{Status: status, Payload: payload}
+		return status, body, &ResponseError{Status: status, Payload: payload, Body: body}
 	}
 	return status, body, fmt.Errorf("runtime returned status %d for an operation expecting %d: %w", status, expected, ErrInvalidResponse)
 }

@@ -366,6 +366,9 @@ func (c *composition) invokeAcceptedProvider(ctx context.Context, provider *capa
 func ownCallError(err error) error {
 	var callErr *extension.CallError
 	if errors.As(err, &callErr) {
+		if len(callErr.Partial) != 0 && !json.Valid(callErr.Partial) {
+			return fmt.Errorf("call error partial is not one JSON value: %w", extension.ErrInvalid)
+		}
 		return &extension.CallError{Err: err, Partial: append(json.RawMessage(nil), callErr.Partial...)}
 	}
 	return err

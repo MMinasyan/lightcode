@@ -17,21 +17,34 @@ beforeEach(() => {
 });
 
 describe('invokeNative declared extension failures', () => {
-  it('uses the nested declared message and preserves the failure payload', async () => {
-    const body = '{"kind":"failure","error":{"code":"guest_code","message":"guest message","data":{"big":9007199254740993}},"partial_result":["partial",null,1]}';
+  it('uses the nested declared message, exact body and exact numeric tokens', async () => {
+    const body = '{\n  "kind": "failure",\n  "error": {"code":"guest_code","message":"guest message","data":{"big":9007199254740993,"text":"line\\nbreak\\t<>&"}},\n  "partial_result": ["partial", null, 9007199254740993]\n}';
     vi.mocked(Call).mockResolvedValue({ status: 422, body, invalid: false });
     const result = await invokeNative(() => client, 'extension', 'InvokeExtension', '{"body":{}}', JSON.parse);
     expect(result.kind).toBe('rejection');
     if (result.kind !== 'rejection') return;
     expect(result.message).toBe('guest message');
-    expect(result.payload).toEqual(JSON.parse(body));
+    expect(result.body).toBe(body);
+    expect(JSON.stringify(result.payload)).toContain('9007199254740993');
+    expect(JSON.stringify(result.payload)).toContain('line\\nbreak\\t<>&');
   });
 
-  it('keeps the baseline Error message unchanged', async () => {
-    vi.mocked(Call).mockResolvedValue({ status: 422, body: '{"code":"corrupt","message":"baseline"}', invalid: false });
+  it('keeps the baseline Error message, body and partial numeric tokens', async () => {
+    const body = '{\n  "code": "corrupt",\n  "message": "baseline",\n  "partial_result": {"big": 9007199254740993, "text": "line\\nbreak"}\n}';
+    vi.mocked(Call).mockResolvedValue({ status: 500, body, invalid: false });
     const result = await invokeNative(() => client, 'extension', 'InvokeExtension', '{"body":{}}', JSON.parse);
     expect(result.kind).toBe('rejection');
     if (result.kind !== 'rejection') return;
     expect(result.message).toBe('baseline');
+    expect(result.body).toBe(body);
+    expect(JSON.stringify(result.payload)).toContain('9007199254740993');
+    expect(JSON.stringify(result.payload)).toContain('line\\nbreak');
+  });
+
+  it('keeps local syntax refusals without an HTTP body', async () => {
+    const result = await invokeNative(() => client, 'extension', 'InvokeExtension', '{bad', JSON.parse);
+    expect(result.kind).toBe('rejection');
+    if (result.kind !== 'rejection') return;
+    expect(result.body).toBeUndefined();
   });
 });

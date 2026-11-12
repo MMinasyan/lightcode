@@ -697,6 +697,7 @@ func TestInvokeMapsDeclaredErrors(t *testing.T) {
 		testassert.Check(t, responseErr.Status == http.StatusConflict, "status = %d, want %d", responseErr.Status, http.StatusConflict)
 		testassert.Check(t, responseErr.Payload.Code == protocol.ErrorCodeConflict && responseErr.Payload.Message == "in use", "payload = %+v", responseErr.Payload)
 		testassert.Check(t, responseErr.Partial == nil, "partial = %+v, want nil", responseErr.Partial)
+		testassert.Check(t, string(responseErr.Body) == payload, "body = %q, want the exact received body", responseErr.Body)
 		if responseErr.Error() != "in use" {
 			t.Errorf("Error() = %q, want the returned message", responseErr.Error())
 		}
@@ -710,6 +711,7 @@ func TestInvokeMapsDeclaredErrors(t *testing.T) {
 		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want *clientops.ResponseError", err)
 		testassert.Require(t, status == http.StatusConflict && string(raw) == payload, "Invoke = (%d, %q), want the received status and body", status, raw)
 		testassert.Require(t, responseErr.Partial != nil, "partial = nil, want the complete generated result")
+		testassert.Check(t, string(responseErr.Body) == payload, "body = %q, want the exact received body", responseErr.Body)
 		testassert.Check(t, len(responseErr.Partial.Restored) == 1 && responseErr.Partial.Restored[0] == "a.go", "restored = %v", responseErr.Partial.Restored)
 		testassert.Check(t, len(responseErr.Partial.Skipped) == 1 && responseErr.Partial.Skipped[0].Path == "b.go", "skipped = %v", responseErr.Partial.Skipped)
 		testassert.Check(t, responseErr.Payload.Message == "partial restore", "payload = %+v", responseErr.Payload)
@@ -721,6 +723,25 @@ func TestInvokeMapsDeclaredErrors(t *testing.T) {
 		_, _, err := invokeRejection(t, "RevertSessionCode", `{"error":{"code":"conflict","message":"none"},"restored":[],"skipped":[]}`)
 		var responseErr *clientops.ResponseError
 		testassert.Require(t, errors.As(err, &responseErr) && responseErr.Partial != nil, "error = %v, want a partial result", err)
+	})
+	t.Run("baseline partial", func(t *testing.T) {
+		partial := "{\n  \"big\": 9007199254740993,\n  \"text\": \"line\\\\nbreak\"\n}"
+		payload := `{"code":"conflict","message":"baseline partial","partial_result":` + partial + `}`
+		status, raw, err := invokeRejection(t, "GetHealth", payload)
+		var responseErr *clientops.ResponseError
+		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want a baseline ResponseError", err)
+		testassert.Require(t, responseErr.Partial == nil, "baseline partial was labelled a code-revert partial")
+		testassert.Require(t, responseErr.Payload.PartialResult != nil, "payload omitted partial_result")
+		testassert.Require(t, string(*responseErr.Payload.PartialResult) == partial, "payload partial = %q, want %q", *responseErr.Payload.PartialResult, partial)
+		testassert.Require(t, string(responseErr.Body) == payload && string(raw) == payload && status == http.StatusConflict, "baseline partial retained = (%d, %q, %q)", status, raw, responseErr.Body)
+	})
+	t.Run("baseline explicit null partial", func(t *testing.T) {
+		const payload = `{"code":"conflict","message":"null partial","partial_result":null}`
+		_, _, err := invokeRejection(t, "GetHealth", payload)
+		var responseErr *clientops.ResponseError
+		testassert.Require(t, errors.As(err, &responseErr), "error = %v, want a baseline ResponseError", err)
+		testassert.Require(t, responseErr.Payload.PartialResult != nil && string(*responseErr.Payload.PartialResult) == "null", "explicit null partial = %+v", responseErr.Payload.PartialResult)
+		testassert.Require(t, string(responseErr.Body) == payload, "explicit null body = %q", responseErr.Body)
 	})
 }
 

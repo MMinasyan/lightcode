@@ -394,13 +394,13 @@ func (e ExtensionSuccessKind) Valid() bool {
 
 // Defines values for HealthProtocolVersion.
 const (
-	N15 HealthProtocolVersion = "15"
+	N16 HealthProtocolVersion = "16"
 )
 
 // Valid indicates whether the value is a known member of the HealthProtocolVersion enum.
 func (e HealthProtocolVersion) Valid() bool {
 	switch e {
-	case N15:
+	case N16:
 		return true
 	default:
 		return false
@@ -1325,9 +1325,12 @@ type DiscoveryRequest struct {
 
 // Error defines model for Error.
 type Error struct {
-	Code      ErrorCode `json:"code"`
-	Message   string    `json:"message"`
-	SessionId *string   `json:"session_id,omitempty"`
+	Code    ErrorCode `json:"code"`
+	Message string    `json:"message"`
+
+	// PartialResult One optional opaque produced partial retained by a baseline error that failed after producing it. The value is the original raw JSON and is absent when no partial was produced.
+	PartialResult *json.RawMessage `json:"partial_result,omitempty"`
+	SessionId     *string          `json:"session_id,omitempty"`
 }
 
 // ErrorCode defines model for Error.Code.
