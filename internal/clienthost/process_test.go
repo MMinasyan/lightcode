@@ -854,7 +854,7 @@ func TestClientHostPreReadyFailureRestartsDiscovery(t *testing.T) {
 		testassert.Require(t, os.IsNotExist(err), "a failing contender published discovery: %v", err)
 	}
 	{
-		_, err := os.Stat(filepath.Join(s.dataDir, "lightcode.db"))
+		_, err := os.Stat(filepath.Join(s.dataDir, "melta.db"))
 		testassert.Require(t, os.IsNotExist(err), "a failing contender opened storage: %v", err)
 	}
 }

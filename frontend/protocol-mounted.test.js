@@ -2,7 +2,7 @@
 // This file exercises the generated fetch SDK — never handwritten requests —
 // against a real loopback listener: the endpoint and bearer credential are
 // read from the temporary mode-0600 discovery record whose path the Go
-// protocol test helper exports in LIGHTCODE_PROTOCOL_DISCOVERY. Without that
+// protocol test helper exports in MELTA_PROTOCOL_DISCOVERY. Without that
 // environment the row is skipped, so the ordinary frontend suite stays
 // self-contained.
 import { readFileSync } from 'node:fs';
@@ -32,7 +32,7 @@ import {
 } from './src/generated/protocol';
 import { createClient } from './src/generated/protocol/client';
 
-const discoveryPath = process.env.LIGHTCODE_PROTOCOL_DISCOVERY;
+const discoveryPath = process.env.MELTA_PROTOCOL_DISCOVERY;
 
 const mounted = test.skipIf(!discoveryPath);
 

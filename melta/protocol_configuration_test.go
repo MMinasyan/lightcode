@@ -46,7 +46,7 @@ const configurationProvidersDocument = `{
     "managedp": {"transport": {"base_url": "https://managed.test/v1", "api_key_env": "MANAGED_TEST_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}},
     "unsetp": {"transport": {"base_url": "https://unset.test/v1", "api_key_env": "UNSET_TEST_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}},
     "keyless": {"transport": {"base_url": "https://keyless.test/v1", "api_key_env": ""}, "discovery": false, "models": {"m": {"context_window": 4096}}},
-    "occupied": {"transport": {"base_url": "https://occupied.test/v1", "api_key_env": "LIGHTCODE_OCCUPIED_API_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}},
+    "occupied": {"transport": {"base_url": "https://occupied.test/v1", "api_key_env": "MELTA_OCCUPIED_API_KEY"}, "discovery": false, "models": {"m": {"context_window": 4096}}},
     "openrouter": {"transport": {"headers": {"x-title": "user-title", "X-Custom": "keep"}}, "models": {"m": {"context_window": 4096}}}
   },
   "sessions": {"auto_archive": false, "archive_after_days": 3},
@@ -98,7 +98,7 @@ func openConfigurationRuntime(t *testing.T, store harness.Storage, configDoc, ag
 // loads it into the managed set and the process environment.
 func writeDotEnv(t *testing.T, home, content string) {
 	t.Helper()
-	dir := filepath.Join(home, ".lightcode")
+	dir := filepath.Join(home, ".melta")
 	testassert.NoError(t, os.MkdirAll(dir, 0o700))
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(content), 0o600))
 }
@@ -887,7 +887,7 @@ func TestConfigurationModelSourceExactThroughCapturedCatalog(t *testing.T) {
 		// first build produced, then reload: the rebuild adopts the discovered
 		// model and labels it from the same accepted record.
 		transport := catalog.Transport{BaseURL: openrouter.BaseUrl, APIKeyEnv: openrouter.ApiKeyEnv, Headers: openrouter.Headers}
-		ok, err := catalog.TryWriteDiscoveryCache(filepath.Join(e.home, ".lightcode", "cache", "discovery"), "openrouter", transport,
+		ok, err := catalog.TryWriteDiscoveryCache(filepath.Join(e.home, ".melta", "cache", "discovery"), "openrouter", transport,
 			catalog.DiscoveredProvider{Models: map[string]catalog.DiscoveredModel{"found-via-cache": {Name: "Found Via Cache", ContextWindow: 4096}}},
 			time.Now().UTC())
 		testassert.Require(t, ok && err == nil, "seed discovery cache = (%v, %v), want a written record", ok, err)

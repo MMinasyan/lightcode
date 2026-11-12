@@ -419,7 +419,7 @@ func eachStore(t *testing.T, run func(t *testing.T, store harness.Storage)) {
 		run(t, storage.NewMemory())
 	})
 	t.Run("sqlite", func(t *testing.T) {
-		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 		testassert.NoError(t, err)
 		defer store.Close()
 		run(t, store)
@@ -2952,7 +2952,7 @@ func TestPublicLifecycleRollbackOnTransactionFailure(t *testing.T) {
 	}{
 		{name: "memory", open: func(t *testing.T) harness.Storage { return storage.NewMemory() }},
 		{name: "sqlite", open: func(t *testing.T) harness.Storage {
-			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 			testassert.NoError(t, err)
 			t.Cleanup(func() { store.Close() })
 			return store

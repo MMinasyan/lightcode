@@ -34,7 +34,7 @@ const (
 	// MinInstallable is the oldest release tag upgrade will install: the
 	// first tag whose binary answers --version, which the smoke check and
 	// the strict dispatcher require. Older releases fall through unknown
-	// arguments into a GUI launch; the installer's LIGHTCODE_VERSION pin
+	// arguments into a GUI launch; the installer's MELTA_VERSION pin
 	// is the path to them.
 	MinInstallable = "v0.0.3"
 )
@@ -111,7 +111,7 @@ func LatestTag() (string, error) {
 
 // AssetURLs composes the download URLs for a target tag. A non-empty base
 // overrides the channel with <base>/<asset> and <base>/SHA256SUMS — no tag
-// in the path, exactly the installer's LIGHTCODE_RELEASE_BASE semantics.
+// in the path, exactly the installer's MELTA_RELEASE_BASE semantics.
 func AssetURLs(base, tag string) (assetURL, sumsURL string) {
 	if base != "" {
 		base = strings.TrimRight(base, "/")
@@ -222,7 +222,7 @@ func Stage(dir string, binary []byte) (string, error) {
 }
 
 // SmokeCheck executes the staged binary with --version before the swap,
-// output captured and never forwarded, LIGHTCODE_* stripped from the child
+// output captured and never forwarded, MELTA_* stripped from the child
 // env. Pass requires both an exit-0 child and the target tag in the
 // captured output; non-termination within the timeout is failure.
 func SmokeCheck(staged, tag string) error {
@@ -243,7 +243,7 @@ func SmokeCheck(staged, tag string) error {
 	cmd := exec.CommandContext(ctx, staged, "--version")
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	cmd.Env = envWithoutLightcode()
+	cmd.Env = envWithoutMelta()
 	// Without WaitDelay, a grandchild inheriting the output pipe keeps
 	// Wait blocked long after the timeout killed the staged binary.
 	cmd.WaitDelay = 100 * time.Millisecond
@@ -260,11 +260,11 @@ func SmokeCheck(staged, tag string) error {
 	return nil
 }
 
-func envWithoutLightcode() []string {
+func envWithoutMelta() []string {
 	env := os.Environ()
 	kept := env[:0]
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "LIGHTCODE_") {
+		if strings.HasPrefix(kv, "MELTA_") {
 			continue
 		}
 		kept = append(kept, kv)
@@ -322,7 +322,7 @@ func Check(currentVersion, currentDisplay, latest string) CheckResult {
 	return result
 }
 
-// IgnoreReleaseBaseAsRoot reports whether a set LIGHTCODE_RELEASE_BASE must
+// IgnoreReleaseBaseAsRoot reports whether a set MELTA_RELEASE_BASE must
 // be dropped: on the install path under euid 0 the override is ignored —
 // custom-base into a root-owned directory is unsupported; use the
 // installer. The --check refusal applies regardless of euid and is the

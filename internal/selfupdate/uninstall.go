@@ -30,7 +30,7 @@ var (
 	}
 )
 
-// DataDirState classifies ~/.lightcode for the purge gates.
+// DataDirState classifies ~/.melta for the purge gates.
 type DataDirState int
 
 const (
@@ -43,7 +43,7 @@ const (
 
 // ClassifyDataDir gates the purge target: only a real directory owned by
 // the current euid may be removed. Lstat never follows a symlink, so a
-// symlinked ~/.lightcode is seen as such, not as what it points to.
+// symlinked ~/.melta is seen as such, not as what it points to.
 func ClassifyDataDir(path string) (DataDirState, error) {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {

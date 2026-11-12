@@ -44,13 +44,13 @@ func runRuntime(ctx context.Context, dataDir, configPath string) (err error) {
 	if err != nil {
 		return err
 	}
-	dataRoot := filepath.Join(home, ".lightcode")
+	dataRoot := filepath.Join(home, ".melta")
 	locations := melta.Locations{
 		GlobalRulesDir:     dataRoot,
 		DiscoveryCacheDir:  filepath.Join(dataRoot, "cache", "discovery"),
 		WorkspacePolicyDir: filepath.Join(dataRoot, "projects"),
 	}
-	if os.Getenv("LIGHTCODE_DEBUG_WIRE") == "1" {
+	if os.Getenv("MELTA_DEBUG_WIRE") == "1" {
 		locations.WireDebugDir = filepath.Join(dataRoot, "debug", "wire")
 	}
 	if err := runtime.InitializeFirstRunConfiguration(absConfigPath); err != nil {

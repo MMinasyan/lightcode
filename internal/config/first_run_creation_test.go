@@ -16,9 +16,9 @@ import (
 func TestManagedEnvCaptureCreatesNothing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", ".env")
 	managed := config.NewManagedEnv(path)
-	captured, err := managed.Capture([]string{"LIGHTCODE_TEST_MISSING"})
+	captured, err := managed.Capture([]string{"MELTA_TEST_MISSING"})
 	testassert.NoError(t, err)
-	testassert.Require(t, !captured["LIGHTCODE_TEST_MISSING"].Defined, "absent file captured a defined value")
+	testassert.Require(t, !captured["MELTA_TEST_MISSING"].Defined, "absent file captured a defined value")
 	{
 		_, err := os.Stat(path)
 		testassert.Require(t, os.IsNotExist(err), "capture created the .env file: %v", err)

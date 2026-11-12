@@ -59,8 +59,8 @@ func credentialValue(t *testing.T, result extension.Result, err error) string {
 
 func TestNativeCredentialsResolveActivationAndOperationCaptures(t *testing.T) {
 	const (
-		activationName = "LIGHTCODE_CRED_ACTIVATION"
-		operationName  = "LIGHTCODE_CRED_OPERATION"
+		activationName = "MELTA_CRED_ACTIVATION"
+		operationName  = "MELTA_CRED_OPERATION"
 	)
 	t.Setenv(activationName, "activation-value")
 	t.Setenv(operationName, "operation-value")
@@ -137,7 +137,7 @@ func TestNativeCredentialsResolveActivationAndOperationCaptures(t *testing.T) {
 // callback keeps the same retained activation capture as Open and ordinary
 // callbacks, and that its call view still expires when Close returns.
 func TestNativeCredentialsActivationAvailableInClose(t *testing.T) {
-	const activationName = "LIGHTCODE_CLOSE_ACTIVATION"
+	const activationName = "MELTA_CLOSE_ACTIVATION"
 	t.Setenv(activationName, "close-activation")
 	capability := extension.ServiceCapability("cred.close", "test.cred.close", extension.ServiceMethod("call", extension.ModeServiceIO, `{}`, `{"type":"object"}`, "", ""))
 	var closeValue string
@@ -168,7 +168,7 @@ func TestNativeCredentialsActivationAvailableInClose(t *testing.T) {
 // through the prepared opener, even when the environment changes while the
 // admitted opener is parked before Operation construction.
 func TestOperationCredentialsUsePreparedOpeningCapture(t *testing.T) {
-	const name = "LIGHTCODE_OP_PREPARED"
+	const name = "MELTA_OP_PREPARED"
 	t.Setenv(name, "prepared-value")
 	h := newServiceHarness(t)
 	probe := &credentialGateProbe{}
@@ -231,7 +231,7 @@ func TestOperationCredentialsUsePreparedOpeningCapture(t *testing.T) {
 // extensions resolving the same credential name derive their Operation fields
 // from the same preparation capture.
 func TestOperationCredentialNamesShareOnePreparationCapture(t *testing.T) {
-	const name = "LIGHTCODE_OP_SHARED"
+	const name = "MELTA_OP_SHARED"
 	t.Setenv(name, "shared-value")
 	h := newServiceHarness(t)
 	first := &credentialGateProbe{}
@@ -278,7 +278,7 @@ func TestOperationCredentialNamesShareOnePreparationCapture(t *testing.T) {
 // prepares a replacement resource set, while an identical candidate reuses
 // the current one.
 func TestDeclaredCredentialRotationReplacesResources(t *testing.T) {
-	const name = "LIGHTCODE_RES_ROTATE"
+	const name = "MELTA_RES_ROTATE"
 	t.Setenv(name, "one")
 	h := newServiceHarness(t)
 	var opens []string
@@ -314,7 +314,7 @@ func TestDeclaredCredentialRotationReplacesResources(t *testing.T) {
 // component that opens after the candidate build uses the captured binding
 // rather than sampling a later environment value.
 func TestDeclaredCredentialLazyWorkspaceUsesCandidateCapture(t *testing.T) {
-	const name = "LIGHTCODE_LAZY_WORKSPACE"
+	const name = "MELTA_LAZY_WORKSPACE"
 	t.Setenv(name, "candidate-value")
 	h := newServiceHarness(t)
 	var opened string
@@ -350,7 +350,7 @@ func TestDeclaredCredentialLazyWorkspaceUsesCandidateCapture(t *testing.T) {
 // preparation's Operation value from that same observation, while activation
 // retains its candidate binding.
 func TestExternalSharedCredentialRotationKeepsProviderObservation(t *testing.T) {
-	const name = "LIGHTCODE_SHARED_PROVIDER"
+	const name = "MELTA_SHARED_PROVIDER"
 	t.Setenv(name, "shared-candidate")
 	h := newServiceHarness(t)
 	native := credentialHostNative(t, "credshared", []extension.SecretRef{
@@ -387,10 +387,10 @@ func TestExternalSharedCredentialRotationKeepsProviderObservation(t *testing.T) 
 // that writes a managed key shared with a declared reference publishes the
 // new binding and replaces the resource set instead of reusing stale values.
 func TestManagedKeyEditRefreshesSharedDeclaredBinding(t *testing.T) {
-	const name = "LIGHTCODE_SHARED_MANAGED"
+	const name = "MELTA_SHARED_MANAGED"
 	h := newServiceHarness(t)
 	t.Cleanup(func() { _ = os.Unsetenv(name) })
-	managed := config.NewManagedEnv(filepath.Join(h.home, ".lightcode", ".env"))
+	managed := config.NewManagedEnv(filepath.Join(h.home, ".melta", ".env"))
 	testassert.NoError(t, managed.TrySet(name, "old-value"))
 	native := credentialHostNative(t, "credmanaged", []extension.SecretRef{
 		{Field: "/activation", Lifetime: extension.SecretActivation},
@@ -425,7 +425,7 @@ func TestManagedKeyEditRefreshesSharedDeclaredBinding(t *testing.T) {
 // and Invocation Open/Close callbacks observe the retained Operation capture,
 // not a fresh environment sample.
 func TestCredentialLifecycleCaptureCoversOperationAndInvocation(t *testing.T) {
-	const name = "LIGHTCODE_LIFECYCLE_BIND"
+	const name = "MELTA_LIFECYCLE_BIND"
 	t.Setenv(name, "lifecycle-value")
 	h := newServiceHarness(t)
 	openValues := make(map[string]string)
@@ -468,7 +468,7 @@ func TestCredentialLifecycleCaptureCoversOperationAndInvocation(t *testing.T) {
 // component that opened before a sibling failure closes with the same
 // retained Operation capture.
 func TestCredentialLifecycleFailedPrefixCleanupKeepsCapture(t *testing.T) {
-	const name = "LIGHTCODE_LIFECYCLE_CLEANUP"
+	const name = "MELTA_LIFECYCLE_CLEANUP"
 	t.Setenv(name, "cleanup-value")
 	h := newServiceHarness(t)
 	openValues := make(map[string]string)
@@ -549,7 +549,7 @@ func lifecycleCredentialNative(t *testing.T, id, credentialName string, openValu
 // before_tool hook receives the retained Operation capture through the same
 // callback handoff as tools.
 func TestCredentialEffectfulHookUsesOperationCapture(t *testing.T) {
-	const name = "LIGHTCODE_EFFECTFUL_HOOK"
+	const name = "MELTA_EFFECTFUL_HOOK"
 	t.Setenv(name, "hook-value")
 	h := newServiceHarness(t)
 	host, ok := extension.HostCapability(extension.ContractCredentials)
@@ -635,7 +635,7 @@ func (s *credentialValueStrategy) Consume(harness.ConsumeInput) (harness.PlanOut
 }
 
 func TestCredentialStrategyCapturesAtItsOperationOpen(t *testing.T) {
-	const name = "LIGHTCODE_STRATEGY_BIND"
+	const name = "MELTA_STRATEGY_BIND"
 	t.Setenv(name, "strategy-value")
 	h := newServiceHarness(t)
 	host, ok := extension.HostCapability(extension.ContractCredentials)
@@ -718,8 +718,8 @@ func (credentialNestedTool) Execute(ctx context.Context, tc extension.ToolContex
 }
 
 func TestCredentialNestedProviderUsesItsOwnDeclaredField(t *testing.T) {
-	const callerName = "LIGHTCODE_NESTED_CALLER"
-	const providerName = "LIGHTCODE_NESTED_PROVIDER"
+	const callerName = "MELTA_NESTED_CALLER"
+	const providerName = "MELTA_NESTED_PROVIDER"
 	t.Setenv(callerName, "caller-value")
 	t.Setenv(providerName, "provider-value")
 	h := newServiceHarness(t)
@@ -807,13 +807,13 @@ func TestCustomProviderCreateRefreshesSharedDeclaredBinding(t *testing.T) {
 		envName     string
 		seedManaged bool
 	}{
-		{name: "previously absent", envName: "LIGHTCODE_CREATE_ABSENT"},
-		{name: "previously managed", envName: "LIGHTCODE_CREATE_MANAGED", seedManaged: true},
+		{name: "previously absent", envName: "MELTA_CREATE_ABSENT"},
+		{name: "previously managed", envName: "MELTA_CREATE_MANAGED", seedManaged: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			h := newServiceHarness(t)
 			t.Cleanup(func() { _ = os.Unsetenv(testCase.envName) })
-			managed := config.NewManagedEnv(filepath.Join(h.home, ".lightcode", ".env"))
+			managed := config.NewManagedEnv(filepath.Join(h.home, ".melta", ".env"))
 			if testCase.seedManaged {
 				testassert.NoError(t, managed.TrySet(testCase.envName, "old-managed"))
 			}
@@ -862,7 +862,7 @@ func TestCustomProviderCreateRefreshesSharedDeclaredBinding(t *testing.T) {
 // the external observation survives and a supplied-key connect refuses before
 // any config, cache or managed-source effect.
 func TestDefinedEmptyExternalSharedKeyRefusesSuppliedConnect(t *testing.T) {
-	const name = "LIGHTCODE_DEFINED_EMPTY_SHARED"
+	const name = "MELTA_DEFINED_EMPTY_SHARED"
 	e := newProductionEnv(t, storage.NewMemory())
 	t.Setenv(name, "")
 	writeServiceFile(t, e.configPath, `{"providers":{"prov":`+nominalProvMember(e.server.URL, name, `{"m":{"name":"M","context_window":4096}}`)+`},"extensions":{"credexternal":{"enabled":true,"value":"`+name+`"}}}`)
@@ -907,7 +907,7 @@ func TestDefinedEmptyExternalSharedKeyRefusesSuppliedConnect(t *testing.T) {
 // provider/Operation observation, while an already prepared Operation keeps
 // its earlier provider, Operation and activation values frozen.
 func TestPreparationUsesCurrentCredentialObservationAfterStartup(t *testing.T) {
-	const name = "LIGHTCODE_CURRENT_OBSERVATION"
+	const name = "MELTA_CURRENT_OBSERVATION"
 	t.Setenv(name, "shared-candidate")
 	h := newServiceHarness(t)
 	server := newProductionModelServer(t, "", "")
@@ -1161,7 +1161,7 @@ func TestDeclaredCredentialsPromptAndChildEnvironment(t *testing.T) {
 		},
 		{
 			name:           "ordinary shell sibling",
-			activationName: "LIGHTCODE_EXT_ONLY",
+			activationName: "MELTA_EXT_ONLY",
 			shell:          "/bin/ordinary-shell",
 			wantPrompt:     "/bin/ordinary-shell",
 			wantChild:      "shell=/bin/ordinary-shell|secret=|other=extension-only-secret",
@@ -1170,7 +1170,7 @@ func TestDeclaredCredentialsPromptAndChildEnvironment(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			e := newProductionEnv(t, storage.NewMemory())
 			const (
-				operationName = "LIGHTCODE_EXT_OPERATION"
+				operationName = "MELTA_EXT_OPERATION"
 				secretValue   = "extension-only-secret"
 			)
 			writeServiceFile(t, e.configPath, credentialConfigDocument(e.server.URL, testCase.activationName, operationName))
@@ -1180,7 +1180,7 @@ func TestDeclaredCredentialsPromptAndChildEnvironment(t *testing.T) {
 			// The fixture's ordinary sibling carries the same bytes as the
 			// secret value: exclusion is by declared name, never by scanning
 			// arbitrary payload bytes.
-			t.Setenv("LIGHTCODE_UNRELATED_PAYLOAD", secretValue)
+			t.Setenv("MELTA_UNRELATED_PAYLOAD", secretValue)
 
 			probe := &credentialProbe{}
 			var steps atomic.Int64
@@ -1189,7 +1189,7 @@ func TestDeclaredCredentialsPromptAndChildEnvironment(t *testing.T) {
 				case 1:
 					return toolCallTurnEvents("cred-call", "cred_probe", `{}`)
 				case 2:
-					command := `printf 'shell=%s|secret=%s|other=%s' "$SHELL" "$` + testCase.activationName + `" "$LIGHTCODE_UNRELATED_PAYLOAD"`
+					command := `printf 'shell=%s|secret=%s|other=%s' "$SHELL" "$` + testCase.activationName + `" "$MELTA_UNRELATED_PAYLOAD"`
 					args, err := json.Marshal(map[string]any{"command": command})
 					testassert.NoError(t, err)
 					return toolCallTurnEvents("cmd-call", "run_command", string(args))
@@ -1244,8 +1244,8 @@ func TestDeclaredCredentialsPromptAndChildEnvironment(t *testing.T) {
 // or lift its child-environment exclusion.
 func TestDeclaredCredentialCapturesStayPerOperation(t *testing.T) {
 	e := newProductionEnv(t, storage.NewMemory())
-	const first = "LIGHTCODE_EXT_FIRST"
-	const second = "LIGHTCODE_EXT_SECOND"
+	const first = "MELTA_EXT_FIRST"
+	const second = "MELTA_EXT_SECOND"
 	writeServiceFile(t, e.configPath, credentialConfigDocument(e.server.URL, first, first))
 	t.Setenv("SHELL", "/bin/capture-shell")
 	t.Setenv(first, "first-secret")
@@ -1263,7 +1263,7 @@ func TestDeclaredCredentialCapturesStayPerOperation(t *testing.T) {
 		case 4:
 			return toolCallTurnEvents("cred-call", "cred_probe", `{"key":"third","park":false}`)
 		case 6:
-			return toolCallTurnEvents("cmd-call", "run_command", `{"command":"printf 'first=%s|second=%s' \"$LIGHTCODE_EXT_FIRST\" \"$LIGHTCODE_EXT_SECOND\""}`)
+			return toolCallTurnEvents("cmd-call", "run_command", `{"command":"printf 'first=%s|second=%s' \"$MELTA_EXT_FIRST\" \"$MELTA_EXT_SECOND\""}`)
 		default:
 			return textTurnEvents("done")
 		}

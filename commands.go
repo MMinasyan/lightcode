@@ -219,7 +219,7 @@ func init() {
 			summary: "remove the installed binary (and optionally all data)",
 			flags: func() *flag.FlagSet {
 				fs := newFlagSet("uninstall")
-				fs.BoolVar(&uninstallPurge, "purge", false, "also remove ~/.lightcode (API keys, sessions, snapshots)")
+				fs.BoolVar(&uninstallPurge, "purge", false, "also remove ~/.melta (API keys, sessions, snapshots)")
 				fs.BoolVar(&uninstallYes, "yes", false, "skip the confirmation prompt")
 				fs.BoolVar(&uninstallDryRun, "dry-run", false, "list what would be removed and exit")
 				return fs
@@ -343,9 +343,9 @@ func runUpgrade(raw []string) error {
 		return fmt.Errorf("no prebuilt release for %s/%s; build from source (see README)", runtime.GOOS, runtime.GOARCH)
 	}
 
-	base := os.Getenv("LIGHTCODE_RELEASE_BASE")
+	base := os.Getenv("MELTA_RELEASE_BASE")
 	if base != "" && selfupdate.IgnoreReleaseBaseAsRoot() {
-		fmt.Fprintln(errW, "note: LIGHTCODE_RELEASE_BASE ignored when running as root")
+		fmt.Fprintln(errW, "note: MELTA_RELEASE_BASE ignored when running as root")
 		base = ""
 	}
 
@@ -365,7 +365,7 @@ func runUpgrade(raw []string) error {
 		}
 		target = explicit
 	case base != "":
-		return usageErrorf("LIGHTCODE_RELEASE_BASE is set; pass an explicit version")
+		return usageErrorf("MELTA_RELEASE_BASE is set; pass an explicit version")
 	default:
 		tag, err := selfupdate.LatestTag()
 		if err != nil {
@@ -399,7 +399,7 @@ func runUpgrade(raw []string) error {
 		fmt.Fprintf(errW, "installing %s over dev build\n", target)
 	}
 	if !floorOK {
-		return fmt.Errorf("%s predates the upgrade command; install it with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | LIGHTCODE_VERSION=%s sh", target, target)
+		return fmt.Errorf("%s predates the upgrade command; install it with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | MELTA_VERSION=%s sh", target, target)
 	}
 
 	targetPath, targetDir, err := selfupdate.ResolveExecutable()
@@ -433,7 +433,7 @@ func runUpgrade(raw []string) error {
 	if err := selfupdate.SmokeCheck(staged, target); err != nil {
 		// #nosec G703 -- staged comes from os.CreateTemp in the binary's own resolved directory, not external input.
 		_ = os.Remove(staged)
-		return fmt.Errorf("%v; install with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | LIGHTCODE_VERSION=%s sh", err, target)
+		return fmt.Errorf("%v; install with the installer instead: curl -fsSL https://github.com/MMinasyan/lightcode/releases/latest/download/install.sh | MELTA_VERSION=%s sh", err, target)
 	}
 	if err := selfupdate.Replace(staged, targetPath); err != nil {
 		return err
@@ -448,8 +448,8 @@ func runUpgradeCheck(positionals []string) error {
 	if len(positionals) > 0 {
 		return usageErrorf("--check takes no version argument")
 	}
-	if os.Getenv("LIGHTCODE_RELEASE_BASE") != "" {
-		return usageErrorf("LIGHTCODE_RELEASE_BASE is set; --check is meaningless against a directory base")
+	if os.Getenv("MELTA_RELEASE_BASE") != "" {
+		return usageErrorf("MELTA_RELEASE_BASE is set; --check is meaningless against a directory base")
 	}
 	latest, err := selfupdate.LatestTag()
 	if err != nil {
@@ -494,7 +494,7 @@ func runUninstall(purge, yes, dryRun bool) error {
 		if err != nil {
 			return "", fmt.Errorf("resolve home dir: %w", err)
 		}
-		return filepath.Join(home, ".lightcode"), nil
+		return filepath.Join(home, ".melta"), nil
 	}
 
 	// A pure read: it works in a pipe without --yes and against an
@@ -532,11 +532,11 @@ func runUninstall(purge, yes, dryRun bool) error {
 			// removed) can never fire when nothing was purged.
 			purge = false
 		case selfupdate.DataDirSymlink:
-			return fmt.Errorf("~/.lightcode is a symlink; refusing to purge through it")
+			return fmt.Errorf("~/.melta is a symlink; refusing to purge through it")
 		case selfupdate.DataDirNotDir:
-			return fmt.Errorf("~/.lightcode is not a directory; refusing to purge")
+			return fmt.Errorf("~/.melta is not a directory; refusing to purge")
 		case selfupdate.DataDirNotOwned:
-			return fmt.Errorf("~/.lightcode is not owned by the current user; refusing to purge")
+			return fmt.Errorf("~/.melta is not owned by the current user; refusing to purge")
 		}
 	}
 
@@ -639,7 +639,7 @@ func runConfig(pathOnly bool) error {
 	if err != nil {
 		return err
 	}
-	if os.Getenv("LIGHTCODE_CONFIG") != "" {
+	if os.Getenv("MELTA_CONFIG") != "" {
 		fmt.Fprintf(errW, "using config at %s\n", path)
 	}
 	_, err = outW.Write(data)

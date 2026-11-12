@@ -30,7 +30,7 @@ const mountedOwnerAgents = `{"solo":{"model":"prov/m","system_prompt":"simple"},
 
 // mountedDiscoveryEnv is the one handshake value the Node process receives:
 // the path to the temporary discovery record, never its contents.
-const mountedDiscoveryEnv = "LIGHTCODE_PROTOCOL_DISCOVERY"
+const mountedDiscoveryEnv = "MELTA_PROTOCOL_DISCOVERY"
 
 func writeMountedFile(t *testing.T, path, content string) {
 	t.Helper()

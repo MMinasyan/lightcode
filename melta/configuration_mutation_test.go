@@ -1001,7 +1001,7 @@ func TestConfigurationMutateMalformedPermissionsFallbackPublishes(t *testing.T) 
 	}
 	dirID, err := config.WorkspacePermissionDirID("/ws")
 	testassert.NoError(t, err)
-	permissionPath := filepath.Join(h.home, ".lightcode", "projects", dirID, "permissions.json")
+	permissionPath := filepath.Join(h.home, ".melta", "projects", dirID, "permissions.json")
 	writeServiceFile(t, permissionPath, `NOT JSON`)
 	candidate, err := svc.mutate(context.Background(), editSettings(mutationSettings()))
 	testassert.NoError(t, err)

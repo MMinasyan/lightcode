@@ -767,7 +767,7 @@ func newExecutableConfigurationService(t *testing.T, h *serviceHarness, declarat
 	}
 	service = newConfigurationService(context.Background(), composition, h.loader,
 		NewFileConfigurationSource(h.configPath),
-		NewEnvironmentCredentialSource(filepath.Join(h.home, ".lightcode", ".env")),
+		NewEnvironmentCredentialSource(filepath.Join(h.home, ".melta", ".env")),
 		h.locations(), harness.IncludedStrategyBinding(), newObservation())
 	service.composition = composition
 	service.dataDir = t.TempDir()

@@ -27,7 +27,7 @@ import (
 // TestMain runs the real command entry with the child's exact argv instead of
 // the test suite. Children re-enter through os.Executable and the marker
 // travels into every runtime contender that clienthost starts.
-const rootExecSelector = "LIGHTCODE_TEST_ROOT_EXEC"
+const rootExecSelector = "MELTA_TEST_ROOT_EXEC"
 
 // TestMain routes self-exec children into the production entry point before
 // any test-flag parsing, so their argv stays the real command argv.
@@ -77,12 +77,12 @@ func newRootSandbox(t *testing.T) *rootSandbox {
 	t.Helper()
 	home := t.TempDir()
 	workspace := t.TempDir()
-	dataDir := filepath.Join(home, ".lightcode")
+	dataDir := filepath.Join(home, ".melta")
 	testassert.NoError(t, os.MkdirAll(dataDir, 0o700))
 	configPath := filepath.Join(home, "config.json")
 	testassert.NoError(t, os.WriteFile(configPath, []byte(rootFixtureConfig), 0o600))
 	t.Setenv("HOME", home)
-	t.Setenv("LIGHTCODE_CONFIG", configPath)
+	t.Setenv("MELTA_CONFIG", configPath)
 	isolateBundledCredentials(t)
 	exe, err := os.Executable()
 	testassert.NoError(t, err)
@@ -117,7 +117,7 @@ func (s *rootSandbox) seedOldState() {
 
 // childEnv is the exact environment every fixture child runs with: the
 // private self-exec selector beside the already-isolated HOME and
-// LIGHTCODE_CONFIG of the parent process.
+// MELTA_CONFIG of the parent process.
 func (s *rootSandbox) childEnv() []string {
 	return append(os.Environ(), rootExecSelector+"=1")
 }
@@ -398,10 +398,21 @@ func TestRootRuntimeComposition(t *testing.T) {
 	oldState := filepath.Join(s.dataDir, "projects")
 	before := snapshotHome(t, oldState)
 
+	other := *s
+	other.dataDir = filepath.Join(s.home, ".lightcode")
+	other.configPath = filepath.Join(s.home, "old-owner-config.json")
+	testassert.NoError(t, os.WriteFile(other.configPath, []byte(rootFixtureConfig), 0o600))
+	oldOwner := other.start(other.runtimeArgs(other.configPath)...)
+	oldConnection := other.awaitReady()
+	oldRecordPath := filepath.Join(other.dataDir, "runtime.json")
+	oldRecord, err := os.ReadFile(oldRecordPath)
+	testassert.NoError(t, err)
+
 	owner := s.start(s.runtimeArgs(s.configPath)...)
 	first := s.awaitReady()
 	instance := first.InstanceID()
 	testassert.Require(t, instance != "", "owner reported an empty instance")
+	testassert.Require(t, instance != oldConnection.InstanceID(), "attached to the old owner")
 
 	t.Run("contended startup exits 0 without replacing the record", func(t *testing.T) {
 		_, stderr, code := s.runOne(s.runtimeArgs(s.configPath)...)
@@ -507,6 +518,16 @@ func TestRootRuntimeComposition(t *testing.T) {
 		after := snapshotHome(t, oldState)
 		testassert.Require(t, maps.Equal(before, after), "old filesystem conversation moved: before=%v after=%v", before, after)
 	}
+	afterRecord, err := os.ReadFile(oldRecordPath)
+	testassert.NoError(t, err)
+	testassert.Require(t, bytes.Equal(oldRecord, afterRecord), "old owner record changed")
+	select {
+	case <-oldOwner.done:
+		t.Fatalf("old owner stopped: %s", oldOwner.out.String())
+	default:
+	}
+	oldOwner.signal(os.Interrupt)
+	testassert.Equal(t, oldOwner.awaitExit(), 0)
 }
 
 // TestRootACPSignalExit pins the ACP entry's retained successful signal

@@ -37,7 +37,7 @@ func TestSQLiteConformance(t *testing.T) {
 // test cleanup.
 func newSQLiteStore(t *testing.T) *SQLite {
 	t.Helper()
-	store, err := OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 	testassert.NoError(t, err)
 	t.Cleanup(func() { store.Close() })
 	return store
@@ -192,7 +192,7 @@ func sqliteFixtureDatabase(t *testing.T, path string, ddl []string, version int)
 // when initialization fails.
 func TestSQLiteSchemaInitialization(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "lightcode.db")
+	path := filepath.Join(dir, "melta.db")
 	store, err := OpenSQLite(path)
 	testassert.NoError(t, err)
 	ctx := context.Background()
@@ -318,7 +318,7 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 		initialized[dirEntry.Name()] = true
 	}
 	wantFiles := map[string]bool{
-		"lightcode.db":       true,
+		"melta.db":           true,
 		"empty.db":           true,
 		"weird?name#part.db": true,
 		":memory:":           true,
@@ -331,7 +331,7 @@ func TestSQLiteSchemaInitialization(t *testing.T) {
 	}
 
 	// A failed initialization must not leave a partial database behind.
-	blocked := filepath.Join(dir, "missing", "lightcode.db")
+	blocked := filepath.Join(dir, "missing", "melta.db")
 	{
 		_, err := OpenSQLite(blocked)
 		testassert.Require(t, err != nil, "OpenSQLite into a missing directory succeeded")
@@ -535,7 +535,7 @@ ON registers(operation_id) WHERE kind = 'operation'`
 // pool closes and the same file reopens with every committed envelope, its
 // sequences, revisions, and commit times intact.
 func TestSQLitePersistenceAcrossCloseReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "lightcode.db")
+	path := filepath.Join(t.TempDir(), "melta.db")
 	ctx := context.Background()
 
 	store, err := OpenSQLite(path)
@@ -633,7 +633,7 @@ func TestSQLitePersistenceAcrossCloseReopen(t *testing.T) {
 // physically malformed fails the open with ErrStorage, is never misread as an
 // incompatible schema, and is left byte-identical by the rejected open.
 func TestSQLitePhysicalCorruption(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "lightcode.db")
+	path := filepath.Join(t.TempDir(), "melta.db")
 	store, err := OpenSQLite(path)
 	testassert.NoError(t, err)
 	confCreateSession(t, context.Background(), store, "s1")

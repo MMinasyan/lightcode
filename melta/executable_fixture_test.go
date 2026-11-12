@@ -219,7 +219,7 @@ func (e *productionEnv) openExecutables(ctx context.Context, executables []execu
 	return open(ctx, options{
 		DataDir:       e.dataDir,
 		Configuration: NewFileConfigurationSource(e.configPath),
-		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".lightcode", ".env")),
+		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".melta", ".env")),
 		Locations:     e.locations(),
 		Identity:      e.identity,
 		Extensions:    []extension.Native{fixtureAgentPlugin(extension.Native{Declaration: declaration})},
@@ -535,7 +535,7 @@ func (e *productionEnv) openExecutablesWith(ctx context.Context, executables []e
 	return open(ctx, options{
 		DataDir:       e.dataDir,
 		Configuration: NewFileConfigurationSource(e.configPath),
-		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".lightcode", ".env")),
+		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".melta", ".env")),
 		Locations:     e.locations(),
 		Identity:      e.identity,
 		Extensions:    extras,

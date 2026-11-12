@@ -1319,7 +1319,7 @@ func TestProtocolComposedHeldCommandEnvironment(t *testing.T) {
 
 		r, host, err := openComposedHost(ctx, dataDir, configPath, home, []extension.Native{composedAgentsNative()})
 		testassert.NoError(t, err)
-		store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
+		store, err := storage.OpenSQLite(filepath.Join(dataDir, "melta.db"))
 		testassert.NoError(t, err)
 		defer store.Close()
 		defer func() { _ = r.Close(ctx) }()

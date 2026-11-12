@@ -11,13 +11,13 @@ usage() {
 
 Usage:
   sh install.sh
-  LIGHTCODE_INSTALL_DIR=/path/to/bin sh install.sh
-  LIGHTCODE_VERSION=vX.Y.Z sh install.sh
+  MELTA_INSTALL_DIR=/path/to/bin sh install.sh
+  MELTA_VERSION=vX.Y.Z sh install.sh
 
 Environment:
-  LIGHTCODE_INSTALL_DIR   Install directory. Default: /usr/local/bin
-  LIGHTCODE_VERSION       Release tag to install. Default: latest release
-  LIGHTCODE_RELEASE_BASE  Release asset base URL for tests
+  MELTA_INSTALL_DIR   Install directory. Default: /usr/local/bin
+  MELTA_VERSION       Release tag to install. Default: latest release
+  MELTA_RELEASE_BASE  Release asset base URL for tests
 
 Downloads the release tarball, verifies SHA256SUMS, installs supported Linux
 runtime packages when needed, and writes lightcode into the target directory.'
@@ -232,11 +232,11 @@ if ! have curl && ! have wget; then
     fail "required command not found: curl or wget"
 fi
 
-install_dir=${LIGHTCODE_INSTALL_DIR:-/usr/local/bin}
-release_base=${LIGHTCODE_RELEASE_BASE:-}
+install_dir=${MELTA_INSTALL_DIR:-/usr/local/bin}
+release_base=${MELTA_RELEASE_BASE:-}
 if [ -z "$release_base" ]; then
-    if [ -n "${LIGHTCODE_VERSION:-}" ]; then
-        release_base="$repo_url/releases/download/$LIGHTCODE_VERSION"
+    if [ -n "${MELTA_VERSION:-}" ]; then
+        release_base="$repo_url/releases/download/$MELTA_VERSION"
     else
         release_base="$repo_url/releases/latest/download"
     fi

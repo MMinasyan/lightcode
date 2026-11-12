@@ -384,7 +384,7 @@ var openStore = func(ctx context.Context, dataDir string) (harness.Storage, func
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	store, err := storage.OpenSQLite(filepath.Join(dataDir, "lightcode.db"))
+	store, err := storage.OpenSQLite(filepath.Join(dataDir, "melta.db"))
 	if err != nil {
 		return nil, nil, err
 	}

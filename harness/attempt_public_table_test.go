@@ -224,7 +224,7 @@ func TestPublicSharedAttemptOrchestrationTable(t *testing.T) {
 	}{
 		{"memory", func(t *testing.T) harness.Storage { return storage.NewMemory() }},
 		{"sqlite", func(t *testing.T) harness.Storage {
-			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+			store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 			testassert.NoError(t, err)
 			t.Cleanup(func() { store.Close() })
 			return store

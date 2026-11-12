@@ -15,7 +15,7 @@ import (
 // environment, and arranges for it to be unset when the test finishes.
 func envKeyForTest(t *testing.T, suffix string) string {
 	t.Helper()
-	key := "LIGHTCODE_TEST_" + suffix
+	key := "MELTA_TEST_" + suffix
 	t.Setenv(key, "") // ensures cleanup; we'll unset properly below
 	_ = os.Unsetenv(key)
 	return key

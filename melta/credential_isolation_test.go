@@ -192,8 +192,8 @@ func awaitBackgroundCompletionBody(t *testing.T, server *productionModelServer) 
 // projection reads the current provider names from the published revision and
 // excludes them without a source call or a reader-visible lock.
 func TestSubprocessEnvironmentUsesCurrentRevision(t *testing.T) {
-	const oldName = "LIGHTCODE_COHERENCE_OLD"
-	const newName = "LIGHTCODE_COHERENCE_NEW"
+	const oldName = "MELTA_COHERENCE_OLD"
+	const newName = "MELTA_COHERENCE_NEW"
 	t.Setenv(oldName, "old-value")
 	t.Setenv(newName, "new-value")
 	h := newServiceHarness(t)
@@ -220,8 +220,8 @@ func TestBlockedCleanupDoesNotHoldProviderNames(t *testing.T) {
 	const (
 		shellName    = "SHELL"
 		shellValue   = "/bin/cleanup-shell"
-		newProvider  = "LIGHTCODE_CLEANUP_NEW_PROVIDER"
-		declaredName = "LIGHTCODE_CLEANUP_DECLARED"
+		newProvider  = "MELTA_CLEANUP_NEW_PROVIDER"
+		declaredName = "MELTA_CLEANUP_DECLARED"
 	)
 	t.Setenv(shellName, shellValue)
 	t.Setenv(newProvider, "new-provider-value")
@@ -308,7 +308,7 @@ func TestBlockedCleanupDoesNotHoldProviderNames(t *testing.T) {
 // failed-prefix cleanup, and releases them when the candidate unwinds without
 // publication.
 func TestCandidateResourceHoldsNamesBeforeOpen(t *testing.T) {
-	const name = "LIGHTCODE_CANDIDATE_OPEN"
+	const name = "MELTA_CANDIDATE_OPEN"
 	t.Setenv(name, "candidate-open-value")
 	h := newServiceHarness(t)
 	var parkOpen, failSibling, parkCleanup atomic.Bool
@@ -404,11 +404,11 @@ func cleanupProviderConfig(endpoint, keyEnv, declaredName string) string {
 
 func TestHeldCredentialNamesProtectOtherSessionsAfterReload(t *testing.T) {
 	const (
-		oldName    = "LIGHTCODE_HELD_OLD"
-		newName    = "LIGHTCODE_HELD_NEW"
+		oldName    = "MELTA_HELD_OLD"
+		newName    = "MELTA_HELD_NEW"
 		oldShell   = "SHELL"
-		newShell   = "LIGHTCODE_HELD_NEW_SHELL"
-		unrelated  = "LIGHTCODE_HELD_UNRELATED"
+		newShell   = "MELTA_HELD_NEW_SHELL"
+		unrelated  = "MELTA_HELD_UNRELATED"
 		shellValue = "/bin/held-shell"
 		oldValue   = "held-old-value"
 		newValue   = "held-new-value"
@@ -496,9 +496,9 @@ func TestHeldCredentialNamesProtectOtherSessionsAfterReload(t *testing.T) {
 
 func TestProviderOnlyRenameUsesAdoptedResourcesAndHeldNames(t *testing.T) {
 	const (
-		oldProvider = "LIGHTCODE_HELD_PROVIDER_OLD"
-		newProvider = "LIGHTCODE_HELD_PROVIDER_NEW"
-		unrelated   = "LIGHTCODE_HELD_PROVIDER_UNRELATED"
+		oldProvider = "MELTA_HELD_PROVIDER_OLD"
+		newProvider = "MELTA_HELD_PROVIDER_NEW"
+		unrelated   = "MELTA_HELD_PROVIDER_UNRELATED"
 	)
 	t.Setenv(oldProvider, "old-provider-value")
 	t.Setenv(newProvider, "new-provider-value")
@@ -561,7 +561,7 @@ func TestProviderOnlyRenameUsesAdoptedResourcesAndHeldNames(t *testing.T) {
 }
 
 func TestFailedPreparationReleasesHeldCredentialNames(t *testing.T) {
-	const name = "LIGHTCODE_FAILED_CAPTURE"
+	const name = "MELTA_FAILED_CAPTURE"
 	t.Setenv(name, "failed-value")
 	h := newServiceHarness(t)
 	writeServiceFile(t, h.configPath, `{"providers":{"prov":`+nominalProvMember("http://prov.test/v1", name, `{"m":{"name":"M","context_window":4096}}`)+`}}`)
@@ -602,7 +602,7 @@ func (s definedOnlyCredentials) Capture(ctx context.Context, names []string) (ma
 // — so a later revision that no longer references the name cannot expose it to
 // child processes while the preparation is live.
 func TestSparseCredentialCaptureHoldsRequestedNames(t *testing.T) {
-	const name = "LIGHTCODE_SPARSE_REQUESTED"
+	const name = "MELTA_SPARSE_REQUESTED"
 	t.Setenv(name, "")
 	_ = os.Unsetenv(name)
 	h := newServiceHarness(t)

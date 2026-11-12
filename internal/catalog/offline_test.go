@@ -43,14 +43,14 @@ func TestBuildOfflineZeroWrites(t *testing.T) {
 		after := snapshotTree(t, home)
 		testassert.Require(t, reflect.DeepEqual(before, after), "filesystem changed:\nbefore: %v\nafter:  %v", before, after)
 		{
-			_, statErr := os.Stat(filepath.Join(home, ".lightcode"))
-			testassert.Require(t, os.IsNotExist(statErr), ".lightcode was created: stat err = %v", statErr)
+			_, statErr := os.Stat(filepath.Join(home, ".melta"))
+			testassert.Require(t, os.IsNotExist(statErr), ".melta was created: stat err = %v", statErr)
 		}
 	})
 
 	t.Run("populated cache dir", func(t *testing.T) {
 		home := t.TempDir()
-		dir := filepath.Join(home, ".lightcode", "cache", "discovery")
+		dir := filepath.Join(home, ".melta", "cache", "discovery")
 		testassert.NoError(t, os.MkdirAll(dir, 0o700))
 		testassert.NoError(t, os.WriteFile(filepath.Join(dir, "corrupt.json"), []byte("{not json"), 0o600))
 		before := snapshotTree(t, home)
@@ -72,7 +72,7 @@ func TestBuildOfflineZeroWrites(t *testing.T) {
 
 func TestBuildOfflineSurfacesCorruptCacheWarning(t *testing.T) {
 	home := t.TempDir()
-	dir := filepath.Join(home, ".lightcode", "cache", "discovery")
+	dir := filepath.Join(home, ".melta", "cache", "discovery")
 	testassert.NoError(t, os.MkdirAll(dir, 0o700))
 	testassert.NoError(t, os.WriteFile(filepath.Join(dir, "someprovider.json"), []byte("{not json"), 0o600))
 

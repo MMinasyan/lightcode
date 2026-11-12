@@ -28,7 +28,7 @@ func TestLaunchChildCommitPointOwnsAdmittedChild(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
-			inner, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+			inner, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 			testassert.NoError(t, err)
 			t.Cleanup(func() { testassert.NoError(t, inner.Close()) })
 			store := &publicationCancelStore{Storage: inner}

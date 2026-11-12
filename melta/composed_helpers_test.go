@@ -96,7 +96,7 @@ func composedCaller(t *testing.T, r *melta.Melta) melta.Caller {
 
 // composedOptions builds explicit construction inputs over one test home.
 func composedOptions(dataDir, configPath, home string, plugins []extension.Native) melta.Options {
-	dataRoot := filepath.Join(home, ".lightcode")
+	dataRoot := filepath.Join(home, ".melta")
 	return melta.Options{
 		DataDir:       dataDir,
 		Configuration: melta.NewFileConfigurationSource(configPath),

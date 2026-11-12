@@ -34,7 +34,7 @@ const readinessInterval = 250 * time.Millisecond
 const restartDelay = time.Second
 
 // Options are one host's startup inputs. An omitted DataDir resolves to
-// ~/.lightcode, an omitted ConfigPath to an absolute LIGHTCODE_CONFIG or the
+// ~/.melta, an omitted ConfigPath to an absolute MELTA_CONFIG or the
 // data directory's config.json, an omitted Executable to the running
 // executable, and an omitted PrefixArgs to none; explicit members win.
 type Options struct {
@@ -93,7 +93,7 @@ func Connect(ctx context.Context, opts Options) (*client.Client, error) {
 }
 
 // resolve applies the stated defaults once: an absolute DataDir, an absolute
-// ConfigPath from the explicit member, the configured LIGHTCODE_CONFIG, or
+// ConfigPath from the explicit member, the configured MELTA_CONFIG, or
 // the data directory's config.json, and the running executable. The
 // caller-owned prefix arguments pass through unchanged; startContender copies
 // them into the fresh launched argv.
@@ -104,7 +104,7 @@ func resolve(opts Options) (Options, error) {
 		if err != nil {
 			return Options{}, fmt.Errorf("resolve home directory: %w", err)
 		}
-		dataDir = filepath.Join(home, ".lightcode")
+		dataDir = filepath.Join(home, ".melta")
 	}
 	absoluteDataDir, err := filepath.Abs(dataDir)
 	if err != nil {
@@ -114,7 +114,7 @@ func resolve(opts Options) (Options, error) {
 
 	configPath := opts.ConfigPath
 	if configPath == "" {
-		if configured := os.Getenv("LIGHTCODE_CONFIG"); configured != "" {
+		if configured := os.Getenv("MELTA_CONFIG"); configured != "" {
 			configPath = configured
 		} else {
 			configPath = filepath.Join(absoluteDataDir, "config.json")

@@ -22,7 +22,7 @@ func main() {
 	// Diagnostics only: no config or env-file loading happens before
 	// dispatch.
 	level := slog.LevelWarn
-	if os.Getenv("LIGHTCODE_DEBUG") == "1" {
+	if os.Getenv("MELTA_DEBUG") == "1" {
 		level = slog.LevelDebug
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))

@@ -1,5 +1,5 @@
 // Package atomicfs provides the shared publication protocol for
-// ~/.lightcode state files: atomic replace, exclusive create, and a
+// ~/.melta state files: atomic replace, exclusive create, and a
 // cross-process advisory lock. Readers of a file written through Write
 // always observe either the old complete contents or the new complete
 // contents, never a partial write. Records that are read-modify-write

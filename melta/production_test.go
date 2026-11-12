@@ -274,9 +274,9 @@ func newProductionEnv(t *testing.T, store harness.Storage) *productionEnv {
 
 func (e *productionEnv) locations() Locations {
 	return Locations{
-		GlobalRulesDir:     filepath.Join(e.home, ".lightcode"),
-		DiscoveryCacheDir:  filepath.Join(e.home, ".lightcode", "cache", "discovery"),
-		WorkspacePolicyDir: filepath.Join(e.home, ".lightcode", "projects"),
+		GlobalRulesDir:     filepath.Join(e.home, ".melta"),
+		DiscoveryCacheDir:  filepath.Join(e.home, ".melta", "cache", "discovery"),
+		WorkspacePolicyDir: filepath.Join(e.home, ".melta", "projects"),
 	}
 }
 
@@ -284,7 +284,7 @@ func (e *productionEnv) options(plugins []extension.Native) Options {
 	return Options{
 		DataDir:       e.dataDir,
 		Configuration: NewFileConfigurationSource(e.configPath),
-		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".lightcode", ".env")),
+		Credentials:   NewEnvironmentCredentialSource(filepath.Join(e.home, ".melta", ".env")),
 		Locations:     e.locations(),
 		Identity:      e.identity,
 		Extensions:    plugins,

@@ -46,15 +46,15 @@ func newComposeEnv(t *testing.T) *composeEnv {
 	isolateBundledCredentials(t)
 	configPath := filepath.Join(configDir, "config.json")
 	testassert.NoError(t, os.WriteFile(configPath, []byte(composedConfigDocument), 0o600))
-	return &composeEnv{t: t, home: home, dataDir: dataDir, configPath: configPath, envPath: filepath.Join(home, ".lightcode", ".env")}
+	return &composeEnv{t: t, home: home, dataDir: dataDir, configPath: configPath, envPath: filepath.Join(home, ".melta", ".env")}
 }
 
 // openComposed constructs the Melta over the included store.
 func (e *composeEnv) locations() Locations {
 	return Locations{
-		GlobalRulesDir:     filepath.Join(e.home, ".lightcode"),
-		DiscoveryCacheDir:  filepath.Join(e.home, ".lightcode", "cache", "discovery"),
-		WorkspacePolicyDir: filepath.Join(e.home, ".lightcode", "projects"),
+		GlobalRulesDir:     filepath.Join(e.home, ".melta"),
+		DiscoveryCacheDir:  filepath.Join(e.home, ".melta", "cache", "discovery"),
+		WorkspacePolicyDir: filepath.Join(e.home, ".melta", "projects"),
 	}
 }
 
@@ -142,11 +142,11 @@ func TestIncludedStoreConstruction(t *testing.T) {
 		testassert.NoError(t, err)
 		testassert.Require(t, store != nil && closeStore != nil, "openStore returned (%v, closer supplied %v), want the store and its closer", store, closeStore != nil)
 		{
-			_, err := os.Stat(filepath.Join(dir, "lightcode.db"))
+			_, err := os.Stat(filepath.Join(dir, "melta.db"))
 			testassert.NoError(t, err)
 		}
 		testassert.NoError(t, closeStore())
-		reopened, err := storage.OpenSQLite(filepath.Join(dir, "lightcode.db"))
+		reopened, err := storage.OpenSQLite(filepath.Join(dir, "melta.db"))
 		testassert.NoError(t, err)
 		testassert.NoError(t, reopened.Close())
 	})
@@ -159,7 +159,7 @@ func TestIncludedStoreConstruction(t *testing.T) {
 		testassert.Require(t, store == nil && closeStore == nil, "canceled openStore returned (%v, closer supplied %v)", store, closeStore != nil)
 		testassert.Require(t, errors.Is(err, context.Canceled), "canceled openStore error = %v, want the context error", err)
 		{
-			_, err := os.Stat(filepath.Join(dir, "lightcode.db"))
+			_, err := os.Stat(filepath.Join(dir, "melta.db"))
 			testassert.Require(t, os.IsNotExist(err), "a canceled openStore touched the filesystem: stat err = %v", err)
 		}
 	})
@@ -172,22 +172,25 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 
 	t.Run("composes the selected backend at the exact data root and preserves unrelated files", func(t *testing.T) {
 		e := newComposeEnv(t)
-		testassert.NoError(t, os.MkdirAll(filepath.Join(e.home, ".lightcode"), 0o700))
-		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, ".lightcode", ".env"), []byte("ISOLATED=1\n"), 0o600))
-		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, ".lightcode", "unrelated.txt"), []byte("keep\n"), 0o600))
+		testassert.NoError(t, os.MkdirAll(filepath.Join(e.home, ".melta"), 0o700))
+		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, ".melta", ".env"), []byte("ISOLATED=1\n"), 0o600))
+		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, ".melta", "unrelated.txt"), []byte("keep\n"), 0o600))
 		testassert.NoError(t, os.MkdirAll(filepath.Join(e.home, "project"), 0o700))
 		testassert.NoError(t, os.WriteFile(filepath.Join(e.home, "project", "notes.txt"), []byte("keep\n"), 0o600))
 		homeBefore := treeFiles(t, e.home)
+		oldDB := filepath.Join(e.dataDir, "lightcode.db")
+		oldBytes := []byte("not a database at all")
+		testassert.NoError(t, os.WriteFile(oldDB, oldBytes, 0o600))
 
 		r, err := e.openComposed(ctx)
 		testassert.NoError(t, err)
 		{
-			_, err := os.Stat(filepath.Join(e.dataDir, "lightcode.db"))
+			_, err := os.Stat(filepath.Join(e.dataDir, "melta.db"))
 			testassert.NoError(t, err)
 		}
 		for _, name := range sortedNames(t, e.dataDir) {
 			switch name {
-			case "runtime.lock", "lightcode.db", "lightcode.db-wal", "lightcode.db-shm":
+			case "runtime.lock", "melta.db", "melta.db-wal", "melta.db-shm", "lightcode.db":
 			default:
 				t.Fatalf("unexpected file %q in the data root while open; it is the sole data-root input", name)
 			}
@@ -195,8 +198,11 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 		testassert.NoError(t, r.Close(ctx))
 		{
 			got := sortedNames(t, e.dataDir)
-			testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after Close = %v, want exactly the ownership lock and the composed database", got)
+			testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "melta.db", "runtime.lock"}), "data root after Close = %v, want the ownership lock, composed database and untouched old file", got)
 		}
+		gotOld, err := os.ReadFile(oldDB)
+		testassert.NoError(t, err)
+		testassert.Equal(t, string(gotOld), string(oldBytes))
 		assertSameTree(t, homeBefore, treeFiles(t, e.home), "the isolated home")
 	})
 
@@ -227,13 +233,13 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 		testassert.NoError(t, second.Close(ctx))
 		{
 			got := sortedNames(t, e.dataDir)
-			testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after the second Close = %v, want exactly the lock and the database", got)
+			testassert.Require(t, slices.Equal(got, []string{"melta.db", "runtime.lock"}), "data root after the second Close = %v, want exactly the lock and the database", got)
 		}
 	})
 
 	t.Run("failed assembly releases ownership and creates no second owner", func(t *testing.T) {
 		e := newComposeEnv(t)
-		testassert.NoError(t, os.WriteFile(filepath.Join(e.dataDir, "lightcode.db"), []byte("not a database at all"), 0o600))
+		testassert.NoError(t, os.WriteFile(filepath.Join(e.dataDir, "melta.db"), []byte("not a database at all"), 0o600))
 		r, err := e.openComposed(ctx)
 		testassert.Require(t, r == nil, "failed assembly returned a Melta (%v)", err)
 		testassert.Require(t, err != nil && !errors.Is(err, ErrOwned), "failed assembly error = %v, want the storage failure, not the ownership identity", err)
@@ -245,7 +251,7 @@ func TestComposedSQLiteRuntime(t *testing.T) {
 
 	t.Run("startup recovery repairs the seeded running state before execution", func(t *testing.T) {
 		e := newComposeEnv(t)
-		store, err := storage.OpenSQLite(filepath.Join(e.dataDir, "lightcode.db"))
+		store, err := storage.OpenSQLite(filepath.Join(e.dataDir, "melta.db"))
 		testassert.NoError(t, err)
 		// Registered before the seed's own cleanup, so the parked execution is
 		// released before the store closes.
@@ -473,7 +479,7 @@ func TestComposedSQLiteRuntimeObservationShutdownAndOwnership(t *testing.T) {
 	testassert.NoError(t, r.Close(ctx))
 	{
 		got := sortedNames(t, e.dataDir)
-		testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after Close = %v, want exactly the ownership lock and the composed database", got)
+		testassert.Require(t, slices.Equal(got, []string{"melta.db", "runtime.lock"}), "data root after Close = %v, want exactly the ownership lock and the composed database", got)
 	}
 	for {
 		event, ok := nextComposedEvent(t, healthy)

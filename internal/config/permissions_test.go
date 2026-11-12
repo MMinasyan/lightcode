@@ -40,7 +40,7 @@ func TestProjectsDir(t *testing.T) {
 	home, err := os.UserHomeDir()
 	testassert.NoError(t, err)
 	{
-		want := filepath.Join(home, ".lightcode", "projects")
+		want := filepath.Join(home, ".melta", "projects")
 		testassert.Equal(t, root, want)
 	}
 }

@@ -84,7 +84,7 @@ func Run(p Params) (Report, bool) {
 		return summarize(checks), false
 	}
 
-	dataDir := filepath.Join(p.Home, ".lightcode")
+	dataDir := filepath.Join(p.Home, ".melta")
 	cfg, agentsCfg, dotenvKeys := dataChecks(p, dataDir, &checks, add)
 
 	// Catalog.

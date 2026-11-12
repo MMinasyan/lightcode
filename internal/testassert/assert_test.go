@@ -11,7 +11,7 @@ import (
 
 // selfExecEnv switches the running test binary into the child mode of the
 // assertion falsification regression.
-const selfExecEnv = "LIGHTCODE_TESTASSERT_SELF_EXEC"
+const selfExecEnv = "MELTA_TESTASSERT_SELF_EXEC"
 
 // selfExecMarker is printed after the assertion calls of one child mode. The
 // parent requires it exactly where the call must not stop the test.

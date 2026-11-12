@@ -513,8 +513,8 @@ func TestTryWithLockRows(t *testing.T) {
 // TestCrashBeforeRenameLeavesReadableOrphanTemp and names the destination it
 // publishes to; crashChildCreateEnv selects the CreateExclusive shape.
 const (
-	crashChildDestEnv   = "LIGHTCODE_ATOMICFS_CRASH_DEST"
-	crashChildCreateEnv = "LIGHTCODE_ATOMICFS_CRASH_CREATE"
+	crashChildDestEnv   = "MELTA_ATOMICFS_CRASH_DEST"
+	crashChildCreateEnv = "MELTA_ATOMICFS_CRASH_CREATE"
 )
 
 // TestCrashBeforeRenameLeavesReadableOrphanTemp proves the crash-before-

@@ -449,7 +449,7 @@ func TestWarningsCompactClosureRecordsWithPostEncodeFailure(t *testing.T) {
 		comp := mustComposition(t, compactToolsPlugin(), fixtureAgentPlugin(compactToolsPlugin()))
 		svc := newConfigurationService(owner, comp, sh.loader,
 			NewFileConfigurationSource(sh.configPath),
-			NewEnvironmentCredentialSource(filepath.Join(sh.home, ".lightcode", ".env")),
+			NewEnvironmentCredentialSource(filepath.Join(sh.home, ".melta", ".env")),
 			sh.locations(), harness.IncludedStrategyBinding(), r.obs)
 		svc.composition, svc.dataDir = comp, sh.dataDir
 		svc.attachWarnings(r.warnings)

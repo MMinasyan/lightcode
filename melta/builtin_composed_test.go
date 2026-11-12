@@ -61,7 +61,7 @@ func TestBuiltinRegistrationComposes(t *testing.T) {
 	testassert.NoError(t, r.Close(ctx))
 	{
 		got := sortedDataRootNames(t, dataDir)
-		testassert.Require(t, slices.Equal(got, []string{"lightcode.db", "runtime.lock"}), "data root after shutdown = %v, want exactly the included store's files and the ownership lock", got)
+		testassert.Require(t, slices.Equal(got, []string{"melta.db", "runtime.lock"}), "data root after shutdown = %v, want exactly the included store's files and the ownership lock", got)
 	}
 }
 

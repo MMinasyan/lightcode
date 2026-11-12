@@ -230,8 +230,8 @@ func TestAssembleInstructionHeadingNormalization(t *testing.T) {
 
 func TestAssembleUsesOnlyExplicitInputs(t *testing.T) {
 	home := t.TempDir()
-	testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".lightcode"), 0o700))
-	writeRules(t, filepath.Join(home, ".lightcode"), "AMBIENT_HOME_RULES")
+	testassert.NoError(t, os.MkdirAll(filepath.Join(home, ".melta"), 0o700))
+	writeRules(t, filepath.Join(home, ".melta"), "AMBIENT_HOME_RULES")
 	t.Setenv("HOME", home)
 	t.Setenv("SHELL", "/ambient-shell")
 

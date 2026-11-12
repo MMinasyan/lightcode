@@ -611,7 +611,7 @@ func eachPrepStore(t *testing.T, run func(t *testing.T, store harness.Storage)) 
 		run(t, storage.NewMemory())
 	})
 	t.Run("sqlite", func(t *testing.T) {
-		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "lightcode.db"))
+		store, err := storage.OpenSQLite(filepath.Join(t.TempDir(), "melta.db"))
 		testassert.NoError(t, err)
 		defer store.Close()
 		run(t, store)

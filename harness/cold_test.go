@@ -21,7 +21,7 @@ import (
 
 // coldChildEnv switches this test binary into the child mode of the cold
 // execution regression.
-const coldChildEnv = "LIGHTCODE_COLD_CHILD"
+const coldChildEnv = "MELTA_COLD_CHILD"
 
 // coldChildDone is the child's completion marker: the parent requires it so a
 // child that ran no assertion cannot pass by exiting zero.

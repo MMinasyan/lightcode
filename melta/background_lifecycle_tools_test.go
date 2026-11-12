@@ -153,8 +153,8 @@ func TestBackgroundLifecycleJobsAcrossSessions(t *testing.T) {
 // the managed key is absent from the spawned job's environment and the
 // external key is present.
 func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
-	t.Setenv("LIGHTCODE_BG_EXTERNAL", "external-value")
-	testassert.NoError(t, os.Unsetenv("LIGHTCODE_BG_MANAGED"))
+	t.Setenv("MELTA_BG_EXTERNAL", "external-value")
+	testassert.NoError(t, os.Unsetenv("MELTA_BG_MANAGED"))
 	background := &harnessBackground{}
 	// The managed key connects through a real manager AFTER the tools
 	// plugin opened: the call-time subprocess-environment producer, not any
@@ -194,7 +194,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 		case "list a":
 			return toolCallStream("call-a-list", "process", `{"action":"list"}`), nil
 		case "start b":
-			return toolCallStream("call-b-start", "run_command", `{"command":"printf 'b-out|%s|%s' \"$LIGHTCODE_BG_EXTERNAL\" \"$LIGHTCODE_BG_MANAGED\"; sleep 30","background":true}`), nil
+			return toolCallStream("call-b-start", "run_command", `{"command":"printf 'b-out|%s|%s' \"$MELTA_BG_EXTERNAL\" \"$MELTA_BG_MANAGED\"; sleep 30","background":true}`), nil
 		case "list b":
 			return toolCallStream("call-b-list", "process", `{"action":"list"}`), nil
 		case "list b again":
@@ -221,7 +221,7 @@ func testJobsAcrossSessions(t *testing.T, store harness.Storage) {
 	})
 	// The connect happens after the plugin scope opened, before any command
 	// starts.
-	testassert.NoError(t, managed.TrySet("LIGHTCODE_BG_MANAGED", "managed-secret"))
+	testassert.NoError(t, managed.TrySet("MELTA_BG_MANAGED", "managed-secret"))
 	sessionA := th.createSession()
 	sessionB := th.createSession()
 

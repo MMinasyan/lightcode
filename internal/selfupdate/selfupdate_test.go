@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -256,11 +257,11 @@ func TestStageAndSmokeAndReplace(t *testing.T) {
 		}
 	})
 
-	t.Run("smoke strips LIGHTCODE_ env from the child", func(t *testing.T) {
-		t.Setenv("LIGHTCODE_SMOKE_CANARY", "leaked")
+	t.Run("smoke strips MELTA_ env from the child", func(t *testing.T) {
+		t.Setenv("MELTA_SMOKE_CANARY", "leaked")
 		dir := t.TempDir()
 		// The script fails the tag check when the canary leaks through.
-		staged, err := Stage(dir, smokeScript(`if [ -n "$LIGHTCODE_SMOKE_CANARY" ]; then echo leaked; else echo lightcode v9.9.9; fi`))
+		staged, err := Stage(dir, smokeScript(`if [ -n "$MELTA_SMOKE_CANARY" ]; then echo leaked; else echo lightcode v9.9.9; fi`))
 		testassert.NoError(t, err)
 		testassert.NoError(t, SmokeCheck(staged, "v9.9.9"))
 	})
@@ -308,22 +309,24 @@ func TestMinInstallableShape(t *testing.T) {
 // TestFloorWithinReleaseTag is the release-workflow gate: it runs against
 // the tag being released and fails when the floor exceeds it.
 func TestFloorWithinReleaseTag(t *testing.T) {
-	tag := os.Getenv("LIGHTCODE_RELEASE_TAG")
+	tag := os.Getenv("MELTA_RELEASE_TAG")
 	if tag == "" {
-		t.Skip("LIGHTCODE_RELEASE_TAG not set")
+		t.Skip("MELTA_RELEASE_TAG not set")
 	}
 	testassert.Require(t, version.IsRelease(MinInstallable), "floor %q is not an exact vMAJOR.MINOR.PATCH tag", MinInstallable)
 	testassert.Require(t, version.IsRelease(tag), "release tag %q is not an exact vMAJOR.MINOR.PATCH tag", tag)
 	testassert.Require(t, version.Compare(MinInstallable, tag) <= 0, "floor %s exceeds the tag being released (%s)", MinInstallable, tag)
 }
 
-func TestEnvWithoutLightcode(t *testing.T) {
-	t.Setenv("LIGHTCODE_TEST_STRIP", "1")
+func TestEnvWithoutMelta(t *testing.T) {
+	t.Setenv("MELTA_TEST_STRIP", "1")
+	t.Setenv("LIGHTCODE_TEST_KEEP", "1")
 	t.Setenv("KEEP_THIS_VAR", "1")
-	env := envWithoutLightcode()
-	joined := strings.Join(env, "\n")
-	testassert.Require(t, !strings.Contains(joined, "LIGHTCODE_"), "LIGHTCODE_ vars not stripped: %s", joined)
-	testassert.Require(t, strings.Contains(joined, "KEEP_THIS_VAR=1"), "non-LIGHTCODE vars must be kept")
+	env := envWithoutMelta()
+	for _, entry := range env {
+		testassert.Require(t, !strings.HasPrefix(entry, "MELTA_"), "MELTA_ entry not stripped: %q", entry)
+	}
+	testassert.Require(t, slices.Contains(env, "LIGHTCODE_TEST_KEEP=1") && slices.Contains(env, "KEEP_THIS_VAR=1"), "ordinary entries were stripped")
 }
 
 func TestIgnoreReleaseBaseAsRoot(t *testing.T) {

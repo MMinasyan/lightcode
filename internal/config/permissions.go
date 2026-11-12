@@ -9,7 +9,7 @@ import (
 
 // ProjectsDir returns the home-based projects inventory directory that holds
 // one per-Workspace permission record directory per derived storage key. It
-// reuses ConfigPath's single home/.lightcode resolution and appends projects.
+// reuses ConfigPath's single home/.melta resolution and appends projects.
 func ProjectsDir() (string, error) {
 	configPath, err := ConfigPath()
 	if err != nil {
