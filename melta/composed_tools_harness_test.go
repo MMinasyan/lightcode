@@ -8,7 +8,7 @@ import (
 	"io"
 	"regexp"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 const (

@@ -17,7 +17,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 type (

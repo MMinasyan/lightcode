@@ -10,9 +10,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/clientops"
-	"github.com/MMinasyan/lightcode/internal/terminal"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/clientops"
+	"github.com/Syntheresis/melta/internal/terminal"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 var commands = []string{"/help", "/clear", "/exit", "/model", "/agent", "/session", "/project", "/new", "/resume", "/context", "/warnings", "/compact", "/copy", "/fork", "/revert", "/children", "/stop", "/runtime"}

@@ -22,8 +22,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/cmdoutput"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/cmdoutput"
 )
 
 // Exit reasons: first reason wins, recorded by whichever of the timeout or

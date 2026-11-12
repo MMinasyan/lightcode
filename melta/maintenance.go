@@ -15,7 +15,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/harness"
 )
 
 // sweepInterval is the retained hourly automatic cadence: one pass runs

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/prompt"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/prompt"
 )
 
 func assemblyInput(workspace string, mode prompt.Mode, rules prompt.Rules) prompt.AssemblyInput {

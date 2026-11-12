@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/model"
-	"github.com/MMinasyan/lightcode/prompt"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/model"
+	"github.com/Syntheresis/melta/prompt"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // ActivateParams is the first request's input: the exact host contract version.

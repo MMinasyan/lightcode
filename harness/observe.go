@@ -1,6 +1,6 @@
 package harness
 
-import "github.com/MMinasyan/lightcode/model"
+import "github.com/Syntheresis/melta/model"
 
 // HarnessFactKind is the closed kind of one passive HarnessFact. It is exactly
 // the set of SSE-originating progress and invalidation facts; no other kind is

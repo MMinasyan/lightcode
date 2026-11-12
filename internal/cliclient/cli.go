@@ -12,10 +12,10 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/terminal"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/terminal"
+	"github.com/Syntheresis/melta/protocol"
 	"golang.org/x/term"
 )
 

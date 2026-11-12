@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/MMinasyan/lightcode/internal/pathutil"
+	"github.com/Syntheresis/melta/internal/pathutil"
 )
 
 type applyPatchTargetRole string

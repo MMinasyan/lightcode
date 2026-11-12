@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // PendingInput is one buffered process-local Submit item: neither a durable

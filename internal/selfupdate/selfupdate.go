@@ -22,7 +22,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/Syntheresis/melta/internal/version"
 )
 
 const (

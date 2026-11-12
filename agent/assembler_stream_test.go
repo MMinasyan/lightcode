@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // TestAssembleReadErrorLiveContext pins a non-EOF read failure on an accepted stream under a live run context: the output is errored with non-empty detail, eligible partial content accumulated before the failure is retained, and close still lands exactly once.

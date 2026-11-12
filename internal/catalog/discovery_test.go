@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestFetchDiscoveryParsesModelsAndSendsHeaders(t *testing.T) {

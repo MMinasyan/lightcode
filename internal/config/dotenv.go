@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/atomicfs"
 )
 
 // envLockPath is the cross-process lock serializing read-modify-write of the

@@ -15,11 +15,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/MMinasyan/lightcode/internal/clienthost"
-	"github.com/MMinasyan/lightcode/internal/config"
-	"github.com/MMinasyan/lightcode/internal/doctor"
-	"github.com/MMinasyan/lightcode/internal/selfupdate"
-	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/Syntheresis/melta/internal/clienthost"
+	"github.com/Syntheresis/melta/internal/config"
+	"github.com/Syntheresis/melta/internal/doctor"
+	"github.com/Syntheresis/melta/internal/selfupdate"
+	"github.com/Syntheresis/melta/internal/version"
 )
 
 // outW and errW are the dispatcher's streams: a command's answer goes to

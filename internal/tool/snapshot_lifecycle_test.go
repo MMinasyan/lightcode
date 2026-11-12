@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/snapshot"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/snapshot"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // revertLifecycleGroup runs the real whole-invocation restore producer over

@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extension/worker"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extension/worker"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/model"
 )
 
 // awaitResponse reads one response without hanging forever when Serve exits on

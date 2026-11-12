@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestTransportWireDiagnosticsWriteReqAndChunksPerDecodedEvent pins the retained wire-diagnostics contract end to end: with a resolved debug directory present, one request dump is written per invocation carrying exactly the encoded body bytes (verified against what the server actually received), and each successfully decoded SSE event appends its raw payload as one JSONL line in delivery order — malformed or [DONE] events never appear there.

@@ -13,10 +13,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
-const publicModule = "github.com/MMinasyan/lightcode"
+const publicModule = "github.com/Syntheresis/melta"
 
 // fixturePkg is the one test-support package an executable fixture may
 // import; it holds the shared native definition both transports serve.
@@ -1240,7 +1240,7 @@ func parseFileImports(path string) ([]string, error) {
 func TestParseFileImportsCanonicalizesRawStringImports(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "x.go")
 	{
-		err := os.WriteFile(file, []byte("package agent\n\nimport `github.com/MMinasyan/lightcode/model`\nimport `fmt`\n"), 0o644)
+		err := os.WriteFile(file, []byte("package agent\n\nimport `github.com/Syntheresis/melta/model`\nimport `fmt`\n"), 0o644)
 		testassert.NoError(t, err)
 	}
 	imports, err := parseFileImports(file)

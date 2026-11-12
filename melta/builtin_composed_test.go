@@ -9,8 +9,8 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/plugins/builtin"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // The shipped registration set composes through the real construction path

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // retainedSummarizerPrompt is the compact built-in's retained summarizer

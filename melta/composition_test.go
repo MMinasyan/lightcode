@@ -11,8 +11,8 @@ import (
 	"testing"
 	"testing/synctest"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestCompositionRejectsScopeInfoShapes(t *testing.T) {

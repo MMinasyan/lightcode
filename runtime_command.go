@@ -7,9 +7,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/MMinasyan/lightcode/internal/plugins/builtin"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/runtime"
+	"github.com/Syntheresis/melta/internal/plugins/builtin"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/runtime"
 )
 
 //go:embed runtime_identity.md

@@ -26,14 +26,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extensions/adaptation"
-	"github.com/MMinasyan/lightcode/extensions/agents"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/storage"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extensions/adaptation"
+	"github.com/Syntheresis/melta/extensions/agents"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/storage"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // composedFlowKey is the model provider's test credential; the connect

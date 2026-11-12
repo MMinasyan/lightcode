@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // targetRef is the identity same-source fixtures in this file carry so replay keeps their extras on the wire; it equals testResolved().Model by construction of that helper's baseline.

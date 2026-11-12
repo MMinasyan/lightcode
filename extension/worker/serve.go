@@ -10,8 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/harness"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/harness"
 )
 
 var errStopped = errors.New("worker: stopped")

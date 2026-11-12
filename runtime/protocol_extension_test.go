@@ -8,11 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/extension"
-	workerfixture "github.com/MMinasyan/lightcode/extension/worker/testdata/fixture/native"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/melta"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	workerfixture "github.com/Syntheresis/melta/extension/worker/testdata/fixture/native"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/melta"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // extensionOwnerOptions mounts the shared native fixture and one

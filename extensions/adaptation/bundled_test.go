@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // loadFixture reads the fixture bundled data into a bundledDoc the tests

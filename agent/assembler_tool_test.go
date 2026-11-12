@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // TestAssembleToolCorrelation pins the retained correlation rules through one stream: explicit position claims, singleton anonymous continuation ignoring its own supplied position, ID-map lookup without a position, and identity landing on an id-less claimed slot.

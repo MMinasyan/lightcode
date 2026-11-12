@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // rootExecSelector is the private test environment marker: when inherited,

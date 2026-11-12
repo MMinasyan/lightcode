@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/Syntheresis/melta/internal/editpreview"
 )
 
 const nl = "\r\n"

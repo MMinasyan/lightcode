@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // ownerHarness opens one cold Harness over the supplied store. Preparation is

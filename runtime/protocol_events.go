@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The one multiplexed events stream: every authenticated GET /v1/events owns

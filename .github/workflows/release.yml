@@ -95,7 +95,7 @@ jobs:
           TAG: ${{ steps.release_ref.outputs.tag }}
         run: |
           commit=$(git rev-parse --short HEAD)
-          pkg=github.com/MMinasyan/lightcode/internal/version
+          pkg=github.com/Syntheresis/melta/internal/version
           $(go env GOPATH)/bin/wails build -tags webkit2_41 -ldflags "-X ${pkg}.Version=${TAG} -X ${pkg}.Commit=${commit}"
 
       - name: Protocol freshness

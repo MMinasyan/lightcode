@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MMinasyan/lightcode/agent"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/agent"
+	"github.com/Syntheresis/melta/model"
 )
 
 // interruptedToolResultContent is the contract-fixed model-visible content of

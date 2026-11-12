@@ -3,7 +3,7 @@ package harness
 import (
 	"context"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // recoveryInterruptedDetail is the exact terminal detail of every Operation

@@ -1,7 +1,7 @@
 package tool
 
 import (
-	"github.com/MMinasyan/lightcode/internal/editpreview"
+	"github.com/Syntheresis/melta/internal/editpreview"
 )
 
 // ApplyPatchPreviewMetadata converts captured per-file previews into the

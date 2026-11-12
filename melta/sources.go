@@ -6,8 +6,8 @@ import (
 	"os"
 	"sync"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
-	"github.com/MMinasyan/lightcode/internal/config"
+	"github.com/Syntheresis/melta/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/config"
 )
 
 // ConfigurationSource supplies and replaces one complete configuration

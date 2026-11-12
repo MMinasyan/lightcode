@@ -5,8 +5,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/MMinasyan/lightcode/internal/safefs"
-	"github.com/MMinasyan/lightcode/internal/snapshot"
+	"github.com/Syntheresis/melta/internal/safefs"
+	"github.com/Syntheresis/melta/internal/snapshot"
 )
 
 // SnapshotStore is the complete internal snapshot surface the prepared write,

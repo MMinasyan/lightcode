@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // firstIncompleteToolSlot returns the lowest normalized position whose observed slot does not end structurally complete (non-empty id and name), or -1 when every observed slot is complete. It reads state only, so the per-delta establishment check and the final-state pin share one completeness rule.

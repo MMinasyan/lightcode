@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestParseSplitsOnFirstSlash(t *testing.T) {

@@ -555,7 +555,7 @@ build
 -tags
 webkit2_41
 -ldflags
--X github.com/MMinasyan/lightcode/internal/version.Version=v1.2.3 -X github.com/MMinasyan/lightcode/internal/version.Commit=abc1234
+-X github.com/Syntheresis/melta/internal/version.Version=v1.2.3 -X github.com/Syntheresis/melta/internal/version.Commit=abc1234
 EOF
 
 run_make_real() {

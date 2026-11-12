@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // FuzzParseStreamChunk exercises the fixed parser's invariants over arbitrary bytes: it must never panic, every failure is a protocol error wrapping ErrProtocol with nothing else leaking through untyped, and every successful parse yields a delta that passes its own accepting boundary (NewStreamDelta) — nonnegative positions throughout, closed content kinds, well-formed extras at all scopes. Seeds are the retained legacy fixture payloads ported inline as authoritative real-world wire shapes plus minimal malformed inputs so interesting coverage starts from corpus rather than cold mutation.

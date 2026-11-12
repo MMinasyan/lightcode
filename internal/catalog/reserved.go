@@ -1,6 +1,6 @@
 package catalog
 
-import "github.com/MMinasyan/lightcode/model"
+import "github.com/Syntheresis/melta/model"
 
 // CheckReservedKeys returns reserved keys present in body, in the model-owned
 // order. The reserved set has one owner — the encoder's base body — so

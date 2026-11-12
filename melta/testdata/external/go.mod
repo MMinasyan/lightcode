@@ -2,7 +2,7 @@ module melta.test/external
 
 go 1.26.0
 
-require github.com/MMinasyan/lightcode v0.0.0
+require github.com/Syntheresis/melta v0.0.0
 
 require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
@@ -15,4 +15,4 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 )
 
-replace github.com/MMinasyan/lightcode => ../../..
+replace github.com/Syntheresis/melta => ../../..

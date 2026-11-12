@@ -4,7 +4,7 @@ PREFIX ?= $(HOME)/.local
 # build; used when testing upgrade flows). COMMIT is best-effort.
 VERSION ?= dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null)
-VERSION_PKG := github.com/MMinasyan/lightcode/internal/version
+VERSION_PKG := github.com/Syntheresis/melta/internal/version
 LDFLAGS := -X $(VERSION_PKG).Version=$(VERSION) -X $(VERSION_PKG).Commit=$(COMMIT)
 
 build:

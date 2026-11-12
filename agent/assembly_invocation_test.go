@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // TestAssembleInvalidInvocation pins every invalid assembler invocation returning the typed boundary-protocol error with boundary "agent", proves a rejected call never reads its stream, and still releases any supplied non-nil stream exactly once — ownership transfers at callback invocation even when the invocation itself is malformed.

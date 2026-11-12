@@ -13,8 +13,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/MMinasyan/lightcode/client"
-	"github.com/MMinasyan/lightcode/internal/hostprocess"
+	"github.com/Syntheresis/melta/client"
+	"github.com/Syntheresis/melta/internal/hostprocess"
 )
 
 // discoveryFileName is the one startup record name inside DataDir, the same

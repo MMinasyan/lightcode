@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The one event stream's bounded delivery: a capacity-256 event queue and a

@@ -1,6 +1,6 @@
 package agent
 
-import "github.com/MMinasyan/lightcode/model"
+import "github.com/Syntheresis/melta/model"
 
 type callAcc struct {
 	id       string // non-empty once any fragment carried one; later different IDs are a conflicting-mapping conflict.

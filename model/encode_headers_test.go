@@ -3,7 +3,7 @@ package model
 import "testing"
 
 import (
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestBuildHeadersPinsDefaultsKeyAndOverrides pins the single header helper: JSON content type and SSE accept defaults, Bearer authorization exactly when a key is present (empty omits it entirely), then resolved headers overwriting matching defaults case-insensitively while adding new ones — every entry stored in MIME canonical form with http.Header.Set semantics.

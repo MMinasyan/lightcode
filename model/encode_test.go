@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // testResolved is the valid resolved-transport baseline for encoder tests: target openai/gpt-test.

@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/extension/worker"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/extension/worker"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // buildExecutableFixture builds the shared Go authoring-adapter fixture at
@@ -38,7 +38,7 @@ func buildExecutableFixtureVersion(t *testing.T, version string) string {
 	binary := filepath.Join(t.TempDir(), "fixture-worker")
 	arguments := []string{"build"}
 	if version != "" {
-		arguments = append(arguments, "-ldflags=-X github.com/MMinasyan/lightcode/extension/worker/testdata/fixture/native.fixtureVersion="+version)
+		arguments = append(arguments, "-ldflags=-X github.com/Syntheresis/melta/extension/worker/testdata/fixture/native.fixtureVersion="+version)
 	}
 	arguments = append(arguments, "-o", binary, "./testdata/fixture")
 	command := exec.Command("go", arguments...)

@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/MMinasyan/lightcode/extension"
-	agents "github.com/MMinasyan/lightcode/extensions/agents"
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/extension"
+	agents "github.com/Syntheresis/melta/extensions/agents"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // suppliedDefinition builds one supplied Agents named selection for tests.

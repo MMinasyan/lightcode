@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // This file owns the connection operators: the write-only connect and

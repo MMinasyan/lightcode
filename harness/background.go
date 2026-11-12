@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // memberKind classifies one background ownership-group member.

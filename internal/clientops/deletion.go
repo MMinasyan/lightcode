@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // DecodeDeletionResult validates and decodes the one DeleteSession success

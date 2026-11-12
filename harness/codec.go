@@ -9,7 +9,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // durableTimeLayout is the landed RFC3339Nano layout of every durable

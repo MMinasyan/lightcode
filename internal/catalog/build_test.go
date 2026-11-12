@@ -7,7 +7,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 func TestBuildCatalogFromBundledOnly(t *testing.T) {

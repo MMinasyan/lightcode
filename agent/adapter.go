@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // ToolFunc is one tool implementation in its plain standalone shape: the started call goes in, its settled result and error come out. AdaptTools is the only route a ToolFunc reaches a run through; the loop itself never sees this type.

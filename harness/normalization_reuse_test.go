@@ -13,8 +13,8 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // seqNormalizer is the fixtures' counting, attempt-stamping normalizer: every

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // reservedKeys is the closed set from rule 5; it must match production order-independently.

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestSidecarLayersShallowMergeInOrder pins rule 6: provider, then model, then runtime extra-body layers shallow-merge over the base in that order with later winning per key; values pass through byte-exact from whichever layer won them. (Reserved keys can never reach this point — their presence rejects encoding first, pinned by TestReservedKeys*.)

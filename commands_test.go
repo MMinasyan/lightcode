@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/selfupdate"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/internal/version"
+	"github.com/Syntheresis/melta/internal/selfupdate"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/internal/version"
 )
 
 // capture swaps the dispatcher streams for one dispatch call.

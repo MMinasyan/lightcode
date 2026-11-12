@@ -2,8 +2,8 @@
 //
 // Version and Commit are stamped at build time:
 //
-//	-ldflags "-X github.com/MMinasyan/lightcode/internal/version.Version=v0.0.3
-//	          -X github.com/MMinasyan/lightcode/internal/version.Commit=abc1234"
+//	-ldflags "-X github.com/Syntheresis/melta/internal/version.Version=v0.0.3
+//	          -X github.com/Syntheresis/melta/internal/version.Commit=abc1234"
 //
 // An unstamped binary is a dev build.
 package version

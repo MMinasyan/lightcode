@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestEncodeStreamOptionsPinnedByFlagOnly pins rule 3: stream_options appears exactly when the resolved flag is true, carrying precisely {"include_usage":true} and nothing else. Zero-value and explicit-false flags both omit it entirely; message count never changes its shape or occurrence. Forged sidecar copies of the key are reserved-key rejections (covered by TestReservedKeys*), not a way to turn this on.

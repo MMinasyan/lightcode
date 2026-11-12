@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/agent"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/agent"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // toolCallSSE and finalTextSSE are OpenAI-compatible streaming bodies the fake provider serves in order: the first response is a completed tool call, the second is the final text answer.

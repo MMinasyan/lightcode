@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/harness"
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/harness"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // This file extends the one validated configuration writer with the retained

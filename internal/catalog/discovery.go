@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MMinasyan/lightcode/internal/atomicfs"
+	"github.com/Syntheresis/melta/internal/atomicfs"
 )
 
 const discoveryCacheTTL = 24 * time.Hour

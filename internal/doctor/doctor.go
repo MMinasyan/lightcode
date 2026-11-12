@@ -14,9 +14,9 @@ import (
 	"slices"
 	"sort"
 
-	agentcfg "github.com/MMinasyan/lightcode/extensions/agents"
-	"github.com/MMinasyan/lightcode/internal/catalog"
-	"github.com/MMinasyan/lightcode/internal/config"
+	agentcfg "github.com/Syntheresis/melta/extensions/agents"
+	"github.com/Syntheresis/melta/internal/catalog"
+	"github.com/Syntheresis/melta/internal/config"
 )
 
 // Check statuses.

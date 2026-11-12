@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
+	"github.com/Syntheresis/melta/internal/testassert"
 )
 
 // TestWireSystemRoleMapping pins rule 7: canonical system messages encode with the resolved wire role exactly; every other canonical role is unchanged no matter what that value is. Empty resolves to "system"; any non-empty value outside {system, user, developer} rejects encoding before producing a body (ErrInvalidWireSystemRole).

@@ -3,7 +3,7 @@ package agent
 import (
 	"io"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 var testRef = model.ModelRef{Provider: "acme", Model: "m-1"} // one complete source identity every assembler and boundary-validation test asserts against.

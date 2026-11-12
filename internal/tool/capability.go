@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/pathutil"
+	"github.com/Syntheresis/melta/internal/pathutil"
 )
 
 type CapabilityOptions struct {

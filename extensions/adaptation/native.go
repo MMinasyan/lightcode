@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/MMinasyan/lightcode/extension"
-	"github.com/MMinasyan/lightcode/prompt"
+	"github.com/Syntheresis/melta/extension"
+	"github.com/Syntheresis/melta/prompt"
 )
 
 // CapabilityID is the extension's one declared preparation capability.

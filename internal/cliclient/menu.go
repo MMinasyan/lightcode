@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/internal/terminal"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/terminal"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 func (c *CLI) invalidateListLocked() {

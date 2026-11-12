@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 type Config struct {

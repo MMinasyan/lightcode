@@ -18,7 +18,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 // The client's closed failure classification. ErrNoRuntime means no verified

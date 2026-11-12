@@ -5,7 +5,7 @@ import (
 	"math"
 	"sort"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 // addInt64 returns a+b under checked signed arithmetic, reporting whether the

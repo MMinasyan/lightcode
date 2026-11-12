@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 func testNative(id string, lifetime Lifetime, capabilities []Capability, requires []Binding, open func(context.Context, InstanceContext) (Instance, error)) Native {

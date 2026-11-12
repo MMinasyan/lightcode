@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/clientops"
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/internal/clientops"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/protocol"
 )
 
 func TestDecodeDeletionResultAcceptsClosedShape(t *testing.T) {

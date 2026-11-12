@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/MMinasyan/lightcode/internal/testassert"
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/internal/testassert"
+	"github.com/Syntheresis/melta/model"
 )
 
 // TestRunCallbackZeroCallsWithOutputRejected pins that a settlement carrying an output requires exactly one callback invocation: an effect that never accepts work through the callback cannot settle an output at all, and a call-bearing output must never reach dispatch.

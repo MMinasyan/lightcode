@@ -1,6 +1,6 @@
 package agents
 
-import "github.com/MMinasyan/lightcode/prompt"
+import "github.com/Syntheresis/melta/prompt"
 
 var builtinOrder = []string{"primary", "secondary", "explore", "review", "compact"}
 

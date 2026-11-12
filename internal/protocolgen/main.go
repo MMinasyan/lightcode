@@ -513,7 +513,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/MMinasyan/lightcode/protocol"
+	"github.com/Syntheresis/melta/protocol"
 )
 {{- end}}
 

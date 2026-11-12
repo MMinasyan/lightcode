@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/MMinasyan/lightcode/model"
+	"github.com/Syntheresis/melta/model"
 )
 
 func Assemble(ctx context.Context, source model.ModelRef, stream model.Stream) (model.Output, error) {
