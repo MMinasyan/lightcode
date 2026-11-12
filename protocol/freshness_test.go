@@ -382,7 +382,9 @@ func checkDeliveryGates(wiring deliveryWiring) error {
 // workflows and requires the delivery gates to stay wired to their real
 // producers: make check-protocol and make check-wails-bindings are exact,
 // unconditional run steps, the binding check follows the tagged Wails build,
-// and the Release checks both precede packaging and upload. Neither workflow
+// and the Release checks both precede packaging and upload. The Test job's
+// race command must carry the -count=1 token, so a cached result cannot stand
+// in for a run and an equivalent flag order is accepted. Neither workflow
 // constrains the protocol check against the Wails build, and the Release
 // workflow must still declare its two publication steps. Mutation rows prove
 // removed, conditionally skipped, allowed-to-fail, suppressed and reordered
@@ -394,10 +396,25 @@ func TestDeliveryGateWorkflowWiring(t *testing.T) {
 	testPath := filepath.Join("..", ".github", "workflows", "test.yml")
 	releasePath := filepath.Join("..", ".github", "workflows", "release.yml")
 
-	testWiring := scanDeliveryWiring(parsedSteps(t, testPath, "test"))
+	testSteps := parsedSteps(t, testPath, "test")
+	testWiring := scanDeliveryWiring(testSteps)
 	{
 		err := checkDeliveryGates(testWiring)
 		testassert.Check(t, err == nil, "test workflow: %v", err)
+	}
+	{
+		// The Test job must execute its race suite afresh: -count=1 is
+		// required as one token, so equivalent flag orders pass and a missing
+		// test step or count flag fails instead of passing silently.
+		uncached := false
+		for _, step := range testSteps {
+			fields := strings.Fields(step.Run)
+			if strings.Contains(step.Run, "go test") && slices.Contains(fields, "-race") {
+				uncached = slices.Contains(fields, "-count=1")
+				break
+			}
+		}
+		testassert.Check(t, uncached, "test workflow must run go test -race with -count=1")
 	}
 	releaseWiring := scanDeliveryWiring(parsedSteps(t, releasePath, "build"))
 	{
