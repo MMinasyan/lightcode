@@ -1106,3 +1106,47 @@ func TestExtensionFailureEnvelopeOnlyAt422(t *testing.T) {
 		})
 	}
 }
+
+// TestInvokeExtensionExactEnvelopeMembers proves the shared generated-value
+// decoder rejects case-variant envelope members that encoding/json would
+// otherwise bind case-insensitively, while opaque result/data objects keep
+// their own independent member names.
+func TestInvokeExtensionExactEnvelopeMembers(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"declared failure Code sibling", http.StatusUnprocessableEntity, `{"kind":"failure","error":{"code":"","Code":"guest","message":"failure"}}`},
+		{"success RESULT sibling", http.StatusOK, `{"kind":"success","result":{"ok":true},"RESULT":{"ok":false}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, doer := newScriptFixture(t)
+			doer.respond = func(*http.Request) (*http.Response, error) {
+				return scriptedResponse(tc.status, tc.body), nil
+			}
+			status, body, err := clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+			var extensionErr *clientops.ExtensionResponseError
+			testassert.Require(t, errors.Is(err, clientops.ErrInvalidResponse) && !errors.As(err, &extensionErr), "error = %v, want invalid delivery without a declared failure", err)
+			testassert.Require(t, status == tc.status && string(body) == tc.body, "retained = (%d, %q), want the exact received response", status, body)
+		})
+	}
+
+	// Opaque result and failure-data objects are not envelope members: their
+	// own case-varied keys stay untouched.
+	c, doer := newScriptFixture(t)
+	doer.respond = func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(http.StatusOK, `{"kind":"success","result":{"Code":"guest","RESULT":9007199254740993}}`), nil
+	}
+	result, err := clientops.Call(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+	testassert.Require(t, err == nil && strings.Contains(string(result), `"RESULT":9007199254740993`), "opaque result = (%s, %v)", result, err)
+
+	c, doer = newScriptFixture(t)
+	declared := `{"kind":"failure","error":{"code":"guest_code","message":"failure","data":{"Code":"guest","RESULT":9007199254740993}}}`
+	doer.respond = func(*http.Request) (*http.Response, error) {
+		return scriptedResponse(http.StatusUnprocessableEntity, declared), nil
+	}
+	_, _, err = clientops.Invoke(context.Background(), c, "InvokeExtension", json.RawMessage(`{"body":{}}`))
+	var extensionErr *clientops.ExtensionResponseError
+	testassert.Require(t, errors.As(err, &extensionErr) && extensionErr.Failure.Error.Data != nil && string(*extensionErr.Failure.Error.Data) == `{"Code":"guest","RESULT":9007199254740993}`, "opaque failure data = %v", err)
+}

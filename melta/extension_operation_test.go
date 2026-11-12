@@ -252,6 +252,9 @@ func TestExtensionSessionCommandsParity(t *testing.T) {
 		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "Session-claiming submit = %v, want invalid", err)
 		testassert.Require(t, errors.Is(readOperationError(ctx, r, other.SessionId, "op-wrong"), harness.ErrNotFound), "refused Session-claiming arguments mutated the other Session")
 		testassert.Require(t, errors.Is(readOperationError(ctx, r, session.SessionId, "op-wrong"), harness.ErrNotFound), "refused Session-claiming arguments mutated the bound Session")
+		_, err = command("submit", `{"operation_id":"op-case","Operation_id":"op-case-other","mode":"regular","content":[{"kind":"text","text":"x"}]}`, "req-case")
+		testassert.Require(t, errors.Is(err, harness.ErrInvalid), "case-variant generated request member = %v, want invalid", err)
+		testassert.Require(t, errors.Is(readOperationError(ctx, r, session.SessionId, "op-case"), harness.ErrNotFound) && errors.Is(readOperationError(ctx, r, session.SessionId, "op-case-other"), harness.ErrNotFound), "case-variant generated request member mutated Session state")
 
 		// Every fixed command route reaches its ordinary producer through the
 		// same bridge.
@@ -300,13 +303,24 @@ func TestExtensionSessionCommandsParity(t *testing.T) {
 		testassert.NoError(t, json.Unmarshal(created.Value, &createdSession))
 		testassert.Require(t, createdSession.SessionId != "", "create_session returned no Session: %s", created.Value)
 
-		// A pure callback cannot dispatch service I/O; a management callback
-		// holds no command grant. Neither records a command effect.
+		// Management service I/O reaches its declared service binding without
+		// starting model work; its forbidden command path keeps the public
+		// denied classification. A pure callback cannot dispatch service I/O.
+		beforeManagement := e.server.requests()
+		managementSuccess, err := r.InvokeExtension(ctx, harnessCaller, fixtureRequest(fixtureExtensionID, fixtureCommands, "fixture.commands/v1", "management_command", harnessTarget(), `{"method":"cache_namespace","arguments":{}}`, "req-management-service"))
+		testassert.NoError(t, err)
+		testassert.Require(t, managementSuccess.Failure == nil && len(managementSuccess.Value) != 0, "management service result = %+v", managementSuccess)
+		var cacheNamespace struct {
+			Directory string `json:"directory"`
+		}
+		testassert.NoError(t, json.Unmarshal(managementSuccess.Value, &cacheNamespace))
+		testassert.Require(t, cacheNamespace.Directory != "", "management cache namespace = %+v", cacheNamespace)
+		testassert.Require(t, e.server.requests() == beforeManagement, "management service I/O started model work")
 		pure, err := r.InvokeExtension(ctx, harnessCaller, fixtureRequest(fixtureExtensionID, fixtureCommands, "fixture.commands/v1", "pure_command", harnessTarget(), `{"method":"submit","arguments":{}}`, "req-pure"))
 		testassert.Require(t, err != nil && pure.Failure == nil, "pure command = (%+v, %v), want the composition refusal", pure, err)
 		management, err := r.InvokeExtension(ctx, harnessCaller, fixtureRequest(fixtureExtensionID, fixtureCommands, "fixture.commands/v1", "management_command", harnessTarget(), `{"method":"submit","arguments":{}}`, "req-management"))
-		testassert.Require(t, err != nil && management.Failure == nil, "management command = (%+v, %v), want the denied refusal", management, err)
-		testassert.Require(t, countFixtureEvent(t, "command:submit") == 3, "pure/management callbacks reached the command bridge: %v", fixtureEvents(t))
+		testassert.Require(t, err != nil && management.Failure == nil && ErrorCode(err) == protocol.ErrorCodeDenied, "management command = (%+v, %v), want the public denied refusal", management, err)
+		testassert.Require(t, countFixtureEvent(t, "command:submit") == 4, "pure/management callbacks reached the command bridge: %v", fixtureEvents(t))
 		testassert.Require(t, countFixtureEvent(t, "pure:submit:attempt") == 1 && countFixtureEvent(t, "management:submit:attempt") == 1, "zero-grant callbacks did not attempt the refused bridge")
 		return newParityObservation()
 	})

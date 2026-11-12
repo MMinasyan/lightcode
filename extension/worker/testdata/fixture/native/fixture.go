@@ -440,6 +440,10 @@ func managementCommandHandler(ctx context.Context, call extension.CallContext, a
 	if err := json.Unmarshal(arguments, &request); err != nil {
 		return extension.Result{}, err
 	}
+	if request.Method == "cache_namespace" {
+		record("management:cache_namespace:attempt")
+		return call.Call(ctx, "data", "cache_namespace", json.RawMessage(`{}`))
+	}
 	record("management:%s:attempt", request.Method)
 	return call.Call(ctx, "commands", request.Method, request.Arguments)
 }

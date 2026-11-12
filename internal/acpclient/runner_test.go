@@ -1321,9 +1321,17 @@ func TestACPRuntimeForwarding(t *testing.T) {
 		},
 		"/v1/sessions/s1/revert-code": jsonHandler(409, `{"error":{"code":"conflict","message":"partial restore"},"restored":["a.go"],"skipped":[{"path":"b.go","reason":"denied"}]}`),
 		"/v1/sessions/s1/hydration":   jsonHandler(500, "<html>broken</html>"),
-		"/v1/extensions/invoke":       jsonHandler(422, `{"kind":"failure","error":{"code":"guest_code","message":"guest message","data":{"big":9007199254740993}},"partial_result":["partial",null,1]}`),
-		"/v1/providers":               jsonHandler(500, `{"code":"storage","message":"baseline partial","partial_result":{"big":9007199254740993,"text":"line\nbreak"}}`),
-		"/v1/providers/discover":      jsonHandler(200, `[]`),
+		"/v1/extensions/invoke": jsonHandler(422, `{
+  "kind": "failure",
+  "error": {"code": "guest_code", "message": "guest message", "data": {"big": 9007199254740993, "whole": 1.0, "huge": 1e400, "text": "line\n<>&"}},
+  "partial_result": ["partial", null, 9007199254740993]
+}`),
+		"/v1/providers": jsonHandler(500, `{
+  "code": "storage",
+  "message": "baseline partial",
+  "partial_result": {"big": 9007199254740993, "whole": 1.0, "huge": 1e400, "text": "line\n<>&"}
+}`),
+		"/v1/providers/discover": jsonHandler(200, `[]`),
 	})
 	b := startBridge(t, f, "/ws")
 	b.call(t, "1", "initialize", "")
@@ -1351,14 +1359,50 @@ func TestACPRuntimeForwarding(t *testing.T) {
 	{
 		code, message, data := errorFrame(t, extensionFailure)
 		testassert.Require(t, code == -32000 && message == "guest message", "extension failure error = (%d, %q)", code, message)
-		testassert.Require(t, string(data) == `{"kind":"failure","error":{"code":"guest_code","message":"guest message","data":{"big":9007199254740993}},"partial_result":["partial",null,1]}`, "extension failure error.data = %s, want the exact declared body", data)
+		testassert.Require(t, json.Valid(data), "extension failure error.data is not one JSON value: %s", data)
+		raw := string(data)
+		for _, token := range []string{"9007199254740993", "1.0", "1e400"} {
+			testassert.Require(t, strings.Contains(raw, token), "extension failure error.data lost numeric token %q: %s", token, data)
+		}
+		var decoded struct {
+			Kind  string `json:"kind"`
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+				Data    struct {
+					Big   json.RawMessage `json:"big"`
+					Whole json.RawMessage `json:"whole"`
+					Huge  json.RawMessage `json:"huge"`
+					Text  string          `json:"text"`
+				} `json:"data"`
+			} `json:"error"`
+			PartialResult []json.RawMessage `json:"partial_result"`
+		}
+		testassert.NoError(t, json.Unmarshal(data, &decoded))
+		testassert.Require(t, decoded.Kind == "failure" && decoded.Error.Code == "guest_code" && decoded.Error.Message == "guest message" && decoded.Error.Data.Text == "line\n<>&" && string(decoded.Error.Data.Big) == "9007199254740993" && string(decoded.Error.Data.Whole) == "1.0" && string(decoded.Error.Data.Huge) == "1e400" && len(decoded.PartialResult) == 3 && string(decoded.PartialResult[2]) == "9007199254740993", "extension failure decoded value = %+v", decoded)
 	}
 
 	baselinePartial := b.call(t, "6", "runtime/ListProviders", `{}`)
 	{
 		code, message, data := errorFrame(t, baselinePartial)
 		testassert.Require(t, code == -32000 && message == "baseline partial", "baseline partial error = (%d, %q)", code, message)
-		testassert.Require(t, string(data) == `{"code":"storage","message":"baseline partial","partial_result":{"big":9007199254740993,"text":"line\nbreak"}}`, "baseline partial error.data = %s, want the exact received body", data)
+		testassert.Require(t, json.Valid(data), "baseline partial error.data is not one JSON value: %s", data)
+		raw := string(data)
+		for _, token := range []string{"9007199254740993", "1.0", "1e400"} {
+			testassert.Require(t, strings.Contains(raw, token), "baseline partial error.data lost numeric token %q: %s", token, data)
+		}
+		var decoded struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Partial struct {
+				Big   json.RawMessage `json:"big"`
+				Whole json.RawMessage `json:"whole"`
+				Huge  json.RawMessage `json:"huge"`
+				Text  string          `json:"text"`
+			} `json:"partial_result"`
+		}
+		testassert.NoError(t, json.Unmarshal(data, &decoded))
+		testassert.Require(t, decoded.Code == "storage" && decoded.Message == "baseline partial" && decoded.Partial.Text == "line\n<>&" && string(decoded.Partial.Big) == "9007199254740993" && string(decoded.Partial.Whole) == "1.0" && string(decoded.Partial.Huge) == "1e400", "baseline partial decoded value = %+v", decoded)
 	}
 
 	malformed := b.call(t, "7", "runtime/GetSessionHydration", `{"session_id":"s1"}`)

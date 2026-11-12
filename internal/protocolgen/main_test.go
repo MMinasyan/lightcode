@@ -1198,9 +1198,9 @@ components:
 // fixtureDispatchTest is the generated module's own test. It drives the real
 // generated SDK through the real stateless binder against an httptest route and
 // compares every request's path, query, raw body, declared status and received
-// response bytes with independently authored expectations. The date row proves
-// the SDK's non-string path type stays compiled and parsed, and a direct string
-// cast producer would fail this module's compilation.
+// response bytes with independently authored expectations. The rows cover
+// unformatted string, string-alias and string-enum path conversion, escaped
+// path and raw query serialization, and the compiled generated bindings.
 const fixtureDispatchTest = `package clientops
 
 import (

@@ -142,6 +142,20 @@ func validateStructMembers(raw []byte, v reflect.Value, path string) error {
 		return fmt.Errorf("%s must be a JSON object: %v", path, err)
 	}
 	t := v.Type()
+	declared := make(map[string]bool, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if !field.IsExported() || field.Tag.Get("json") == "" || field.Tag.Get("json") == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		declared[name] = true
+	}
+	for name := range members {
+		if !declared[name] {
+			return fmt.Errorf("%s member %q is not declared", path, name)
+		}
+	}
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		if !field.IsExported() || field.Tag.Get("json") == "" || field.Tag.Get("json") == "-" {

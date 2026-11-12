@@ -151,27 +151,13 @@ func Invoke(ctx context.Context, c *client.Client, operation string, params json
 	return status, body, err
 }
 
-// decodeExtensionSuccess validates the fixed 200 extension envelope by its
-// kind and required member presence. The opaque result itself stays untouched.
+// decodeExtensionSuccess validates the fixed 200 extension envelope through
+// the shared generated-value decoder. The opaque result itself stays
+// untouched.
 func decodeExtensionSuccess(body []byte) error {
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(body, &members); err != nil {
+	var success protocol.ExtensionSuccess
+	if err := protocol.DecodeValue(body, &success); err != nil {
 		return fmt.Errorf("malformed extension success body: %v", err)
-	}
-	if members == nil {
-		return fmt.Errorf("malformed extension success body: not one JSON object")
-	}
-	for name := range members {
-		if name != "kind" && name != "result" {
-			return fmt.Errorf("extension success carries unknown member %q", name)
-		}
-	}
-	var kind string
-	if raw, ok := members["kind"]; !ok || isJSONNull(raw) || json.Unmarshal(raw, &kind) != nil || kind != "success" {
-		return fmt.Errorf("extension success kind is not success")
-	}
-	if _, ok := members["result"]; !ok {
-		return fmt.Errorf("extension success is missing result")
 	}
 	return nil
 }
@@ -179,7 +165,9 @@ func decodeExtensionSuccess(body []byte) error {
 // decodeExtensionFailure recognizes the fixed 422 declared-failure envelope by
 // its explicit kind. An absent kind is the ordinary baseline Error; a present
 // but malformed envelope is a delivery failure, never a fabricated baseline
-// ErrorCode.
+// ErrorCode. Structural validation belongs to the shared generated-value
+// decoder; only the nonempty guest code/message and raw null preservation stay
+// here.
 func decodeExtensionFailure(body []byte) (*protocol.ExtensionFailureResult, error) {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(body, &members); err != nil {
@@ -196,30 +184,18 @@ func decodeExtensionFailure(body []byte) (*protocol.ExtensionFailureResult, erro
 	if isJSONNull(rawKind) || json.Unmarshal(rawKind, &kind) != nil || kind != "failure" {
 		return nil, fmt.Errorf("extension failure kind is not failure")
 	}
-	for name := range members {
-		if name != "kind" && name != "error" && name != "partial_result" {
-			return nil, fmt.Errorf("extension failure carries unknown member %q", name)
-		}
+	var failure protocol.ExtensionFailureResult
+	if err := protocol.DecodeValue(body, &failure); err != nil {
+		return nil, fmt.Errorf("malformed extension failure body: %v", err)
 	}
-	rawError, ok := members["error"]
-	if !ok || isJSONNull(rawError) {
-		return nil, fmt.Errorf("extension failure is missing its error object")
+	if failure.Error.Code == "" || failure.Error.Message == "" {
+		return nil, fmt.Errorf("extension failure requires nonempty code and message")
 	}
 	var errorMembers map[string]json.RawMessage
-	if err := json.Unmarshal(rawError, &errorMembers); err != nil || errorMembers == nil {
-		return nil, fmt.Errorf("malformed extension failure error object")
-	}
-	for name := range errorMembers {
-		if name != "code" && name != "message" && name != "data" {
-			return nil, fmt.Errorf("extension failure error carries unknown member %q", name)
+	if rawError, ok := members["error"]; ok {
+		if err := json.Unmarshal(rawError, &errorMembers); err != nil {
+			return nil, fmt.Errorf("malformed extension failure error object: %v", err)
 		}
-	}
-	var failure protocol.ExtensionFailureResult
-	if code, ok := errorMembers["code"]; !ok || isJSONNull(code) || json.Unmarshal(code, &failure.Error.Code) != nil || failure.Error.Code == "" {
-		return nil, fmt.Errorf("extension failure is missing its non-empty code")
-	}
-	if message, ok := errorMembers["message"]; !ok || isJSONNull(message) || json.Unmarshal(message, &failure.Error.Message) != nil || failure.Error.Message == "" {
-		return nil, fmt.Errorf("extension failure is missing its non-empty message")
 	}
 	if data, ok := errorMembers["data"]; ok {
 		value := append(json.RawMessage(nil), data...)
@@ -229,7 +205,6 @@ func decodeExtensionFailure(body []byte) (*protocol.ExtensionFailureResult, erro
 		value := append(json.RawMessage(nil), partial...)
 		failure.PartialResult = &value
 	}
-	failure.Kind = protocol.ExtensionFailureResultKindFailure
 	return &failure, nil
 }
 
