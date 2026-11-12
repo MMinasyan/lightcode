@@ -881,9 +881,9 @@ func TestSleepTool(t *testing.T) {
 				testassert.Check(t, err != nil, "sleep normalized %s, want rejection", args)
 			}
 		}
-		raw, err := normalize(t, sleepTool, tc, "sleep", `{"seconds":2,"_lightcode_receipt":"x"}`)
+		raw, err := normalize(t, sleepTool, tc, "sleep", `{"seconds":2,"_melta_receipt":"x"}`)
 		testassert.NoError(t, err)
-		testassert.Require(t, strings.Contains(string(raw), `"seconds":2`) && !strings.Contains(string(raw), "_lightcode_receipt"), "normalized = %s, want the clamped value with private fields stripped", raw)
+		testassert.Require(t, strings.Contains(string(raw), `"seconds":2`) && !strings.Contains(string(raw), "_melta_receipt"), "normalized = %s, want the clamped value with private fields stripped", raw)
 		raw, err = normalize(t, sleepTool, tc, "sleep", `{"seconds":5000}`)
 		testassert.Require(t, err == nil && strings.Contains(string(raw), `"seconds":300`), "normalized = (%s, %v), want the 300 clamp", raw, err)
 		for _, args := range []string{`{}`, `{"seconds":0}`, `{"seconds":-5}`} {

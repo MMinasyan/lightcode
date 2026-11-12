@@ -253,18 +253,19 @@ func TestNormalizeWriteEditArgsStrictConsumedFields(t *testing.T) {
 
 func TestNormalizeArgsStripsPrivateFieldsAndRetainsUnrelated(t *testing.T) {
 	// Locally defined private-field literals stand in for model-supplied
-	// private `_lightcode_` fields of every retired receipt shape.
+	// private `_melta_` fields of every retired receipt shape.
 	const (
-		privateCanonicalPath = "_lightcode_canonical_path"
-		privatePatchReceipt  = "_lightcode_apply_patch_receipt"
+		privateCanonicalPath = "_melta_canonical_path"
+		privatePatchReceipt  = "_melta_apply_patch_receipt"
 	)
 	args, err := NormalizeWriteArgs(map[string]any{
-		"path":                            "a.txt",
-		"content":                         "x",
-		privateCanonicalPath:              "/forged/canonical",
-		privatePatchReceipt:               map[string]any{"forged": true},
-		"_lightcode_apply_patch_receipt2": "forged",
-		"unrelated_metadata":              "kept",
+		"path":                        "a.txt",
+		"content":                     "x",
+		privateCanonicalPath:          "/forged/canonical",
+		privatePatchReceipt:           map[string]any{"forged": true},
+		"_melta_apply_patch_receipt2": "forged",
+		"unrelated_metadata":          "kept",
+		"_lightcode_receipt":          "ordinary",
 	})
 	testassert.NoError(t, err)
 	{
@@ -275,6 +276,9 @@ func TestNormalizeArgsStripsPrivateFieldsAndRetainsUnrelated(t *testing.T) {
 		_, forged := args[privatePatchReceipt]
 		testassert.Require(t, !forged, "normalized args retained the private apply_patch receipt field")
 	}
+	_, forged := args["_melta_apply_patch_receipt2"]
+	testassert.Require(t, !forged, "normalized args retained a second private receipt")
+	testassert.Equal(t, args["_lightcode_receipt"], any("ordinary"))
 	testassert.Require(t, args["unrelated_metadata"] == "kept" && args["path"] == "a.txt" && args["content"] == "x", "normalized args = %+v, want unrelated fields retained; normalized args = %+v, want schema fields preserved", args, args)
 }
 

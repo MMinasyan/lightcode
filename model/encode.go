@@ -125,7 +125,7 @@ func encodeOwned(rt ResolvedTransport, request Request, runtimeLayer Extra) (jso
 
 	for _, layer := range []Extra{rt.ProviderExtraBody, rt.ModelExtraBody, runtimeLayer} { // shallow merge: later layers win per key; values are cloned into the body.
 		for k, v := range layer {
-			if strings.HasPrefix(k, "_lightcode_") {
+			if strings.HasPrefix(k, "_melta_") {
 				continue // rule 9 at top-level scope too: private persistence fields never become wire data from any sidecar layer (reserved keys already rejected above).
 			}
 			body[k] = cloneRaw(v)
@@ -302,7 +302,7 @@ func serializeContent(parts []ContentPart, policy replayPolicy) (any, bool) {
 	return out, true
 }
 
-// rawExtraMap projects one retained scope's extras through the policy: !keep contributes nothing; otherwise each surviving value is deep-copied after passing both the target drop set and the scope allowlist (which always excludes canonical keys, reserved top-level keys, and _lightcode_* private fields).
+// rawExtraMap projects one retained scope's extras through the policy: !keep contributes nothing; otherwise each surviving value is deep-copied after passing both the target drop set and the scope allowlist (which always excludes canonical keys, reserved top-level keys, and _melta_* private fields).
 func rawExtraMap(extra Extra, policy replayPolicy, allowed func(string) bool) map[string]any {
 	out := make(map[string]any)
 	if !policy.keep {
@@ -317,9 +317,9 @@ func rawExtraMap(extra Extra, policy replayPolicy, allowed func(string) bool) ma
 	return out
 }
 
-// globalExtraAllowed is the common floor for every scope: empty keys and _lightcode_* private persistence fields are never wire data, nor can any reserved top-level key come from extras. Retained legacy denylist semantics verbatim.
+// globalExtraAllowed is the common floor for every scope: empty keys and _melta_* private persistence fields are never wire data, nor can any reserved top-level key come from extras. Retained legacy denylist semantics verbatim.
 func globalExtraAllowed(key string) bool {
-	if key == "" || strings.HasPrefix(key, "_lightcode_") {
+	if key == "" || strings.HasPrefix(key, "_melta_") {
 		return false
 	}
 	for _, reserved := range reservedKeys { // the closed set is shared with sidecar rejection so both agree on ownership by construction.

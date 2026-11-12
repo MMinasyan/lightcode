@@ -810,12 +810,12 @@ func (t processTool) Prepare(_ context.Context, tc ToolContext, call model.ToolC
 }
 
 // normalizeProcessArgs is the process tool's member validator: private
-// `_lightcode_` fields are stripped, a present action or id must be a
+// `_melta_` fields are stripped, a present action or id must be a
 // string, and every other member is preserved; Prepare owns the semantics.
 func normalizeProcessArgs(args map[string]any) (map[string]any, error) {
 	clean := make(map[string]any, len(args))
 	for key, value := range args {
-		if strings.HasPrefix(key, "_lightcode_") {
+		if strings.HasPrefix(key, "_melta_") {
 			continue
 		}
 		if key == "action" || key == "id" {

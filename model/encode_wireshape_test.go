@@ -198,7 +198,7 @@ func TestOpaquePartReplayKeptAndStripped(t *testing.T) {
 	rt := testResolved() // target openai/gpt-test; each fixture below chooses its source identity to land on exactly one side of the keep/strip boundary.
 
 	t.Run("kept-reconstructs-original-wire-object", func(t *testing.T) {
-		m, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "preamble"}, {Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"summary": json.RawMessage(`"hidden"`), "_lightcode_private": json.RawMessage(`1`)}}}}) // text first so order is observable; the private field must still be filtered out inside a kept scope.
+		m, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "preamble"}, {Kind: PartOpaque, OpaqueWireType: "thinking", Extra: Extra{"summary": json.RawMessage(`"hidden"`), "_melta_private": json.RawMessage(`1`)}}}}) // text first so order is observable; the private field must still be filtered out inside a kept scope.
 		testassert.NoError(t, err)
 		body := mustEncode(t, rt, Request{Messages: []Message{m}})
 		msgs := decodeMessages(t, body)                    // one wire object for this request.
@@ -207,7 +207,7 @@ func TestOpaquePartReplayKeptAndStripped(t *testing.T) {
 		assertStringField(t, parts[1], "summary", `hidden`)
 		// private persistence fields never reconstruct even under full retention.
 		{
-			_, ok := parts[1]["_lightcode_private"]
+			_, ok := parts[1]["_melta_private"]
 			testassert.Require(t, !ok, "private field leaked onto a reconstructed opaque part: %#v", parts[1])
 		}
 	})
@@ -245,8 +245,9 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 			"id":            json.RawMessage(`"forged-id"`), // canonical identity forgery must not override the real value on the wire.
 			"type":          json.RawMessage(`"other"`),     // type always emits "function" regardless of any extra claiming otherwise at this scope.
 			"index":         json.RawMessage(`2`),           // streaming-only in the retained producer: never part of a completed request's call wire shape, so it must not come from extras either.
-			"_lightcode_x":  json.RawMessage(`1`),           // private floor applies inside a tool call too (rule 9 is shared across every scope).
-			"n":             json.RawMessage(`7`),           // reserved top-level key: never from extras at any scope including this nested one.
+			"_melta_x":      json.RawMessage(`1`),           // private floor applies inside a tool call too.
+			"_lightcode_x":  json.RawMessage(`1`),
+			"n":             json.RawMessage(`7`), // reserved top-level key: never from extras at any scope including this nested one.
 		}})
 		testassert.NoError(t, err)
 		m, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{{Kind: PartText, Text: "go"}}, ToolCalls: []ToolCall{call}}) // content present keeps this row focused on call-scope filtering rather than payload-validation rules owned by other suites.
@@ -261,6 +262,7 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 			testassert.Require(t, err == nil && len(calls) == 1, "tool_calls not a one-object array: %s", string(rawCalls))
 		}
 		assertStringField(t, calls[0], "id", "c1")
+		testassert.Equal(t, string(calls[0]["_lightcode_x"]), "1")
 		assertStringField(t, calls[0], "type", "function") // explicit function type survives any forged extra attempt for the same dual-mechanism reason as above.
 		var fn struct {                                    // nested object decoded into its own substruct so name and arguments are asserted independently below.
 			Name      string          `json:"name"`
@@ -275,7 +277,7 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 			got, ok := calls[0]["provider_hint"]
 			testassert.Require(t, ok && string(got) == `42`, "kept call-scope extra missing or altered: %#v", calls[0])
 		}
-		for _, key := range []string{"_lightcode_x", "n", "index"} { // private floor, reserved top-level keys, and streaming-only call fields never reach this wire object.
+		for _, key := range []string{"_melta_x", "n", "index"} { // private floor, reserved top-level keys, and streaming-only call fields never reach this wire object.
 			{
 				_, ok := calls[0][key]
 				testassert.Require(t, !ok, "forbidden key %q leaked onto the wire object of a tool call: %#v", key, calls[0])
@@ -289,7 +291,7 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 		if forged == nil {
 			forged = Extra{}
 		}
-		for _, key := range []string{"_lightcode_state", "role", "content", "refusal", "tool_calls", "tool_call_id", "name", "function_call", "system_fingerprint", "service_tier", "id", "created", "object", "stream"} { // stream is the single reserved top-level key forged here alongside every canonical/private forgery.
+		for _, key := range []string{"_melta_state", "role", "content", "refusal", "tool_calls", "tool_call_id", "name", "function_call", "system_fingerprint", "service_tier", "id", "created", "object", "stream"} { // stream is the single reserved top-level key forged here alongside every canonical/private forgery.
 			forged[key] = json.RawMessage(`"` + "forged-" + key + `"`) // valid JSON string, distinct per key so byte aliasing between entries cannot mask a projection ownership defect.
 		}
 
@@ -312,7 +314,7 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 			_, ok := wireString(t, obj, "marker")
 			testassert.Require(t, ok, "legitimate marker lost while forging siblings present: %#v", obj)
 		}
-		for _, key := range []string{"_lightcode_state", "refusal", "tool_call_id", "name", "function_call", "system_fingerprint", "service_tier", "id", "created", "object", "stream"} { // the reserved top-level stream forgery must be omitted by the shared message-scope filter exactly like its canonical/private siblings.
+		for _, key := range []string{"_melta_state", "refusal", "tool_call_id", "name", "function_call", "system_fingerprint", "service_tier", "id", "created", "object", "stream"} { // the reserved top-level stream forgery must be omitted by the shared message-scope filter exactly like its canonical/private siblings.
 			{
 				_, ok := obj[key]
 				testassert.Require(t, !ok, "forbidden message-scope key %q reached the wire: %#v", key, obj)
@@ -322,10 +324,10 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 
 	t.Run("content-part-scope-canonical-stripping", func(t *testing.T) {
 		part := ContentPart{Kind: PartText, Text: "real text", Extra: Extra{"note": json.RawMessage(`7`), // non-canonical at content-part scope: retained onto the same array-form object as its forged siblings below.
-			"type":         json.RawMessage(`"image_url"`),   // canonical kind forgery must not change a text part's wire type away from "text".
-			"text":         json.RawMessage(`"forged-text"`), // value-level collision on the same field: real Text wins through denylist plus overwrite.
-			"_lightcode_p": json.RawMessage(`1`),             // private floor applies inside a content part too (rule 9 shared across every scope).
-			"n":            json.RawMessage(`7`),             // reserved top-level name never comes from extras at any scope, including this nested one.
+			"type":     json.RawMessage(`"image_url"`),   // canonical kind forgery must not change a text part's wire type away from "text".
+			"text":     json.RawMessage(`"forged-text"`), // value-level collision on the same field: real Text wins through denylist plus overwrite.
+			"_melta_p": json.RawMessage(`1`),             // private floor applies inside a content part too (rule 9 shared across every scope).
+			"n":        json.RawMessage(`7`),             // reserved top-level name never comes from extras at any scope, including this nested one.
 		}}
 		m, err := NewMessage(Message{Role: RoleAssistant, Source: targetRef, Content: []ContentPart{part}, Name: ""})
 		testassert.NoError(t, err)
@@ -338,7 +340,7 @@ func TestToolCallAndContentPartExtraScopesPinned(t *testing.T) {
 			got, ok := parts[0]["note"]
 			testassert.Require(t, ok && string(got) == `7`, "kept part-scope extra missing or altered: %#v", parts[0])
 		}
-		for _, key := range []string{"_lightcode_p", "n"} { // private floor and reserved top-level keys never reach this wire object.
+		for _, key := range []string{"_melta_p", "n"} { // private floor and reserved top-level keys never reach this wire object.
 			{
 				_, ok := parts[0][key]
 				testassert.Require(t, !ok, "forbidden key %q leaked onto the wire object of a content part: %#v", key, parts[0])

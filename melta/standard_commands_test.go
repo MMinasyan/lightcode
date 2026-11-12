@@ -16,13 +16,13 @@ func TestRunCommandNormalization(t *testing.T) {
 	runCommand := byID["run_command"]
 
 	t.Run("applies the default timeout and strips private fields", func(t *testing.T) {
-		raw, err := normalize(t, runCommand, tc, "run_command", `{"command":"ls","_lightcode_receipt":"x"}`)
+		raw, err := normalize(t, runCommand, tc, "run_command", `{"command":"ls","_melta_receipt":"x"}`)
 		testassert.NoError(t, err)
 		var args map[string]any
 		testassert.NoError(t, json.Unmarshal(raw, &args))
 		testassert.Require(t, args["command"] == "ls" && args["timeout"] == float64(120) && args["background"] == false, "normalized = %s, want the command with the default 120 timeout and background false", raw)
 		{
-			_, ok := args["_lightcode_receipt"]
+			_, ok := args["_melta_receipt"]
 			testassert.Require(t, !ok, "normalized arguments retained a private field")
 		}
 	})

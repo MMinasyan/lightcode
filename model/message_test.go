@@ -238,7 +238,7 @@ func TestNewContentPartKindsAndExclusivity(t *testing.T) {
 
 // TestMessageHasOnlyContractFields pins that Message, Output, Request and the
 // stream values carry exactly their contract fields: no internal kind, display
-// metadata, or _lightcode_* persistence state.
+// metadata, or _melta_* persistence state.
 func TestMessageHasOnlyContractFields(t *testing.T) {
 	expectExactStruct(t, "Message", Message{}, []string{"Role", "Content", "Refusal", "ToolCalls", "ToolCallID", "Name", "Extra", "Source"})
 	expectExactStruct(t, "Output", Output{}, []string{"Status", "Source", "Message", "Usage", "Detail"})

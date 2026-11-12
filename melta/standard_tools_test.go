@@ -248,13 +248,13 @@ func TestNormalizeArguments(t *testing.T) {
 	tc := callToolContext(t.TempDir(), ToolConstraints{})
 
 	t.Run("read_file applies defaults and strips private fields", func(t *testing.T) {
-		raw, err := normalize(t, byID["read_file"], tc, "read_file", `{"path":"a.txt","_lightcode_receipt":"x"}`)
+		raw, err := normalize(t, byID["read_file"], tc, "read_file", `{"path":"a.txt","_melta_receipt":"x"}`)
 		testassert.NoError(t, err)
 		var args map[string]any
 		testassert.NoError(t, json.Unmarshal(raw, &args))
 		testassert.Require(t, args["path"] == "a.txt" && args["offset"] == float64(1) && args["limit"] == float64(500), "normalized = %s, want the path with default offset/limit", raw)
 		{
-			_, ok := args["_lightcode_receipt"]
+			_, ok := args["_melta_receipt"]
 			testassert.Require(t, !ok, "normalized arguments retained a private field")
 		}
 	})
@@ -303,13 +303,14 @@ func TestNormalizeArguments(t *testing.T) {
 				testassert.Check(t, err != nil, "process normalized %s, want rejection", args)
 			}
 		}
-		raw, err := normalize(t, byID["process"], tc, "process", `{"action":"read","id":"deadbeef","_lightcode_receipt":"x","note":"kept"}`)
+		raw, err := normalize(t, byID["process"], tc, "process", `{"action":"read","id":"deadbeef","_melta_receipt":"x","_lightcode_receipt":"ordinary","note":"kept"}`)
 		testassert.NoError(t, err)
 		var normalized map[string]any
 		testassert.NoError(t, json.Unmarshal(raw, &normalized))
 		testassert.Require(t, normalized["action"] == "read" && normalized["id"] == "deadbeef" && normalized["note"] == "kept", "normalized = %s, want the members preserved", raw)
+		testassert.Equal(t, normalized["_lightcode_receipt"], any("ordinary"))
 		{
-			_, ok := normalized["_lightcode_receipt"]
+			_, ok := normalized["_melta_receipt"]
 			testassert.Require(t, !ok, "normalized arguments retained a private field")
 		}
 	})

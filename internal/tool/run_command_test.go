@@ -350,10 +350,10 @@ func TestNormalizeRunCommandArgs(t *testing.T) {
 		}
 	}
 
-	normalized, err := NormalizeRunCommandArgs(decode(t, `{"command":"ls","_lightcode_receipt":"x"}`), 120)
+	normalized, err := NormalizeRunCommandArgs(decode(t, `{"command":"ls","_melta_receipt":"x"}`), 120)
 	testassert.NoError(t, err)
 	{
-		_, ok := normalized["_lightcode_receipt"]
+		_, ok := normalized["_melta_receipt"]
 		testassert.Require(t, !ok, "normalized arguments retained a private field")
 	}
 }
