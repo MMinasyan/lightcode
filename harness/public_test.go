@@ -2118,6 +2118,7 @@ func TestPublicSessionLifecycle(t *testing.T) {
 
 		t.Run("archive and sweep leave buffered input to the retiring execution", func(t *testing.T) {
 			script := newScriptModel(publicFail("terminal-to-retirement window boom"))
+			script.gate = make(chan struct{}) // the attempt cannot settle a terminal before the fixture releases it
 			sessionID := ""
 			parked := make(chan struct{})
 			release := make(chan struct{})
@@ -2144,8 +2145,9 @@ func TestPublicSessionLifecycle(t *testing.T) {
 				case <-time.After(60 * time.Second):
 				}
 			})
+			defer f.close()                                  // the run is released before the fixture context dies
 			defer closeRelease.Do(func() { close(release) }) // the latch releases in every outcome
-			defer f.close()
+			defer script.releaseGate()                       // the gated attempt releases in every outcome
 			h = f.h
 			session, err := h.CreateSession(context.Background(), harness.CreateSessionRequest{Workspace: "/tmp/works", AgentSelection: publicSelection("coder")})
 			testassert.NoError(t, err)
@@ -2155,7 +2157,13 @@ func TestPublicSessionLifecycle(t *testing.T) {
 				_, err := submit(t, f.h, sessionID, "window-1", harness.MessageModeRegular, "hello")
 				testassert.NoError(t, err)
 			}
-			<-f.prepare // the admission prepared; the scripted attempt fails and settles the terminal
+			<-f.prepare // the admission prepared; Submit returned before the gated attempt could settle a terminal
+			select {
+			case <-script.arrived: // the attempt waits on its gate: no terminal has settled yet
+			case <-time.After(10 * time.Second):
+				t.Fatal("the gated attempt never arrived")
+			}
+			script.releaseGate() // the attempt fails and settles the terminal from the run goroutine, whose emission parks the run
 			select {
 			case <-parked:
 			case <-time.After(10 * time.Second):
